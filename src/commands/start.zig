@@ -36,5 +36,5 @@ pub fn run(io: std.Io) !void {
     // 5. Run it
     var runtime = engine.Runtime.init();
     defer runtime.deinit();
-    _ = runtime.eval(source, main_name_z);
+    _ = runtime.evalModule(source, main_name_z);
 }

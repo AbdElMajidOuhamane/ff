@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
             defer std.heap.page_allocator.free(buf);
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf.ptr[0..size :0];
-            _ = runtime.eval(source, first_arg);
+            _ = runtime.evalModule(source, first_arg);
         },
         .none => printUsage(),
     }

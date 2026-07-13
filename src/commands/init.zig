@@ -19,19 +19,15 @@ pub fn run(io: std.Io) !void {
     ;
     try dir.writeFile(io, .{ .sub_path = "ff.json", .data = ff_json_content });
     // Logo
-    const ff_logo =
-        \\    /||    ||\
-        \\   / ||    || \
-        \\  | /||    ||\ |
-        \\  |/ ||    || \|
-        \\    \||    ||/
-        \\     \\    //
-        \\      \\  //
-        \\       \\//
-        \\        ||
-        \\        ||
-        \\    Fairyfly v1.0.0
-    ;
+     const ff_logo =
+\\                            ||
+\\                     Fairyfly v0.0.1
+\\███████╗  █████╗  ██╗ ██████╗  ██╗   ██╗ ███████╗ ██╗       ██╗   ██╗
+\\██╔════╝ ██╔══██╗ ██║ ██╔══██╗ ╚██╗ ██╔╝ ██╔════╝ ██║       ╚██╗ ██╔╝
+\\█████╗   ███████║ ██║ ██████╔╝  ╚████╔╝  █████╗   ██║        ╚████╔╝ 
+\\██╔══╝   ██╔══██║ ██║ ██╔══██╗   ╚██╔╝   ██╔══╝   ██║         ╚██╔╝  
+\\██║      ██║  ██║ ██║ ██║  ██║    ██║    ██║      ███████╗     ██║   
+;
     std.debug.print("Initialized fairyfly project\n", .{});
     std.debug.print("{s}\n", .{ff_logo});
     std.debug.print("  main.js  — entry point\n", .{});
