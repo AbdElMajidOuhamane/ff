@@ -14,6 +14,7 @@ pub const ModuleCache = struct {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
+            //self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit();
     }

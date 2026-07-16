@@ -176,6 +176,7 @@ pub const Runtime = struct {
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
         var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         const allocator = arena_state.allocator();
+        defer arena_state.deinit();
 
         var sources = std.ArrayList(DepEntry).empty;
 
@@ -190,6 +191,7 @@ pub const Runtime = struct {
             m.parseImports() catch continue;
             m.parseExports() catch continue;
             const wrapped = self.wrapModule(s.src, s.key, &m) catch continue;
+            defer std.heap.page_allocator.free(wrapped);
             _ = self.eval(wrapped, s.key);
             m.deinit();
         }
@@ -199,6 +201,7 @@ pub const Runtime = struct {
         m.parseImports() catch return false;
         m.parseExports() catch return false;
         const wrapped = self.wrapModule(source, filename, &m) catch return false;
+        defer std.heap.page_allocator.free(wrapped);
         return self.eval(wrapped, filename);
     }
 
@@ -296,6 +299,7 @@ pub const Runtime = struct {
                 };
 
                 const dep_z = std.heap.page_allocator.dupeZ(u8, resolved) catch continue;
+                defer std.heap.page_allocator.free(dep_z);
                 const key_z = std.heap.page_allocator.dupeZ(u8, imp.specifier) catch continue;
                 dep_keys.append(std.heap.page_allocator, key_z) catch continue;
                 _ = self.evalModuleKey(dep_source, dep_z, key_z);

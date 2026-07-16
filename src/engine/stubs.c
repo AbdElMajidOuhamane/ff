@@ -11,6 +11,11 @@ void* zigAlloc(const void* allocator, uint64_t bytes) {
     return malloc(bytes);
 }
 
+void zigFree(const void* allocator, void* pointer) {
+    (void)allocator;
+    free(pointer);
+}
+
 // Inspector stubs
 void v8_inspector__Channel__IMPL__sendResponse(
     void* self, void* data, int callId, const char* resp, size_t resp_len) {

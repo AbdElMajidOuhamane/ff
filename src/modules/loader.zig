@@ -24,10 +24,20 @@ pub const Module = struct {
         };
     }
 
-    pub fn deinit(self: *Module) void {
-        self.imports.deinit(self.allocator);
-        self.exports.deinit(self.allocator);
+   pub fn deinit(self: *Module) void {
+    for (self.imports.items) |imp| {
+        self.allocator.free(imp.specifier);
+        self.allocator.free(imp.local_name);
+        self.allocator.free(imp.export_name);
     }
+    for (self.exports.items) |exp| {
+        if (exp.name.len > 0) self.allocator.free(exp.name);
+        self.allocator.free(exp.local_name);
+        if (exp.source) |s| self.allocator.free(s);
+    }
+    self.imports.deinit(self.allocator);
+    self.exports.deinit(self.allocator);
+}
 
     pub fn parseImports(self: *Module) !void {
         try parse.parseImports(self.allocator, self.source, &self.imports);
