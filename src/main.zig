@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
             var runtime = engine.Runtime.init();
             defer runtime.deinit();
             _ = runtime.eval(code, "<eval>");
+            
         },
         .file => {
             var runtime = engine.Runtime.init();
@@ -60,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf.ptr[0..size :0];
             _ = runtime.evalModule(source, first_arg);
+            
         },
         .none => printUsage(),
     }

@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .link_libcpp = true,
             .imports = &.{
                 .{ .name = "fairyfly", .module = mod },
+                .{ .name = "xev", .module = b.dependency("libxev", .{}).module("xev") },
             },
         }),
     });

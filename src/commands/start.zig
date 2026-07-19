@@ -37,4 +37,5 @@ pub fn run(io: std.Io) !void {
     var runtime = engine.Runtime.init();
     defer runtime.deinit();
     _ = runtime.evalModule(source, main_name_z);
+    //try runtime.event_loop.run();
 }
