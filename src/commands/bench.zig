@@ -22,9 +22,13 @@ pub fn run(io: std.Io) !void {
 
     std.debug.print("\n  Fairyfly Bench\n\n", .{});
 
-    var runtime = engine.Runtime.init();
-    defer runtime.deinit();
-
+    const runtime = try engine.Runtime.init();
+    defer {
+        runtime.event_loop.deinit();
+        std.heap.page_allocator.destroy(runtime.event_loop);
+        runtime.deinit();
+        std.heap.page_allocator.destroy(runtime);
+    }
     var total_ms: i64 = 0;
     var bench_count: u32 = 0;
 

@@ -1,18 +1,21 @@
 
 const std = @import("std");
-pub fn run(io: std.Io) !void {
-    const dir = std.Io.Dir.cwd();
-    // Create main.js
+const Io=std.Io;
+
+
+pub fn run(io: Io) !void {
+    const dir = Io.Dir.cwd();
+    
     const main_content =
         \\console.log("Hello from fairyfly!");
         \\
     ;
     try dir.writeFile(io, .{ .sub_path = "main.js", .data = main_content });
-    // Create ff.json
+    
     const ff_json_content =
         \\{
         \\  "name": "my-app",
-        \\  "version": "1.0.0",
+        \\  "version": "0.0.1",
         \\  "main": "main.js"
         \\}
         \\

@@ -10,11 +10,20 @@ pub const EventLoop = struct {
         };
     }
 
+  pub fn initHeap(allocator: std.mem.Allocator) !*EventLoop {
+        const ptr = try allocator.create(EventLoop);
+        ptr.* = .{
+            .loop = try xev.Loop.init(.{}),
+        };
+        return ptr;
+    }
     pub fn deinit(self: *EventLoop) void {
         self.loop.deinit();
     }
 
     pub fn run(self: *EventLoop) !void {
-        try self.loop.run(.until_done);
-    }
+
+    try self.loop.run(.until_done);
+  
+}
 };

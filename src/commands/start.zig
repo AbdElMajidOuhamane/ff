@@ -34,8 +34,13 @@ pub fn run(io: std.Io) !void {
     defer allocator.free(js_content);
     const source: [:0]const u8 = js_content.ptr[0..js_content.len :0];
     // 5. Run it
-    var runtime = engine.Runtime.init();
-    defer runtime.deinit();
+    const runtime = try engine.Runtime.init();
+    defer {
+        runtime.event_loop.deinit();
+        std.heap.page_allocator.destroy(runtime.event_loop);
+        runtime.deinit();
+        std.heap.page_allocator.destroy(runtime);
+    }
     _ = runtime.evalModule(source, main_name_z);
-    //try runtime.event_loop.run();
+    try runtime.event_loop.run();
 }

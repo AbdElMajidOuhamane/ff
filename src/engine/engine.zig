@@ -1,8 +1,11 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("binding.h");
-});
+const c = @import("../c.zig").c;
 const mod = @import("../modules/mod.zig");
+const EventLoop =@import("../event/loop.zig").EventLoop;
+const TimerManager = @import("../event/timers.zig").TimerManager;
+const microtasks = @import("../event/microtasks.zig");
+
+
 const DepEntry = struct { key: [:0]const u8, src: []const u8 };
 const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
@@ -13,6 +16,7 @@ const FunctionCallback = *const fn (?*const c.FunctionCallbackInfo) callconv(.c)
 // Global V8 platform — initialized once, never disposed
 // ============================================================
 var g_platform: ?*c.Platform = null;
+var g_runtime: ?*Runtime = null;
 fn initGlobal() void {
     if (g_platform != null) return;
     c.v8__V8__SetFlagsFromString("--turbo-fast-api-calls", 22);
@@ -62,36 +66,57 @@ fn consoleDetailCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
 pub const Runtime = struct {
     isolate: ?*c.Isolate,
     params: c.CreateParams,
-    handle_scope: c.HandleScope,
+    
     context: ?*c.Context,
     module_cache: mod.ModuleCache,
     modules_initialized: bool,
-    pub fn init() Runtime {
+    event_loop: *EventLoop,
+    timer_manager:TimerManager,
+      pub fn init() !*Runtime {
         initGlobal();
-        // Create isolate
         var params: c.CreateParams = undefined;
         c.v8__Isolate__CreateParams__CONSTRUCT(&params);
         params.array_buffer_allocator = c.v8__ArrayBuffer__Allocator__NewDefaultAllocator();
         const isolate = c.v8__Isolate__New(&params);
         c.v8__Isolate__Enter(isolate);
-        // Handle scope
         var handle_scope: c.HandleScope = undefined;
         c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
-        // Context
+        
         const context = c.v8__Context__New(isolate, null, null);
         c.v8__Context__Enter(context);
-        // Setup console
-        setupConsole(isolate, context);
-        return .{
+        setupConsole(isolate, context);        const loop_ptr = try EventLoop.initHeap(std.heap.page_allocator);
+        const runtime = try std.heap.page_allocator.create(Runtime);
+        runtime.* = .{
             .isolate = isolate,
             .params = params,
-            .handle_scope = handle_scope,
+            
             .context = context,
             .module_cache = mod.ModuleCache.init(std.heap.page_allocator),
             .modules_initialized = false,
+            .event_loop = loop_ptr,
+            .timer_manager = TimerManager.init(&loop_ptr.loop),
         };
-    }
+        g_runtime = runtime;
+        return runtime;    }
+       fn setTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        const rt = g_runtime orelse return;
+        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+        const argc = c.v8__FunctionCallbackInfo__Length(info);
+        if (argc < 2) return;
+        const fn_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
+        const ms_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
+        const context = c.v8__Isolate__GetCurrentContext(isolate);
+        var maybe: c.MaybeF64 = undefined;
+        c.v8__Value__NumberValue(ms_val, context, &maybe);
+        if (!maybe.has_value) return;
+        const ms: u64 = @intFromFloat(maybe.value);
+        _ = rt.timer_manager.setTimeout(isolate, fn_val, ms) catch return; 
+       }
+
     fn setupConsole(isolate: ?*c.Isolate, context: ?*c.Context) void {
+        var handle_scope: c.HandleScope = undefined;       
+        c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate); 
+        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
         const global = c.v8__Context__Global(context);
         const console_obj = c.v8__Object__New(isolate);
         // console.log
@@ -117,18 +142,24 @@ pub const Runtime = struct {
         const detail_func = c.v8__Function__New__DEFAULT(context, consoleDetailCallback);
         const detail_key = c.v8__String__NewFromUtf8(isolate, "detail", 0, -1);
         var out5: c.MaybeBool = undefined;
+
         c.v8__Object__Set(console_obj, context, detail_key, detail_func, &out5);
+        const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
+        const setTimeout_key = c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1);
+        _ = c.v8__Object__Set(global, context, setTimeout_key, setTimeout_func, &out1);
     }
-    pub fn deinit(self: *Runtime) void {
+      pub fn deinit(self: *Runtime) void {
         self.module_cache.deinit();
+        self.timer_manager.cancelAll();
         c.v8__Context__Exit(self.context);
-        c.v8__HandleScope__DESTRUCT(&self.handle_scope);
         c.v8__Isolate__Exit(self.isolate);
         c.v8__Isolate__Dispose(self.isolate);
         c.v8__ArrayBuffer__Allocator__DELETE(self.params.array_buffer_allocator);
-        // Platform is global — never dispose it
     }
     pub fn eval(self: *Runtime, source: [:0]const u8, filename: [:0]const u8) bool {
+        var handle_scope: c.HandleScope = undefined;
+        c.v8__HandleScope__CONSTRUCT(&handle_scope, self.isolate); 
+        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
         const js_src = c.v8__String__NewFromUtf8(self.isolate, source.ptr, 0, -1);
         const js_name = c.v8__String__NewFromUtf8(self.isolate, filename.ptr, 0, -1);
         var origin: c.ScriptOrigin = undefined;
@@ -171,6 +202,7 @@ pub const Runtime = struct {
             }
             return false;
         }
+        microtasks.pumpMicrotasks(self.isolate);
         return true;
     }
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
@@ -202,7 +234,9 @@ pub const Runtime = struct {
         m.parseExports() catch return false;
         const wrapped = self.wrapModule(source, filename, &m) catch return false;
         defer std.heap.page_allocator.free(wrapped);
-        return self.eval(wrapped, filename);
+        const result = self.eval(wrapped, filename);
+        microtasks.pumpMicrotasks(self.isolate);
+        return result;
     }
 
     fn collectDeps(
@@ -313,9 +347,12 @@ pub const Runtime = struct {
         defer std.heap.page_allocator.free(wrapped);
         return self.eval(wrapped, filename);
     }
-    fn setupModuleRegistry(self: *Runtime) !void {
+       fn setupModuleRegistry(self: *Runtime) !void {
         if (self.modules_initialized) return;
         self.modules_initialized = true;
+        var handle_scope: c.HandleScope = undefined;
+        c.v8__HandleScope__CONSTRUCT(&handle_scope, self.isolate);
+        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
         const global = c.v8__Context__Global(self.context);
         const registry = c.v8__Object__New(self.isolate);
         const key = c.v8__String__NewFromUtf8(self.isolate, "__modules", 0, -1);
