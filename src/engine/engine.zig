@@ -5,6 +5,8 @@ const EventLoop = @import("../event/loop.zig").EventLoop;
 const TimerManager = @import("../event/timers.zig").TimerManager;
 const microtasks = @import("../event/microtasks.zig");
 const console_api = @import("../api/console.zig");
+const fs_api =@import("../api/fs.zig");
+const process_api = @import("../api/process.zig");
 
 const DepEntry = struct { key: [:0]const u8, src: []const u8 };
 const FunctionCallback = *const fn (?*const c.FunctionCallbackInfo) callconv(.c) void;
@@ -35,7 +37,7 @@ pub const Runtime = struct {
     event_loop: *EventLoop,
     timer_manager: TimerManager,
 
-    pub fn init() !*Runtime {
+    pub fn init(args: std.process.Args) !*Runtime {
         initGlobal();
         var params: c.CreateParams = undefined;
         c.v8__Isolate__CreateParams__CONSTRUCT(&params);
@@ -49,7 +51,8 @@ pub const Runtime = struct {
         c.v8__Context__Enter(context);
 
         console_api.setup(isolate, context);
-
+        fs_api.setup(isolate, context);
+        process_api.setup(isolate, context,args);
         const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
         const setTimeout_key = c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1);
         const global = c.v8__Context__Global(context);

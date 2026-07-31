@@ -16,13 +16,13 @@ const bench_files = [_][]const u8{
     "bench/array.js",
 };
 
-pub fn run(io: std.Io) !void {
+pub fn run(io: std.Io,init : std.process.Init) !void {
     const dir = std.Io.Dir.cwd();
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n  Fairyfly Bench\n\n", .{});
 
-    const runtime = try engine.Runtime.init();
+    const runtime = try engine.Runtime.init(init.minimal.args);
     defer {
         runtime.event_loop.deinit();
         std.heap.page_allocator.destroy(runtime.event_loop);

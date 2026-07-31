@@ -34,14 +34,14 @@ pub fn main(init: std.process.Init) !void {
     const cmd = parseCommand(first_arg);
     switch (cmd) {
         .init => try init_cmd.run(init.io),
-        .start => try start_cmd.run(init.io),
-        .bench => try bench_cmd.run(init.io),
+        .start => try start_cmd.run(init.io, init),
+        .bench => try bench_cmd.run(init.io,init),
         .e_flag => {
             const code = args_iter.next() orelse {
             std.debug.print("Error: -e requires an argument\n", .{});
             std.process.exit(1);
                 };
-            const runtime = try engine.Runtime.init();
+            const runtime = try engine.Runtime.init(init.minimal.args);
             defer {
                 runtime.event_loop.deinit();
                 std.heap.page_allocator.destroy(runtime.event_loop);
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
             _ = runtime.eval(code, "<eval>");
             try runtime.event_loop.run();},
         .file => {
-                const runtime = try engine.Runtime.init();
+                 const runtime = try engine.Runtime.init(init.minimal.args);
                 defer {
                     runtime.event_loop.deinit();
                     std.heap.page_allocator.destroy(runtime.event_loop);
