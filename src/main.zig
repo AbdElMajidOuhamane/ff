@@ -49,7 +49,8 @@ pub fn main(init: std.process.Init) !void {
                 std.heap.page_allocator.destroy(runtime);
             }
             _ = runtime.eval(code, "<eval>");
-            try runtime.event_loop.run();},
+            runtime.event_loop.runWithMicrotasks(runtime.isolate);
+        },
         .file => {
                  const runtime = try engine.Runtime.init(init.minimal.args);
                 defer {
@@ -72,8 +73,7 @@ pub fn main(init: std.process.Init) !void {
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf.ptr[0..size :0];
              _ = runtime.evalModule(source, first_arg);
-            microtasks.pumpMicrotasks(runtime.isolate);
-            try runtime.event_loop.run();
+            runtime.event_loop.runWithMicrotasks(runtime.isolate);
 
             
         },
