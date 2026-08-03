@@ -9,6 +9,9 @@ const fs_api =@import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
 const crypto_api=@import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
+const header=@import("../types/headers.zig");
+const request= @import("../types/request.zig");
+const response= @import("../types/response.zig");
 
 const DepEntry = struct { key: [:0]const u8, src: []const u8 };
 const FunctionCallback = *const fn (?*const c.FunctionCallbackInfo) callconv(.c) void;
@@ -57,6 +60,10 @@ pub const Runtime = struct {
         process_api.setup(isolate, context,args);
         crypto_api.setup(isolate, context);
         url_api.setup(isolate, context);
+
+        header.setup(isolate, context);
+        request.setup(isolate, context);
+        response.setup(isolate, context);
         const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
         const setTimeout_key = c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1);
         const global = c.v8__Context__Global(context);
