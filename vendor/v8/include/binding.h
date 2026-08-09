@@ -282,6 +282,10 @@ bool v8__Isolate__AddMessageListenerWithErrorLevel(
     MessageCallback callback,
     int message_levels,
     const Value* data);
+// Locker
+typedef void Locker;
+Locker* v8__Locker__New(Isolate* isolate);
+void v8__Locker__DESTRUCT(Locker* self);
 void v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(
     Isolate* isolate,
     bool capture,

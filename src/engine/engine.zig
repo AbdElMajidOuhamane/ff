@@ -9,30 +9,32 @@ const fs_api =@import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
 const crypto_api=@import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
+const fetch_api =@import("../api/fetch.zig");
 const header=@import("../types/headers.zig");
 const request= @import("../types/request.zig");
 const response= @import("../types/response.zig");
+const http = @import("../net/http.zig");
+
 
 const DepEntry = struct { key: [:0]const u8, src: []const u8 };
 const FunctionCallback = *const fn (?*const c.FunctionCallbackInfo) callconv(.c) void;
 
-// ============================================================
-// Global V8 platform — initialized once, never disposed
-// ============================================================
 var g_platform: ?*c.Platform = null;
 var g_runtime: ?*Runtime = null;
 fn initGlobal() void {
     if (g_platform != null) return;
+    _ = c.unsetenv("NODE_OPTIONS");
+    _ = c.unsetenv("V8_OPTIONS");
     c.v8__V8__SetFlagsFromString("--turbo-fast-api-calls", 22);
     const nproc: c_int = @intCast(std.Thread.getCpuCount() catch 4);
     g_platform = c.v8__Platform__NewDefaultPlatform(nproc, 1);
     c.v8__V8__InitializePlatform(g_platform);
     c.v8__V8__Initialize();
 }
+pub fn getEventLoop() ?*EventLoop {
+    if (g_runtime) |rt| return rt.event_loop else return null;
+}
 
-// ============================================================
-// Runtime — one per eval, platform is shared globally
-// ============================================================
 pub const Runtime = struct {
     isolate: ?*c.Isolate,
     params: c.CreateParams,
@@ -47,7 +49,13 @@ pub const Runtime = struct {
         var params: c.CreateParams = undefined;
         c.v8__Isolate__CreateParams__CONSTRUCT(&params);
         params.array_buffer_allocator = c.v8__ArrayBuffer__Allocator__NewDefaultAllocator();
+
+        var constraints: c.ResourceConstraints = undefined;
+        c.v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(&constraints, 0, 256 * 1024 * 1024);
+        params.constraints = constraints;
+
         const isolate = c.v8__Isolate__New(&params);
+        std.debug.print("[dbg] isolate created  thread_id={d}\n", .{std.Thread.getCurrentId()});
         c.v8__Isolate__Enter(isolate);
         var handle_scope: c.HandleScope = undefined;
         c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
@@ -60,10 +68,12 @@ pub const Runtime = struct {
         process_api.setup(isolate, context,args);
         crypto_api.setup(isolate, context);
         url_api.setup(isolate, context);
+        fetch_api.setup(isolate, context);
 
         header.setup(isolate, context);
         request.setup(isolate, context);
         response.setup(isolate, context);
+        http.setup(isolate, context);
         const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
         const setTimeout_key = c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1);
         const global = c.v8__Context__Global(context);
@@ -166,6 +176,7 @@ pub const Runtime = struct {
         defer arena_state.deinit();
 
         var sources = std.ArrayList(DepEntry).empty;
+        sources.ensureTotalCapacity(allocator, 16) catch return false;
 
         self.collectDeps(allocator, source, filename, &sources) catch return false;
 
@@ -202,6 +213,7 @@ pub const Runtime = struct {
         out: *std.ArrayList(DepEntry),
     ) !void {
         const dir = std.fs.path.dirname(filename) orelse ".";
+        try out.ensureTotalCapacity(allocator, 16);
         var m = mod.Module.init(allocator, source, filename, dir);
         defer m.deinit();
         m.parseImports() catch return;
@@ -257,6 +269,7 @@ pub const Runtime = struct {
         self.setupModuleRegistry() catch return false;
 
         var dep_keys = std.ArrayList([:0]const u8).empty;
+        dep_keys.ensureTotalCapacity(std.heap.page_allocator, 16) catch return false;
         defer {
             for (dep_keys.items) |k| std.heap.page_allocator.free(k);
             dep_keys.deinit(std.heap.page_allocator);
@@ -316,69 +329,72 @@ pub const Runtime = struct {
         c.v8__Object__Set(global, self.context, key, registry, &out);
     }
 
-    fn wrapModule(self: *Runtime, source: []const u8, registry_key: [:0]const u8, m: *mod.Module) ![:0]const u8 {
-        _ = self;
-        const gpa = std.heap.page_allocator;
-        var buf = std.ArrayList(u8).empty;
-        try buf.appendSlice(gpa, "var __exports = {};\n");
-        for (m.imports.items) |imp| {
-            try buf.appendSlice(gpa, "var ");
-            try buf.appendSlice(gpa, imp.local_name);
-            switch (imp.import_type) {
-                .namespace => {
-                    try buf.appendSlice(gpa, " = __modules['");
-                    try buf.appendSlice(gpa, imp.specifier);
-                    try buf.appendSlice(gpa, "'] || {};\n");
-                },
-                .default => {
-                    try buf.appendSlice(gpa, " = (__modules['");
-                    try buf.appendSlice(gpa, imp.specifier);
-                    try buf.appendSlice(gpa, "'] || {}).default;\n");
-                },
-                .named => {
-                    try buf.appendSlice(gpa, " = (__modules['");
-                    try buf.appendSlice(gpa, imp.specifier);
-                    try buf.appendSlice(gpa, "'] || {}).");
-                    try buf.appendSlice(gpa, imp.export_name);
-                    try buf.appendSlice(gpa, ";\n");
-                },
-            }
-        }
-        var lines = std.mem.splitScalar(u8, source, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trimStart(u8, line, " \t");
-            if (std.mem.startsWith(u8, trimmed, "import ")) continue;
-            if (std.mem.startsWith(u8, trimmed, "export default ")) {
-                continue;
-            } else if (std.mem.startsWith(u8, trimmed, "export ")) {
-                const exp_offset = std.mem.indexOf(u8, line, "export").?;
-                const prefix = line[0..exp_offset];
-                const rest = line[exp_offset + 7 ..];
-                try buf.appendSlice(gpa, prefix);
-                try buf.appendSlice(gpa, rest);
-                try buf.append(gpa, '\n');
-            } else {
-                try buf.appendSlice(gpa, line);
-                try buf.append(gpa, '\n');
-            }
-        }
-        for (m.exports.items) |exp| {
-            if (exp.export_type == .named) {
-                try buf.appendSlice(gpa, "__exports['");
-                try buf.appendSlice(gpa, exp.name);
-                try buf.appendSlice(gpa, "'] = ");
-                try buf.appendSlice(gpa, exp.local_name);
+fn wrapModule(self: *Runtime, source: []const u8, registry_key: [:0]const u8, m: *mod.Module) ![:0]const u8 {
+    _ = self;
+    const gpa = std.heap.page_allocator;
+    var buf = std.ArrayList(u8).empty;
+    try buf.appendSlice(gpa, "(function (__modules) {\n");
+    try buf.appendSlice(gpa, "var __exports = {};\n");
+    for (m.imports.items) |imp| {
+        try buf.appendSlice(gpa, "var ");
+        try buf.appendSlice(gpa, imp.local_name);
+        switch (imp.import_type) {
+            .namespace => {
+                try buf.appendSlice(gpa, " = (__modules['");
+                try buf.appendSlice(gpa, imp.specifier);
+                try buf.appendSlice(gpa, "'] || {});\n");
+            },
+            .default => {
+                try buf.appendSlice(gpa, " = (__modules['");
+                try buf.appendSlice(gpa, imp.specifier);
+                try buf.appendSlice(gpa, "'] || {}).default;\n");
+            },
+            .named => {
+                try buf.appendSlice(gpa, " = (__modules['");
+                try buf.appendSlice(gpa, imp.specifier);
+                try buf.appendSlice(gpa, "'] || {}).");
+                try buf.appendSlice(gpa, imp.export_name);
                 try buf.appendSlice(gpa, ";\n");
-            } else if (exp.export_type == .default) {
-                try buf.appendSlice(gpa, "__exports['default'] = ");
-                try buf.appendSlice(gpa, exp.local_name);
-                try buf.appendSlice(gpa, ";\n");
-            }
+            },
         }
-        try buf.appendSlice(gpa, "__modules['");
-        try buf.appendSlice(gpa, registry_key);
-        try buf.appendSlice(gpa, "'] = __exports;\n");
-        const items = try buf.toOwnedSliceSentinel(gpa, 0);
-        return items;
     }
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "import ")) continue;
+        if (std.mem.startsWith(u8, trimmed, "export default ")) {
+            continue;
+        } else if (std.mem.startsWith(u8, trimmed, "export ")) {
+            const exp_offset = std.mem.indexOf(u8, line, "export").?;
+            const prefix = line[0..exp_offset];
+            const rest = line[exp_offset + 7 ..];
+            try buf.appendSlice(gpa, prefix);
+            try buf.appendSlice(gpa, rest);
+            try buf.append(gpa, '\n');
+        } else {
+            try buf.appendSlice(gpa, line);
+            try buf.append(gpa, '\n');
+        }
+    }
+    for (m.exports.items) |exp| {
+        if (exp.export_type == .named) {
+            try buf.appendSlice(gpa, "__exports['");
+            try buf.appendSlice(gpa, exp.name);
+            try buf.appendSlice(gpa, "'] = ");
+            try buf.appendSlice(gpa, exp.local_name);
+            try buf.appendSlice(gpa, ";\n");
+        } else if (exp.export_type == .default) {
+            try buf.appendSlice(gpa, "__exports['");
+            try buf.appendSlice(gpa, exp.name);
+            try buf.appendSlice(gpa, "'] = ");
+            try buf.appendSlice(gpa, exp.local_name);
+            try buf.appendSlice(gpa, ";\n");
+        }
+    }
+    try buf.appendSlice(gpa, "__modules['");
+    try buf.appendSlice(gpa, registry_key);
+    try buf.appendSlice(gpa, "'] = __exports;\n");
+    try buf.appendSlice(gpa, "})(__modules);\n");
+    return try buf.toOwnedSliceSentinel(gpa, 0);
+}
 };

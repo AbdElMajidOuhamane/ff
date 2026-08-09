@@ -5,6 +5,70 @@ const headers_mod = @import("headers.zig");
 const gpa = std.heap.page_allocator;
 
 // ============================================================
+// Cached V8 strings + functions (created once in setup)
+// ============================================================
+
+var str___d: c.Global = .{ .data_ptr = 0 };
+var str_headers: c.Global = .{ .data_ptr = 0 };
+var str_bodyUsed: c.Global = .{ .data_ptr = 0 };
+var str_ok: c.Global = .{ .data_ptr = 0 };
+var str_status: c.Global = .{ .data_ptr = 0 };
+var str_statusText: c.Global = .{ .data_ptr = 0 };
+var str_url: c.Global = .{ .data_ptr = 0 };
+var str_type: c.Global = .{ .data_ptr = 0 };
+var str_redirected: c.Global = .{ .data_ptr = 0 };
+var str_text: c.Global = .{ .data_ptr = 0 };
+var str_json: c.Global = .{ .data_ptr = 0 };
+var str_arrayBuffer: c.Global = .{ .data_ptr = 0 };
+var str_blob: c.Global = .{ .data_ptr = 0 };
+var str_formData: c.Global = .{ .data_ptr = 0 };
+var str_bytes: c.Global = .{ .data_ptr = 0 };
+var str_clone: c.Global = .{ .data_ptr = 0 };
+
+var fn_bodyUsed: c.Global = .{ .data_ptr = 0 };
+var fn_ok: c.Global = .{ .data_ptr = 0 };
+var fn_status: c.Global = .{ .data_ptr = 0 };
+var fn_statusText: c.Global = .{ .data_ptr = 0 };
+var fn_url: c.Global = .{ .data_ptr = 0 };
+var fn_type: c.Global = .{ .data_ptr = 0 };
+var fn_redirected: c.Global = .{ .data_ptr = 0 };
+var fn_text: c.Global = .{ .data_ptr = 0 };
+var fn_json: c.Global = .{ .data_ptr = 0 };
+var fn_arrayBuffer: c.Global = .{ .data_ptr = 0 };
+var fn_blob: c.Global = .{ .data_ptr = 0 };
+var fn_formData: c.Global = .{ .data_ptr = 0 };
+var fn_bytes: c.Global = .{ .data_ptr = 0 };
+var fn_clone: c.Global = .{ .data_ptr = 0 };
+
+// Cached Headers strings + functions
+var h_str___d: c.Global = .{ .data_ptr = 0 };
+var h_str_get: c.Global = .{ .data_ptr = 0 };
+var h_str_getAll: c.Global = .{ .data_ptr = 0 };
+var h_str_has: c.Global = .{ .data_ptr = 0 };
+var h_str_set: c.Global = .{ .data_ptr = 0 };
+var h_str_append: c.Global = .{ .data_ptr = 0 };
+var h_str_delete: c.Global = .{ .data_ptr = 0 };
+var h_str_entries: c.Global = .{ .data_ptr = 0 };
+var h_str_keys: c.Global = .{ .data_ptr = 0 };
+var h_str_values: c.Global = .{ .data_ptr = 0 };
+var h_str_forEach: c.Global = .{ .data_ptr = 0 };
+var h_str_toString: c.Global = .{ .data_ptr = 0 };
+var h_str_size: c.Global = .{ .data_ptr = 0 };
+
+var h_fn_get: c.Global = .{ .data_ptr = 0 };
+var h_fn_getAll: c.Global = .{ .data_ptr = 0 };
+var h_fn_has: c.Global = .{ .data_ptr = 0 };
+var h_fn_set: c.Global = .{ .data_ptr = 0 };
+var h_fn_append: c.Global = .{ .data_ptr = 0 };
+var h_fn_delete: c.Global = .{ .data_ptr = 0 };
+var h_fn_entries: c.Global = .{ .data_ptr = 0 };
+var h_fn_keys: c.Global = .{ .data_ptr = 0 };
+var h_fn_values: c.Global = .{ .data_ptr = 0 };
+var h_fn_forEach: c.Global = .{ .data_ptr = 0 };
+var h_fn_toString: c.Global = .{ .data_ptr = 0 };
+var h_fn_size: c.Global = .{ .data_ptr = 0 };
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -46,51 +110,149 @@ fn extractIntFromVal(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.
 }
 
 // ============================================================
-// ResponseData — pure Zig, no V8 types
+// Interning — spec-constrained Response.type as a dense enum
+// ============================================================
+pub const ResponseType = enum(u8) {
+    basic,
+    cors,
+    default,
+    err,
+    opaque_type,
+    opaqueredirect,
+    other,
+
+    pub fn fromSlice(s: []const u8) ResponseType {
+        if (std.mem.eql(u8, s, "basic")) return .basic;
+        if (std.mem.eql(u8, s, "cors")) return .cors;
+        if (std.mem.eql(u8, s, "default")) return .default;
+        if (std.mem.eql(u8, s, "error")) return .err;
+        if (std.mem.eql(u8, s, "opaque")) return .opaque_type;
+        if (std.mem.eql(u8, s, "opaqueredirect")) return .opaqueredirect;
+        return .other;
+    }
+
+    pub fn string(self: ResponseType) []const u8 {
+        return switch (self) {
+            .basic => "basic",
+            .cors => "cors",
+            .default => "default",
+            .err => "error",
+            .opaque_type => "opaque",
+            .opaqueredirect => "opaqueredirect",
+            .other => unreachable,
+        };
+    }
+};
+// ============================================================
+// ResponseData — DOD: contiguous string pool + interned scalars
 // ============================================================
 
+const PoolSlice = struct { off: usize = 0, len: usize = 0 };
+
 pub const ResponseData = struct {
+    pool: std.ArrayList(u8),
     status: u16,
-    status_text: []const u8,
+    status_text: PoolSlice,
     headers: headers_mod.HeadersData,
-    body: ?[]const u8,
+    _body: PoolSlice,
+    has_body: bool,
     body_used: bool,
-    url: []const u8,
+    _url: PoolSlice,
     redirected: bool,
-    response_type: []const u8,
+    response_type: ResponseType,
+    response_type_other: PoolSlice,
 
     pub fn init() ResponseData {
-        return .{
+        var self = ResponseData{
+            .pool = std.ArrayList(u8).empty,
             .status = 200,
-            .status_text = "OK",
+            .status_text = .{},
             .headers = headers_mod.HeadersData.init(),
-            .body = null,
+            ._body = .{},
+            .has_body = false,
             .body_used = false,
-            .url = "",
+            ._url = .{},
             .redirected = false,
-            .response_type = "basic",
+            .response_type = .basic,
+            .response_type_other = .{},
         };
+        self.storeString("OK", &self.status_text);
+        return self;
     }
 
     pub fn deinit(self: *ResponseData) void {
+        self.pool.deinit(gpa);
         self.headers.deinit();
-        if (self.body) |b| gpa.free(b);
-        if (self.status_text.len > 0 and !std.mem.eql(u8, self.status_text, "OK")) gpa.free(self.status_text);
-        if (self.url.len > 0) gpa.free(self.url);
-        if (self.response_type.len > 0 and !std.mem.eql(u8, self.response_type, "basic")) gpa.free(self.response_type);
+    }
+
+    pub fn statusText(self: *const ResponseData) []const u8 {
+        return self.pool.items[self.status_text.off .. self.status_text.off + self.status_text.len];
+    }
+
+    pub fn body(self: *const ResponseData) ?[]const u8 {
+        if (!self.has_body) return null;
+        return self.pool.items[self._body.off .. self._body.off + self._body.len];
+    }
+
+    pub fn url(self: *const ResponseData) []const u8 {
+        return self.pool.items[self._url.off .. self._url.off + self._url.len];
+    }
+
+    pub fn responseType(self: *const ResponseData) []const u8 {
+        if (self.response_type == .other) {
+            return self.pool.items[self.response_type_other.off .. self.response_type_other.off + self.response_type_other.len];
+        }
+        return self.response_type.string();
+    }
+
+    fn storeString(self: *ResponseData, s: []const u8, dst: *PoolSlice) void {
+        if (s.len == 0) {
+            dst.* = .{};
+            return;
+        }
+        const off = self.pool.items.len;
+        self.pool.appendSlice(gpa, s) catch return;
+        dst.* = .{ .off = off, .len = s.len };
+    }
+
+    pub fn setStatusText(self: *ResponseData, s: []const u8) void {
+        self.storeString(s, &self.status_text);
+    }
+
+    pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
+        if (s) |b| {
+            self.has_body = b.len > 0;
+            self.storeString(b, &self._body);
+        } else {
+            self.has_body = false;
+        }
+    }
+
+    pub fn setUrl(self: *ResponseData, s: []const u8) void {
+        self.storeString(s, &self._url);
+    }
+
+    pub fn setResponseType(self: *ResponseData, s: []const u8) void {
+        const t = ResponseType.fromSlice(s);
+        self.response_type = t;
+        if (t == .other) self.storeString(s, &self.response_type_other);
     }
 
     pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) void {
+        self.pool.appendSlice(gpa, src.pool.items) catch {};
         self.status = src.status;
-        self.status_text = if (std.mem.eql(u8, src.status_text, "OK")) "OK" else (gpa.dupe(u8, src.status_text) catch "OK");
-        for (src.headers.pairs.items) |pair| {
-            self.headers.appendEntry(pair.name, pair.value);
-        }
-        self.body = if (src.body) |b| gpa.dupe(u8, b) catch null else null;
+        self.status_text = src.status_text;
+        self._body = src._body;
+        self.has_body = src.has_body;
         self.body_used = false;
-        self.url = if (src.url.len > 0) (gpa.dupe(u8, src.url) catch "") else "";
+        self._url = src._url;
         self.redirected = src.redirected;
-        self.response_type = if (std.mem.eql(u8, src.response_type, "basic")) "basic" else (gpa.dupe(u8, src.response_type) catch "basic");
+        self.response_type = src.response_type;
+        self.response_type_other = src.response_type_other;
+        for (0..src.headers.len()) |i| {
+            const p = src.headers.getPair(i);
+            self.headers.appendEntry(p.name, p.value);
+        }
     }
 };
 
@@ -103,40 +265,38 @@ fn extractResponseData(info: ?*const c.FunctionCallbackInfo) ?*ResponseData {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const this = c.v8__FunctionCallbackInfo__This(info);
     if (this == null) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, data_key);
+    const ext_val = c.v8__Object__Get(@ptrCast(this), context, @ptrCast(c.v8__Global__Get(&str___d, isolate)));
     if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
 }
 
 // ============================================================
-// Build a Headers JS object from HeadersData
+// Build Headers JS object (cached)
 // ============================================================
 
 fn createHeadersJSObject(isolate: ?*c.Isolate, context: ?*c.Context, hdr_data: *headers_mod.HeadersData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate);
     const ext = c.v8__External__New(isolate, @ptrCast(hdr_data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&h_str___d, isolate)), ext, &out);
 
-    const fns = .{
-        .{ "get", headersGetStub },
-        .{ "getAll", headersGetAllStub },
-        .{ "has", headersHasStub },
-        .{ "set", headersSetStub },
-        .{ "append", headersAppendStub },
-        .{ "delete", headersDeleteStub },
-        .{ "entries", headersEntriesStub },
-        .{ "keys", headersKeysStub },
-        .{ "values", headersValuesStub },
-        .{ "forEach", headersForEachStub },
-        .{ "toString", headersToStringStub },
-        .{ "size", headersSizeStub },
+    const pairs = .{
+        .{ &h_fn_get, &h_str_get },
+        .{ &h_fn_getAll, &h_str_getAll },
+        .{ &h_fn_has, &h_str_has },
+        .{ &h_fn_set, &h_str_set },
+        .{ &h_fn_append, &h_str_append },
+        .{ &h_fn_delete, &h_str_delete },
+        .{ &h_fn_entries, &h_str_entries },
+        .{ &h_fn_keys, &h_str_keys },
+        .{ &h_fn_values, &h_str_values },
+        .{ &h_fn_forEach, &h_str_forEach },
+        .{ &h_fn_toString, &h_str_toString },
+        .{ &h_fn_size, &h_str_size },
     };
-    inline for (fns) |entry| {
-        const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
+    inline for (pairs) |pair| {
+        c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(pair[1], isolate)), @ptrCast(c.v8__Global__Get(pair[0], isolate)), &out);
     }
     return obj;
 }
@@ -167,11 +327,13 @@ fn parseHeadersInit(isolate: ?*c.Isolate, context: ?*c.Context, init_val: ?*cons
     if (c.v8__Value__IsUndefined(init_val) or c.v8__Value__IsNull(init_val)) return;
 
     if (c.v8__Value__IsObject(init_val)) {
-        const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-        const ext_val = c.v8__Object__Get(@ptrCast(init_val), context, data_key);
+        const ext_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str___d, isolate)));
         if (ext_val != null and c.v8__Value__IsExternal(ext_val)) {
             const src: *headers_mod.HeadersData = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(ext_val))));
-            for (src.pairs.items) |pair| target.appendEntry(pair.name, pair.value);
+            for (0..src.len()) |i| {
+                const p = src.getPair(i);
+                target.appendEntry(p.name, p.value);
+            }
             return;
         }
 
@@ -226,7 +388,7 @@ fn parseHeadersInit(isolate: ?*c.Isolate, context: ?*c.Context, init_val: ?*cons
 
 fn parseHeadersInitFromObj(isolate: ?*c.Isolate, context: ?*c.Context, init_obj: ?*const c.Value, target: *headers_mod.HeadersData) void {
     if (init_obj == null) return;
-    const headers_val = c.v8__Object__Get(@ptrCast(init_obj), context, c.v8__String__NewFromUtf8(isolate, "headers", 0, -1));
+    const headers_val = c.v8__Object__Get(@ptrCast(init_obj), context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)));
     if (headers_val != null and !c.v8__Value__IsUndefined(headers_val) and !c.v8__Value__IsNull(headers_val)) {
         parseHeadersInit(isolate, context, headers_val, target);
     }
@@ -277,7 +439,7 @@ fn responseStatusText(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "")));
         return;
     };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.status_text)));
+    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.statusText())));
 }
 
 fn responseUrl(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -288,7 +450,7 @@ fn responseUrl(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "")));
         return;
     };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.url)));
+    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.url())));
 }
 
 fn responseType(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -299,7 +461,7 @@ fn responseType(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "basic")));
         return;
     };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.response_type)));
+    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.responseType())));
 }
 
 fn responseRedirected(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -322,24 +484,20 @@ fn responseText(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     const data = extractResponseData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
-
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-
     data.body_used = true;
-    const body_text = data.body orelse "";
+    const body_text = data.body() orelse "";
     var out: c.MaybeBool = undefined;
     _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(zigStringToV8(isolate, body_text)), &out);
-
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -348,31 +506,26 @@ fn responseJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     const data = extractResponseData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
-
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-
     data.body_used = true;
-    const body_text = data.body orelse "";
+    const body_text = data.body() orelse "";
     const js_str = c.v8__String__NewFromUtf8(isolate, @ptrCast(body_text.ptr), 0, @intCast(body_text.len));
     const parsed = c.v8__JSON__Parse(context, js_str);
-
     var out: c.MaybeBool = undefined;
     if (parsed != null) {
         _ = c.v8__Promise__Resolver__Resolve(resolver, context, parsed, &out);
     } else {
         _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid JSON")), &out);
     }
-
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -381,23 +534,19 @@ fn responseArrayBuffer(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     const data = extractResponseData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
-
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-
     data.body_used = true;
-    const body_bytes = data.body orelse "";
+    const body_bytes = data.body() orelse "";
     const byte_len: usize = body_bytes.len;
-
     const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
     if (ab != null and byte_len > 0) {
         const backing = c.v8__ArrayBuffer__GetBackingStore(ab);
@@ -407,10 +556,8 @@ fn responseArrayBuffer(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             @memcpy(data_ptr[0..byte_len], body_bytes);
         }
     }
-
     var out: c.MaybeBool = undefined;
     _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out);
-
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -451,23 +598,19 @@ fn responseBytes(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     const data = extractResponseData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
-
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-
     data.body_used = true;
-    const body_bytes = data.body orelse "";
+    const body_bytes = data.body() orelse "";
     const byte_len: usize = body_bytes.len;
-
     const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
     if (ab != null and byte_len > 0) {
         const backing = c.v8__ArrayBuffer__GetBackingStore(ab);
@@ -477,10 +620,8 @@ fn responseBytes(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             @memcpy(data_ptr[0..byte_len], body_bytes);
         }
     }
-
     var out: c.MaybeBool = undefined;
     _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out);
-
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -489,19 +630,16 @@ fn responseClone(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     const data = extractResponseData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
-
     const new_data = gpa.create(ResponseData) catch {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     };
     new_data.* = ResponseData.init();
     new_data.cloneFrom(data);
-
     const obj = buildResponseJSObject(isolate, context, new_data);
     if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
 }
@@ -526,7 +664,10 @@ fn responseStaticJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         const arg0 = c.v8__FunctionCallbackInfo__INDEX(info, 0);
         const json_str = c.v8__JSON__Stringify(context, arg0, null);
         if (json_str != null) {
-            data.body = extractStringFromVal(isolate, json_str);
+            if (extractStringFromVal(isolate, json_str)) |owned| {
+                data.setBody(owned);
+                gpa.free(owned);
+            }
         }
         data.headers.appendEntry("content-type", "application/json");
     }
@@ -534,11 +675,12 @@ fn responseStaticJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (c.v8__Value__IsObject(init_val)) {
-            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "status", 0, -1));
+            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_status, isolate)));
             data.status = extractIntFromVal(isolate, context, status_val, 200);
-            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "statusText", 0, -1));
+            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)));
             if (extractStringFromVal(isolate, status_text_val)) |st| {
-                data.status_text = st;
+                data.setStatusText(st);
+                gpa.free(st);
             }
             parseHeadersInitFromObj(isolate, context, init_val, &data.headers);
         }
@@ -566,9 +708,12 @@ fn responseStaticRedirect(info: ?*const c.FunctionCallbackInfo) callconv(.c) voi
     data.* = ResponseData.init();
 
     const url_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    data.url = extractStringFromVal(isolate, url_val) orelse "";
+    if (extractStringFromVal(isolate, url_val)) |u| {
+        data.setUrl(u);
+        gpa.free(u);
+    }
     data.status = 302;
-    data.status_text = "Found";
+    data.setStatusText("Found");
     data.redirected = true;
 
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
@@ -592,46 +737,54 @@ fn responseStaticError(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     };
     data.* = ResponseData.init();
     data.status = 0;
-    data.status_text = "";
-    data.response_type = "error";
+    data.setStatusText("");
+    data.setResponseType("error");
 
     const obj = buildResponseJSObject(isolate, context, data);
     if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
 }
 
 // ============================================================
-// Helper: build JS object from ResponseData
+// Helper: set all cached function properties on a response object
 // ============================================================
 
-fn buildResponseJSObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *ResponseData) ?*const c.Object {
+fn setCachedFns(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate) void {
+    var out: c.MaybeBool = undefined;
+    const pairs = .{
+        .{ &fn_bodyUsed, &str_bodyUsed },
+        .{ &fn_ok, &str_ok },
+        .{ &fn_status, &str_status },
+        .{ &fn_statusText, &str_statusText },
+        .{ &fn_url, &str_url },
+        .{ &fn_type, &str_type },
+        .{ &fn_redirected, &str_redirected },
+        .{ &fn_text, &str_text },
+        .{ &fn_json, &str_json },
+        .{ &fn_arrayBuffer, &str_arrayBuffer },
+        .{ &fn_blob, &str_blob },
+        .{ &fn_formData, &str_formData },
+        .{ &fn_bytes, &str_bytes },
+        .{ &fn_clone, &str_clone },
+    };
+    inline for (pairs) |pair| {
+        c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(pair[1], isolate)), @ptrCast(c.v8__Global__Get(pair[0], isolate)), &out);
+    }
+}
+
+// ============================================================
+// buildResponseJSObject (cached)
+// ============================================================
+
+pub fn buildResponseJSObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *ResponseData) ?*const c.Object {
     const obj = c.v8__Object__New(isolate);
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str___d, isolate)), ext, &out);
 
     const headers_obj = createHeadersJSObject(isolate, context, &data.headers);
-    _ = c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "headers", 0, -1), @ptrCast(headers_obj), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
 
-    const fns = .{
-        .{ "bodyUsed", responseBodyUsed },
-        .{ "ok", responseOk },
-        .{ "status", responseStatus },
-        .{ "statusText", responseStatusText },
-        .{ "url", responseUrl },
-        .{ "type", responseType },
-        .{ "redirected", responseRedirected },
-        .{ "text", responseText },
-        .{ "json", responseJson },
-        .{ "arrayBuffer", responseArrayBuffer },
-        .{ "blob", responseBlob },
-        .{ "formData", responseFormData },
-        .{ "bytes", responseBytes },
-        .{ "clone", responseClone },
-    };
-    inline for (fns) |entry| {
-        const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
-    }
+    setCachedFns(obj, context, isolate);
 
     return obj;
 }
@@ -655,18 +808,22 @@ fn responseConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
         const body_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
         if (!c.v8__Value__IsUndefined(body_val) and !c.v8__Value__IsNull(body_val)) {
-            data.body = extractStringFromVal(isolate, body_val);
+            if (extractStringFromVal(isolate, body_val)) |owned| {
+                data.setBody(owned);
+                gpa.free(owned);
+            }
         }
     }
 
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (c.v8__Value__IsObject(init_val)) {
-            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "status", 0, -1));
+            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_status, isolate)));
             data.status = extractIntFromVal(isolate, context, status_val, 200);
-            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "statusText", 0, -1));
+            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)));
             if (extractStringFromVal(isolate, status_text_val)) |st| {
-                data.status_text = st;
+                data.setStatusText(st);
+                gpa.free(st);
             }
             parseHeadersInitFromObj(isolate, context, init_val, &data.headers);
         }
@@ -688,6 +845,59 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const global = c.v8__Context__Global(context);
     var out: c.MaybeBool = undefined;
 
+    // Cache strings
+    const strings = .{
+        .{ "__d", &str___d },       .{ "headers", &str_headers },   .{ "bodyUsed", &str_bodyUsed },
+        .{ "ok", &str_ok },         .{ "status", &str_status },      .{ "statusText", &str_statusText },
+        .{ "url", &str_url },       .{ "type", &str_type },          .{ "redirected", &str_redirected },
+        .{ "text", &str_text },     .{ "json", &str_json },          .{ "arrayBuffer", &str_arrayBuffer },
+        .{ "blob", &str_blob },     .{ "formData", &str_formData },  .{ "bytes", &str_bytes },
+        .{ "clone", &str_clone },
+    };
+    inline for (strings) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
+
+    // Cache functions
+    const funcs = .{
+        .{ responseBodyUsed, &fn_bodyUsed },   .{ responseOk, &fn_ok },
+        .{ responseStatus, &fn_status },       .{ responseStatusText, &fn_statusText },
+        .{ responseUrl, &fn_url },             .{ responseType, &fn_type },
+        .{ responseRedirected, &fn_redirected }, .{ responseText, &fn_text },
+        .{ responseJson, &fn_json },           .{ responseArrayBuffer, &fn_arrayBuffer },
+        .{ responseBlob, &fn_blob },           .{ responseFormData, &fn_formData },
+        .{ responseBytes, &fn_bytes },         .{ responseClone, &fn_clone },
+    };
+    inline for (funcs) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
+    }
+
+    // Cache headers strings
+    const h_strings = .{
+        .{ "__d", &h_str___d }, .{ "get", &h_str_get }, .{ "getAll", &h_str_getAll },
+        .{ "has", &h_str_has }, .{ "set", &h_str_set }, .{ "append", &h_str_append },
+        .{ "delete", &h_str_delete }, .{ "entries", &h_str_entries }, .{ "keys", &h_str_keys },
+        .{ "values", &h_str_values }, .{ "forEach", &h_str_forEach }, .{ "toString", &h_str_toString },
+        .{ "size", &h_str_size },
+    };
+    inline for (h_strings) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
+
+    // Cache headers functions
+    const h_funcs = .{
+        .{ headersGetStub, &h_fn_get },       .{ headersGetAllStub, &h_fn_getAll },
+        .{ headersHasStub, &h_fn_has },       .{ headersSetStub, &h_fn_set },
+        .{ headersAppendStub, &h_fn_append }, .{ headersDeleteStub, &h_fn_delete },
+        .{ headersEntriesStub, &h_fn_entries }, .{ headersKeysStub, &h_fn_keys },
+        .{ headersValuesStub, &h_fn_values }, .{ headersForEachStub, &h_fn_forEach },
+        .{ headersToStringStub, &h_fn_toString }, .{ headersSizeStub, &h_fn_size },
+    };
+    inline for (h_funcs) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
+    }
+
+    // Register Response constructor + static methods
     const constructor = c.v8__Function__New__DEFAULT(context, responseConstructor);
     const ctor_obj: *const c.Object = @ptrCast(constructor);
 

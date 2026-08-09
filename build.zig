@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    const httpz = b.dependency("httpz", .{
+    .target = target,
+    .optimize = optimize,
+    });
 
     const exe = b.addExecutable(.{
         .name = "ff",
@@ -19,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "fairyfly", .module = mod },
                 .{ .name = "xev", .module = b.dependency("libxev", .{}).module("xev") },
+                .{ .name = "httpz", .module = httpz.module("httpz") },
             },
         }),
     });

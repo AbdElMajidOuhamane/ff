@@ -44,83 +44,153 @@ fn lowerCaseAlloc(input: []const u8) ![]const u8 {
 }
 
 // ============================================================
-// HeadersData — pure Zig, no V8 types
+// HeadersData — DOD / SoA: contiguous string log + offset index
+//
+//   names   : one contiguous buffer of lowercase names (append-only)
+//   values  : one contiguous buffer of values (append-only)
+//   entries : dense index of {offset,len} pairs into the two buffers
+//
+// Per-pair heap allocations are gone: insert = amortized buffer
+// appends. Removed/replaced bytes are left in the log (garbage
+// reclaimed once at deinit) — the classic append-log tradeoff,
+// cache-friendly and allocation-free in the hot path.
 // ============================================================
 
-const Pair = struct { name: []const u8, value: []const u8 };
+pub const Pair = struct { name: []const u8, value: []const u8 };
+
+const Entry = struct {
+    name_off: usize,
+    name_len: usize,
+    val_off: usize,
+    val_len: usize,
+};
 
 pub const HeadersData = struct {
-    pairs: std.ArrayList(Pair),
+    names: std.ArrayList(u8),
+    values: std.ArrayList(u8),
+    entries: std.ArrayList(Entry),
+
+    pub const PairView = struct { name: []const u8, value: []const u8 };
 
     pub fn init() HeadersData {
-        return .{ .pairs = std.ArrayList(Pair).empty };
+        return .{
+            .names = std.ArrayList(u8).empty,
+            .values = std.ArrayList(u8).empty,
+            .entries = std.ArrayList(Entry).empty,
+        };
     }
 
     pub fn deinit(self: *HeadersData) void {
-        for (self.pairs.items) |pair| {
-            gpa.free(pair.name);
-            gpa.free(pair.value);
-        }
-        self.pairs.deinit(gpa);
+        self.names.deinit(gpa);
+        self.values.deinit(gpa);
+        self.entries.deinit(gpa);
     }
 
-    pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
-        const n = lowerCaseAlloc(name) catch return;
-        const v = gpa.dupe(u8, value) catch {
-            gpa.free(n);
+    fn nameOf(self: *const HeadersData, e: Entry) []const u8 {
+        return self.names.items[e.name_off .. e.name_off + e.name_len];
+    }
+
+    fn valueOf(self: *const HeadersData, e: Entry) []const u8 {
+        return self.values.items[e.val_off .. e.val_off + e.val_len];
+    }
+
+    pub fn len(self: *const HeadersData) usize {
+        return self.entries.items.len;
+    }
+
+    pub fn getPair(self: *const HeadersData, i: usize) PairView {
+        return .{
+            .name = self.nameOf(self.entries.items[i]),
+            .value = self.valueOf(self.entries.items[i]),
+        };
+    }
+
+    // O(1) removal: swap the last entry into the removed slot.
+    // Bytes stay in the append-only log until deinit.
+    fn removeSwap(self: *HeadersData, i: usize) void {
+        const last = self.entries.items.len - 1;
+        if (i != last) self.entries.items[i] = self.entries.items[last];
+        self.entries.items.len -= 1;
+    }
+
+    // Append an already-lowercased name. Zero heap allocations.
+    fn appendLowered(self: *HeadersData, ln: []const u8, value: []const u8) void {
+        const nbase = self.names.items.len;
+        self.names.appendSlice(gpa, ln) catch return;
+        const vbase = self.values.items.len;
+        self.values.appendSlice(gpa, value) catch {
+            self.names.items.len = nbase;
             return;
         };
-        self.pairs.append(gpa, .{ .name = n, .value = v }) catch {
-            gpa.free(n);
-            gpa.free(v);
+        self.entries.append(gpa, .{
+            .name_off = nbase,
+            .name_len = ln.len,
+            .val_off = vbase,
+            .val_len = value.len,
+        }) catch {
+            self.names.items.len = nbase;
+            self.values.items.len = vbase;
+            return;
+        };
+    }
+
+    // Hot path: lowercases in place inside the names buffer — no temp alloc.
+    pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+        const nbase = self.names.items.len;
+        self.names.appendSlice(gpa, name) catch return;
+        for (self.names.items[nbase..]) |*b| b.* = std.ascii.toLower(b.*);
+
+        const vbase = self.values.items.len;
+        self.values.appendSlice(gpa, value) catch {
+            self.names.items.len = nbase;
+            return;
+        };
+        self.entries.append(gpa, .{
+            .name_off = nbase,
+            .name_len = name.len,
+            .val_off = vbase,
+            .val_len = value.len,
+        }) catch {
+            self.names.items.len = nbase;
+            self.values.items.len = vbase;
+            return;
         };
     }
 
     pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
         const ln = lowerCaseAlloc(name) catch return;
-        const v = gpa.dupe(u8, value) catch {
-            gpa.free(ln);
-            return;
-        };
+        defer gpa.free(ln);
 
-        var found = false;
+        var first: ?usize = null;
         var i: usize = 0;
-        while (i < self.pairs.items.len) {
-            if (std.mem.eql(u8, self.pairs.items[i].name, ln)) {
-                if (!found) {
-                    gpa.free(self.pairs.items[i].value);
-                    self.pairs.items[i].value = v;
-                    found = true;
+        while (i < self.entries.items.len) {
+            if (std.mem.eql(u8, self.nameOf(self.entries.items[i]), ln)) {
+                if (first == null) {
+                    first = i;
+                    const vbase = self.values.items.len;
+                    self.values.appendSlice(gpa, value) catch return;
+                    self.entries.items[i].val_off = vbase;
+                    self.entries.items[i].val_len = value.len;
                     i += 1;
                 } else {
-                    gpa.free(self.pairs.items[i].name);
-                    gpa.free(self.pairs.items[i].value);
-                    _ = self.pairs.orderedRemove(i);
+                    self.removeSwap(i);
                 }
             } else {
                 i += 1;
             }
         }
-        if (!found) {
-            self.pairs.append(gpa, .{ .name = ln, .value = v }) catch {
-                gpa.free(ln);
-                gpa.free(v);
-            };
-        } else {
-            gpa.free(ln);
-        }
+        if (first == null) self.appendLowered(ln, value);
     }
 
     pub fn deleteEntry(self: *HeadersData, name: []const u8, value: ?[]const u8) void {
         const ln = lowerCaseAlloc(name) catch return;
         defer gpa.free(ln);
         var i: usize = 0;
-        while (i < self.pairs.items.len) {
-            if (std.mem.eql(u8, self.pairs.items[i].name, ln)) {
-                if (value == null or std.mem.eql(u8, self.pairs.items[i].value, value.?)) {
-                    gpa.free(self.pairs.items[i].name);
-                    gpa.free(self.pairs.items[i].value);
-                    _ = self.pairs.orderedRemove(i);
+        while (i < self.entries.items.len) {
+            const e = self.entries.items[i];
+            if (std.mem.eql(u8, self.nameOf(e), ln)) {
+                if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) {
+                    self.removeSwap(i);
                     if (value != null) return;
                     continue;
                 }
@@ -133,40 +203,41 @@ pub const HeadersData = struct {
         const ln = lowerCaseAlloc(name) catch return null;
         defer gpa.free(ln);
 
-        var first_val: ?[]const u8 = null;
+        var first: ?Entry = null;
         var count: usize = 0;
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, ln)) {
-                if (count == 0) first_val = pair.value;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), ln)) {
+                if (count == 0) first = e;
                 count += 1;
             }
         }
         if (count == 0) return null;
-        if (count == 1) return gpa.dupe(u8, first_val.?) catch null;
+        const f = first.?;
+        if (count == 1) return gpa.dupe(u8, self.valueOf(f)) catch null;
 
         var result = std.ArrayList(u8).empty;
-        result.appendSlice(gpa, first_val.?) catch return gpa.dupe(u8, first_val.?) catch null;
-        var skipped_first = false;
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, ln)) {
-                if (!skipped_first) {
-                    skipped_first = true;
+        result.appendSlice(gpa, self.valueOf(f)) catch return gpa.dupe(u8, self.valueOf(f)) catch null;
+        var skipped = false;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), ln)) {
+                if (!skipped) {
+                    skipped = true;
                     continue;
                 }
                 result.appendSlice(gpa, ", ") catch break;
-                result.appendSlice(gpa, pair.value) catch break;
+                result.appendSlice(gpa, self.valueOf(e)) catch break;
             }
         }
-        return result.toOwnedSlice(gpa) catch gpa.dupe(u8, first_val.?) catch null;
+        return result.toOwnedSlice(gpa) catch gpa.dupe(u8, self.valueOf(f)) catch null;
     }
 
     pub fn getAllValues(self: *const HeadersData, name: []const u8) [][]const u8 {
         const ln = lowerCaseAlloc(name) catch return &.{};
         defer gpa.free(ln);
         var result = std.ArrayList([]const u8).empty;
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, ln)) {
-                result.append(gpa, pair.value) catch break;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), ln)) {
+                result.append(gpa, self.valueOf(e)) catch break;
             }
         }
         return result.toOwnedSlice(gpa) catch &.{};
@@ -175,9 +246,9 @@ pub const HeadersData = struct {
     pub fn hasEntry(self: *const HeadersData, name: []const u8, value: ?[]const u8) bool {
         const ln = lowerCaseAlloc(name) catch return false;
         defer gpa.free(ln);
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, ln)) {
-                if (value == null or std.mem.eql(u8, pair.value, value.?)) return true;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), ln)) {
+                if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) return true;
             }
         }
         return false;
@@ -185,26 +256,27 @@ pub const HeadersData = struct {
 
     pub fn getUniqueNames(self: *const HeadersData) [][]const u8 {
         var result = std.ArrayList([]const u8).empty;
-        for (self.pairs.items) |pair| {
+        for (self.entries.items) |e| {
+            const n = self.nameOf(e);
             var found = false;
             for (result.items) |existing| {
-                if (std.mem.eql(u8, existing, pair.name)) {
+                if (std.mem.eql(u8, existing, n)) {
                     found = true;
                     break;
                 }
             }
-            if (!found) result.append(gpa, pair.name) catch break;
+            if (!found) result.append(gpa, n) catch break;
         }
         return result.toOwnedSlice(gpa) catch &.{};
     }
 
     pub fn serialize(self: *const HeadersData) ![]const u8 {
         var result = std.ArrayList(u8).empty;
-        for (self.pairs.items, 0..) |pair, i| {
+        for (self.entries.items, 0..) |e, i| {
             if (i > 0) try result.appendSlice(gpa, "\r\n");
-            try result.appendSlice(gpa, pair.name);
+            try result.appendSlice(gpa, self.nameOf(e));
             try result.appendSlice(gpa, ": ");
-            try result.appendSlice(gpa, pair.value);
+            try result.appendSlice(gpa, self.valueOf(e));
         }
         return try result.toOwnedSlice(gpa);
     }
@@ -265,7 +337,10 @@ fn headersConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             const ext_val = c.v8__Object__Get(@ptrCast(init_val), context, data_key);
             if (ext_val != null and c.v8__Value__IsExternal(ext_val)) {
                 const src: *HeadersData = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(ext_val))));
-                for (src.pairs.items) |pair| data.appendEntry(pair.name, pair.value);
+                for (0..src.len()) |i| {
+                    const p = src.getPair(i);
+                    data.appendEntry(p.name, p.value);
+                }
             } else if (c.v8__Value__IsArray(init_val)) {
                 var pairs_buf = std.ArrayList(Pair).empty;
                 const len: usize = @intCast(c.v8__Array__Length(init_val));
@@ -490,11 +565,12 @@ pub fn headersEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractHeadersData(info) orelse return;
 
     const pairs_arr = c.v8__Array__New(isolate, 0);
-    for (data.pairs.items, 0..) |pair, i| {
+    for (0..data.len()) |i| {
+        const p = data.getPair(i);
         const inner = c.v8__Array__New(isolate, 2);
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Object__Set(@ptrCast(inner), context, c.v8__Integer__NewFromUnsigned(isolate, 0), @ptrCast(zigStringToV8(isolate, pair.name)), &out);
-        _ = c.v8__Object__Set(@ptrCast(inner), context, c.v8__Integer__NewFromUnsigned(isolate, 1), @ptrCast(zigStringToV8(isolate, pair.value)), &out);
+        _ = c.v8__Object__Set(@ptrCast(inner), context, c.v8__Integer__NewFromUnsigned(isolate, 0), @ptrCast(zigStringToV8(isolate, p.name)), &out);
+        _ = c.v8__Object__Set(@ptrCast(inner), context, c.v8__Integer__NewFromUnsigned(isolate, 1), @ptrCast(zigStringToV8(isolate, p.value)), &out);
         var out2: c.MaybeBool = undefined;
         _ = c.v8__Object__Set(@ptrCast(pairs_arr), context, c.v8__Integer__NewFromUnsigned(isolate, @intCast(i)), inner, &out2);
     }
@@ -526,10 +602,11 @@ pub fn headersValues(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
 
     const data = extractHeadersData(info) orelse return;
-    const arr = c.v8__Array__New(isolate, @intCast(data.pairs.items.len));
-    for (data.pairs.items, 0..) |pair, i| {
+    const arr = c.v8__Array__New(isolate, @intCast(data.len()));
+    for (0..data.len()) |i| {
+        const p = data.getPair(i);
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Object__Set(@ptrCast(arr), context, c.v8__Integer__NewFromUnsigned(isolate, @intCast(i)), @ptrCast(zigStringToV8(isolate, pair.value)), &out);
+        _ = c.v8__Object__Set(@ptrCast(arr), context, c.v8__Integer__NewFromUnsigned(isolate, @intCast(i)), @ptrCast(zigStringToV8(isolate, p.value)), &out);
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
@@ -543,10 +620,11 @@ pub fn headersForEach(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const callback = c.v8__FunctionCallbackInfo__INDEX(info, 0);
     if (!c.v8__Value__IsFunction(callback)) return;
 
-    for (data.pairs.items) |pair| {
+    for (0..data.len()) |i| {
+        const p = data.getPair(i);
         var argv: [3]?*const c.Value = .{
-            zigStringToV8(isolate, pair.value),
-            zigStringToV8(isolate, pair.name),
+            zigStringToV8(isolate, p.value),
+            zigStringToV8(isolate, p.name),
             @ptrCast(c.v8__FunctionCallbackInfo__This(info)),
         };
         _ = c.v8__Function__Call(@ptrCast(callback), context, @ptrCast(c.v8__Undefined(isolate)), 3, &argv);
@@ -579,7 +657,7 @@ pub fn headersSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Integer__New(isolate, 0)));
         return;
     };
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Integer__New(isolate, @intCast(data.pairs.items.len))));
+    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Integer__New(isolate, @intCast(data.len()))));
 }
 
 // ============================================================
