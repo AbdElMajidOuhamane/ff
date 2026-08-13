@@ -29,13 +29,6 @@ var str_clone: c.Global = .{ .data_ptr = 0 };
 var str_toString: c.Global = .{ .data_ptr = 0 };
 var str_toJSON: c.Global = .{ .data_ptr = 0 };
 
-var fn_bodyUsed: c.Global = .{ .data_ptr = 0 };
-var fn_cache: c.Global = .{ .data_ptr = 0 };
-var fn_credentials: c.Global = .{ .data_ptr = 0 };
-var fn_mode: c.Global = .{ .data_ptr = 0 };
-var fn_redirect: c.Global = .{ .data_ptr = 0 };
-var fn_integrity: c.Global = .{ .data_ptr = 0 };
-var fn_keepalive: c.Global = .{ .data_ptr = 0 };
 var fn_text: c.Global = .{ .data_ptr = 0 };
 var fn_json: c.Global = .{ .data_ptr = 0 };
 var fn_arrayBuffer: c.Global = .{ .data_ptr = 0 };
@@ -100,10 +93,9 @@ fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u
     const str = c.v8__Value__ToDetailString(v, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [8192]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+    return buf;
 }
 
 // ============================================================
@@ -577,87 +569,6 @@ fn parseHeadersInitFromObj(isolate: ?*c.Isolate, context: ?*c.Context, init_obj:
 }
 
 // ============================================================
-// JS Callbacks — Property getters
-// ============================================================
-
-fn requestBodyUsed(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, if (data.body_used) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
-}
-
-fn requestCache(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "default")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.cache())));
-}
-
-fn requestCredentials(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "same-origin")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.credentials())));
-}
-
-fn requestMode(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "cors")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.mode())));
-}
-
-fn requestRedirect(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "follow")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.redirect())));
-}
-
-fn requestIntegrity(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.integrity())));
-}
-
-fn requestKeepalive(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractRequestData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, if (data.keepalive) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
-}
-
-// ============================================================
 // JS Callbacks — Body methods
 // ============================================================
 
@@ -834,6 +745,7 @@ fn requestClone(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const headers_obj = createHeadersJSObject(isolate, context, &new_data.headers);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
 
+    setDataProps(obj, context, isolate, new_data);
     setCachedFns(obj, context, isolate);
 
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
@@ -867,27 +779,29 @@ fn requestToJSON(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 }
 
 // ============================================================
-// Helper: set all cached function properties on an object
+// Helper: set scalar data properties + cached function properties
 // ============================================================
+
+fn setDataProps(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate, data: *RequestData) void {
+    var out: c.MaybeBool = undefined;
+    const body_used = if (data.body_used) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(body_used), &out);
+    const keepalive = if (data.keepalive) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_keepalive, isolate)), @ptrCast(keepalive), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_cache, isolate)), @ptrCast(zigStringToV8(isolate, data.cache())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_credentials, isolate)), @ptrCast(zigStringToV8(isolate, data.credentials())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_mode, isolate)), @ptrCast(zigStringToV8(isolate, data.mode())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_redirect, isolate)), @ptrCast(zigStringToV8(isolate, data.redirect())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_integrity, isolate)), @ptrCast(zigStringToV8(isolate, data.integrity())), &out);
+}
 
 fn setCachedFns(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate) void {
     var out: c.MaybeBool = undefined;
     const pairs = .{
-        .{ &fn_bodyUsed, &str_bodyUsed },
-        .{ &fn_cache, &str_cache },
-        .{ &fn_credentials, &str_credentials },
-        .{ &fn_mode, &str_mode },
-        .{ &fn_redirect, &str_redirect },
-        .{ &fn_integrity, &str_integrity },
-        .{ &fn_keepalive, &str_keepalive },
-        .{ &fn_text, &str_text },
-        .{ &fn_json, &str_json },
-        .{ &fn_arrayBuffer, &str_arrayBuffer },
-        .{ &fn_blob, &str_blob },
-        .{ &fn_formData, &str_formData },
-        .{ &fn_bytes, &str_bytes },
-        .{ &fn_clone, &str_clone },
-        .{ &fn_toString, &str_toString },
+        .{ &fn_text, &str_text },          .{ &fn_json, &str_json },
+        .{ &fn_arrayBuffer, &str_arrayBuffer }, .{ &fn_blob, &str_blob },
+        .{ &fn_formData, &str_formData },  .{ &fn_bytes, &str_bytes },
+        .{ &fn_clone, &str_clone },        .{ &fn_toString, &str_toString },
         .{ &fn_toJSON, &str_toJSON },
     };
     inline for (pairs) |pair| {
@@ -909,6 +823,7 @@ pub fn buildRequestJSObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *R
     const headers_obj = createHeadersJSObject(isolate, context, &data.headers);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
 
+    setDataProps(obj, context, isolate, data);
     setCachedFns(obj, context, isolate);
 
     return obj;
@@ -998,6 +913,7 @@ fn requestConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const headers_obj = createHeadersJSObject(isolate, context, &data.headers);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
 
+    setDataProps(obj, context, isolate, data);
     setCachedFns(obj, context, isolate);
 
     var ret: c.ReturnValue = undefined;
@@ -1033,14 +949,11 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
 
     // Cache functions
     const funcs = .{
-        .{ requestBodyUsed, &fn_bodyUsed },   .{ requestCache, &fn_cache },
-        .{ requestCredentials, &fn_credentials }, .{ requestMode, &fn_mode },
-        .{ requestRedirect, &fn_redirect },   .{ requestIntegrity, &fn_integrity },
-        .{ requestKeepalive, &fn_keepalive }, .{ requestText, &fn_text },
-        .{ requestJson, &fn_json },           .{ requestArrayBuffer, &fn_arrayBuffer },
-        .{ requestBlob, &fn_blob },           .{ requestFormData, &fn_formData },
-        .{ requestBytes, &fn_bytes },         .{ requestClone, &fn_clone },
-        .{ requestToString, &fn_toString },   .{ requestToJSON, &fn_toJSON },
+        .{ requestText, &fn_text },         .{ requestJson, &fn_json },
+        .{ requestArrayBuffer, &fn_arrayBuffer }, .{ requestBlob, &fn_blob },
+        .{ requestFormData, &fn_formData }, .{ requestBytes, &fn_bytes },
+        .{ requestClone, &fn_clone },       .{ requestToString, &fn_toString },
+        .{ requestToJSON, &fn_toJSON },
     };
     inline for (funcs) |entry| {
         c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);

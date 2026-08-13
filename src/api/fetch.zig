@@ -2,34 +2,10 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const request_mod = @import("../types/request.zig");
 const response_mod = @import("../types/response.zig");
+const tls = @import("../net/tls.zig");
 
 const gpa = std.heap.page_allocator;
 const http = std.http;
-
-// ============================================================
-// Global HTTP client
-// ============================================================
-
-var io_backend: std.Io.Threaded = undefined;
-var http_client: http.Client = undefined;
-var client_initialized = false;
-
-pub fn initClient() void {
-    if (client_initialized) return;
-    io_backend = std.Io.Threaded.init(gpa, .{});
-    http_client = .{
-        .allocator = gpa,
-        .io = io_backend.io(),
-    };
-    client_initialized = true;
-}
-
-pub fn deinitClient() void {
-    if (!client_initialized) return;
-    http_client.deinit();
-    io_backend.deinit();
-    client_initialized = false;
-}
 
 // ============================================================
 // Helpers
@@ -51,21 +27,32 @@ fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u
     const str = c.v8__Value__ToDetailString(v, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [8192]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+    return buf;
+}
+
+// Packed 64-bit word compare: fold a comptime token (zero-padded on the
+// right, little-endian) so a single unaligned wide load matches it.
+fn methodToken(comptime s: []const u8) u64 {
+    var buf = [_]u8{ 0 } ** 8;
+    @memcpy(buf[0..s.len], s);
+    return std.mem.readInt(u64, &buf, .little);
 }
 
 fn parseMethod(method_str: []const u8) http.Method {
-    if (std.mem.eql(u8, method_str, "GET")) return .GET;
-    if (std.mem.eql(u8, method_str, "HEAD")) return .HEAD;
-    if (std.mem.eql(u8, method_str, "POST")) return .POST;
-    if (std.mem.eql(u8, method_str, "PUT")) return .PUT;
-    if (std.mem.eql(u8, method_str, "DELETE")) return .DELETE;
-    if (std.mem.eql(u8, method_str, "OPTIONS")) return .OPTIONS;
-    if (std.mem.eql(u8, method_str, "PATCH")) return .PATCH;
-    return .GET;
+    var buf = [_]u8{ 0 } ** 8;
+    const n = @min(method_str.len, 8);
+    @memcpy(buf[0..n], method_str[0..n]);
+    const w = std.mem.readInt(u64, &buf, .little);
+    return switch (method_str.len) {
+        3 => if (w == methodToken("GET")) .GET else if (w == methodToken("PUT")) .PUT else .GET,
+        4 => if (w == methodToken("HEAD")) .HEAD else if (w == methodToken("POST")) .POST else .GET,
+        5 => if (w == methodToken("PATCH")) .PATCH else .GET,
+        6 => if (w == methodToken("DELETE")) .DELETE else .GET,
+        7 => if (w == methodToken("OPTIONS")) .OPTIONS else .GET,
+        else => .GET,
+    };
 }
 
 fn collectHeadersFromJS(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, list: *std.ArrayList(http.Header)) void {
@@ -216,7 +203,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         return;
     };
 
-    var req = http_client.request(method, uri, .{
+    var req = tls.client().request(method, uri, .{
         .extra_headers = if (extra_headers) |*h| h.items else &.{},
     }) catch {
         var out: c.MaybeBool = undefined;
@@ -225,6 +212,15 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         return;
     };
     defer req.deinit();
+
+    // Register the connection in the transport pool (records fd + TLS flag)
+    // and apply TCP_NODELAY before any byte is written — the TLS handshake
+    // runs lazily on the first read/write, so NODELAY covers the
+    // ClientHello -> Finished -> request sequence. Without it, each small
+    // second write stalls on a delayed-ACK round trip (~90ms per fresh conn).
+    var slot: ?usize = null;
+    if (req.connection) |cn| slot = tls.attach(cn);
+    defer if (slot) |s| tls.detach(s);
 
     if (body_payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
@@ -259,8 +255,8 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         return;
     };
 
-    var body_list = std.ArrayList(u8).empty;
-    defer body_list.deinit(gpa);
+    var owned_body: ?[]u8 = null;
+    defer if (owned_body) |b| gpa.free(b);
 
     const status_code = @intFromEnum(response.head.status);
     const status_class = status_code / 100;
@@ -277,8 +273,92 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
     if (has_body) {
         var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        reader.appendRemaining(gpa, &body_list, .unlimited) catch {};
+        const content_encoding = response.head.content_encoding;
+        const compressed = content_encoding != .identity;
+        var decompress_buf: ?[]u8 = null;
+        defer if (decompress_buf) |d| gpa.free(d);
+        var decompress: std.http.Decompress = undefined;
+
+        const reader = if (!compressed)
+            response.reader(&transfer_buf)
+        else dec: {
+            const window_len: usize = switch (content_encoding) {
+                .gzip, .deflate => std.compress.flate.max_window_len,
+                .zstd => std.compress.zstd.default_window_len,
+                else => 0,
+            };
+            if (window_len == 0) {
+                std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
+                break :dec response.reader(&transfer_buf);
+            }
+            const d = gpa.alloc(u8, window_len) catch break :dec response.reader(&transfer_buf);
+            decompress_buf = d;
+            break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
+        };
+
+        // Content-Length describes the *wire* (compressed) bytes, so the
+        // exact-size prealloc path only applies to identity payloads.
+        const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
+
+        if (wire_cl) |cl| {
+            if (cl > 0) {
+                const len: usize = @intCast(cl);
+                const buf = gpa.alloc(u8, len) catch |err| alloc_b: {
+                    std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
+                    break :alloc_b null;
+                };
+                if (buf) |b| {
+                    const n = reader.readSliceShort(b) catch |err| read_b: {
+                        std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
+                        break :read_b 0;
+                    };
+                    if (n == 0) {
+                        gpa.free(b);
+                    } else if (n == len) {
+                        owned_body = b;
+                    } else {
+                        owned_body = gpa.dupe(u8, b[0..n]) catch b[0..n];
+                        if (owned_body.?.len == n) gpa.free(b);
+                    }
+                }
+            }
+        } else {
+            var acc: std.ArrayList(u8) = .empty;
+            defer acc.deinit(gpa);
+            var chunk: [16 * 1024]u8 = undefined;
+            var total: usize = 0;
+            while (true) {
+                const n = reader.readSliceShort(chunk[0..]) catch |err| acc_b: {
+                    std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
+                    break :acc_b 0;
+                };
+                if (n == 0) break;
+                acc.appendSlice(gpa, chunk[0..n]) catch |err| {
+                    std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
+                    break;
+                };
+                total += n;
+            }
+            if (total > 0) {
+                owned_body = acc.toOwnedSlice(gpa) catch |err| fin_b: {
+                    std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
+                    break :fin_b null;
+                };
+            }
+        }
+
+        if (compressed) {
+            // readerDecompressing stops at the gzip EOF; for te=chunked the
+            // final chunk terminator is left unread. Draining the framing
+            // reader to its deterministic end-of-message (no extra RTT) keeps
+            // the connection reusable.
+            var plain_reader = response.reader(&transfer_buf);
+            var drain: [2048]u8 = undefined;
+            while (true) {
+                const n = plain_reader.readSliceShort(drain[0..]) catch break;
+                if (n == 0) break;
+            }
+        }
     }
 
     const resp_data = gpa.create(response_mod.ResponseData) catch {
@@ -297,8 +377,11 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         resp_data.headers.appendEntry(h.name, h.value);
     }
 
-    if (body_list.items.len > 0) {
-        resp_data.setBody(body_list.items);
+    if (owned_body) |b| {
+        resp_data.setBodyOwned(b);
+        owned_body = null;
+    } else if (response.head.content_length != null and has_body) {
+        resp_data.setBody("");
     }
 
     const resp_obj = response_mod.buildResponseJSObject(isolate, context, resp_data);
@@ -314,8 +397,12 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 // Setup
 // ============================================================
 
+pub fn deinitClient() void {
+    tls.deinit();
+}
+
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
-    initClient();
+    tls.init();
 
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);

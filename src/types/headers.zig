@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 
 const gpa = std.heap.page_allocator;
+const simd = std.simd;
 
 // ============================================================
 // Helpers
@@ -29,10 +30,9 @@ fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u
     const str = c.v8__Value__ToDetailString(v, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [8192]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+    return buf;
 }
 
 fn lowerCaseAlloc(input: []const u8) ![]const u8 {
@@ -41,6 +41,29 @@ fn lowerCaseAlloc(input: []const u8) ![]const u8 {
         buf.appendAssumeCapacity(std.ascii.toLower(b));
     }
     return try buf.toOwnedSlice(gpa);
+}
+
+// Vectorized ASCII lowercase: lanes in 'A'..'Z' get += 0x20.
+fn lowerAsciiSimd(buf: []u8) void {
+    const N = simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
+    const spl_a: V = @splat('A');
+    const spl_z: V = @splat('Z');
+    const spl_32: V = @splat(0x20);
+    const spl_0: V = @splat(0);
+    var i: usize = 0;
+    const tail = buf.len % N;
+    const main_end = buf.len - tail;
+    while (i < main_end) : (i += N) {
+        var v: V = buf[i..][0..N].*;
+        const upper = (v >= spl_a) & (v <= spl_z);
+        v += @select(u8, upper, spl_32, spl_0);
+        const arr: [N]u8 = v;
+        buf[i..][0..N].* = arr;
+    }
+    while (i < buf.len) : (i += 1) {
+        buf[i] = std.ascii.toLower(buf[i]);
+    }
 }
 
 // ============================================================
@@ -138,7 +161,7 @@ pub const HeadersData = struct {
     pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
         const nbase = self.names.items.len;
         self.names.appendSlice(gpa, name) catch return;
-        for (self.names.items[nbase..]) |*b| b.* = std.ascii.toLower(b.*);
+        lowerAsciiSimd(self.names.items[nbase..]);
 
         const vbase = self.values.items.len;
         self.values.appendSlice(gpa, value) catch {

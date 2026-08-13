@@ -25,13 +25,6 @@ var str_formData: c.Global = .{ .data_ptr = 0 };
 var str_bytes: c.Global = .{ .data_ptr = 0 };
 var str_clone: c.Global = .{ .data_ptr = 0 };
 
-var fn_bodyUsed: c.Global = .{ .data_ptr = 0 };
-var fn_ok: c.Global = .{ .data_ptr = 0 };
-var fn_status: c.Global = .{ .data_ptr = 0 };
-var fn_statusText: c.Global = .{ .data_ptr = 0 };
-var fn_url: c.Global = .{ .data_ptr = 0 };
-var fn_type: c.Global = .{ .data_ptr = 0 };
-var fn_redirected: c.Global = .{ .data_ptr = 0 };
 var fn_text: c.Global = .{ .data_ptr = 0 };
 var fn_json: c.Global = .{ .data_ptr = 0 };
 var fn_arrayBuffer: c.Global = .{ .data_ptr = 0 };
@@ -94,10 +87,9 @@ fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u
     const str = c.v8__Value__ToDetailString(v, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [8192]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+    return buf;
 }
 
 fn extractIntFromVal(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, default: u16) u16 {
@@ -155,6 +147,7 @@ pub const ResponseData = struct {
     status_text: PoolSlice,
     headers: headers_mod.HeadersData,
     _body: PoolSlice,
+    owned_body: ?[]u8 = null,
     has_body: bool,
     body_used: bool,
     _url: PoolSlice,
@@ -181,6 +174,7 @@ pub const ResponseData = struct {
     }
 
     pub fn deinit(self: *ResponseData) void {
+        if (self.owned_body) |b| gpa.free(b);
         self.pool.deinit(gpa);
         self.headers.deinit();
     }
@@ -191,6 +185,7 @@ pub const ResponseData = struct {
 
     pub fn body(self: *const ResponseData) ?[]const u8 {
         if (!self.has_body) return null;
+        if (self.owned_body) |b| return b;
         return self.pool.items[self._body.off .. self._body.off + self._body.len];
     }
 
@@ -219,7 +214,20 @@ pub const ResponseData = struct {
         self.storeString(s, &self.status_text);
     }
 
+    pub fn setBodyOwned(self: *ResponseData, b: []u8) void {
+        if (self.owned_body) |old| gpa.free(old);
+        self.has_body = b.len > 0;
+        if (b.len > 0) {
+            self.owned_body = b;
+            self._body = .{};
+        } else {
+            self.owned_body = null;
+        }
+    }
+
     pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
+        if (self.owned_body) |old| gpa.free(old);
+        self.owned_body = null;
         if (s) |b| {
             self.has_body = b.len > 0;
             self.storeString(b, &self._body);
@@ -249,6 +257,7 @@ pub const ResponseData = struct {
         self.redirected = src.redirected;
         self.response_type = src.response_type;
         self.response_type_other = src.response_type_other;
+        self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
             self.headers.appendEntry(p.name, p.value);
@@ -395,87 +404,6 @@ fn parseHeadersInitFromObj(isolate: ?*c.Isolate, context: ?*c.Context, init_obj:
 }
 
 // ============================================================
-// JS Callbacks — Instance property functions
-// ============================================================
-
-fn responseBodyUsed(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, if (data.body_used) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
-}
-
-fn responseOk(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, if (data.status >= 200 and data.status <= 299) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
-}
-
-fn responseStatus(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Integer__NewFromUnsigned(isolate, 0)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Integer__NewFromUnsigned(isolate, data.status)));
-}
-
-fn responseStatusText(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.statusText())));
-}
-
-fn responseUrl(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.url())));
-}
-
-fn responseType(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, "basic")));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, @ptrCast(zigStringToV8(isolate, data.responseType())));
-}
-
-fn responseRedirected(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
-    c.v8__ReturnValue__Set(ret, if (data.redirected) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
-}
-
-// ============================================================
 // JS Callbacks — Instance body methods
 // ============================================================
 
@@ -495,6 +423,7 @@ fn responseText(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
     data.body_used = true;
+    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_text = data.body() orelse "";
     var out: c.MaybeBool = undefined;
     _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(zigStringToV8(isolate, body_text)), &out);
@@ -517,6 +446,7 @@ fn responseJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
     data.body_used = true;
+    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_text = data.body() orelse "";
     const js_str = c.v8__String__NewFromUtf8(isolate, @ptrCast(body_text.ptr), 0, @intCast(body_text.len));
     const parsed = c.v8__JSON__Parse(context, js_str);
@@ -545,6 +475,7 @@ fn responseArrayBuffer(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
     data.body_used = true;
+    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_bytes = data.body() orelse "";
     const byte_len: usize = body_bytes.len;
     const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
@@ -609,6 +540,7 @@ fn responseBytes(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
     data.body_used = true;
+    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_bytes = data.body() orelse "";
     const byte_len: usize = body_bytes.len;
     const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
@@ -745,25 +677,36 @@ fn responseStaticError(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 }
 
 // ============================================================
-// Helper: set all cached function properties on a response object
+// Helper: set scalar data properties + cached functions
 // ============================================================
+
+fn setDataProps(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate, data: *ResponseData) void {
+    var out: c.MaybeBool = undefined;
+    const body_used = if (data.body_used) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(body_used), &out);
+    const ok = if (data.status >= 200 and data.status <= 299) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_ok, isolate)), @ptrCast(ok), &out);
+    const redirected = if (data.redirected) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_redirected, isolate)), @ptrCast(redirected), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_status, isolate)), @ptrCast(c.v8__Integer__NewFromUnsigned(isolate, data.status)), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)), @ptrCast(zigStringToV8(isolate, data.statusText())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_url, isolate)), @ptrCast(zigStringToV8(isolate, data.url())), &out);
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_type, isolate)), @ptrCast(zigStringToV8(isolate, data.responseType())), &out);
+}
+
+fn refreshBodyUsed(isolate: ?*c.Isolate, context: ?*c.Context, this_val: ?*const c.Value, value: bool) void {
+    if (this_val == null) return;
+    var out: c.MaybeBool = undefined;
+    const bv = if (value) c.v8__True(isolate) else c.v8__False(isolate);
+    c.v8__Object__Set(@ptrCast(this_val), context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(bv), &out);
+}
 
 fn setCachedFns(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate) void {
     var out: c.MaybeBool = undefined;
     const pairs = .{
-        .{ &fn_bodyUsed, &str_bodyUsed },
-        .{ &fn_ok, &str_ok },
-        .{ &fn_status, &str_status },
-        .{ &fn_statusText, &str_statusText },
-        .{ &fn_url, &str_url },
-        .{ &fn_type, &str_type },
-        .{ &fn_redirected, &str_redirected },
-        .{ &fn_text, &str_text },
-        .{ &fn_json, &str_json },
-        .{ &fn_arrayBuffer, &str_arrayBuffer },
-        .{ &fn_blob, &str_blob },
-        .{ &fn_formData, &str_formData },
-        .{ &fn_bytes, &str_bytes },
+        .{ &fn_text, &str_text },          .{ &fn_json, &str_json },
+        .{ &fn_arrayBuffer, &str_arrayBuffer }, .{ &fn_blob, &str_blob },
+        .{ &fn_formData, &str_formData },  .{ &fn_bytes, &str_bytes },
         .{ &fn_clone, &str_clone },
     };
     inline for (pairs) |pair| {
@@ -784,6 +727,7 @@ pub fn buildResponseJSObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *
     const headers_obj = createHeadersJSObject(isolate, context, &data.headers);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
 
+    setDataProps(obj, context, isolate, data);
     setCachedFns(obj, context, isolate);
 
     return obj;
@@ -860,13 +804,10 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
 
     // Cache functions
     const funcs = .{
-        .{ responseBodyUsed, &fn_bodyUsed },   .{ responseOk, &fn_ok },
-        .{ responseStatus, &fn_status },       .{ responseStatusText, &fn_statusText },
-        .{ responseUrl, &fn_url },             .{ responseType, &fn_type },
-        .{ responseRedirected, &fn_redirected }, .{ responseText, &fn_text },
-        .{ responseJson, &fn_json },           .{ responseArrayBuffer, &fn_arrayBuffer },
-        .{ responseBlob, &fn_blob },           .{ responseFormData, &fn_formData },
-        .{ responseBytes, &fn_bytes },         .{ responseClone, &fn_clone },
+        .{ responseText, &fn_text },       .{ responseJson, &fn_json },
+        .{ responseArrayBuffer, &fn_arrayBuffer }, .{ responseBlob, &fn_blob },
+        .{ responseFormData, &fn_formData }, .{ responseBytes, &fn_bytes },
+        .{ responseClone, &fn_clone },
     };
     inline for (funcs) |entry| {
         c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
