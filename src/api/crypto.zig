@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const builtin = @import("builtin");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
@@ -11,6 +12,7 @@ const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
 const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 
 extern fn std__shared_ptr__v8__BackingStore__get(self: *const c.SharedPtr) callconv(.c) ?*c.BackingStore;
+extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 
 fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
@@ -91,7 +93,17 @@ fn extractStringFromVal(isolate: ?*c.Isolate, val: *const c.Value) ?[:0]const u8
 }
 
 fn getRandomBytes(buf: []u8) void {
-    std.c.arc4random_buf(buf.ptr, buf.len);
+    switch (builtin.os.tag) {
+        .linux => {
+            var off: usize = 0;
+            while (off < buf.len) {
+                const n = std.c.getrandom(buf.ptr + off, buf.len - off, 0);
+                if (n < 0) continue;
+                off += @intCast(n);
+            }
+        },
+        else => arc4random_buf(buf.ptr, buf.len),
+    }
 }
 
 fn getRandomValuesCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -818,7 +830,7 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const decrypt_fn = c.v8__Function__New__DEFAULT(context, subtleDecryptCallback);
     c.v8__Object__Set(subtle_obj, context, c.v8__String__NewFromUtf8(isolate, "decrypt", 0, -1), decrypt_fn, &out);
 
-        const sign_fn = c.v8__Function__New__DEFAULT(context, subtleSignCallback);
+    const sign_fn = c.v8__Function__New__DEFAULT(context, subtleSignCallback);
     c.v8__Object__Set(subtle_obj, context, c.v8__String__NewFromUtf8(isolate, "sign", 0, -1), sign_fn, &out);
 
     const verify_fn = c.v8__Function__New__DEFAULT(context, subtleVerifyCallback);

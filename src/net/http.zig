@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const http_native = @import("http_native.zig");
 const engine = @import("../engine/engine.zig");
+const api_ws = @import("../api/websocket.zig");
 
 pub var server_running = std.atomic.Value(bool).init(false);
 
@@ -37,6 +38,20 @@ fn serveCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (c.v8__Value__IsObject(opts_val)) {
         const port_val = c.v8__Object__Get(@ptrCast(opts_val), context, c.v8__String__NewFromUtf8(isolate, "port", 0, -1));
         port = extractIntFromVal(isolate, context, port_val, 3000);
+
+        const ws_obj_val = c.v8__Object__Get(@ptrCast(opts_val), context, c.v8__String__NewFromUtf8(isolate, "websocket", 0, -1));
+        if (ws_obj_val != null and c.v8__Value__IsObject(ws_obj_val)) {
+            http_native.ws_enabled = true;
+            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "open", 0, -1))) |v| {
+                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_open);
+            }
+            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "message", 0, -1))) |v| {
+                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_message);
+            }
+            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "close", 0, -1))) |v| {
+                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_close);
+            }
+        }
     } else if (c.v8__Value__IsNumber(opts_val)) {
         port = extractIntFromVal(isolate, context, opts_val, 3000);
     }
@@ -68,6 +83,7 @@ fn serveCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     http_native.setupStrings(isolate);
+    api_ws.setupStrings(isolate);
 
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);

@@ -29,13 +29,26 @@ pub const EventLoop = struct {
         try self.loop.run(.until_done);
     }
 
+    fn hasPendingCompletions(loop: *const xev.Loop) bool {
+        if (@hasField(@TypeOf(loop.*), "completions")) {
+            return !loop.completions.empty();
+        }
+        return false;
+    }
+
+    fn hasWork(loop: *const xev.Loop) bool {
+        return loop.active > 0 or
+            !loop.submissions.empty() or
+            hasPendingCompletions(loop);
+    }
+
     const GC_POLICE = (1 << 13);
     const GC_MIN_HEAP = 8 * 1024 * 1024;
 
     pub fn runWithMicrotasks(self: *EventLoop, isolate: ?*c.Isolate) void {
         var gc_ticks: usize = 0;
         while (true) {
-            if (self.loop.active > 0 or !self.loop.submissions.empty() or !self.loop.completions.empty()) {
+            if (hasWork(&self.loop)) {
                 self.loop.run(.once) catch {};
             }
 
@@ -51,11 +64,12 @@ pub const EventLoop = struct {
             gc_ticks +%= 1;
 
             if (self.loop.stopped()) break;
-            if (!http_api.server_running.load(.acquire)) break;
+            if (!http_api.server_running.load(.acquire) and
+                !hasWork(&self.loop)) break;
 
-            if (self.loop.active == 0 and self.loop.submissions.empty() and self.loop.completions.empty()) {
-                var ts: c.timespec = .{ .tv_sec = 0, .tv_nsec = 100_000 };
-                _ = c.nanosleep(&ts, null);
+            if (!hasWork(&self.loop)) {
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 100_000 };
+                _ = std.c.nanosleep(&ts, null);
             }
         }
     }

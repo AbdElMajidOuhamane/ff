@@ -75,10 +75,15 @@ pub const Runtime = struct {
         response.setup(isolate, context);
         http.setup(isolate, context);
         const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
-        const setTimeout_key = c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1);
+        const setInterval_func = c.v8__Function__New__DEFAULT(context, setIntervalCallback);
+        const clearTimeout_func = c.v8__Function__New__DEFAULT(context, clearTimeoutCallback);
+        const clearInterval_func = c.v8__Function__New__DEFAULT(context, clearIntervalCallback);
         const global = c.v8__Context__Global(context);
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Object__Set(global, context, setTimeout_key, setTimeout_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1), setTimeout_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setInterval", 0, -1), setInterval_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearTimeout", 0, -1), clearTimeout_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearInterval", 0, -1), clearInterval_func, &out);
 
         const loop_ptr = try EventLoop.initHeap(std.heap.page_allocator);
 
@@ -96,7 +101,7 @@ pub const Runtime = struct {
         return runtime;
     }
 
-    fn setTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    fn scheduleCallback(info: ?*const c.FunctionCallbackInfo, interval: bool) void {
         const rt = g_runtime orelse return;
         const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
         const argc = c.v8__FunctionCallbackInfo__Length(info);
@@ -108,7 +113,42 @@ pub const Runtime = struct {
         c.v8__Value__NumberValue(ms_val, context, &maybe);
         if (!maybe.has_value) return;
         const ms: u64 = @intFromFloat(maybe.value);
-        _ = rt.timer_manager.setTimeout(isolate, fn_val, ms) catch return;
+
+        const result = if (interval)
+            rt.timer_manager.setInterval(isolate, fn_val, ms)
+        else
+            rt.timer_manager.setTimeout(isolate, fn_val, ms);
+        const id = result catch return;
+
+        var retval: c.ReturnValue = undefined;
+        c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
+        const num = c.v8__Number__New(isolate, @floatFromInt(@as(i64, @intCast(id))));
+        c.v8__ReturnValue__Set(retval, @ptrCast(num));
+    }
+
+    fn clearCallback(info: ?*const c.FunctionCallbackInfo) void {
+        const rt = g_runtime orelse return;
+        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+        if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
+        const id_val = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
+        const context = c.v8__Isolate__GetCurrentContext(isolate);
+        var maybe: c.MaybeI32 = undefined;
+        c.v8__Value__Int32Value(id_val, context, &maybe);
+        if (!maybe.has_value or maybe.value < 0) return;
+        rt.timer_manager.clear(@intCast(maybe.value));
+    }
+
+    fn setTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        scheduleCallback(info, false);
+    }
+    fn setIntervalCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        scheduleCallback(info, true);
+    }
+    fn clearTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        clearCallback(info);
+    }
+    fn clearIntervalCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        clearCallback(info);
     }
 
     pub fn deinit(self: *Runtime) void {
