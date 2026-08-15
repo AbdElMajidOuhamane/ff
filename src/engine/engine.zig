@@ -383,15 +383,14 @@ fn packedPrefix(comptime n: usize, comptime lit: []const u8) @Vector(n, u8) {
     return arr;
 }
 
-// Single vector compare of a literal prefix starting at lane 0. Coerced to an
-// array first — Zig vector element access requires a comptime-known index.
+// Single vector compare of a literal prefix starting at lane 0. Masked to the
+// first lit.len lanes via @bitCast -> integer mask (TigerBeetle style); the
+// pad lanes are masked off so they never affect the match.
 fn vecHasPrefix(comptime n: usize, v: @Vector(n, u8), comptime lit: []const u8) bool {
-    const eq: [n]bool = v == packedPrefix(n, lit);
-    var bits: u64 = 0;
-    for (0..lit.len) |j| {
-        if (eq[j]) bits |= @as(u64, 1) << @intCast(j);
-    }
-    return bits == (@as(u64, 1) << @intCast(lit.len)) - 1;
+    const M = std.meta.Int(.unsigned, n);
+    const raw: M = @bitCast(v == packedPrefix(n, lit));
+    const m: M = (@as(M, 1) << @intCast(lit.len)) - 1;
+    return (raw & m) == m;
 }
 
 // Vectorized line-kind classifier: full-vector path for lines wide enough to
@@ -410,11 +409,12 @@ fn classifyLineStart(trimmed: []const u8) LineKind {
     return .body;
 }
 
-// Vectorized leading-' ' / '\t' count: per-chunk lane mask -> bitset, first
-// clear lane is the trim width; scalar tail for the leftover bytes.
+// Vectorized leading-' ' / '\t' count: per-chunk lane mask -> @bitCast integer
+// bitset, first clear lane is the trim width; scalar tail for leftover bytes.
 fn trimStartWidth(line: []const u8) usize {
     const N = simd.suggestVectorLength(u8) orelse 16;
     const V = @Vector(N, u8);
+    const M = std.meta.Int(.unsigned, N);
     const spl_space: V = @splat(' ');
     const spl_tab: V = @splat('\t');
     var i: usize = 0;
@@ -422,12 +422,8 @@ fn trimStartWidth(line: []const u8) usize {
     const main_end = line.len - tail;
     while (i < main_end) : (i += N) {
         const v: V = line[i..][0..N].*;
-        const ws: [N]bool = (v == spl_space) | (v == spl_tab);
-        var bits: u64 = 0;
-        for (0..N) |j| {
-            if (ws[j]) bits |= @as(u64, 1) << @intCast(j);
-        }
-        if (bits != (@as(u64, 1) << @intCast(N)) - 1) return i + @ctz(~bits);
+        const ws: M = @bitCast((v == spl_space) | (v == spl_tab));
+        if (ws != ~@as(M, 0)) return i + @ctz(~ws);
     }
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     return i;

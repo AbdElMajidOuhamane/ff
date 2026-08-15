@@ -128,16 +128,13 @@ pub fn findCrLf(haystack: []const u8) ?usize {
     const V = @Vector(N, u8);
     const spl_cr: V = @splat(0x0D);
     const spl_lf: V = @splat(0x0A);
+    const M = std.meta.Int(.unsigned, N);
     var i: usize = 0;
     const tail = haystack.len % N;
     const main_end = haystack.len - tail;
     while (i < main_end) : (i += N) {
         const v: V = haystack[i..][0..N].*;
-        const m = (v == spl_cr) | (v == spl_lf);
-        var bits: u64 = 0;
-        for (0..N) |j| {
-            if (m[j]) bits |= @as(u64, 1) << @intCast(j);
-        }
+        const bits: M = @bitCast((v == spl_cr) | (v == spl_lf));
         if (bits != 0) return i + @ctz(bits);
     }
     while (i < haystack.len) : (i += 1) {

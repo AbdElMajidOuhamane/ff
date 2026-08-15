@@ -130,16 +130,13 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     const first = std.ascii.toLower(needle[0]);
     const N = simd.suggestVectorLength(u8) orelse 16;
     const V = @Vector(N, u8);
+    const M = std.meta.Int(.unsigned, N);
     const spl_first: V = @splat(first);
     const spl_lower: V = @splat(@as(u8, 0x20));
     var i: usize = 0;
     while (i < window_end and window_end - i >= N) : (i += N) {
         const v: V = haystack[i..][0..N].*;
-        const m: [N]bool = (v | spl_lower) == spl_first;
-        var bits: u64 = 0;
-        for (0..N) |j| {
-            if (m[j]) bits |= @as(u64, 1) << @intCast(j);
-        }
+        var bits: M = @bitCast((v | spl_lower) == spl_first);
         while (bits != 0) {
             const j: usize = @ctz(bits);
             if (matchCI(haystack, i + j, needle)) return i + j;
