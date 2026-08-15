@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = std.simd;
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const microtasks = @import("../event/microtasks.zig");
@@ -18,6 +19,14 @@ const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
 
 // ---- SoA hot state: compact + contiguous ----
 var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
+var sockets: [MAX_CONN]std.posix.socket_t = undefined;
+var read_bytes: [MAX_CONN]usize = undefined;
+var rbufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
+var wbufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
+var write_len: [MAX_CONN]usize = undefined;
+var write_off: [MAX_CONN]usize = undefined;
+var api_ids: [MAX_CONN]?u32 = undefined;
+var total_bytes: [MAX_CONN]usize = undefined;
 var fds: [MAX_CONN]xev.TCP = undefined;
 var buf_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
@@ -112,21 +121,29 @@ fn matchCI(haystack: []const u8, pos: usize, needle: []const u8) bool {
 
 // Wide scan for the lowercased first needle byte (OR 0x20 lowercases A-Z;
 // exact for 'c'/'k'/'h' since only alpha bytes can map onto a lowercase
-// letter), then scalar-confirm the remaining needle chars. Mirrors the
-// headers.zig vector->array + async_fetch vector-then-scalar hybrid.
+// letter), then scalar-confirm the remaining needle chars. First set lane is
+// found via @ctz on the lane bitmask (TigerBeetle style), falling back to a
+// scalar tail. Mirrors tls.zig:findCrLf / engine.zig:trimStartWidth.
 fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     const n = needle.len;
     const window_end = haystack.len - n + 1;
     const first = std.ascii.toLower(needle[0]);
-    const V = 16;
-    const lower_all: @Vector(V, u8) = @splat(@as(u8, 0x20));
-    const needle_v: @Vector(V, u8) = @splat(first);
+    const N = simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
+    const spl_first: V = @splat(first);
+    const spl_lower: V = @splat(@as(u8, 0x20));
     var i: usize = 0;
-    while (i < window_end and window_end - i >= V) : (i += V) {
-        const v: @Vector(V, u8) = haystack[i..][0..V].*;
-        const hits: [V]bool = (v | lower_all) == needle_v;
-        for (hits, 0..) |hit, j| {
-            if (hit and matchCI(haystack, i + j, needle)) return i + j;
+    while (i < window_end and window_end - i >= N) : (i += N) {
+        const v: V = haystack[i..][0..N].*;
+        const m: [N]bool = (v | spl_lower) == spl_first;
+        var bits: u64 = 0;
+        for (0..N) |j| {
+            if (m[j]) bits |= @as(u64, 1) << @intCast(j);
+        }
+        while (bits != 0) {
+            const j: usize = @ctz(bits);
+            if (matchCI(haystack, i + j, needle)) return i + j;
+            bits &= bits - 1;
         }
     }
     while (i < window_end) : (i += 1) {
