@@ -70,8 +70,8 @@ pub fn parseHeader(buf: []const u8) ?FrameHdr {
     };
 }
 
-// In-place XOR with the 4-byte mask.
-pub fn unmask(buf: []u8, mask: [4]u8) void {
+// Scalar reference (old implementation), kept as the test oracle.
+fn unmaskScalar(buf: []u8, mask: [4]u8) void {
     var i: usize = 0;
     const last = buf.len - (buf.len % 4);
     while (i < last) : (i += 4) {
@@ -79,6 +79,27 @@ pub fn unmask(buf: []u8, mask: [4]u8) void {
         buf[i + 1] ^= mask[1];
         buf[i + 2] ^= mask[2];
         buf[i + 3] ^= mask[3];
+    }
+    while (i < buf.len) : (i += 1) {
+        buf[i] ^= mask[i & 3];
+    }
+}
+
+// In-place XOR with the 4-byte mask, 16 bytes at a time.
+pub fn unmask(buf: []u8, mask: [4]u8) void {
+    var i: usize = 0;
+    const body = buf.len & ~@as(usize, 15);
+    if (body >= 16) {
+        const m: @Vector(16, u8) = .{
+            mask[0], mask[1], mask[2], mask[3],
+            mask[0], mask[1], mask[2], mask[3],
+            mask[0], mask[1], mask[2], mask[3],
+            mask[0], mask[1], mask[2], mask[3],
+        };
+        while (i < body) : (i += 16) {
+            const v: @Vector(16, u8) = buf[i..][0..16].*;
+            buf[i..][0..16].* = v ^ m;
+        }
     }
     while (i < buf.len) : (i += 1) {
         buf[i] ^= mask[i & 3];
@@ -139,4 +160,20 @@ test "parseHeader roundtrip" {
     try std.testing.expect(hdr.fin);
     try std.testing.expectEqual(@as(usize, 300), hdr.payload_len);
     try std.testing.expectEqual(@as(u8, 8), hdr.header_len);
+}
+
+test "unmask vector equals scalar" {
+    const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const sizes = [_]usize{ 0, 1, 3, 4, 15, 16, 17, 20, 63, 64, 100, 255, 256 };
+    for (sizes) |s| {
+        var a: [300]u8 = undefined;
+        var b: [300]u8 = undefined;
+        for (0..s) |k| {
+            a[k] = @intCast((k * 37 + 11) & 0xff);
+            b[k] = a[k];
+        }
+        unmask(a[0..s], mask);
+        unmaskScalar(b[0..s], mask);
+        try std.testing.expectEqualSlices(u8, a[0..s], b[0..s]);
+    }
 }

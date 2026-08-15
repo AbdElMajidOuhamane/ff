@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const request_mod = @import("../types/request.zig");
-const response_mod = @import("../types/response.zig");
+const async_fetch = @import("../net/async_fetch.zig");
 const tls = @import("../net/tls.zig");
 
 const gpa = std.heap.page_allocator;
@@ -92,7 +92,8 @@ fn extractRequestData(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c
 }
 
 // ============================================================
-// Main fetch callback
+// Main fetch callback — parse args on the v8 thread, spawn a worker,
+// return the (pending) promise immediately.
 // ============================================================
 
 fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -116,11 +117,13 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const arg0 = c.v8__FunctionCallbackInfo__INDEX(info, 0);
     var url_str: ?[:0]const u8 = null;
     var method_override: ?[]const u8 = null;
+    var owned_method: ?[:0]const u8 = null; // only when extractStringFromVal allocated it
     var extra_headers: ?std.ArrayList(http.Header) = null;
     var body_payload: ?[:0]const u8 = null;
 
     defer {
         if (url_str) |u| gpa.free(u);
+        if (owned_method) |m| gpa.free(m);
         if (body_payload) |b| gpa.free(b);
         if (extra_headers) |*h| {
             for (h.items) |hdr| {
@@ -168,6 +171,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             const method_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "method", 0, -1));
             if (extractStringFromVal(isolate, method_val)) |m| {
                 method_override = m;
+                owned_method = m;
             }
 
             const headers_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "headers", 0, -1));
@@ -203,206 +207,37 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         return;
     };
 
-    var req = tls.client().request(method, uri, .{
-        .extra_headers = if (extra_headers) |*h| h.items else &.{},
-    }) catch {
+    // Ownership moves into the pool on success, freed by submit on failure.
+    // Null first so the defer-frees below never double-free.
+    const header_list: std.ArrayList(http.Header) = if (extra_headers) |*h| h.* else .empty;
+    extra_headers = null;
+    const body_copy = body_payload;
+    body_payload = null;
+    const url_copy = url;
+    url_str = null;
+
+    async_fetch.submit(isolate, @ptrCast(resolver), url_copy, uri, method, header_list, body_copy) catch {
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Network error")), &out);
+        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to start fetch")), &out);
         c.v8__ReturnValue__Set(ret, @ptrCast(promise));
         return;
     };
-    defer req.deinit();
-
-    // Register the connection in the transport pool (records fd + TLS flag)
-    // and apply TCP_NODELAY before any byte is written — the TLS handshake
-    // runs lazily on the first read/write, so NODELAY covers the
-    // ClientHello -> Finished -> request sequence. Without it, each small
-    // second write stalls on a delayed-ACK round trip (~90ms per fresh conn).
-    var slot: ?usize = null;
-    if (req.connection) |cn| slot = tls.attach(cn);
-    defer if (slot) |s| tls.detach(s);
-
-    if (body_payload) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var body_writer = req.sendBodyUnflushed(&.{}) catch {
-            var out: c.MaybeBool = undefined;
-            _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to send request body")), &out);
-            c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-            return;
-        };
-        body_writer.writer.writeAll(payload) catch {
-            var out: c.MaybeBool = undefined;
-            _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to write request body")), &out);
-            c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-            return;
-        };
-        body_writer.end() catch {};
-        req.connection.?.flush() catch {};
-    } else {
-        req.sendBodiless() catch {
-            var out: c.MaybeBool = undefined;
-            _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to send request")), &out);
-            c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-            return;
-        };
-    }
-
-    var redirect_buf: [8000]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to receive response")), &out);
-        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-        return;
-    };
-
-    var owned_body: ?[]u8 = null;
-    defer if (owned_body) |b| gpa.free(b);
-
-    const status_code = @intFromEnum(response.head.status);
-    const status_class = status_code / 100;
-    const has_body = switch (status_class) {
-        1 => false,
-        2 => response.head.status != .no_content and response.head.status != .not_modified,
-        3 => false,
-        else => true,
-    };
-
-    if (!has_body) {
-        req.connection.?.closing = true;
-    }
-
-    if (has_body) {
-        var transfer_buf: [8192]u8 = undefined;
-        const content_encoding = response.head.content_encoding;
-        const compressed = content_encoding != .identity;
-        var decompress_buf: ?[]u8 = null;
-        defer if (decompress_buf) |d| gpa.free(d);
-        var decompress: std.http.Decompress = undefined;
-
-        const reader = if (!compressed)
-            response.reader(&transfer_buf)
-        else dec: {
-            const window_len: usize = switch (content_encoding) {
-                .gzip, .deflate => std.compress.flate.max_window_len,
-                .zstd => std.compress.zstd.default_window_len,
-                else => 0,
-            };
-            if (window_len == 0) {
-                std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
-                break :dec response.reader(&transfer_buf);
-            }
-            const d = gpa.alloc(u8, window_len) catch break :dec response.reader(&transfer_buf);
-            decompress_buf = d;
-            break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
-        };
-
-        // Content-Length describes the *wire* (compressed) bytes, so the
-        // exact-size prealloc path only applies to identity payloads.
-        const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
-
-        if (wire_cl) |cl| {
-            if (cl > 0) {
-                const len: usize = @intCast(cl);
-                const buf = gpa.alloc(u8, len) catch |err| alloc_b: {
-                    std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
-                    break :alloc_b null;
-                };
-                if (buf) |b| {
-                    const n = reader.readSliceShort(b) catch |err| read_b: {
-                        std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
-                        break :read_b 0;
-                    };
-                    if (n == 0) {
-                        gpa.free(b);
-                    } else if (n == len) {
-                        owned_body = b;
-                    } else {
-                        owned_body = gpa.dupe(u8, b[0..n]) catch b[0..n];
-                        if (owned_body.?.len == n) gpa.free(b);
-                    }
-                }
-            }
-        } else {
-            var acc: std.ArrayList(u8) = .empty;
-            defer acc.deinit(gpa);
-            var chunk: [16 * 1024]u8 = undefined;
-            var total: usize = 0;
-            while (true) {
-                const n = reader.readSliceShort(chunk[0..]) catch |err| acc_b: {
-                    std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
-                    break :acc_b 0;
-                };
-                if (n == 0) break;
-                acc.appendSlice(gpa, chunk[0..n]) catch |err| {
-                    std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
-                    break;
-                };
-                total += n;
-            }
-            if (total > 0) {
-                owned_body = acc.toOwnedSlice(gpa) catch |err| fin_b: {
-                    std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
-                    break :fin_b null;
-                };
-            }
-        }
-
-        if (compressed) {
-            // readerDecompressing stops at the gzip EOF; for te=chunked the
-            // final chunk terminator is left unread. Draining the framing
-            // reader to its deterministic end-of-message (no extra RTT) keeps
-            // the connection reusable.
-            var plain_reader = response.reader(&transfer_buf);
-            var drain: [2048]u8 = undefined;
-            while (true) {
-                const n = plain_reader.readSliceShort(drain[0..]) catch break;
-                if (n == 0) break;
-            }
-        }
-    }
-
-    const resp_data = gpa.create(response_mod.ResponseData) catch {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Out of memory")), &out);
-        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-        return;
-    };
-    resp_data.* = response_mod.ResponseData.init();
-
-    resp_data.status = status_code;
-    resp_data.setStatusText(response.head.status.phrase() orelse "OK");
-
-    var header_it = response.head.iterateHeaders();
-    while (header_it.next()) |h| {
-        resp_data.headers.appendEntry(h.name, h.value);
-    }
-
-    if (owned_body) |b| {
-        resp_data.setBodyOwned(b);
-        owned_body = null;
-    } else if (response.head.content_length != null and has_body) {
-        resp_data.setBody("");
-    }
-
-    const resp_obj = response_mod.buildResponseJSObject(isolate, context, resp_data);
-    if (resp_obj) |obj| {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(obj), &out);
-    }
 
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
 // ============================================================
-// Setup
+// Setup / teardown
 // ============================================================
 
 pub fn deinitClient() void {
+    async_fetch.deinit();
     tls.deinit();
 }
 
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     tls.init();
+    async_fetch.init();
 
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);

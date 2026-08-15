@@ -14,6 +14,7 @@ const header=@import("../types/headers.zig");
 const request= @import("../types/request.zig");
 const response= @import("../types/response.zig");
 const http = @import("../net/http.zig");
+const simd = std.simd;
 
 
 const DepEntry = struct { key: [:0]const u8, src: []const u8 };
@@ -55,7 +56,6 @@ pub const Runtime = struct {
         params.constraints = constraints;
 
         const isolate = c.v8__Isolate__New(&params);
-        std.debug.print("[dbg] isolate created  thread_id={d}\n", .{std.Thread.getCurrentId()});
         c.v8__Isolate__Enter(isolate);
         var handle_scope: c.HandleScope = undefined;
         c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
@@ -152,6 +152,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        fetch_api.deinitClient();
         self.module_cache.deinit();
         self.timer_manager.cancelAll();
         c.v8__Context__Exit(self.context);
@@ -369,6 +370,69 @@ pub const Runtime = struct {
         c.v8__Object__Set(global, self.context, key, registry, &out);
     }
 
+const LineKind = enum { import_statement, export_default, export_statement, body };
+
+// Comptime-padded literal prefix as a vector. Pad lanes are never inspected —
+// only the first lit.len lanes are compared.
+fn packedPrefix(comptime n: usize, comptime lit: []const u8) @Vector(n, u8) {
+    const arr: [n]u8 = comptime blk: {
+        var a: [n]u8 = [_]u8{0x00} ** n;
+        @memcpy(a[0..lit.len], lit);
+        break :blk a;
+    };
+    return arr;
+}
+
+// Single vector compare of a literal prefix starting at lane 0. Coerced to an
+// array first — Zig vector element access requires a comptime-known index.
+fn vecHasPrefix(comptime n: usize, v: @Vector(n, u8), comptime lit: []const u8) bool {
+    const eq: [n]bool = v == packedPrefix(n, lit);
+    var bits: u64 = 0;
+    for (0..lit.len) |j| {
+        if (eq[j]) bits |= @as(u64, 1) << @intCast(j);
+    }
+    return bits == (@as(u64, 1) << @intCast(lit.len)) - 1;
+}
+
+// Vectorized line-kind classifier: full-vector path for lines wide enough to
+// hold a literal, scalar startsWith fallback for ragged/short lines.
+fn classifyLineStart(trimmed: []const u8) LineKind {
+    const N = simd.suggestVectorLength(u8) orelse 16;
+    if (trimmed.len >= N) {
+        const v: @Vector(N, u8) = trimmed[0..N].*;
+        if (vecHasPrefix(N, v, "import ")) return .import_statement;
+        if (vecHasPrefix(N, v, "export default ")) return .export_default;
+        if (vecHasPrefix(N, v, "export ")) return .export_statement;
+    }
+    if (std.mem.startsWith(u8, trimmed, "import ")) return .import_statement;
+    if (std.mem.startsWith(u8, trimmed, "export default ")) return .export_default;
+    if (std.mem.startsWith(u8, trimmed, "export ")) return .export_statement;
+    return .body;
+}
+
+// Vectorized leading-' ' / '\t' count: per-chunk lane mask -> bitset, first
+// clear lane is the trim width; scalar tail for the leftover bytes.
+fn trimStartWidth(line: []const u8) usize {
+    const N = simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
+    const spl_space: V = @splat(' ');
+    const spl_tab: V = @splat('\t');
+    var i: usize = 0;
+    const tail = line.len % N;
+    const main_end = line.len - tail;
+    while (i < main_end) : (i += N) {
+        const v: V = line[i..][0..N].*;
+        const ws: [N]bool = (v == spl_space) | (v == spl_tab);
+        var bits: u64 = 0;
+        for (0..N) |j| {
+            if (ws[j]) bits |= @as(u64, 1) << @intCast(j);
+        }
+        if (bits != (@as(u64, 1) << @intCast(N)) - 1) return i + @ctz(~bits);
+    }
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    return i;
+}
+
 fn wrapModule(self: *Runtime, source: []const u8, registry_key: [:0]const u8, m: *mod.Module) ![:0]const u8 {
     _ = self;
     const gpa = std.heap.page_allocator;
@@ -400,20 +464,18 @@ fn wrapModule(self: *Runtime, source: []const u8, registry_key: [:0]const u8, m:
     }
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "import ")) continue;
-        if (std.mem.startsWith(u8, trimmed, "export default ")) {
-            continue;
-        } else if (std.mem.startsWith(u8, trimmed, "export ")) {
-            const exp_offset = std.mem.indexOf(u8, line, "export").?;
-            const prefix = line[0..exp_offset];
-            const rest = line[exp_offset + 7 ..];
-            try buf.appendSlice(gpa, prefix);
-            try buf.appendSlice(gpa, rest);
-            try buf.append(gpa, '\n');
-        } else {
-            try buf.appendSlice(gpa, line);
-            try buf.append(gpa, '\n');
+        const off = trimStartWidth(line);
+        switch (classifyLineStart(line[off..])) {
+            .import_statement, .export_default => continue,
+            .export_statement => {
+                try buf.appendSlice(gpa, line[0..off]);
+                try buf.appendSlice(gpa, line[off + 7 ..]);
+                try buf.append(gpa, '\n');
+            },
+            .body => {
+                try buf.appendSlice(gpa, line);
+                try buf.append(gpa, '\n');
+            },
         }
     }
     for (m.exports.items) |exp| {

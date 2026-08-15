@@ -3,6 +3,7 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const microtasks = @import("./microtasks.zig");
 const http_api = @import("../net/http.zig");
+const async_fetch = @import("../net/async_fetch.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -52,6 +53,14 @@ pub const EventLoop = struct {
                 self.loop.run(.once) catch {};
             }
 
+            // Async-fetch: keep the xev Async armed while jobs are in flight
+            // (worker notify() wakes us promptly), drain finished jobs, then
+            // pump microtasks so the awaited fetch continuation runs.
+            if (async_fetch.pending.load(.acquire) > 0) {
+                async_fetch.arm(&self.loop);
+            }
+            async_fetch.drainCompleted(isolate);
+
             microtasks.pumpMicrotasks(isolate);
 
             if (isolate != null and (gc_ticks % GC_POLICE == 0)) {
@@ -65,7 +74,8 @@ pub const EventLoop = struct {
 
             if (self.loop.stopped()) break;
             if (!http_api.server_running.load(.acquire) and
-                !hasWork(&self.loop)) break;
+                !hasWork(&self.loop) and
+                async_fetch.pending.load(.acquire) == 0) break;
 
             if (!hasWork(&self.loop)) {
                 var ts: std.c.timespec = .{ .sec = 0, .nsec = 100_000 };

@@ -24,6 +24,17 @@ var reuse_gen: [MAX_CONN]u32 = [_]u32{0} ** MAX_CONN;
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = MAX_CONN;
 
+// Async-fetch buildout: workers call attach/detach from their own threads,
+// so the free-list head is guarded by a tiny spinlock (std.atomic.Mutex).
+var pool_lock: std.atomic.Mutex = .unlocked;
+
+fn poolLock() void {
+    while (!pool_lock.tryLock()) std.atomic.spinLoopHint();
+}
+fn poolUnlock() void {
+    pool_lock.unlock();
+}
+
 // ---- O(1) slot allocator ----
 fn poolInit() void {
     for (0..MAX_CONN) |i| free_list[i] = @intCast(MAX_CONN - 1 - i);
@@ -56,7 +67,14 @@ var client_initialized = false;
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
-    io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    // async_fetch spawns up to 10 concurrent connect+handshake paths through
+    // this io instance. The std default limit is cpus-1 (7 here), which the
+    // connect wave saturates — excess Io.async tasks then run inline on the
+    // calling worker, ~1 RTT of scheduling contention per straggler. Raise it
+    // so every connect+DNS dispatch gets a dedicated pool thread.
+    io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .async_limit = .limited(64),
+    });
     http_client = .{
         .allocator = std.heap.page_allocator,
         .io = io_backend.io(),
@@ -156,7 +174,10 @@ pub fn tuneAllLive() void {
 
 /// Register a connection handed back by std.http into the pool: records its
 /// fd + TLS flag so reuse/tuning is data-oriented at fetch time.
+/// Thread-safe (spinlock-guarded) for the async worker buildout.
 pub fn attach(conn: *http.Client.Connection) ?usize {
+    poolLock();
+    defer poolUnlock();
     const s = acquireSlot() orelse return null;
     fds[s] = conn.stream_reader.stream.socket.handle;
     tls_active[s] = conn.protocol == .tls;
@@ -166,5 +187,7 @@ pub fn attach(conn: *http.Client.Connection) ?usize {
 }
 
 pub fn detach(s: usize) void {
+    poolLock();
+    defer poolUnlock();
     releaseSlot(s);
 }

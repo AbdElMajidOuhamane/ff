@@ -91,8 +91,7 @@ fn freePush(id: usize) void {
     free_count += 1;
 }
 
-fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or haystack.len < needle.len) return null;
+fn findTokenCIScalar(haystack: []const u8, needle: []const u8) ?usize {
     outer: for (0..haystack.len - needle.len + 1) |i| {
         var j: usize = 0;
         while (j < needle.len) : (j += 1) {
@@ -101,6 +100,45 @@ fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
         return i;
     }
     return null;
+}
+
+fn matchCI(haystack: []const u8, pos: usize, needle: []const u8) bool {
+    var j: usize = 0;
+    while (j < needle.len) : (j += 1) {
+        if (std.ascii.toLower(haystack[pos + j]) != std.ascii.toLower(needle[j])) return false;
+    }
+    return true;
+}
+
+// Wide scan for the lowercased first needle byte (OR 0x20 lowercases A-Z;
+// exact for 'c'/'k'/'h' since only alpha bytes can map onto a lowercase
+// letter), then scalar-confirm the remaining needle chars. Mirrors the
+// headers.zig vector->array + async_fetch vector-then-scalar hybrid.
+fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
+    const n = needle.len;
+    const window_end = haystack.len - n + 1;
+    const first = std.ascii.toLower(needle[0]);
+    const V = 16;
+    const lower_all: @Vector(V, u8) = @splat(@as(u8, 0x20));
+    const needle_v: @Vector(V, u8) = @splat(first);
+    var i: usize = 0;
+    while (i < window_end and window_end - i >= V) : (i += V) {
+        const v: @Vector(V, u8) = haystack[i..][0..V].*;
+        const hits: [V]bool = (v | lower_all) == needle_v;
+        for (hits, 0..) |hit, j| {
+            if (hit and matchCI(haystack, i + j, needle)) return i + j;
+        }
+    }
+    while (i < window_end) : (i += 1) {
+        if (matchCI(haystack, i, needle)) return i;
+    }
+    return null;
+}
+
+fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    if (haystack.len - needle.len + 1 >= 16) return findTokenCISimd(haystack, needle);
+    return findTokenCIScalar(haystack, needle);
 }
 
 fn classifyMethod(s: []const u8) Method {
