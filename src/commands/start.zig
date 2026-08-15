@@ -1,6 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine/engine.zig");
-pub fn run(io: std.Io) !void {
+pub fn run(io: std.Io,init:std.process.Init) !void {
     const dir = std.Io.Dir.cwd();
     const allocator = std.heap.page_allocator;
     // 1. Read ff.json directly with readFileAlloc
@@ -34,7 +34,13 @@ pub fn run(io: std.Io) !void {
     defer allocator.free(js_content);
     const source: [:0]const u8 = js_content.ptr[0..js_content.len :0];
     // 5. Run it
-    var runtime = engine.Runtime.init();
-    defer runtime.deinit();
-    _ = runtime.eval(source, main_name_z);
+    const runtime = try engine.Runtime.init(init.minimal.args);
+    defer {
+        runtime.event_loop.deinit();
+        std.heap.page_allocator.destroy(runtime.event_loop);
+        runtime.deinit();
+        std.heap.page_allocator.destroy(runtime);
+    }
+    _ = runtime.evalModule(source, main_name_z);
+    try runtime.event_loop.run();
 }

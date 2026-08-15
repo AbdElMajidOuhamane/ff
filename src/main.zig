@@ -7,6 +7,7 @@ const c = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
 });
+const microtasks =@import("./event/microtasks.zig");
 
 const Command = enum {
     init,
@@ -33,21 +34,33 @@ pub fn main(init: std.process.Init) !void {
     const cmd = parseCommand(first_arg);
     switch (cmd) {
         .init => try init_cmd.run(init.io),
-        .start => try start_cmd.run(init.io),
-        .bench => try bench_cmd.run(init.io),
+        .start => try start_cmd.run(init.io, init),
+        .bench => try bench_cmd.run(init.io,init),
         .e_flag => {
             const code = args_iter.next() orelse {
-                std.debug.print("Error: -e requires an argument\n", .{});
-                std.process.exit(1);
-            };
-            var runtime = engine.Runtime.init();
-            defer runtime.deinit();
+            std.debug.print("Error: -e requires an argument\n", .{});
+            std.process.exit(1);
+                };
+            const runtime = try engine.Runtime.init(init.minimal.args);
+            defer {
+                runtime.event_loop.deinit();
+                std.heap.page_allocator.destroy(runtime.event_loop);
+                runtime.deinit();
+                std.heap.page_allocator.destroy(runtime);
+            }
             _ = runtime.eval(code, "<eval>");
+            runtime.event_loop.runWithMicrotasks(runtime.isolate);
         },
         .file => {
-            var runtime = engine.Runtime.init();
-            defer runtime.deinit();
-            const file = c.fopen(first_arg.ptr, "rb") orelse {
+                 const runtime = try engine.Runtime.init(init.minimal.args);
+                defer {
+                    runtime.event_loop.deinit();
+                    std.heap.page_allocator.destroy(runtime.event_loop);
+                    runtime.deinit();
+                    std.heap.page_allocator.destroy(runtime);
+                     }   
+                const file = c.fopen(first_arg.ptr, "rb") orelse {
+
                 std.debug.print("Error: could not open file '{s}'\n", .{first_arg});
                 std.process.exit(1);
             };
@@ -59,7 +72,10 @@ pub fn main(init: std.process.Init) !void {
             defer std.heap.page_allocator.free(buf);
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf.ptr[0..size :0];
-            _ = runtime.eval(source, first_arg);
+             _ = runtime.evalModule(source, first_arg);
+            runtime.event_loop.runWithMicrotasks(runtime.isolate);
+
+            
         },
         .none => printUsage(),
     }

@@ -298,6 +298,9 @@ typedef enum MemoryPressureLevel {
     kCritical = 2
 } MemoryPressureLevel;
 void v8__Isolate__MemoryPressureNotification(Isolate* self, MemoryPressureLevel level);
+int64_t v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
+    Isolate* self,
+    int64_t change_in_bytes);
 typedef struct HeapStatistics {
     size_t total_heap_size;
     size_t total_heap_size_executable;
@@ -325,6 +328,7 @@ usize v8__HeapStatistics__SIZEOF();
 typedef size_t (*NearHeapLimitCallback)(void* data, size_t current_heap_limit, size_t initial_heap_limit);
 void v8__Isolate__AddNearHeapLimitCallback(Isolate* self, NearHeapLimitCallback callback, void* data);
 void v8__Isolate__RemoveNearHeapLimitCallback(Isolate* self, NearHeapLimitCallback callback, size_t heap_limit);
+void v8__Isolate__AutomaticallyRestoreInitialHeapLimit(Isolate* self, double threshold_percent);
 void* v8__Isolate__GetData(Isolate* self, int idx);
 void v8__Isolate__SetData(Isolate* self, int idx, void* val);
 void v8__Isolate__EnqueueMicrotask(Isolate* self, MicrotaskCallback callback, void* data);
@@ -602,6 +606,7 @@ bool v8__Value__IsUint32Array(const Value* self);
 bool v8__Value__IsInt32Array(const Value* self);
 bool v8__Value__IsBigInt64Array(const Value* self);
 bool v8__Value__IsBigUint64Array(const Value* self);
+bool v8__Value__IsFloat16Array(const Value* self);
 bool v8__Value__IsFloat32Array(const Value* self);
 bool v8__Value__IsFloat64Array(const Value* self);
 bool v8__Value__IsArrayBuffer(const Value* self);

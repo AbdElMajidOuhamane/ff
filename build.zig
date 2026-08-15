@@ -4,9 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const v8_linux = b.option(bool, "v8-linux", "link prebuilt Linux x86_64 V8 archive (vendor/v8/linux/libc_v8.a)") orelse false;
+    const v8_lib_path = if (v8_linux) "vendor/v8/linux" else "vendor/v8/lib";
+
     const mod = b.addModule("fairyfly", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+    });
+    const httpz = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{
@@ -18,6 +25,11 @@ pub fn build(b: *std.Build) void {
             .link_libcpp = true,
             .imports = &.{
                 .{ .name = "fairyfly", .module = mod },
+                .{ .name = "xev", .module = b.addModule("xev-shim", .{
+    .root_source_file = b.path("src/xev.zig"),
+    .imports = &.{ .{ .name = "xev-inner",
+    .module = b.dependency("libxev", .{}).module("xev") } },
+}) },                .{ .name = "httpz", .module = httpz.module("httpz") },
             },
         }),
     });
@@ -31,8 +43,8 @@ pub fn build(b: *std.Build) void {
         .flags = &.{},
     });
 
-    // Link V8 C bindings library
-    exe.root_module.addLibraryPath(.{ .cwd_relative = "vendor/v8/lib" });
+    // Link V8 C bindings library (macOS arm64 by default, Linux x86_64 with -Dv8-linux)
+    exe.root_module.addLibraryPath(.{ .cwd_relative = v8_lib_path });
     exe.root_module.linkSystemLibrary("c_v8", .{
         .preferred_link_mode = .static,
     });
@@ -42,14 +54,24 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("pthread", .{});
     exe.root_module.linkSystemLibrary("m", .{});
     exe.root_module.linkSystemLibrary("dl", .{});
+     if (target.result.os.tag == .linux) {
+        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor/cross" });
+        if (target.result.abi == .musl) {
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/engine/musl_shims.c"),
+                .flags = &.{},
+            });
+        }
+    }
 
     // macOS frameworks needed by V8
-    exe.root_module.linkFramework("CoreFoundation", .{});
-    exe.root_module.linkFramework("CoreServices", .{});
-    exe.root_module.linkFramework("Security", .{});
-    exe.root_module.linkFramework("IOKit", .{});
-    exe.root_module.linkFramework("Foundation", .{});
-
+    if (target.result.os.tag == .macos) {
+        exe.root_module.linkFramework("CoreFoundation", .{});
+        exe.root_module.linkFramework("CoreServices", .{});
+        exe.root_module.linkFramework("Security", .{});
+        exe.root_module.linkFramework("IOKit", .{});
+        exe.root_module.linkFramework("Foundation", .{});
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");

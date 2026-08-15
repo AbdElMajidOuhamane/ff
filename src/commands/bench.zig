@@ -1,10 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine/engine.zig");
 
-const c = @cImport({
-    @cInclude("time.h");
-});
-
 const bench_files = [_][]const u8{
     "bench/fib.js",
     "bench/sort.js",
@@ -16,15 +12,19 @@ const bench_files = [_][]const u8{
     "bench/array.js",
 };
 
-pub fn run(io: std.Io) !void {
+pub fn run(io: std.Io, init: std.process.Init) !void {
     const dir = std.Io.Dir.cwd();
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n  Fairyfly Bench\n\n", .{});
 
-    var runtime = engine.Runtime.init();
-    defer runtime.deinit();
-
+    const runtime = try engine.Runtime.init(init.minimal.args);
+    defer {
+        runtime.event_loop.deinit();
+        std.heap.page_allocator.destroy(runtime.event_loop);
+        runtime.deinit();
+        std.heap.page_allocator.destroy(runtime);
+    }
     var total_ms: i64 = 0;
     var bench_count: u32 = 0;
 
@@ -42,14 +42,14 @@ pub fn run(io: std.Io) !void {
         path_z_buf[path.len] = 0;
         const path_z: [:0]const u8 = path_z_buf[0..path.len :0];
 
-        var start_ts: c.struct_timespec = undefined;
-        var end_ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &start_ts);
+        var start_ts: std.c.timespec = undefined;
+        var end_ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &start_ts);
         _ = runtime.eval(source, path_z);
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &end_ts);
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &end_ts);
 
-        const elapsed_ns = (@as(i64, @intCast(end_ts.tv_sec)) - @as(i64, @intCast(start_ts.tv_sec))) * 1_000_000_000 +
-            (@as(i64, @intCast(end_ts.tv_nsec)) - @as(i64, @intCast(start_ts.tv_nsec)));
+        const elapsed_ns = (@as(i64, @intCast(end_ts.sec)) - @as(i64, @intCast(start_ts.sec))) * 1_000_000_000 +
+            (@as(i64, @intCast(end_ts.nsec)) - @as(i64, @intCast(start_ts.nsec)));
         const elapsed_ms = @divTrunc(elapsed_ns, 1_000_000);
 
         total_ms += elapsed_ms;

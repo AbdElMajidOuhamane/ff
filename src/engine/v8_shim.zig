@@ -99,3 +99,33 @@ pub extern "c" fn v8__Undefined(isolate: ?*Isolate) ?*const Value;
 
 // Number
 pub extern "c" fn v8__Number__New(isolate: ?*Isolate, val: f64) ?*const Value;
+// Microtask
+pub extern "c" fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: ?*Isolate) void;
+
+// Function
+pub extern "c" fn v8__Function__Call(
+    func: ?*const Function,
+    context: ?*const Context,
+    recv: ?*const Value,
+    argc: c_int,
+    argv: [*]const ?*const Value,
+) ?*const Value;
+
+// Global
+pub const Global = c.Global;
+
+pub extern "c" fn v8__Global__Reset(self: *Global) void;
+
+
+// External
+pub const External = c.External;
+pub extern "c" fn v8__External__New(isolate: ?*Isolate, value: ?*anyopaque) ?*const External;
+pub extern "c" fn v8__External__Value(self: ?*const External) ?*anyopaque;
+
+
+
+// Value type checks
+pub extern "c" fn v8__Value__IsFunction(val: ?*const Value) bool;
+pub extern "c" fn v8__Value__IsNumber(val: ?*const Value) bool;
+
+
