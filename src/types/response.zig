@@ -3,6 +3,7 @@ const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
 const blob_api = @import("../api/blob.zig");
 const formdata_api = @import("../api/formdata.zig");
+const streams_api = @import("../api/streams.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -712,9 +713,9 @@ fn responseStaticError(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 // ============================================================
 // Helper: set scalar data properties + cached functions
 // ============================================================
-
 fn setDataProps(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate, data: *ResponseData) void {
     var out: c.MaybeBool = undefined;
+    data.body_used = true;
     const body_used = if (data.body_used) c.v8__True(isolate) else c.v8__False(isolate);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(body_used), &out);
     const ok = if (data.status >= 200 and data.status <= 299) c.v8__True(isolate) else c.v8__False(isolate);
@@ -725,6 +726,8 @@ fn setDataProps(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolat
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)), @ptrCast(zigStringToV8(isolate, data.statusText())), &out);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_url, isolate)), @ptrCast(zigStringToV8(isolate, data.url())), &out);
     c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_type, isolate)), @ptrCast(zigStringToV8(isolate, data.responseType())), &out);
+    const body_stream = streams_api.makeByteStream(isolate, context, data.body() orelse "");
+    c.v8__Object__Set(obj, context, @ptrCast(c.v8__String__NewFromUtf8(isolate, "body", 0, -1)), @ptrCast(body_stream orelse c.v8__Undefined(isolate)), &out);
 }
 
 fn refreshBodyUsed(isolate: ?*c.Isolate, context: ?*c.Context, this_val: ?*const c.Value, value: bool) void {

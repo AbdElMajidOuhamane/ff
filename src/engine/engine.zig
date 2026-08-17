@@ -21,6 +21,7 @@ const buffer_api = @import("../api/buffer.zig");
 const abort_api = @import("../api/abort.zig");
 const blob_api = @import("../api/blob.zig");
 const formdata_api = @import("../api/formdata.zig");
+const streams_api = @import("../api/streams.zig");
 const simd = std.simd;
 
 
@@ -83,6 +84,7 @@ pub const Runtime = struct {
         abort_api.setup(isolate, context);
         blob_api.setup(isolate, context);
         formdata_api.setup(isolate, context);
+        streams_api.setup(isolate, context);
         fetch_api.setup(isolate, context);
 
         header.setup(isolate, context);

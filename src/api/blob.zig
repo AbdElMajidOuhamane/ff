@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const streams_api = @import("streams.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -351,18 +352,15 @@ fn blobSlice(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn blobStream(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
+    const context = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
+    const data = extractBlobData(info) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "ReadableStream not implemented")), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    };
+    const stream_obj = streams_api.makeByteStream(isolate, context, data.bytes) orelse c.v8__Object__New(isolate);
+    c.v8__ReturnValue__Set(ret, @ptrCast(stream_obj));
 }
 
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
