@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const builtin = @import("builtin");
+const version_meta = @import("../version.zig");
 
 const Io = std.Io;
 
@@ -207,28 +208,38 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context, args: std.process.Args)
     c.v8__Object__Set(process_obj, context, pid_key, @ptrCast(pid_val), &out);
 
     // --- process.platform ---
-    const platform_str = comptime switch (builtin.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        .windows => "win32",
-        .freebsd => "freebsd",
-        else => "unknown",
-    };
-    const platform_val = zigStringToV8(isolate, platform_str);
+    const platform_val = zigStringToV8(isolate, version_meta.platform);
     const platform_key = c.v8__String__NewFromUtf8(isolate, "platform", 0, -1);
     c.v8__Object__Set(process_obj, context, platform_key, platform_val, &out);
 
     // --- process.arch ---
-    const arch_str = comptime switch (builtin.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "x64",
-        .x86 => "ia32",
-        .riscv64 => "riscv64",
-        else => "unknown",
-    };
-    const arch_val = zigStringToV8(isolate, arch_str);
+    const arch_val = zigStringToV8(isolate, version_meta.arch);
     const arch_key = c.v8__String__NewFromUtf8(isolate, "arch", 0, -1);
     c.v8__Object__Set(process_obj, context, arch_key, arch_val, &out);
+
+    // --- process.version ---
+    const ff_version_val = zigStringToV8(isolate, std.fmt.comptimePrint("v{s}", .{version_meta.version}));
+    const version_key = c.v8__String__NewFromUtf8(isolate, "version", 0, -1);
+    c.v8__Object__Set(process_obj, context, version_key, ff_version_val, &out);
+
+    // --- process.versions ---
+    const versions_obj = c.v8__Object__New(isolate);
+    {
+        const kv = [_]struct { k: []const u8, v: []const u8 }{
+            .{ .k = "v8", .v = version_meta.v8 },
+            .{ .k = "fairyfly", .v = version_meta.version },
+            .{ .k = "zig", .v = version_meta.zig_version },
+            .{ .k = "arch", .v = version_meta.arch },
+            .{ .k = "platform", .v = version_meta.platform },
+        };
+        for (kv) |e| {
+            const k = zigStringToV8(isolate, e.k);
+            const v = zigStringToV8(isolate, e.v);
+            c.v8__Object__Set(versions_obj, context, k, v, &out);
+        }
+    }
+    const versions_key = c.v8__String__NewFromUtf8(isolate, "versions", 0, -1);
+    c.v8__Object__Set(process_obj, context, versions_key, versions_obj, &out);
 
     // --- process.env ---
     const env_obj = c.v8__Object__New(isolate);

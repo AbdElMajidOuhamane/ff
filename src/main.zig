@@ -3,17 +3,20 @@ const engine = @import("engine/engine.zig");
 const init_cmd = @import("commands/init.zig");
 const start_cmd = @import("commands/start.zig");
 const bench_cmd = @import("commands/bench.zig");
+const version_meta = @import("version.zig");
 const c = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
 });
-const microtasks =@import("./event/microtasks.zig");
+const microtasks = @import("./event/microtasks.zig");
 
 const Command = enum {
     init,
     start,
     bench,
     e_flag,
+    version_flag,
+    help_flag,
     file,
     none,
 };
@@ -22,6 +25,8 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "start")) return .start;
     if (std.mem.eql(u8, arg, "bench")) return .bench;
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
+    if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) return .version_flag;
+    if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help_flag;
     return .file;
 }
 pub fn main(init: std.process.Init) !void {
@@ -35,12 +40,22 @@ pub fn main(init: std.process.Init) !void {
     switch (cmd) {
         .init => try init_cmd.run(init.io),
         .start => try start_cmd.run(init.io, init),
-        .bench => try bench_cmd.run(init.io,init),
+        .bench => try bench_cmd.run(init.io, init),
+        .version_flag => {
+            std.debug.print("fairyfly v{s} (V8 {s}, Zig {s}, {s} {s})\n", .{
+                version_meta.version,
+                version_meta.v8,
+                version_meta.zig_version,
+                version_meta.platform,
+                version_meta.arch,
+            });
+        },
+        .help_flag => printUsage(),
         .e_flag => {
             const code = args_iter.next() orelse {
-            std.debug.print("Error: -e requires an argument\n", .{});
-            std.process.exit(1);
-                };
+                std.debug.print("Error: -e requires an argument\n", .{});
+                std.process.exit(1);
+            };
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer {
                 runtime.event_loop.deinit();
@@ -52,15 +67,14 @@ pub fn main(init: std.process.Init) !void {
             runtime.event_loop.runWithMicrotasks(runtime.isolate);
         },
         .file => {
-                 const runtime = try engine.Runtime.init(init.minimal.args);
-                defer {
-                    runtime.event_loop.deinit();
-                    std.heap.page_allocator.destroy(runtime.event_loop);
-                    runtime.deinit();
-                    std.heap.page_allocator.destroy(runtime);
-                     }   
-                const file = c.fopen(first_arg.ptr, "rb") orelse {
-
+            const runtime = try engine.Runtime.init(init.minimal.args);
+            defer {
+                runtime.event_loop.deinit();
+                std.heap.page_allocator.destroy(runtime.event_loop);
+                runtime.deinit();
+                std.heap.page_allocator.destroy(runtime);
+            }
+            const file = c.fopen(first_arg.ptr, "rb") orelse {
                 std.debug.print("Error: could not open file '{s}'\n", .{first_arg});
                 std.process.exit(1);
             };
@@ -72,10 +86,8 @@ pub fn main(init: std.process.Init) !void {
             defer std.heap.page_allocator.free(buf);
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf.ptr[0..size :0];
-             _ = runtime.evalModule(source, first_arg);
+            _ = runtime.evalModule(source, first_arg);
             runtime.event_loop.runWithMicrotasks(runtime.isolate);
-
-            
         },
         .none => printUsage(),
     }
@@ -87,4 +99,6 @@ fn printUsage() void {
     std.debug.print("  ff bench             Run benchmarks\n", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript\n", .{});
     std.debug.print("  ff <file.js>         Run a JavaScript file\n", .{});
+    std.debug.print("  ff --version, -v     Print version\n", .{});
+    std.debug.print("  ff --help, -h        Show this help\n", .{});
 }
