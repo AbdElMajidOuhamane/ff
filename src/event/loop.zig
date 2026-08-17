@@ -4,6 +4,7 @@ const c = @import("../c.zig").c;
 const microtasks = @import("./microtasks.zig");
 const http_api = @import("../net/http.zig");
 const async_fetch = @import("../net/async_fetch.zig");
+const immediates = @import("./immediates.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -46,10 +47,15 @@ pub const EventLoop = struct {
     const GC_POLICE = (1 << 13);
     const GC_MIN_HEAP = 8 * 1024 * 1024;
 
-    pub fn runWithMicrotasks(self: *EventLoop, isolate: ?*c.Isolate) void {
+        pub fn runWithMicrotasks(self: *EventLoop, isolate: ?*c.Isolate) void {
         var gc_ticks: usize = 0;
         while (true) {
-            if (hasWork(&self.loop)) {
+            // setImmediate: never block on .once while the in-process queue
+            // is non-empty - .nowait processes any ready fds without parking,
+            // then flush() below drains immediates (zero syscalls per item).
+             if (immediates.pending()) {
+                self.loop.run(.no_wait) catch {};
+            } else if (hasWork(&self.loop)) {
                 self.loop.run(.once) catch {};
             }
 
@@ -62,6 +68,7 @@ pub const EventLoop = struct {
             async_fetch.drainCompleted(isolate);
 
             microtasks.pumpMicrotasks(isolate);
+            immediates.flush(isolate);
 
             if (isolate != null and (gc_ticks % GC_POLICE == 0)) {
                 var stats: c.HeapStatistics = undefined;
@@ -75,9 +82,10 @@ pub const EventLoop = struct {
             if (self.loop.stopped()) break;
             if (!http_api.server_running.load(.acquire) and
                 !hasWork(&self.loop) and
+                !immediates.pending() and
                 async_fetch.pending.load(.acquire) == 0) break;
 
-            if (!hasWork(&self.loop)) {
+            if (!hasWork(&self.loop) and !immediates.pending()) {
                 var ts: std.c.timespec = .{ .sec = 0, .nsec = 100_000 };
                 _ = std.c.nanosleep(&ts, null);
             }

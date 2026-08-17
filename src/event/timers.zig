@@ -141,8 +141,7 @@ fn timerCallback(
             const recv = c.v8__Undefined(isolate);
             _ = c.v8__Function__Call(@ptrCast(val), context, @ptrCast(recv), 0, null);
         }
-        microtasks.pumpMicrotasks(isolate);
-    }
+            }
 
     if (tm.repeat_ms[idx] != MS_ONESHOT) {
         if (tm.active[idx]) {

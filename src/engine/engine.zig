@@ -4,6 +4,7 @@ const mod = @import("../modules/mod.zig");
 const EventLoop = @import("../event/loop.zig").EventLoop;
 const TimerManager = @import("../event/timers.zig").TimerManager;
 const microtasks = @import("../event/microtasks.zig");
+const immediates = @import("../event/immediates.zig");
 const console_api = @import("../api/console.zig");
 const fs_api =@import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
@@ -122,6 +123,7 @@ pub const Runtime = struct {
         };
         g_runtime = runtime;
         fetch_api.setTimerManager(&runtime.timer_manager);
+        immediates.init();
         return runtime;
     }
 
@@ -138,11 +140,13 @@ pub const Runtime = struct {
         if (!maybe.has_value) return;
         const ms: u64 = @intFromFloat(maybe.value);
 
-        const result = if (interval)
-            rt.timer_manager.setInterval(isolate, fn_val, ms)
-        else
-            rt.timer_manager.setTimeout(isolate, fn_val, ms);
-        const id = result catch return;
+        // setTimeout(fn, 0) joins the in-process immediate queue (no kernel
+        // timer); setInterval and positive-delay setTimeout stay on xev timers.
+        const id: usize = if (interval) blk: {
+            break :blk rt.timer_manager.setInterval(isolate, fn_val, ms) catch return;
+        } else if (ms > 0) blk: {
+            break :blk rt.timer_manager.setTimeout(isolate, fn_val, ms) catch return;
+        } else immediates.set(isolate, fn_val) catch return;
 
         var retval: c.ReturnValue = undefined;
         c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
@@ -159,7 +163,13 @@ pub const Runtime = struct {
         var maybe: c.MaybeI32 = undefined;
         c.v8__Value__Int32Value(id_val, context, &maybe);
         if (!maybe.has_value or maybe.value < 0) return;
-        rt.timer_manager.clear(@intCast(maybe.value));
+        // Immediate ids live at ID_OFFSET.., timer ids below; ranges are
+        // disjoint so every clear* routes to the right manager.
+        if (maybe.value >= immediates.ID_OFFSET) {
+            immediates.clear(@intCast(maybe.value));
+        } else {
+            rt.timer_manager.clear(@intCast(maybe.value));
+        }
     }
 
     fn setTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -175,19 +185,18 @@ pub const Runtime = struct {
         clearCallback(info);
     }
 
-    // clearImmediate(id): 0ms timer id, drops straight into clear()
+    // clearImmediate(id): drop a queued immediate (or a 0ms timeout id)
     fn clearImmediateCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         clearCallback(info);
     }
 
-    // setImmediate(fn): 0ms one-shot, reuses TimerManager
+    // setImmediate(fn): in-process queue, flushed on the next tick
     fn setImmediateCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-        const rt = g_runtime orelse return;
         const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
         if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
         const fn_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
         if (!c.v8__Value__IsFunction(fn_val)) return;
-        const id = rt.timer_manager.setTimeout(isolate, fn_val, 0) catch return;
+        const id = immediates.set(isolate, fn_val) catch return;
         var retval: c.ReturnValue = undefined;
         c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
         const num = c.v8__Number__New(isolate, @floatFromInt(@as(i64, @intCast(id))));
@@ -227,6 +236,7 @@ pub const Runtime = struct {
         fetch_api.deinitClient();
         self.module_cache.deinit();
         self.timer_manager.cancelAll();
+        immediates.cancelAll();
         c.v8__Context__Exit(self.context);
         c.v8__Isolate__Exit(self.isolate);
         c.v8__Isolate__Dispose(self.isolate);
@@ -417,6 +427,7 @@ pub const Runtime = struct {
                 defer std.heap.page_allocator.free(dep_z);
                 const key_z = std.heap.page_allocator.dupeZ(u8, imp.specifier) catch continue;
                 dep_keys.append(std.heap.page_allocator, key_z) catch continue;
+
                 _ = self.evalModuleKey(dep_source, dep_z, key_z);
             } else {
                 const key_z = std.heap.page_allocator.dupeZ(u8, imp.specifier) catch continue;
