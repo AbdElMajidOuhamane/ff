@@ -7,4 +7,5 @@ pub const c = @cImport({
     @cInclude("time.h");
     @cInclude("pthread.h");
     @cInclude("semaphore.h");
+    @cInclude("sys/resource.h");
 });

@@ -14,6 +14,10 @@ const header=@import("../types/headers.zig");
 const request= @import("../types/request.zig");
 const response= @import("../types/response.zig");
 const http = @import("../net/http.zig");
+const perf_api = @import("../api/perf.zig");
+const base64_api = @import("../api/base64.zig");
+const text_api = @import("../api/text.zig");
+const buffer_api = @import("../api/buffer.zig");
 const simd = std.simd;
 
 
@@ -56,6 +60,7 @@ pub const Runtime = struct {
         params.constraints = constraints;
 
         const isolate = c.v8__Isolate__New(&params);
+        c.v8__Isolate__SetPromiseRejectCallback(isolate, promiseRejectCallback);
         c.v8__Isolate__Enter(isolate);
         var handle_scope: c.HandleScope = undefined;
         c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
@@ -67,6 +72,10 @@ pub const Runtime = struct {
         fs_api.setup(isolate, context);
         process_api.setup(isolate, context,args);
         crypto_api.setup(isolate, context);
+        perf_api.setup(isolate, context);
+        base64_api.setup(isolate, context);
+        text_api.setup(isolate, context);
+        buffer_api.setup(isolate, context);
         url_api.setup(isolate, context);
         fetch_api.setup(isolate, context);
 
@@ -78,12 +87,18 @@ pub const Runtime = struct {
         const setInterval_func = c.v8__Function__New__DEFAULT(context, setIntervalCallback);
         const clearTimeout_func = c.v8__Function__New__DEFAULT(context, clearTimeoutCallback);
         const clearInterval_func = c.v8__Function__New__DEFAULT(context, clearIntervalCallback);
+        const queueMicrotask_func = c.v8__Function__New__DEFAULT(context, queueMicrotaskCallback);
+        const setImmediate_func = c.v8__Function__New__DEFAULT(context, setImmediateCallback);
+        const clearImmediate_func = c.v8__Function__New__DEFAULT(context, clearImmediateCallback);
         const global = c.v8__Context__Global(context);
         var out: c.MaybeBool = undefined;
         _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1), setTimeout_func, &out);
         _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setInterval", 0, -1), setInterval_func, &out);
         _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearTimeout", 0, -1), clearTimeout_func, &out);
         _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearInterval", 0, -1), clearInterval_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "queueMicrotask", 0, -1), queueMicrotask_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setImmediate", 0, -1), setImmediate_func, &out);
+        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearImmediate", 0, -1), clearImmediate_func, &out);
 
         const loop_ptr = try EventLoop.initHeap(std.heap.page_allocator);
 
@@ -149,6 +164,54 @@ pub const Runtime = struct {
     }
     fn clearIntervalCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         clearCallback(info);
+    }
+
+    // clearImmediate(id): 0ms timer id, drops straight into clear()
+    fn clearImmediateCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        clearCallback(info);
+    }
+
+    // setImmediate(fn): 0ms one-shot, reuses TimerManager
+    fn setImmediateCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        const rt = g_runtime orelse return;
+        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+        if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
+        const fn_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
+        if (!c.v8__Value__IsFunction(fn_val)) return;
+        const id = rt.timer_manager.setTimeout(isolate, fn_val, 0) catch return;
+        var retval: c.ReturnValue = undefined;
+        c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
+        const num = c.v8__Number__New(isolate, @floatFromInt(@as(i64, @intCast(id))));
+        c.v8__ReturnValue__Set(retval, @ptrCast(num));
+    }
+
+    // queueMicrotask(fn): enqueue into V8's microtask queue
+    fn queueMicrotaskCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+        if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
+        const val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
+        if (!c.v8__Value__IsFunction(val)) return;
+        c.v8__Isolate__EnqueueMicrotaskFunc(isolate, @ptrCast(val));
+    }
+
+    // Unhandled promise rejection reporting
+    fn promiseRejectCallback(msg: c.PromiseRejectMessage) callconv(.c) void {
+        if (c.v8__PromiseRejectMessage__GetEvent(&msg) != c.kPromiseRejectWithNoHandler) return;
+        const isolate = c.v8__Isolate__GetCurrent();
+        if (isolate == null) return;
+        const val = c.v8__PromiseRejectMessage__GetValue(&msg);
+        if (val == null) return;
+        var handle_scope: c.HandleScope = undefined;
+        c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
+        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
+        const context = c.v8__Isolate__GetCurrentContext(isolate);
+        const err_str = c.v8__Value__ToString(val, context);
+        if (err_str == null) return;
+        const utf8_len = c.v8__String__Utf8Length(err_str, isolate);
+        var buf: [4096]u8 = undefined;
+        const len = @min(@as(usize, @intCast(utf8_len)), buf.len);
+        _ = c.v8__String__WriteUtf8(err_str, isolate, &buf, @intCast(len), 0);
+        std.debug.print("Unhandled promise rejection: {s}\n", .{buf[0..len]});
     }
 
     pub fn deinit(self: *Runtime) void {

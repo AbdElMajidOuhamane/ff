@@ -94,6 +94,76 @@ fn chdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 }
 
 // ============================================================
+// process.nextTick(callback)
+// ============================================================
+
+fn nextTickCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
+        throw(isolate, "nextTick requires a callback argument");
+        return;
+    }
+    const val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
+    if (!c.v8__Value__IsFunction(val)) {
+        throw(isolate, "nextTick callback must be a function");
+        return;
+    }
+    c.v8__Isolate__EnqueueMicrotaskFunc(isolate, @ptrCast(val));
+}
+
+// ============================================================
+// process.memoryUsage()
+// ============================================================
+
+fn currentRssBytes() u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            const fd = std.posix.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+            defer std.posix.close(fd);
+            var buf: [64]u8 = undefined;
+            const n = std.posix.read(fd, &buf) catch return 0;
+            var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+            _ = it.next() orelse return 0; // size (pages)
+            const resident = it.next() orelse return 0; // resident pages
+            const pages = std.fmt.parseInt(usize, resident, 10) catch return 0;
+            const page_size: usize = @intCast(c.sysconf(c._SC_PAGESIZE));
+            return pages * page_size;
+        },
+        .macos => {
+            var usage: c.rusage = undefined;
+            if (c.getrusage(c.RUSAGE_SELF, &usage) != 0) return 0;
+            const peak: i64 = usage.ru_maxrss; // macOS: bytes
+            return if (peak > 0) @intCast(peak) else 0;
+        },
+        else => return 0,
+    }
+}
+
+fn memoryUsageCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+    const context = c.v8__Isolate__GetCurrentContext(isolate);
+    var stats: c.HeapStatistics = undefined;
+    c.v8__Isolate__GetHeapStatistics(isolate, &stats);
+
+    const obj = c.v8__Object__New(isolate) orelse return;
+    const set_n = struct {
+        fn f(o: *const c.Object, ctx: ?*c.Context, is: ?*c.Isolate, name: [:0]const u8, v: u64) void {
+            var ob: c.MaybeBool = undefined;
+            _ = c.v8__Object__Set(o, ctx, c.v8__String__NewFromUtf8(is, name.ptr, 0, -1), c.v8__Number__New(is, @floatFromInt(@as(i64, @intCast(v)))), &ob);
+        }
+    }.f;
+    set_n(obj, context, isolate, "rss", currentRssBytes());
+    set_n(obj, context, isolate, "heapUsed", stats.used_heap_size);
+    set_n(obj, context, isolate, "heapTotal", stats.total_heap_size);
+    set_n(obj, context, isolate, "external", 0);
+    set_n(obj, context, isolate, "arrayBuffers", 0);
+
+    var retval: c.ReturnValue = undefined;
+    c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
+    c.v8__ReturnValue__Set(retval, @ptrCast(obj));
+}
+
+// ============================================================
 // Registration
 // ============================================================
 
@@ -120,6 +190,16 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context, args: std.process.Args)
     const chdir_fn = c.v8__Function__New__DEFAULT(context, chdirCallback);
     const chdir_key = c.v8__String__NewFromUtf8(isolate, "chdir", 0, -1);
     c.v8__Object__Set(process_obj, context, chdir_key, chdir_fn, &out);
+
+    // --- process.nextTick(callback) ---
+    const nextTick_fn = c.v8__Function__New__DEFAULT(context, nextTickCallback);
+    const nextTick_key = c.v8__String__NewFromUtf8(isolate, "nextTick", 0, -1);
+    c.v8__Object__Set(process_obj, context, nextTick_key, nextTick_fn, &out);
+
+    // --- process.memoryUsage() ---
+    const mu_fn = c.v8__Function__New__DEFAULT(context, memoryUsageCallback);
+    const mu_key = c.v8__String__NewFromUtf8(isolate, "memoryUsage", 0, -1);
+    c.v8__Object__Set(process_obj, context, mu_key, mu_fn, &out);
 
     // --- process.pid ---
     const pid_val = c.v8__Number__New(isolate, @floatFromInt(@as(i64, std.c.getpid())));

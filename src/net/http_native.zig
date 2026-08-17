@@ -6,8 +6,6 @@ const microtasks = @import("../event/microtasks.zig");
 const ws = @import("ws_native.zig");
 const api_ws = @import("../api/websocket.zig");
 
-const gpa = std.heap.smp_allocator;
-
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 16384;
 const WRITE_BUF_SIZE = 16384;
@@ -66,6 +64,12 @@ var str_status: c.Global = .{ .data_ptr = 0 };
 var str_body: c.Global = .{ .data_ptr = 0 };
 var str_empty: c.Global = .{ .data_ptr = 0 };
 
+comptime {
+    std.debug.assert(str_methods.len == 8);               // one slot per Method + .none
+    std.debug.assert(MAX_CONN <= std.math.maxInt(u16));   // slot_ids fit u16
+    std.debug.assert(READ_BUF_SIZE > 0 and WRITE_BUF_SIZE > 0);
+}
+
 // ---- WebSocket V8 handler callbacks ----
 pub var ws_enabled: bool = false;
 pub var ws_on_open: c.Global = .{ .data_ptr = 0 };
@@ -90,18 +94,27 @@ const ParsedRequest = struct {
 };
 
 fn freePop() ?usize {
+    std.debug.assert(free_count <= MAX_CONN);
     if (free_count == 0) return null;
+    const id = free_list[free_count - 1];
+    std.debug.assert(id < MAX_CONN);
     free_count -= 1;
-    return free_list[free_count];
+    return id;
 }
 
 fn freePush(id: usize) void {
+    std.debug.assert(id < MAX_CONN);
+    std.debug.assert(free_count < MAX_CONN);              // capacity guard
     free_list[free_count] = @intCast(id);
     free_count += 1;
 }
 
 fn findTokenCIScalar(haystack: []const u8, needle: []const u8) ?usize {
-    outer: for (0..haystack.len - needle.len + 1) |i| {
+    std.debug.assert(needle.len > 0);
+    std.debug.assert(haystack.len >= needle.len);
+    const window_end = haystack.len - needle.len + 1;
+    std.debug.assert(window_end >= 1);
+    outer: for (0..window_end) |i| {
         var j: usize = 0;
         while (j < needle.len) : (j += 1) {
             if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) continue :outer;
@@ -112,6 +125,8 @@ fn findTokenCIScalar(haystack: []const u8, needle: []const u8) ?usize {
 }
 
 fn matchCI(haystack: []const u8, pos: usize, needle: []const u8) bool {
+    std.debug.assert(pos < haystack.len);
+    std.debug.assert(pos + needle.len <= haystack.len);
     var j: usize = 0;
     while (j < needle.len) : (j += 1) {
         if (std.ascii.toLower(haystack[pos + j]) != std.ascii.toLower(needle[j])) return false;
@@ -155,7 +170,34 @@ fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
     return findTokenCIScalar(haystack, needle);
 }
 
+// Vectorized scan for the 4-byte header terminator ("\r\n\r\n"): wide-scan for
+// a '\r' lane, then scalar-confirm the trailing 3 bytes; @ctz first-lane find
+// with a scalar tail. Mirrors findTokenCISimd.
+fn findHeadersEnd(haystack: []const u8) ?usize {
+    if (haystack.len < 4) return null;
+    const N = simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
+    const M = std.meta.Int(.unsigned, N);
+    const spl_cr: V = @splat(@as(u8, '\r'));
+    var i: usize = 0;
+    while (i < haystack.len and haystack.len - i >= N) : (i += N) {
+        const v: V = haystack[i..][0..N].*;
+        var bits: M = @bitCast(v == spl_cr);
+        while (bits != 0) {
+            const j: usize = @ctz(bits);
+            if (i + j + 3 < haystack.len and std.mem.eql(u8, haystack[i + j ..][0..4], "\r\n\r\n"))
+                return i + j;
+            bits &= bits - 1;
+        }
+    }
+    while (i < haystack.len - 3) : (i += 1) {
+        if (std.mem.eql(u8, haystack[i..][0..4], "\r\n\r\n")) return i;
+    }
+    return null;
+}
+
 fn classifyMethod(s: []const u8) Method {
+    std.debug.assert(s.len >= 3 and s.len <= 7);          // every HTTP method is 3..7 chars
     if (s.len == 3) {
         if (s[0] == 'G' and s[1] == 'E' and s[2] == 'T') return .get;
         if (s[0] == 'P' and s[1] == 'U' and s[2] == 'T') return .put;
@@ -173,6 +215,7 @@ fn classifyMethod(s: []const u8) Method {
 }
 
 fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
+    std.debug.assert(headers_end <= buf.len);
     var pr = ParsedRequest{ .method = "", .method_tag = .none, .url = "", .content_length = 0, .keep_alive = true };
     const line = buf[0..headers_end];
     if (line.len < 10) return pr;
@@ -180,6 +223,7 @@ fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return pr;
     if (sp1 + 1 >= line.len) return pr;
     const sp2 = std.mem.indexOfScalarPos(u8, line, sp1 + 1, ' ') orelse return pr;
+    std.debug.assert(sp1 < sp2);
     pr.method = line[0..sp1];
     pr.method_tag = classifyMethod(pr.method);
     pr.url = line[sp1 + 1 .. sp2];
@@ -226,11 +270,14 @@ fn statusReason(status: u16) []const u8 {
 }
 
 fn pushStr(w: []u8, pos: *usize, s: []const u8) void {
+    std.debug.assert(pos.* <= w.len);
+    std.debug.assert(pos.* + s.len <= w.len);
     @memcpy(w[pos.*..][0..s.len], s);
     pos.* += s.len;
 }
 
 fn appendUInt(w: []u8, pos: *usize, value: usize) void {
+    std.debug.assert(pos.* <= w.len);
     var buf: [20]u8 = undefined;
     var n: usize = 0;
     var v = value;
@@ -244,6 +291,8 @@ fn appendUInt(w: []u8, pos: *usize, value: usize) void {
         }
         std.mem.reverse(u8, buf[0..n]);
     }
+    std.debug.assert(n <= buf.len);
+    std.debug.assert(pos.* + n <= w.len);
     @memcpy(w[pos.* ..][0..n], buf[0..n]);
     pos.* += n;
 }
@@ -267,6 +316,8 @@ fn buildResponseHeader(id: usize, status: u16, body_len: usize) usize {
 }
 
 fn buildResponse(id: usize, status: u16, body: []const u8) void {
+    std.debug.assert(id < MAX_CONN);
+    std.debug.assert(body.len <= WRITE_BUF_SIZE);
     const header_len = buildResponseHeader(id, status, body.len);
     const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
     var pos = header_len;
@@ -275,6 +326,7 @@ fn buildResponse(id: usize, status: u16, body: []const u8) void {
         pos += body.len;
     }
     write_lens[id] = pos;
+    std.debug.assert(pos <= WRITE_BUF_SIZE);
 }
 
 fn v8BodyLen(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value) ?usize {
@@ -506,6 +558,7 @@ pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) voi
         ws_batch[id] = 0;
     }
     const tail = write_lens[id];
+    std.debug.assert(tail <= WRITE_BUF_SIZE);
     const need = @as(usize, ws.MAX_HDR) + ulen;
     if (tail + need > WRITE_BUF_SIZE) return; // drop-new: no room in staging
 
@@ -515,6 +568,7 @@ pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) voi
     const plen = @min(@as(usize, @intCast(wrote)), ulen);
     const hlen = ws.buildHeader(buf, ws.OP_TEXT, true, plen);
     write_lens[id] = tail + hlen + plen;
+    std.debug.assert(tail + hlen + plen <= WRITE_BUF_SIZE);
 
     if (!ws_writing[id]) wsKick(id);
 }
@@ -612,9 +666,11 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 
 // Three-pass engine over one read buffer: decode header -> unmask -> act.
 fn wsConsume(id: usize, l: *xev.Loop) void {
+    std.debug.assert(buf_lens[id] <= READ_BUF_SIZE);
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
         const hdr = ws.parseHeader(leftover) orelse break;
+        std.debug.assert(hdr.header_len <= leftover.len);
         if (hdr.payload_len > ws.WS_MSG_SIZE and !ws.isControl(hdr.opcode)) {
             wsSendClose(id, 1009);
             return;
@@ -806,13 +862,14 @@ fn readCb(
     }
 
     buf_lens[id] += n;
+    std.debug.assert(buf_lens[id] <= READ_BUF_SIZE);
 
     if (ws_open[id]) {
         wsConsume(id, l);
         return .disarm;
     }
 
-    const search = std.mem.indexOf(u8, read_bufs[id][0..buf_lens[id]], "\r\n\r\n");
+    const search = findHeadersEnd(read_bufs[id][0..buf_lens[id]]);
     if (search == null) {
         if (buf_lens[id] >= READ_BUF_SIZE) {
             closeConn(id);
@@ -822,6 +879,7 @@ fn readCb(
         return .disarm;
     }
     const headers_end = search.? + 4;
+    std.debug.assert(headers_end <= buf_lens[id]);
 
     const pr = parseRequest(read_bufs[id][0..buf_lens[id]], headers_end);
     methods[id] = pr.method_tag;
@@ -912,7 +970,7 @@ fn writeCb(
             wsNotifyOpen(id);
         }
         if (ws_close_after_write[id]) {
-            wsShutdown(id);
+            ws_close_after_write[id] = false;
             closeConn(id);
             return .disarm;
         }
@@ -923,31 +981,37 @@ fn writeCb(
         return .disarm;
     }
 
-    // ---- HTTP write path (unchanged) ----
-    write_offsets[id] += written;
+    // ---- plain HTTP: stay in .writing until the whole response is out ----
+    write_offsets[id] = write_offsets[id] + written;
     if (write_offsets[id] < write_lens[id]) {
         tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
         return .disarm;
     }
-    write_offsets[id] = 0;
 
-    if (keep_alives[id]) {
-        states[id] = .reading;
+    finalizeWrite(id, l) catch {
+        closeConn(id);
+        return .disarm;
+    };
+    return .disarm;
+}
+
+fn finalizeWrite(id: usize, l: *xev.Loop) !void {
+    if (keep_alives[id] and states[id] != .closing) {
         buf_lens[id] = 0;
         write_lens[id] = 0;
+        write_offsets[id] = 0;
+        states[id] = .reading;
         fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
     } else {
         closeConn(id);
     }
-
-    return .disarm;
 }
 
+// Restored original name/signature (http.zig:74 calls http_native.init(&loop_ptr.loop, port))
+// plus the g_loop, FF_ECHO flag, and slot_ids seed.
 pub fn init(loop: *xev.Loop, port: u16) !void {
     if (initialized) return;
-
     g_loop = loop;
-
     if (c.getenv("FF_ECHO") != null) native_echo = true;
 
     for (0..MAX_CONN) |i| {
