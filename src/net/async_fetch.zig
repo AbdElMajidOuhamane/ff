@@ -3,6 +3,7 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
+const TimerManager = @import("../event/timers.zig").TimerManager;
 
 const gpa = std.heap.page_allocator;
 const http = std.http;
@@ -25,6 +26,12 @@ const http = std.http;
 // also runs every tick as a safety net against a coalesced/missed notify.
 //
 // v8 is touched ONLY on the main thread (drainCompleted/completeJob).
+//
+// Abort/timeout semantics (no mid-flight teardown): rejecting a fetch
+// settles its promise immediately on the main thread and marks the slot
+// aborted; the worker keeps running and its buffers are freed when it
+// reaches JOB_DONE (deferred cleanup via completeJob). The event loop
+// still waits on `pending`, so the process lives until the worker exits.
 // ============================================================
 
 pub const MAX_FETCH = 64; // matches tls.MAX_CONN; == u64 mask lanes
@@ -44,6 +51,13 @@ var bodies:    [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
 var resolvers: [MAX_FETCH]c.Global = undefined;
 var results:   [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
 var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
+
+// ---- abort/timeout state (main thread only) ----
+var signal_ptrs: [MAX_FETCH]?*anyopaque = [_]?*anyopaque{null} ** MAX_FETCH;
+var aborted:     [MAX_FETCH]bool = [_]bool{false} ** MAX_FETCH;
+var timeout_ids: [MAX_FETCH]?usize = [_]?usize{null} ** MAX_FETCH;
+var timer_manager: ?*TimerManager = null;
+var tmo_cells:   [MAX_FETCH]u16 = undefined; // stable extern data for the timeout fn
 
 // ---- O(1) slot allocator (spinlock-guarded) ----
 var free_list: [MAX_FETCH]u16 = undefined;
@@ -90,6 +104,9 @@ fn releaseSlot(s: usize) void {
     resolvers[s] = undefined;
     results[s] = null;
     errs[s] = null;
+    signal_ptrs[s] = null;
+    aborted[s] = false;
+    timeout_ids[s] = null;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
@@ -100,6 +117,10 @@ pub fn init() void {
     poolInit();
     async_h = AsyncT.init() catch unreachable;
     async_armed = false;
+}
+
+pub fn setTimerManager(tm: *TimerManager) void {
+    timer_manager = tm;
 }
 
 pub fn deinit() void {
@@ -126,6 +147,7 @@ fn freeOwned(s: usize) void {
 
 // ---- submission (main thread, from fetchCallback) ----
 // Takes ownership of url_buf/headers/body on success; frees them on failure.
+// Returns the slot id so the caller can arm a timeout.
 
 pub fn submit(
     isolate: ?*c.Isolate,
@@ -135,7 +157,8 @@ pub fn submit(
     method: http.Method,
     header_list: std.ArrayList(http.Header),
     body: ?[:0]const u8,
-) !void {
+    signal: ?*anyopaque,
+) !usize {
     var hl = header_list; // deinit()/items take *Self — the param is const
     poolLock();
     defer poolUnlock();
@@ -158,6 +181,9 @@ pub fn submit(
     bodies[s] = body;
     results[s] = null;
     errs[s] = null;
+    signal_ptrs[s] = signal;
+    aborted[s] = false;
+    timeout_ids[s] = null;
     c.v8__Global__New(isolate, @ptrCast(resolver), &resolvers[s]);
 
     _ = pending.fetchAdd(1, .acq_rel);
@@ -170,6 +196,74 @@ pub fn submit(
         return error.SpawnFailed;
     };
     th.detach();
+    return s;
+}
+
+// ---- abort / timeout (main thread only) ----
+
+fn makeFetchError(isolate: ?*c.Isolate, comptime name: []const u8, comptime message: []const u8) *const c.Value {
+    const ctx = c.v8__Isolate__GetCurrentContext(isolate);
+    const err = c.v8__Exception__Error(c.v8__String__NewFromUtf8(isolate, message.ptr, 0, message.len));
+    var out: c.MaybeBool = undefined;
+    _ = c.v8__Object__Set(
+        @ptrCast(err),
+        ctx,
+        c.v8__String__NewFromUtf8(isolate, "name", 0, -1),
+        c.v8__String__NewFromUtf8(isolate, name.ptr, 0, name.len),
+        &out,
+    );
+    return @ptrCast(err);
+}
+
+fn rejectSlot(s: usize, comptime name: []const u8, comptime message: []const u8) void {
+    const isolate = c.v8__Isolate__GetCurrent() orelse return;
+    var hs: c.HandleScope = undefined;
+    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
+    defer c.v8__HandleScope__DESTRUCT(&hs);
+    const ctx = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
+    const resolver: *const c.PromiseResolver = @ptrCast(c.v8__Global__Get(&resolvers[s], isolate) orelse return);
+    var out: c.MaybeBool = undefined;
+    c.v8__Promise__Resolver__Reject(resolver, ctx, makeFetchError(isolate, name, message), &out);
+    c.v8__Global__Reset(&resolvers[s]);
+}
+
+fn abortSlot(s: usize, comptime name: []const u8, comptime message: []const u8) void {
+    if (aborted[s]) return;
+    const st = states[s].load(.acquire);
+    if (st == JOB_FREE) return;
+    aborted[s] = true;
+    if (st != JOB_CLAIMED) {
+        if (timeout_ids[s]) |id| {
+            if (timer_manager) |tm| tm.clear(id);
+        }
+        timeout_ids[s] = null;
+    }
+    rejectSlot(s, name, message);
+}
+
+/// Reject every in-flight fetch that shares this signal (controller.abort).
+pub fn abortWalk(sig: ?*anyopaque) void {
+    if (sig == null) return;
+    for (0..MAX_FETCH) |s| {
+        if (signal_ptrs[s] != sig) continue;
+        abortSlot(s, "AbortError", "The operation was aborted.");
+    }
+}
+
+/// One-shot timeout: reject the fetch with TimeoutError after `ms` unless it
+/// completes first (completeJob clears the timer on the normal path).
+pub fn armTimeout(isolate: ?*c.Isolate, context: ?*const c.Context, s: usize, ms: u64) void {
+    const tm = timer_manager orelse return;
+    tmo_cells[s] = @intCast(s);
+    const ext = c.v8__External__New(isolate, @ptrCast(&tmo_cells[s]));
+    const fn_val = c.v8__Function__New__DEFAULT2(context, fetchTimeoutCb, @ptrCast(ext)) orelse return;
+    timeout_ids[s] = tm.setTimeout(isolate, @ptrCast(fn_val), ms) catch return;
+}
+
+fn fetchTimeoutCb(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    const dv = c.v8__FunctionCallbackInfo__Data(info) orelse return;
+    const sp: *u16 = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(dv))));
+    abortSlot(@intCast(sp.*), "TimeoutError", "The operation timed out.");
 }
 
 // ---- worker (never touches v8) ----
@@ -426,6 +520,11 @@ fn completeJob(isolate: ?*c.Isolate, s: usize) void {
 
     const context = c.v8__Isolate__GetCurrentContext(isolate);
 
+    if (timeout_ids[s]) |id| {
+        if (timer_manager) |tm| tm.clear(id);
+        timeout_ids[s] = null;
+    }
+
     const resolver: *const c.PromiseResolver = @ptrCast(
         c.v8__Global__Get(&resolvers[s], isolate) orelse {
             c.v8__Global__Reset(&resolvers[s]);
@@ -436,16 +535,19 @@ fn completeJob(isolate: ?*c.Isolate, s: usize) void {
     );
     var out: c.MaybeBool = undefined;
 
-    if (results[s]) |data| {
-        if (response_mod.buildResponseJSObject(isolate, context, data)) |obj| {
-            c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(obj), &out);
+    // Already rejected by abort/timeout — don't settle a second time.
+    if (!aborted[s]) {
+        if (results[s]) |data| {
+            if (response_mod.buildResponseJSObject(isolate, context, data)) |obj| {
+                c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(obj), &out);
+            }
+            // data is deliberately NOT freed: buildResponseJSObject stashed it as
+            // the __d external on the JS Response, which owns it for its lifetime.
+        } else {
+            const msg = errs[s] orelse "fetch failed";
+            const ev = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
+            c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(ev), &out);
         }
-        // data is deliberately NOT freed: buildResponseJSObject stashed it as
-        // the __d external on the JS Response, which owns it for its lifetime.
-    } else {
-        const msg = errs[s] orelse "fetch failed";
-        const ev = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-        c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(ev), &out);
     }
 
     c.v8__Global__Reset(&resolvers[s]);

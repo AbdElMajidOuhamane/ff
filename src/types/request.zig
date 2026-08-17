@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
+const blob_api = @import("../api/blob.zig");
+const formdata_api = @import("../api/formdata.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -649,8 +651,9 @@ fn requestArrayBuffer(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             @memcpy(data_ptr[0..byte_len], body_bytes);
         }
     }
+    const u8arr = c.v8__Uint8Array__New(@ptrCast(ab), 0, byte_len);
     var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out);
+    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(u8arr), &out);
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -659,14 +662,23 @@ fn requestBlob(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+    const data = extractRequestData(info) orelse {
+        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
+        return;
+    };
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
+    data.body_used = true;
+    const body_bytes = data.body() orelse "";
+    const ct = data.headers.getFirst("content-type");
+    defer if (ct) |c_| gpa.free(c_);
+    const obj = blob_api.makeBlobObject(isolate, context, body_bytes, ct orelse "");
     var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Blob not supported")), &out);
+    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(obj), &out);
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 
@@ -675,14 +687,33 @@ fn requestFormData(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+    const data = extractRequestData(info) orelse {
+        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
+        return;
+    };
     const resolver = c.v8__Promise__Resolver__New(context);
     if (resolver == null) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
         return;
     }
     const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "FormData not supported")), &out);
+    data.body_used = true;
+    const body_bytes = data.body() orelse "";
+    const ct = data.headers.getFirst("content-type");
+    defer if (ct) |c_| gpa.free(c_);
+
+    if (ct) |content_type| {
+        if (formdata_api.parseFromContentType(content_type, body_bytes)) |fd| {
+            const fd_obj = formdata_api.makeFormDataObject(isolate, context, fd);
+            if (fd_obj != null) {
+                var out: c.MaybeBool = undefined;
+                _ = c.v8__Promise__Resolver__Resolve(resolver, context, fd_obj, &out);
+                c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+                return;
+            }
+        }
+    }
+        formdata_api.rejectUnsupported(isolate, context, resolver);
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
 

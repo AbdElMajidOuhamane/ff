@@ -18,6 +18,9 @@ const perf_api = @import("../api/perf.zig");
 const base64_api = @import("../api/base64.zig");
 const text_api = @import("../api/text.zig");
 const buffer_api = @import("../api/buffer.zig");
+const abort_api = @import("../api/abort.zig");
+const blob_api = @import("../api/blob.zig");
+const formdata_api = @import("../api/formdata.zig");
 const simd = std.simd;
 
 
@@ -77,6 +80,9 @@ pub const Runtime = struct {
         text_api.setup(isolate, context);
         buffer_api.setup(isolate, context);
         url_api.setup(isolate, context);
+        abort_api.setup(isolate, context);
+        blob_api.setup(isolate, context);
+        formdata_api.setup(isolate, context);
         fetch_api.setup(isolate, context);
 
         header.setup(isolate, context);
@@ -113,6 +119,7 @@ pub const Runtime = struct {
             .timer_manager = TimerManager.init(&loop_ptr.loop),
         };
         g_runtime = runtime;
+        fetch_api.setTimerManager(&runtime.timer_manager);
         return runtime;
     }
 

@@ -3,9 +3,53 @@ const c = @import("../c.zig").c;
 const request_mod = @import("../types/request.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const tls = @import("../net/tls.zig");
+const abort_api = @import("./abort.zig");
+const TimerManager = @import("../event/timers.zig").TimerManager;
 
 const gpa = std.heap.page_allocator;
 const http = std.http;
+
+// ============================================================
+// Pre-aborted fetch: defer the rejection to a microtask so the caller's
+// await handler attaches first (kills the unhandled-rejection report and
+// mirrors the spec's queued task). Tiny DOD free-list of Global cells.
+// ============================================================
+const DEFER_MAX = 8;
+var defer_globals: [DEFER_MAX]c.Global = undefined;
+var defer_next: [DEFER_MAX]u8 = undefined;
+var defer_head: u8 = DEFER_MAX; // DEFER_MAX doubles as the "empty" sentinel
+
+fn deferInit() void {
+    for (0..DEFER_MAX) |i| defer_next[i] = @intCast(i + 1);
+    defer_next[DEFER_MAX - 1] = DEFER_MAX;
+    defer_head = 0;
+}
+
+fn deferAcquire() ?u8 {
+    const head = defer_head;
+    if (head == DEFER_MAX) return null;
+    defer_head = defer_next[head];
+    return head;
+}
+
+fn deferPush(i: u8) void {
+    defer_next[i] = defer_head;
+    defer_head = i;
+}
+
+fn preAbortedRejectCb(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+    const ctx = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
+    const dv = c.v8__FunctionCallbackInfo__Data(info) orelse return;
+    const gp: *c.Global = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(dv))));
+    const idx = (@intFromPtr(gp) - @intFromPtr(&defer_globals[0])) / @sizeOf(c.Global);
+    if (c.v8__Global__Get(gp, isolate)) |resolver| {
+        var out: c.MaybeBool = undefined;
+        c.v8__Promise__Resolver__Reject(@ptrCast(resolver), ctx, abortReasonValue(isolate, ctx), &out);
+    }
+    c.v8__Global__Reset(gp);
+    deferPush(@intCast(idx));
+}
 
 // ============================================================
 // Helpers
@@ -91,6 +135,19 @@ fn extractRequestData(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c
     return @ptrCast(@alignCast(ptr));
 }
 
+fn abortReasonValue(isolate: ?*c.Isolate, context: ?*const c.Context) *const c.Value {
+    const err = c.v8__Exception__Error(c.v8__String__NewFromUtf8(isolate, "This operation was aborted", 0, -1));
+    var out: c.MaybeBool = undefined;
+    _ = c.v8__Object__Set(
+        @ptrCast(err),
+        context,
+        c.v8__String__NewFromUtf8(isolate, "name", 0, -1),
+        c.v8__String__NewFromUtf8(isolate, "AbortError", 0, -1),
+        &out,
+    );
+    return @ptrCast(err);
+}
+
 // ============================================================
 // Main fetch callback — parse args on the v8 thread, spawn a worker,
 // return the (pending) promise immediately.
@@ -120,6 +177,8 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     var owned_method: ?[:0]const u8 = null; // only when extractStringFromVal allocated it
     var extra_headers: ?std.ArrayList(http.Header) = null;
     var body_payload: ?[:0]const u8 = null;
+    var signal_ptr: ?*anyopaque = null;
+    var timeout_ms: ?u64 = null;
 
     defer {
         if (url_str) |u| gpa.free(u);
@@ -184,6 +243,18 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
             if (body_val != null and !c.v8__Value__IsUndefined(body_val) and !c.v8__Value__IsNull(body_val)) {
                 body_payload = extractStringFromVal(isolate, body_val);
             }
+
+            const signal_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "signal", 0, -1));
+            if (signal_val != null and !c.v8__Value__IsUndefined(signal_val) and !c.v8__Value__IsNull(signal_val)) {
+                signal_ptr = @ptrCast(abort_api.dataOf(isolate, context, signal_val) orelse null);
+            }
+
+            const timeout_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "timeout", 0, -1));
+            if (timeout_val != null and !c.v8__Value__IsUndefined(timeout_val) and !c.v8__Value__IsNull(timeout_val)) {
+                var maybe: c.MaybeF64 = undefined;
+                c.v8__Value__NumberValue(timeout_val, context, &maybe);
+                if (maybe.has_value and maybe.value > 0) timeout_ms = @intFromFloat(maybe.value);
+            }
         }
     }
 
@@ -207,6 +278,33 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         return;
     };
 
+    // Signal already aborted → defer the rejection to a microtask (never
+    // send the request). The caller's await handler attaches before V8
+    // reports "no handler", so no spurious unhandled-rejection warning.
+    if (signal_ptr != null and abort_api.isAborted(signal_ptr)) {
+        if (deferAcquire()) |cell| {
+            c.v8__Global__New(isolate, @ptrCast(resolver), &defer_globals[cell]);
+            const fn_val = c.v8__Function__New__DEFAULT2(
+                context,
+                preAbortedRejectCb,
+                @ptrCast(c.v8__External__New(isolate, @ptrCast(&defer_globals[cell]))),
+            ) orelse {
+                c.v8__Global__Reset(&defer_globals[cell]);
+                deferPush(cell);
+                var out: c.MaybeBool = undefined;
+                _ = c.v8__Promise__Resolver__Reject(resolver, context, abortReasonValue(isolate, context), &out);
+                c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+                return;
+            };
+            c.v8__Isolate__EnqueueMicrotaskFunc(isolate, @ptrCast(fn_val));
+        } else {
+            var out: c.MaybeBool = undefined;
+            _ = c.v8__Promise__Resolver__Reject(resolver, context, abortReasonValue(isolate, context), &out);
+        }
+        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+        return;
+    }
+
     // Ownership moves into the pool on success, freed by submit on failure.
     // Null first so the defer-frees below never double-free.
     const header_list: std.ArrayList(http.Header) = if (extra_headers) |*h| h.* else .empty;
@@ -216,12 +314,25 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const url_copy = url;
     url_str = null;
 
-    async_fetch.submit(isolate, @ptrCast(resolver), url_copy, uri, method, header_list, body_copy) catch {
+    const slot = async_fetch.submit(
+        isolate,
+        @ptrCast(resolver),
+        url_copy,
+        uri,
+        method,
+        header_list,
+        body_copy,
+        signal_ptr,
+    ) catch {
         var out: c.MaybeBool = undefined;
         _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to start fetch")), &out);
         c.v8__ReturnValue__Set(ret, @ptrCast(promise));
         return;
     };
+
+    if (timeout_ms) |tw| {
+        async_fetch.armTimeout(isolate, context, slot, tw);
+    }
 
     c.v8__ReturnValue__Set(ret, @ptrCast(promise));
 }
@@ -235,9 +346,14 @@ pub fn deinitClient() void {
     tls.deinit();
 }
 
+pub fn setTimerManager(tm: *TimerManager) void {
+    async_fetch.setTimerManager(tm);
+}
+
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     tls.init();
     async_fetch.init();
+    deferInit();
 
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);
