@@ -11,6 +11,7 @@ const process_api = @import("../api/process.zig");
 const crypto_api=@import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
 const fetch_api =@import("../api/fetch.zig");
+const structured_api = @import("../api/structured.zig");
 const header=@import("../types/headers.zig");
 const request= @import("../types/request.zig");
 const response= @import("../types/response.zig");
@@ -22,7 +23,9 @@ const buffer_api = @import("../api/buffer.zig");
 const abort_api = @import("../api/abort.zig");
 const blob_api = @import("../api/blob.zig");
 const formdata_api = @import("../api/formdata.zig");
+const iterables = @import("../api/iterables.zig");
 const streams_api = @import("../api/streams.zig");
+
 const simd = std.simd;
 
 
@@ -86,7 +89,9 @@ pub const Runtime = struct {
         blob_api.setup(isolate, context);
         formdata_api.setup(isolate, context);
         streams_api.setup(isolate, context);
+        structured_api.setup(isolate, context);
         fetch_api.setup(isolate, context);
+        iterables.setup(isolate, context);
 
         header.setup(isolate, context);
         request.setup(isolate, context);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const iterables = @import("./iterables.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -99,10 +100,11 @@ fn formUrlDecode(input: []const u8) ![]const u8 {
 // URLSearchParams
 // ============================================================
 
-const Pair = struct { name: []const u8, value: []const u8 };
+pub const Pair = struct { name: []const u8, value: []const u8 };
 
-const URLSearchParamsData = struct {
+pub const URLSearchParamsData = struct {
     pairs: std.ArrayList(Pair),
+
 
     fn init() URLSearchParamsData {
         return .{ .pairs = std.ArrayList(Pair).empty };
@@ -283,7 +285,7 @@ fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
+    iterables.attach(isolate, context, obj, .searchparams);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
@@ -920,7 +922,7 @@ fn createSPJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *URLSearch
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
+    iterables.attach(isolate, context, obj, .searchparams);
     return obj;
 }
 

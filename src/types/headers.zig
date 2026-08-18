@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const iterables = @import("../api/iterables.zig");
 
 const gpa = std.heap.page_allocator;
 const simd = std.simd;
@@ -459,7 +460,7 @@ fn headersConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
+    iterables.attach(isolate, context, obj, .headers);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));

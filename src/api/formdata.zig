@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const iterables = @import("./iterables.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -343,6 +344,7 @@ pub fn makeFormDataObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *For
         const fn_val = c.v8__Function__New__DEFAULT(context, e[1]);
         _ = c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, e[0], 0, -1), fn_val, &out);
     }
+    iterables.attach(isolate, context, obj, .formdata);
     return @ptrCast(obj);
 }
 

@@ -10,6 +10,7 @@ pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 16384;
 const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
+pub const CLOSE_REASON_MAX = 123; // RFC6455: close payload <=125, minus 2-byte code
 
 const ConnState = enum(u8) { idle, reading, writing, closing };
 
@@ -42,6 +43,10 @@ var ws_close_after_write: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
 var ws_read_armed: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
 var ws_pending_open: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
 var ws_partial_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var ws_partial_binary: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
+var ws_close_code: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
+var ws_close_reason_len: [MAX_CONN]u8 = [_]u8{0} ** MAX_CONN;
+var ws_close_reason: [MAX_CONN][CLOSE_REASON_MAX]u8 = undefined;
 var ws_sockets: [MAX_CONN]c.Global = [_]c.Global{.{ .data_ptr = 0 }} ** MAX_CONN;
 var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 
@@ -539,6 +544,33 @@ fn wsNotifyMessage(id: usize, msg: []const u8) void {
     _ = c.v8__Function__Call(cb_fn, context, @ptrCast(global), 2, &argv);
 }
 
+// Binary frame -> fresh ArrayBuffer + Uint8Array (string path stays for text).
+fn wsNotifyBinaryMessage(id: usize, bytes: []const u8) void {
+    const isolate = handler_isolate orelse return;
+    const ctxp = c.v8__Global__Get(&handler_context_global, isolate) orelse return;
+    const context: *c.Context = @ptrCast(@constCast(ctxp));
+    var hs: c.HandleScope = undefined;
+    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
+    defer c.v8__HandleScope__DESTRUCT(&hs);
+    c.v8__Context__Enter(context);
+    defer c.v8__Context__Exit(context);
+
+    const global = c.v8__Context__Global(context) orelse return;
+    const cb_data = c.v8__Global__Get(&ws_on_message, isolate) orelse return;
+    const cb_fn: *const c.Function = @ptrCast(cb_data);
+    const sock = wsSocket(id, isolate, context) orelse return;
+
+    const ab = c.v8__ArrayBuffer__New(isolate, bytes.len);
+    var store = c.v8__ArrayBuffer__GetBackingStore(ab);
+    const backing = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return;
+    const dest: [*]u8 = @ptrCast(@alignCast(c.v8__BackingStore__Data(backing) orelse return));
+    @memcpy(dest[0..bytes.len], bytes);
+    const ua = c.v8__Uint8Array__New(ab, 0, bytes.len);
+
+    var argv = [_]*const c.Value{ sock, @ptrCast(ua) };
+    _ = c.v8__Function__Call(cb_fn, context, @ptrCast(global), 2, &argv);
+}
+
 pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) void {
     const iso = isolate orelse return;
     const s = str orelse return;
@@ -567,16 +599,21 @@ pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) voi
     if (wrote <= 0) return;
     const plen = @min(@as(usize, @intCast(wrote)), ulen);
     const hlen = ws.buildHeader(buf, ws.OP_TEXT, true, plen);
+    if (hlen < ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     std.debug.assert(tail + hlen + plen <= WRITE_BUF_SIZE);
 
     if (!ws_writing[id]) wsKick(id);
 }
 
-pub fn wsSendClose(id: usize, code: u16) void {
-    if (states[id] == .closing) return;
-    if (!ws_open[id]) {
-        closeConn(id);
+// socket.sendBinary(bytes): coalesced OP_BINARY write straight into the
+// slot's staging buffer. Header is built first because the payload length is
+// known up front (unlike the text path), then one memcpy.
+pub fn wsSendBinary(id: usize, bytes: []const u8, isolate: ?*c.Isolate) void {
+    _ = isolate;
+    if (!ws_open[id] or states[id] == .closing) return;
+    if (bytes.len > ws.WS_MSG_SIZE) {
+        wsSendClose(id, 1009);
         return;
     }
     if (!ws_writing[id]) {
@@ -584,16 +621,115 @@ pub fn wsSendClose(id: usize, code: u16) void {
         write_offsets[id] = 0;
         ws_batch[id] = 0;
     }
-    var payload: [2]u8 = undefined;
-    payload[0] = @intCast((code >> 8) & 0xff);
-    payload[1] = @intCast(code & 0xff);
+    const tail = write_lens[id];
+    std.debug.assert(tail <= WRITE_BUF_SIZE);
+    const need = @as(usize, ws.MAX_HDR) + bytes.len;
+    if (tail + need > WRITE_BUF_SIZE) return; // drop-new: no room in staging
+    const buf = write_bufs[id][tail..];
+    const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, bytes.len);
+    @memcpy(buf[hlen..][0..bytes.len], bytes);
+    write_lens[id] = tail + hlen + bytes.len;
+    std.debug.assert(tail + hlen + bytes.len <= WRITE_BUF_SIZE);
+    if (!ws_writing[id]) wsKick(id);
+}
+
+// sendBinary(string): UTF-8 bytes under OP_BINARY, encoded straight into the
+// staging buffer (single pass, header length matched to Utf8Length like the
+// text path).
+pub fn wsSendBinaryUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) void {
+    const iso = isolate orelse return;
+    const s = str orelse return;
+    if (!ws_open[id] or states[id] == .closing) return;
+
+    const ulen_raw = c.v8__String__Utf8Length(s, iso);
+    if (ulen_raw <= 0) return;
+    const ulen: usize = @intCast(ulen_raw);
+    if (ulen > ws.WS_MSG_SIZE) {
+        wsSendClose(id, 1009);
+        return;
+    }
+
+    if (!ws_writing[id]) {
+        write_lens[id] = 0;
+        write_offsets[id] = 0;
+        ws_batch[id] = 0;
+    }
+    const tail = write_lens[id];
+    std.debug.assert(tail <= WRITE_BUF_SIZE);
+    const need = @as(usize, ws.MAX_HDR) + ulen;
+    if (tail + need > WRITE_BUF_SIZE) return; // drop-new
+
+    const buf = write_bufs[id][tail..];
+    const wrote = c.v8__String__WriteUtf8(s, iso, buf[ws.MAX_HDR..].ptr, WRITE_BUF_SIZE - tail - ws.MAX_HDR, 0);
+    if (wrote <= 0) return;
+    const plen = @min(@as(usize, @intCast(wrote)), ulen);
+    const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, plen);
+    if (hlen < ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
+    write_lens[id] = tail + hlen + plen;
+    std.debug.assert(tail + hlen + plen <= WRITE_BUF_SIZE);
+    if (!ws_writing[id]) wsKick(id);
+}
+
+// Close reason must be <= CLOSE_REASON_MAX bytes AND must not split a UTF-8
+// code point. Only the last 4 bytes of the allowed window can straddle a
+// multi-byte sequence, so: reverse-gather that 4-byte tail into a vector,
+// tag continuation bytes (0b10xxxxxx) with one vector compare, bitcast to a
+// u4 bitset, and count trailing continuations with @ctz. A dangling lead
+// byte is dropped with it, so the cut is always on a boundary.
+fn truncateCloseReason(reason: []const u8) usize {
+    if (reason.len <= CLOSE_REASON_MAX) return reason.len;
+    const last = CLOSE_REASON_MAX - 1; // byte index 122
+    const tail: @Vector(4, u8) = .{ reason[last], reason[last - 1], reason[last - 2], reason[last - 3] };
+    const cont = (tail & @as(@Vector(4, u8), @splat(0xC0))) == @as(@Vector(4, u8), @splat(0x80));
+    const b: u4 = @bitCast(cont); // lane 0 <-> byte 122
+    const k: usize = @ctz(@as(u4, ~b)); // contiguous trailing continuations, 0..4
+    return CLOSE_REASON_MAX - (if (k == 0) @as(usize, 0) else k + 1);
+}
+
+pub fn wsSendClose(id: usize, code: u16) void {
+    wsSendCloseReason(id, code, "");
+}
+
+// socket.close(code, reason): OP_CLOSE frame, code(2)+reason(<=123), then
+// close the TCP conn once the coalesced batch flushes.
+pub fn wsSendCloseReason(id: usize, code: u16, reason: []const u8) void {
+    if (states[id] == .closing) return;
+    if (!ws_open[id]) {
+        closeConn(id);
+        return;
+    }
+    const rlen = truncateCloseReason(reason);
+    ws_close_code[id] = code;
+    @memcpy(ws_close_reason[id][0..rlen], reason[0..rlen]);
+    ws_close_reason_len[id] = @intCast(rlen);
+
+    if (!ws_writing[id]) {
+        write_lens[id] = 0;
+        write_offsets[id] = 0;
+        ws_batch[id] = 0;
+    }
     const tail = write_lens[id];
     const buf = write_bufs[id][tail..];
-    @memcpy(buf[ws.MAX_HDR..][0..2], &payload);
-    const hlen = ws.buildHeader(buf, ws.OP_CLOSE, true, 2);
-    write_lens[id] = tail + hlen + 2;
+    std.debug.assert(tail + @as(usize, ws.MAX_HDR) + 2 + rlen <= WRITE_BUF_SIZE);
+    buf[ws.MAX_HDR] = @intCast((code >> 8) & 0xff);
+    buf[ws.MAX_HDR + 1] = @intCast(code & 0xff);
+    @memcpy(buf[(ws.MAX_HDR + 2)..][0..rlen], reason[0..rlen]);
+    const hlen = ws.buildHeader(buf, ws.OP_CLOSE, true, 2 + rlen);
+    if (hlen < ws.MAX_HDR) @memmove(buf[hlen..][0 .. 2 + rlen], buf[ws.MAX_HDR..][0 .. 2 + rlen]);
+    write_lens[id] = tail + hlen + 2 + rlen;
     ws_close_after_write[id] = true;
     if (!ws_writing[id]) wsKick(id);
+}
+
+// Stash the client's close code/reason before echoing so close() sees them.
+fn recordCloseInfo(id: usize, payload: []const u8) void {
+    ws_close_code[id] = 0;
+    ws_close_reason_len[id] = 0;
+    if (payload.len < 2) return;
+    ws_close_code[id] = (@as(u16, payload[0]) << 8) | payload[1];
+    const rlen = @min(payload.len - 2, @as(usize, CLOSE_REASON_MAX));
+    @memcpy(ws_close_reason[id][0..rlen], payload[2 .. 2 + rlen]);
+    ws_close_reason_len[id] = @intCast(rlen);
 }
 
 fn wsSendCloseEcho(id: usize, payload: []const u8) void {
@@ -608,6 +744,7 @@ fn wsSendCloseEcho(id: usize, payload: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..plen], payload[0..plen]);
     const hlen = ws.buildHeader(buf, ws.OP_CLOSE, true, plen);
+    if (hlen < ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     ws_close_after_write[id] = true;
     if (!ws_writing[id]) wsKick(id);
@@ -625,6 +762,7 @@ fn wsSendPong(id: usize, payload: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..plen], payload[0..plen]);
     const hlen = ws.buildHeader(buf, ws.OP_PONG, true, plen);
+    if (hlen < ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     if (!ws_writing[id]) wsKick(id);
 }
@@ -636,7 +774,11 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
             return false;
         }
         if (hdr.fin) {
-            wsNotifyMessage(id, payload);
+            if (hdr.opcode == ws.OP_BINARY) {
+                wsNotifyBinaryMessage(id, payload);
+            } else {
+                wsNotifyMessage(id, payload);
+            }
             return true;
         }
         if (payload.len > ws.WS_MSG_SIZE) {
@@ -645,6 +787,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         }
         @memcpy(ws_partial[id][0..payload.len], payload);
         ws_partial_len[id] = payload.len;
+        ws_partial_binary[id] = (hdr.opcode == ws.OP_BINARY);
         return true;
     }
     if (ws_partial_len[id] == 0) {
@@ -658,7 +801,11 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
     @memcpy(ws_partial[id][ws_partial_len[id]..][0..payload.len], payload);
     ws_partial_len[id] += payload.len;
     if (hdr.fin) {
-        wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]]);
+        if (ws_partial_binary[id]) {
+            wsNotifyBinaryMessage(id, ws_partial[id][0..ws_partial_len[id]]);
+        } else {
+            wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]]);
+        }
         ws_partial_len[id] = 0;
     }
     return true;
@@ -683,6 +830,7 @@ fn wsConsume(id: usize, l: *xev.Loop) void {
             ws.OP_PING => wsSendPong(id, payload),
             ws.OP_PONG => {},
             ws.OP_CLOSE => {
+                recordCloseInfo(id, payload);
                 wsSendCloseEcho(id, payload);
                 return;
             },
@@ -702,8 +850,28 @@ fn wsConsume(id: usize, l: *xev.Loop) void {
 fn wsNotifyOpen(id: usize) void {
     wsNotify(id, &ws_on_open, 1);
 }
+
+// close(socket, code, reason): code/reason recorded either from our own
+// wsSendCloseReason or from recordCloseInfo on a client close frame.
 fn wsNotifyClose(id: usize) void {
-    wsNotify(id, &ws_on_close, 1);
+    const isolate = handler_isolate orelse return;
+    const ctxp = c.v8__Global__Get(&handler_context_global, isolate) orelse return;
+    const context: *c.Context = @ptrCast(@constCast(ctxp));
+    var hs: c.HandleScope = undefined;
+    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
+    defer c.v8__HandleScope__DESTRUCT(&hs);
+    c.v8__Context__Enter(context);
+    defer c.v8__Context__Exit(context);
+    const global = c.v8__Context__Global(context) orelse return;
+    const cb_data = c.v8__Global__Get(&ws_on_close, isolate) orelse return;
+    const cb_fn: *const c.Function = @ptrCast(cb_data);
+    const sock = wsSocket(id, isolate, context) orelse return;
+
+    const code_val = c.v8__Number__New(isolate, @floatFromInt(ws_close_code[id]));
+       const reason_val = c.v8__String__NewFromUtf8(isolate, @ptrCast(&ws_close_reason[id]), 0, @intCast(ws_close_reason_len[id])) orelse
+        (c.v8__String__NewFromUtf8(isolate, "", 0, 0) orelse return);
+    var argv = [_]*const c.Value{ @ptrCast(sock), @ptrCast(code_val), @ptrCast(reason_val) };
+    _ = c.v8__Function__Call(cb_fn, context, @ptrCast(global), 3, &argv);
 }
 
 fn wsShutdown(id: usize) void {
@@ -713,6 +881,9 @@ fn wsShutdown(id: usize) void {
     ws_sockets[id] = .{ .data_ptr = 0 };
     ws_open[id] = false;
     ws_partial_len[id] = 0;
+    ws_partial_binary[id] = false;
+    ws_close_code[id] = 0;
+    ws_close_reason_len[id] = 0;
     ws_close_after_write[id] = false;
     ws_writing[id] = false;
 }
@@ -806,6 +977,9 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     ws_close_after_write[id] = false;
     ws_pending_open[id] = false;
     ws_partial_len[id] = 0;
+    ws_partial_binary[id] = false;
+    ws_close_code[id] = 0;
+    ws_close_reason_len[id] = 0;
     ws_batch[id] = 0;
     ws_read_armed[id] = true;
 
@@ -997,7 +1171,7 @@ fn writeCb(
 
 fn finalizeWrite(id: usize, l: *xev.Loop) !void {
     if (keep_alives[id] and states[id] != .closing) {
-        buf_lens[id] = 0;
+        states[id] = .reading;
         write_lens[id] = 0;
         write_offsets[id] = 0;
         states[id] = .reading;
