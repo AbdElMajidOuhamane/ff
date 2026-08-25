@@ -5,10 +5,40 @@ const c = @import("../c.zig").c;
 const microtasks = @import("../event/microtasks.zig");
 const ws = @import("ws_native.zig");
 const api_ws = @import("../api/websocket.zig");
+const builtin = @import("builtin");
+
+// Thread-safe general-purpose allocator (server main-thread writes only).
+// Debug builds route response-staging allocations through a counter:
+// proves the request-path budget (socket buffers are static, never alloc).
+var req_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
+const gpa = if (builtin.mode == .Debug)
+    req_counter.allocator()
+else
+    std.heap.smp_allocator;
+
+const counting = @import("../util/counting_allocator.zig");
+
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 16384;
 const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
+
+// ============================================================
+// Response staging — two-tier (skill: zero-alloc hot path, cold exception):
+//   ≤16KB  : static per-conn write_bufs[id]   — zero allocations, always
+//   >16KB  : ONE smp allocation per response  — cold exceptional path,
+//            freed when the write drains or the connection closes
+// ============================================================
+var big_write: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN;
+
+/// Idempotent release of any spilled response buffer for slot `id`.
+fn freeBigWrite(id: usize) void {
+    if (big_write[id]) |p| {
+        gpa.free(p);
+        big_write[id] = null;
+    }
+}
+
 const ConnState = enum(u8) { idle, reading, writing, closing };
 // Packed per-connection flags (skill Practice #4): six booleans that were
 // previously six parallel bool arrays now share one byte per slot, so flag
@@ -23,6 +53,11 @@ const ConnFlags = packed struct(u8) {
     ws_pending_open: bool = false,
     _pad: u2 = 0,
 };
+comptime {
+    assert(@sizeOf(ConnFlags) == 1); // skill: verify packed layout claims
+}
+const assert = std.debug.assert;
+
 const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
 // ---- SoA hot state: compact + contiguous ----
 var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
@@ -295,27 +330,42 @@ fn appendUInt(w: []u8, pos: *usize, value: usize) void {
     @memcpy(w[pos.* ..][0..n], buf[0..n]);
     pos.* += n;
 }
-fn buildResponseHeader(id: usize, status: u16, body_len: usize) usize {
+/// RFC-correct response semantics:
+///   HEAD          -> Content-Length reflects what GET would return,
+///                    but zero body bytes are staged.
+///   204 / 304     -> no Content-Length header at all, no body.
+///   everything el -> Content-Length + body staged by the caller.
+fn wantsBodyBytes(id: usize, status: u16) bool {
+    return methods[id] != .head and status != 204 and status != 304;
+}
+/// Pure header formatter: status line, Content-Type, optional
+/// Content-Length, optional Connection. Returns bytes written. Operates on
+/// ANY destination slice so both the static fast path and the spilled
+/// large-response path share one wire-format implementation.
+fn formatResponseHeader(w: []u8, status: u16, content_length: ?usize, keep_alive: bool) usize {
     var pos: usize = 0;
-    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
     pushStr(w, &pos, "HTTP/1.1 ");
     appendUInt(w, &pos, status);
     pushStr(w, &pos, " ");
     pushStr(w, &pos, statusReason(status));
     pushStr(w, &pos, "\r\n");
     pushStr(w, &pos, "Content-Type: text/plain\r\n");
-    pushStr(w, &pos, "Content-Length: ");
-    appendUInt(w, &pos, body_len);
-    pushStr(w, &pos, "\r\n");
-    if (cflags[id].keep_alive) pushStr(w, &pos, "Connection: keep-alive\r\n");
+    if (content_length) |n| {
+        pushStr(w, &pos, "Content-Length: ");
+        appendUInt(w, &pos, n);
+        pushStr(w, &pos, "\r\n");
+    }
+    if (keep_alive) pushStr(w, &pos, "Connection: keep-alive\r\n");
     pushStr(w, &pos, "\r\n");
     return pos;
 }
 fn buildResponse(id: usize, status: u16, body: []const u8) void {
-    const header_len = buildResponseHeader(id, status, body.len);
+    const suppress = !wantsBodyBytes(id, status);
+    // 204/304 MUST NOT carry Content-Length; HEAD carries GET's length.
+    const cl: ?usize = if (status == 204 or status == 304) null else body.len;
     const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
-    var pos = header_len;
-    if (body.len > 0 and pos + body.len <= WRITE_BUF_SIZE) {
+    var pos = formatResponseHeader(w[0..], status, cl, cflags[id].keep_alive);
+    if (!suppress and body.len > 0 and pos + body.len <= WRITE_BUF_SIZE) {
         @memcpy(w[pos..][0..body.len], body);
         pos += body.len;
     }
@@ -330,6 +380,7 @@ fn extractInt(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, 
     return @intCast(out.value);
 }
 fn callV8Handler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
+    if (builtin.mode == .Debug) req_counter.reset(); // DIAGNOSTIC (W3)
     const isolate = handler_isolate orelse {
         buildResponse(id, 500, "");
         return;
@@ -403,11 +454,9 @@ fn callV8Handler(id: usize, parsed: *const ParsedRequest, body: []const u8) void
     const status_val = c.v8__Object__Get(@ptrCast(response_val), context, @ptrCast(c.v8__Global__Get(&str_status, isolate)));
     const status = extractInt(isolate, context, status_val, 200);
     const body_out_val = c.v8__Object__Get(@ptrCast(response_val), context, @ptrCast(c.v8__Global__Get(&str_body, isolate)));
-    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
-    const max_body = WRITE_BUF_SIZE - 1024;
-    // Single conversion pipeline: resolve the string handle once, measure
-    // once, build one header, write once. Non-string bodies previously paid
-    // ToDetailString + Utf8Length twice per request.
+
+    const suppress = !wantsBodyBytes(id, status);
+    const keep_alive = cflags[id].keep_alive;
     var done = false;
     body_pipeline: {
         const bv = body_out_val orelse break :body_pipeline;
@@ -416,31 +465,106 @@ fn callV8Handler(id: usize, parsed: *const ParsedRequest, body: []const u8) void
         const s = str_v orelse break :body_pipeline;
         const l: i32 = c.v8__String__Utf8Length(s, isolate);
         if (l <= 0) break :body_pipeline;
-        const body_cap = @min(@as(usize, @intCast(l)), max_body);
-        const header_len = buildResponseHeader(id, status, body_cap);
-        if (body_cap > 0) {
-            const wrote_raw = c.v8__String__WriteUtf8(s, isolate, w[header_len..].ptr, body_cap, 0);
+        const blen: usize = @intCast(l);
+
+        if (suppress) {
+            // HEAD: full headers incl. GET-equivalent Content-Length,
+            // zero body bytes staged (RFC 9110 §9.3.2). 204/304: no CL.
+            const cl: ?usize = if (status == 204 or status == 304) null else blen;
+            write_lens[id] = formatResponseHeader(
+                write_bufs[id][0..],
+                status,
+                cl,
+                keep_alive,
+            );
+            done = true;
+            break :body_pipeline;
+        }
+
+        if (blen <= WRITE_BUF_SIZE - 1024) {
+            // ---- inline fast path: static buffer, ZERO allocations ----
+            const hlen = formatResponseHeader(write_bufs[id][0..], status, blen, keep_alive);
+            const wrote_raw = c.v8__String__WriteUtf8(s, isolate, write_bufs[id][hlen..].ptr, blen, 0);
             const written: usize = if (wrote_raw > 0)
-                @min(@as(usize, @intCast(wrote_raw)), body_cap)
+                @min(@as(usize, @intCast(wrote_raw)), blen)
             else
                 0;
-            if (written != body_cap) {
-                // Actual UTF-8 length differed from the Utf8Length prediction:
-                // rebuild the header with the real count.
-                _ = buildResponseHeader(id, status, written);
+            if (written != blen) {
+                // Byte-length prediction differed: reformat in place and
+                // slide the body down (overlap-safe).
+                const h2 = formatResponseHeader(write_bufs[id][0..], status, written, keep_alive);
+                std.mem.copyForwards(
+                    u8,
+                    write_bufs[id][h2..][0..written],
+                    write_bufs[id][hlen..][0..written],
+                );
+                write_lens[id] = h2 + written;
+            } else {
+                write_lens[id] = hlen + blen;
             }
-            write_lens[id] = header_len + written;
-        } else {
-            write_lens[id] = header_len;
+            done = true;
+            break :body_pipeline;
         }
+
+        // ---- large-body spill (>16KB): ONE allocation, cold path.
+        // Header formats into stack scratch (realistic max ~120B), body
+        // lands behind it in the same buffer, utf8-mismatch slides in place
+        // with copyForwards. Freed by freeBigWrite on drain/close. ----
+
+        var hdr: [256]u8 = undefined;
+        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
+        const out = gpa.alloc(u8, hlen + blen) catch {
+            // Spill OOM: clean small rejection instead of a truncated lie.
+            buildResponse(id, 500, "out of memory");
+            done = true;
+            break :body_pipeline;
+        };
+        @memcpy(out[0..hlen], hdr[0..hlen]);
+        const wrote_raw = c.v8__String__WriteUtf8(s, isolate, out[hlen..].ptr, blen, 0);
+        const written: usize = if (wrote_raw > 0)
+            @min(@as(usize, @intCast(wrote_raw)), blen)
+        else
+            0;
+        var total = hlen + blen;
+        if (written != blen) {
+            const h2 = formatResponseHeader(out[0..], status, written, keep_alive);
+            std.mem.copyForwards(u8, out[h2..][0..written], out[hlen..][0..written]);
+            total = h2 + written;
+        }
+        big_write[id] = out;
+        write_lens[id] = total;
+        write_offsets[id] = 0;
         done = true;
         break :body_pipeline;
     }
     if (!done) {
-        write_lens[id] = buildResponseHeader(id, status, 0);
+        write_lens[id] = formatResponseHeader(
+            write_bufs[id][0..],
+            status,
+            0,
+            cflags[id].keep_alive,
+        );
+    }
+    if (builtin.mode == .Debug) { // DIAGNOSTIC (W3): budget proof + leak assert
+        std.debug.print(
+            "[allocs] req id={d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
+            .{
+                id,
+                req_counter.alloc_count,
+                req_counter.free_count,
+                req_counter.bytes_allocated,
+                req_counter.bytes_freed,
+                req_counter.balanced(),
+            },
+        );
+        std.debug.assert(req_counter.balanced()); // leak => loud failure
     }
 }
+
+
+
 // ---- WebSocket helpers ----
+
 fn wsKick(id: usize) void {
     const l = g_loop orelse return;
     states[id] = .writing;
@@ -449,10 +573,12 @@ fn wsKick(id: usize) void {
     ws_batch[id] = write_lens[id];
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
 }
+
 fn armReadId(id: usize, l: *xev.Loop) void {
     cflags[id].ws_read_armed = true;
     fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
 }
+
 fn wsSocket(id: usize, isolate: ?*c.Isolate, context: *c.Context) ?*const c.Value {
     const iso = isolate orelse return null;
     if (ws_sockets[id].data_ptr != 0) return @ptrCast(c.v8__Global__Get(&ws_sockets[id], iso));
@@ -460,6 +586,7 @@ fn wsSocket(id: usize, isolate: ?*c.Isolate, context: *c.Context) ?*const c.Valu
     c.v8__Global__New(iso, @ptrCast(obj), &ws_sockets[id]);
     return @ptrCast(obj);
 }
+
 fn wsNotify(id: usize, which: *c.Global, argc: u32) void {
     const isolate = handler_isolate orelse return;
     const ctxp = c.v8__Global__Get(&handler_context_global, isolate) orelse return;
@@ -481,6 +608,7 @@ fn wsNotify(id: usize, which: *c.Global, argc: u32) void {
         _ = c.v8__Function__Call(cb_fn, context, @ptrCast(global), 2, &argv);
     }
 }
+
 // Binary payloads surface to JS as Uint8Array views over a fresh ArrayBuffer
 // (matching the client side), so handlers can branch on
 // `data instanceof Uint8Array` reliably.
@@ -512,6 +640,7 @@ fn wsNotifyMessage(id: usize, msg: []const u8, binary: bool) void {
     var argv = [_]*const c.Value{ sock, dv };
     _ = c.v8__Function__Call(cb_fn, context, @ptrCast(global), 2, &argv);
 }
+
 pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) void {
     const iso = isolate orelse return;
     const s = str orelse return;
@@ -536,13 +665,13 @@ pub fn wsSendTextUtf8(id: usize, str: ?*const c.Value, isolate: ?*c.Isolate) voi
     if (wrote <= 0) return;
     const plen = @min(@as(usize, @intCast(wrote)), ulen);
     const hlen = ws.buildHeader(buf, ws.OP_TEXT, true, plen);
-    // Payload was staged at the fixed MAX_HDR reservation; slide it down to
-    // sit directly behind the actual (variable-length) header so the wire
-    // slice [0 .. hlen+plen] carries header immediately followed by payload.
+    // Slide payload behind the actual header: the wire slice must be
+    // contiguous header||payload.
     if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     if (!cflags[id].ws_writing) wsKick(id);
 }
+
 pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     if (!cflags[id].ws_open or states[id] == .closing) return;
     if (bytes.len > ws.WS_MSG_SIZE) {
@@ -560,11 +689,11 @@ pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..bytes.len], bytes);
     const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, bytes.len);
-    // Slide payload behind the actual header (see wsSendTextUtf8).
     if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..bytes.len], buf[ws.MAX_HDR..][0..bytes.len]);
     write_lens[id] = tail + hlen + bytes.len;
     if (!cflags[id].ws_writing) wsKick(id);
 }
+
 pub fn wsSendClose(id: usize, code: u16) void {
     if (states[id] == .closing) return;
     if (!cflags[id].ws_open) {
@@ -583,12 +712,12 @@ pub fn wsSendClose(id: usize, code: u16) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..2], &payload);
     const hlen = ws.buildHeader(buf, ws.OP_CLOSE, true, 2);
-    // Slide payload behind the actual header (see wsSendTextUtf8).
     if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..2], buf[ws.MAX_HDR..][0..2]);
     write_lens[id] = tail + hlen + 2;
     cflags[id].ws_close_after_write = true;
     if (!cflags[id].ws_writing) wsKick(id);
 }
+
 fn wsSendCloseEcho(id: usize, payload: []const u8) void {
     if (states[id] == .closing) return;
     if (!cflags[id].ws_writing) {
@@ -601,12 +730,12 @@ fn wsSendCloseEcho(id: usize, payload: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..plen], payload[0..plen]);
     const hlen = ws.buildHeader(buf, ws.OP_CLOSE, true, plen);
-    // Slide payload behind the actual header (see wsSendTextUtf8).
     if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     cflags[id].ws_close_after_write = true;
     if (!cflags[id].ws_writing) wsKick(id);
 }
+
 fn wsSendPong(id: usize, payload: []const u8) void {
     if (!cflags[id].ws_writing) {
         write_lens[id] = 0;
@@ -619,11 +748,11 @@ fn wsSendPong(id: usize, payload: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..plen], payload[0..plen]);
     const hlen = ws.buildHeader(buf, ws.OP_PONG, true, plen);
-    // Slide payload behind the actual header (see wsSendTextUtf8).
     if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..plen], buf[ws.MAX_HDR..][0..plen]);
     write_lens[id] = tail + hlen + plen;
     if (!cflags[id].ws_writing) wsKick(id);
 }
+
 fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
     if (ws.isData(hdr.opcode)) {
         if (ws_partial_len[id] != 0) {
@@ -660,6 +789,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
     }
     return true;
 }
+
 // Three-pass engine over one read buffer: decode header -> unmask -> act.
 fn wsConsume(id: usize, l: *xev.Loop) void {
     var leftover = read_bufs[id][0..buf_lens[id]];
@@ -692,12 +822,15 @@ fn wsConsume(id: usize, l: *xev.Loop) void {
     }
     if (states[id] == .reading and !cflags[id].ws_writing) armReadId(id, l);
 }
+
 fn wsNotifyOpen(id: usize) void {
     wsNotify(id, &ws_on_open, 1);
 }
+
 fn wsNotifyClose(id: usize) void {
     wsNotify(id, &ws_on_close, 1);
 }
+
 fn wsShutdown(id: usize) void {
     if (!cflags[id].ws_open) return;
     wsNotifyClose(id);
@@ -709,6 +842,7 @@ fn wsShutdown(id: usize) void {
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_writing = false;
 }
+
 fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *const ParsedRequest) void {
     const total = buf_lens[id];
     var start = kpos + "sec-websocket-key:".len;
@@ -752,7 +886,9 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
     ws_batch[id] = write_lens[id];
     fds[id].write(l, &write_comps[id], .{ .slice = w[0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
 }
+
 fn closeConn(id: usize) void {
+    freeBigWrite(id); // release any spilled large response for this slot
     wsShutdown(id);
     if (states[id] == .closing) return;
     states[id] = .closing;
@@ -763,6 +899,7 @@ fn closeConn(id: usize) void {
     };
     fds[id].close(loop, &close_comps[id], u16, &slot_ids[id], closeCb);
 }
+
 fn closeCb(
     ud: ?*u16,
     _: *xev.Loop,
@@ -777,6 +914,7 @@ fn closeCb(
     freePush(id);
     return .disarm;
 }
+
 fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     const id = freePop() orelse {
         _ = c.close(tcp.fd);
@@ -798,6 +936,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
+    freeBigWrite(id); // defensive: slot must never inherit stale spill
     // One store replaces the previous six separate flag writes.
     cflags[id] = .{ .keep_alive = true, .ws_read_armed = true };
     ws_partial_len[id] = 0;
@@ -806,6 +945,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
     return true;
 }
+
 fn acceptCb(
     _: ?*void,
     l: *xev.Loop,
@@ -827,6 +967,7 @@ fn acceptCb(
     listener_tcp.accept(l, &accept_comp, void, null, acceptCb);
     return .disarm;
 }
+
 fn readCb(
     ud: ?*u16,
     l: *xev.Loop,
@@ -902,6 +1043,7 @@ fn readCb(
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
     return .disarm;
 }
+
 fn writeCb(
     ud: ?*u16,
     l: *xev.Loop,
@@ -916,6 +1058,7 @@ fn writeCb(
         closeConn(id);
         return .disarm;
     };
+
     if (cflags[id].ws_open) {
         // ---- WebSocket coalesced write path ----
         write_offsets[id] += written;
@@ -954,12 +1097,32 @@ fn writeCb(
         }
         return .disarm;
     }
-    // ---- HTTP write path ----
+
+    // ---- HTTP write path: source switches between the static fast buffer
+    // and a spilled large-response allocation. The spill is freed exactly
+    // when fully drained (before any keep-alive reuse of the slot). ----
     write_offsets[id] += written;
-    if (write_offsets[id] < write_lens[id]) {
-        tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
-        return .disarm;
+
+    if (big_write[id] != null) {
+        if (write_offsets[id] < write_lens[id]) {
+            tcp.write(
+                l,
+                &write_comps[id],
+                .{ .slice = big_write[id].?[write_offsets[id]..write_lens[id]] },
+                u16,
+                &slot_ids[id],
+                writeCb,
+            );
+            return .disarm;
+        }
+        freeBigWrite(id); // fully drained — release before keep-alive re-arm
+    } else {
+        if (write_offsets[id] < write_lens[id]) {
+            tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+            return .disarm;
+        }
     }
+
     write_offsets[id] = 0;
     if (cflags[id].keep_alive) {
         states[id] = .reading;
@@ -972,6 +1135,7 @@ fn writeCb(
     }
     return .disarm;
 }
+
 pub fn init(loop: *xev.Loop, port: u16) !void {
     if (initialized) return;
     g_loop = loop;
@@ -989,6 +1153,7 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
     initialized = true;
     std.debug.print("[http] listening on 0.0.0.0:{d}\n", .{port});
 }
+
 pub fn deinit() void {
     if (!initialized) return;
     initialized = false;
@@ -997,8 +1162,10 @@ pub fn deinit() void {
             closeConn(i);
         }
     }
+    for (0..MAX_CONN) |i| freeBigWrite(i); // paranoia sweep; closeConn covers it
     g_loop = null;
 }
+
 pub fn setupStrings(isolate: ?*c.Isolate) void {
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);

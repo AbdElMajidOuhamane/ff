@@ -3,22 +3,39 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
+const builtin = @import("builtin");
 
-const gpa = std.heap.smp_allocator;
+// Debug builds route job allocations through a counter: per-job reports
+// prove the allocation budget and catch leaks mechanically (balanced()
+// asserted at job end). ReleaseFast binds straight to smp_allocator.
+var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
+const gpa = if (builtin.mode == .Debug)
+    job_counter.allocator()
+else
+    std.heap.smp_allocator;
+
+const counting = @import("../util/counting_allocator.zig");
 const http = std.http;
 
 // ============================================================
-// Async fetch — DOD/SoA slot pool, same idiom as net/tls.zig.
+// Async fetch — DOD/SoA slot pool over a PERSISTENT WORKER POOL.
 //
 // No per-fetch heap structs. Every live fetch is an integer slot id into
 // dense per-field arrays; slots come from an O(1) free-list. The pool
-// doubles as the concurrency cap: at most MAX_FETCH workers exist, so
-// spawns are bounded and "submit" fails fast with error.NoConnectionAvailable.
+// doubles as the concurrency cap: at most MAX_FETCH jobs are in flight,
+// so submit fails fast with error.NoConnectionAvailable.
+//
+// PHASE 4: threads are spawned ONCE at init() and consume slot ids from a
+// preallocated MPSC ring. Workers PARK on a blocking read of a shared
+// wakeup pipe (Zig 0.16 removed Thread.Mutex/Condition; the Io-bound ones
+// don't fit raw pooled threads). submit() is enqueue-only — the
+// per-request std.Thread.spawn (syscall + stack map + scheduler churn) is
+// gone. `pending` counts IN-FLIGHT JOBS rather than live threads; the
+// event loop's arm/drain gating semantics are unchanged.
 //
 // Worker completion is detected with a SIMD sweep over the state vector
-// (a doneBitmap), then each candidate is confirmed with a per-slot acquire
-// CAS — vector front-end for cheap batching, atomics for correctness
-// (the same vector-then-scalar hybrid as findCrLf in tls.zig).
+// (doneMask), then each candidate is confirmed with a per-slot acquire
+// CAS — vector front-end for cheap batching, atomics for correctness.
 //
 // Wakeup: a single xev.Async (mach port). Worker notify() wakes the loop;
 // the callback re-arms while pending > 0 and disarms at 0. drainCompleted()
@@ -50,13 +67,26 @@ var free_list: [MAX_FETCH]u16 = undefined;
 var free_count: usize = MAX_FETCH;
 var pool_lock: std.atomic.Mutex = .unlocked;
 
+// ---- persistent worker pool: MPSC job ring (spinlock + wakeup pipe) ----
+const RING_CAP = MAX_FETCH; // >= slot count: enqueue cannot overflow
+var job_ring: [RING_CAP]u16 = undefined;
+var ring_head: usize = 0; // consumer index (workers)
+var ring_tail: usize = 0; // producer index (main thread)
+var ring_lock: std.atomic.Mutex = .unlocked;
+var shutdown_requested = false;
+var pool_started = false;
+var worker_threads: [MAX_FETCH]?std.Thread = [_]?std.Thread{null} ** MAX_FETCH;
+// Wakeup pipe: workers block on read(job_pipe[0]); each enqueued job /
+// shutdown broadcast writes one byte.
+var job_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
 // ---- cross-thread wakeup ----
 const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
 var async_armed = false;
 
-// main-thread/pump-visible wip counter; 0 => all workers done
+// main-thread/pump-visible wip counter; 0 => all jobs done
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 
 fn poolLock() void {
@@ -65,6 +95,14 @@ fn poolLock() void {
 
 fn poolUnlock() void {
     pool_lock.unlock();
+}
+
+fn ringLock() void {
+    while (!ring_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn ringUnlock() void {
+    ring_lock.unlock();
 }
 
 fn poolInit() void {
@@ -96,13 +134,58 @@ fn releaseSlot(s: usize) void {
 
 // ---- lifecycle ----
 
+fn makeJobPipe() !void {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeCreateFailed;
+    job_pipe = fds;
+}
+
+/// Wakes every parked worker: one byte each so all of them re-check state.
+fn wakeAllWorkers() void {
+    if (job_pipe[1] < 0) return;
+    var b: [MAX_FETCH]u8 = [_]u8{1} ** MAX_FETCH;
+    _ = std.c.write(job_pipe[1], &b, b.len);
+}
+
 pub fn init() void {
     poolInit();
     async_h = AsyncT.init() catch unreachable;
     async_armed = false;
+    ring_head = 0;
+    ring_tail = 0;
+    shutdown_requested = false;
+    makeJobPipe() catch {
+        async_h.deinit();
+        return;
+    };
+    // Best-effort spawn: a partial pool is fine — excess jobs simply wait
+    // in the ring until a worker frees up.
+    for (&worker_threads) |*t| {
+        t.* = std.Thread.spawn(.{}, workerLoop, .{}) catch {
+            t.* = null;
+            break;
+        };
+    }
+    pool_started = true;
 }
 
 pub fn deinit() void {
+    if (pool_started) {
+        ringLock();
+        shutdown_requested = true;
+        ringUnlock();
+        wakeAllWorkers(); // one byte per parked worker
+        for (&worker_threads) |*t| {
+            if (t.*) |*tt| {
+                tt.join();
+                t.* = null;
+            }
+        }
+        pool_started = false;
+    }
+    if (job_pipe[0] >= 0) _ = c.close(job_pipe[0]);
+    if (job_pipe[1] >= 0) _ = c.close(job_pipe[1]);
+    job_pipe = .{ -1, -1 };
     async_h.deinit();
     // Loop only exits once pending==0 and everything is drained, so slots
     // should all be free. Safety: reclaim anything that leaked regardless.
@@ -124,8 +207,34 @@ fn freeOwned(s: usize) void {
     if (bodies[s]) |b| gpa.free(b);
 }
 
+// ---- persistent worker loop ----
+
+fn workerLoop() void {
+    while (true) {
+        // Park until a job byte arrives (blocking read — zero idle CPU).
+        var wake: [1]u8 = undefined;
+        const n = std.c.read(job_pipe[0], &wake, 1);
+        if (n <= 0) return; // pipe closed => hard shutdown
+
+        var got: ?u16 = null;
+        ringLock();
+        if (ring_head != ring_tail) {
+            got = job_ring[ring_head % RING_CAP];
+            ring_head +%= 1;
+        }
+        const stop = shutdown_requested and ring_head == ring_tail;
+        ringUnlock();
+
+        // Always run a claimed job first — even during shutdown — then exit
+        // if the ring drained under a shutdown request.
+        if (got) |slot_id| runJob(slot_id);
+        if (stop) return;
+    }
+}
+
 // ---- submission (main thread, from fetchCallback) ----
 // Takes ownership of url_buf/headers/body on success; frees them on failure.
+// ENQUEUE-ONLY: hands the slot id to the persistent pool — no thread spawn.
 
 pub fn submit(
     isolate: ?*c.Isolate,
@@ -160,22 +269,31 @@ pub fn submit(
     errs[s] = null;
     c.v8__Global__New(isolate, @ptrCast(resolver), &resolvers[s]);
 
+    // Count the job BEFORE signaling so the worker's completion decrement
+    // can never race ahead of our increment.
     _ = pending.fetchAdd(1, .acq_rel);
-    const s16: u16 = @intCast(s);
-    const th = std.Thread.spawn(.{}, workerMain, .{s16}) catch {
+
+    // Enqueue for the persistent pool, then poke one parked worker.
+    ringLock();
+    if (shutdown_requested) {
+        ringUnlock();
         _ = pending.fetchSub(1, .acq_rel);
         c.v8__Global__Reset(&resolvers[s]);
         freeOwned(s);
         releaseSlot(s);
-        return error.SpawnFailed;
-    };
-    th.detach();
+        return error.NoConnectionAvailable;
+    }
+    job_ring[ring_tail % RING_CAP] = @intCast(s);
+    ring_tail +%= 1;
+    ringUnlock();
+    _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
 }
 
-// ---- worker (never touches v8) ----
+// ---- job execution (worker threads, never touches v8) ----
 
-fn workerMain(slot_id: u16) void {
+fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
+    if (builtin.mode == .Debug) job_counter.reset(); // DIAGNOSTIC (W3)
 
     var req = tls.client().request(methods[s], uris[s], .{
         .extra_headers = headers[s].items,
@@ -233,6 +351,24 @@ fn workerMain(slot_id: u16) void {
         req.connection.?.closing = true;
     }
 
+    // ---- Build ResponseData + copy headers FIRST (pristine head).
+    // Creating response.reader() below mutates head/buffering state, so
+    // iterateHeaders must run before it (else it spins on stale offsets). ----
+    const resp_data = gpa.create(response_mod.ResponseData) catch {
+        failSlot(s, "Out of memory");
+        return;
+    };
+    resp_data.* = response_mod.ResponseData.init();
+
+    resp_data.status = status_code;
+    resp_data.setStatusText(response.head.status.phrase() orelse "OK");
+
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |h| {
+        resp_data.headers.appendEntry(h.name, h.value);
+    }
+
+    // ---- Stream the body AFTER headers are captured ----
     if (has_body) {
         var transfer_buf: [8192]u8 = undefined;
         const content_encoding = response.head.content_encoding;
@@ -258,6 +394,9 @@ fn workerMain(slot_id: u16) void {
             break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
         };
 
+        // Tracks whether a Content-Length'd body under-delivered — such a
+        // connection's framing state is unreliable and must never be reused.
+        var body_incomplete = false;
         const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
 
         if (wire_cl) |cl| {
@@ -274,11 +413,13 @@ fn workerMain(slot_id: u16) void {
                     };
                     if (n == 0) {
                         gpa.free(b);
+                        body_incomplete = true;
                     } else if (n == len) {
                         owned_body = b;
                     } else {
-                        owned_body = gpa.dupe(u8, b[0..n]) catch b[0..n];
-                        if (owned_body.?.len == n) gpa.free(b);
+                        owned_body = gpa.realloc(b, n) catch null;
+                        if (owned_body == null) gpa.free(b);
+                        body_incomplete = true; // promised bytes never arrived
                     }
                 }
             }
@@ -319,20 +460,12 @@ fn workerMain(slot_id: u16) void {
                 if (n == 0) break;
             }
         }
-    }
 
-    const resp_data = gpa.create(response_mod.ResponseData) catch {
-        failSlot(s, "Out of memory");
-        return;
-    };
-    resp_data.* = response_mod.ResponseData.init();
-
-    resp_data.status = status_code;
-    resp_data.setStatusText(response.head.status.phrase() orelse "OK");
-
-    var header_it = response.head.iterateHeaders();
-    while (header_it.next()) |h| {
-        resp_data.headers.appendEntry(h.name, h.value);
+        if (body_incomplete) {
+            // Content-Length unmet: this connection's framing state is
+            // unreliable — never hand it back to the keep-alive pool.
+            req.connection.?.closing = true;
+        }
     }
 
     if (owned_body) |b| {
@@ -340,6 +473,21 @@ fn workerMain(slot_id: u16) void {
         owned_body = null; // transferred; the Response owns it now
     } else if (response.head.content_length != null and has_body) {
         resp_data.setBody("");
+    }
+
+    if (builtin.mode == .Debug) { // DIAGNOSTIC (W3): budget proof + leak assert
+        std.debug.print(
+            "[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
+            .{
+                slot_id,
+                job_counter.alloc_count,
+                job_counter.free_count,
+                job_counter.bytes_allocated,
+                job_counter.bytes_freed,
+                job_counter.balanced(),
+            },
+        );
+        std.debug.assert(job_counter.balanced()); // leak => loud failure
     }
 
     okSlot(s, resp_data);

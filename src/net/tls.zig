@@ -13,6 +13,12 @@ const http = std.http;
 // this module previously carried unused copies that have been removed.
 // ============================================================
 pub const MAX_CONN = 64;
+
+/// Hard bound on any single socket read/write on pooled connections: a
+/// dead/slow upstream must fail the job (surfacing as a JS rejection via
+/// the existing catch paths) instead of parking a pool worker forever.
+pub const IO_TIMEOUT_SEC: u32 = 30;
+
 const ConnState = enum(u8) { free, connecting, active, closing };
 var states: [MAX_CONN]ConnState = [_]ConnState{.free} ** MAX_CONN;
 var fds: [MAX_CONN]std.posix.fd_t = undefined;
@@ -82,9 +88,17 @@ pub fn client() *http.Client {
 // ============================================================
 // Transport tuning
 // ============================================================
-/// TCP_NODELAY for one fd: std.http never sets it, so each small second
-/// write (TLS Finished record, then the request segment) awaits a
-/// delayed-ACK round trip — up to ~2 RTTs (~90ms) per fresh connection.
+/// Per-connection transport tuning: TCP_NODELAY + bounded idle waits.
+///
+/// NODELAY: std.http never sets it, so each small second write (TLS
+/// Finished record, then the request segment) awaits a delayed-ACK round
+/// trip — up to ~2 RTTs (~90ms) per fresh connection.
+///
+/// RCVTIMEO/SNDTIMEO: without them, any stalled upstream (half-open conn,
+/// throttled host, mid-body stall) blocks a pool worker's read forever —
+/// there is no other deadline in the fetch path. With them, the stalled
+/// op errors after IO_TIMEOUT_SEC and the existing catch paths turn it
+/// into a normal job failure -> JS rejection -> slot recycles.
 pub fn tuneFd(fd: std.posix.fd_t) void {
     const one: c_int = 1;
     std.posix.setsockopt(
@@ -92,6 +106,19 @@ pub fn tuneFd(fd: std.posix.fd_t) void {
         @intCast(std.posix.IPPROTO.TCP),
         @intCast(std.posix.TCP.NODELAY),
         std.mem.asBytes(&one),
+    ) catch {};
+    const tv = std.posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
+    std.posix.setsockopt(
+        fd,
+        @intCast(std.posix.SOL.SOCKET),
+        @intCast(std.posix.SO.RCVTIMEO),
+        std.mem.asBytes(&tv),
+    ) catch {};
+    std.posix.setsockopt(
+        fd,
+        @intCast(std.posix.SOL.SOCKET),
+        @intCast(std.posix.SO.SNDTIMEO),
+        std.mem.asBytes(&tv),
     ) catch {};
 }
 /// Register a connection handed back by std.http into the pool: records its
