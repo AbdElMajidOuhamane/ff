@@ -4,7 +4,7 @@ const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
 
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 const http = std.http;
 
 // ============================================================

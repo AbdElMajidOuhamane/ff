@@ -1,17 +1,14 @@
 const std = @import("std");
-
 // ---- RFC6455 constants ----
 pub const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub const WS_MSG_SIZE = 16384;
 pub const MAX_HDR = 14;
-
 pub const OP_CONT: u8 = 0x0;
 pub const OP_TEXT: u8 = 0x1;
 pub const OP_BINARY: u8 = 0x2;
 pub const OP_CLOSE: u8 = 0x8;
 pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xa;
-
 pub const FrameHdr = struct {
     opcode: u8,
     fin: bool,
@@ -19,14 +16,12 @@ pub const FrameHdr = struct {
     header_len: u8,
     mask: [4]u8,
 };
-
 pub fn isControl(op: u8) bool {
     return op >= 0x8;
 }
 pub fn isData(op: u8) bool {
     return op == OP_TEXT or op == OP_BINARY;
 }
-
 // sec-websocket-key (base64, 24 chars max) -> 28-byte base64 accept.
 pub fn computeAccept(key: []const u8, out: *[28]u8) void {
     var buf: [24 + WS_GUID.len]u8 = undefined;
@@ -34,16 +29,19 @@ pub fn computeAccept(key: []const u8, out: *[28]u8) void {
     @memcpy(buf[0..klen], key[0..klen]);
     @memcpy(buf[klen..][0..WS_GUID.len], WS_GUID);
     var sha: [20]u8 = undefined;
-   std.crypto.hash.Sha1.hash(buf[0 .. klen + WS_GUID.len], &sha, .{});
-   _ = std.base64.standard.Encoder.encode(out, sha[0..]);
+    std.crypto.hash.Sha1.hash(buf[0 .. klen + WS_GUID.len], &sha, .{});
+    _ = std.base64.standard.Encoder.encode(out, sha[0..]);
 }
-
-// Parse a client frame header. Client frames are always masked -> 6/8/14 bytes.
+// Parse a frame header for either direction: client->server frames are
+// masked (RFC6455 clients MUST), server->client frames are not (servers
+// MUST NOT). The mask key is only consumed when present; a zero mask is an
+// identity XOR so consumers can unmask unconditionally.
 pub fn parseHeader(buf: []const u8) ?FrameHdr {
     if (buf.len < 2) return null;
     const b0 = buf[0];
     const b1 = buf[1];
     const fin = (b0 & 0x80) != 0;
+    const masked = (b1 & 0x80) != 0;
     const opcode = b0 & 0x0f;
     var len: u64 = b1 & 0x7f;
     var header_len: u8 = 2;
@@ -57,10 +55,12 @@ pub fn parseHeader(buf: []const u8) ?FrameHdr {
         for (0..8) |i| len = (len << 8) | buf[2 + i];
         header_len = 10;
     }
-    const total = header_len + 4;
+    // Mask key present only when the sender masked it into the header.
+    const mlen: u8 = if (masked) 4 else 0;
+    const total = header_len + mlen;
     if (buf.len < total) return null;
-    var mask: [4]u8 = undefined;
-    @memcpy(&mask, buf[header_len..total]);
+    var mask: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) @memcpy(&mask, buf[header_len..total]);
     return .{
         .opcode = opcode,
         .fin = fin,
@@ -69,7 +69,6 @@ pub fn parseHeader(buf: []const u8) ?FrameHdr {
         .mask = mask,
     };
 }
-
 // Scalar reference (old implementation), kept as the test oracle.
 fn unmaskScalar(buf: []u8, mask: [4]u8) void {
     var i: usize = 0;
@@ -84,28 +83,32 @@ fn unmaskScalar(buf: []u8, mask: [4]u8) void {
         buf[i] ^= mask[i & 3];
     }
 }
-
-// In-place XOR with the 4-byte mask, 16 bytes at a time.
+// In-place XOR with the 4-byte mask at CPU-native vector width
+// (32 lanes on AVX2, 64 on AVX-512), scalar tail for the remainder.
 pub fn unmask(buf: []u8, mask: [4]u8) void {
+    const N = std.simd.suggestVectorLength(u8) orelse 16;
+    const V = @Vector(N, u8);
     var i: usize = 0;
-    const body = buf.len & ~@as(usize, 15);
-    if (body >= 16) {
-        const m: @Vector(16, u8) = .{
-            mask[0], mask[1], mask[2], mask[3],
-            mask[0], mask[1], mask[2], mask[3],
-            mask[0], mask[1], mask[2], mask[3],
-            mask[0], mask[1], mask[2], mask[3],
-        };
-        while (i < body) : (i += 16) {
-            const v: @Vector(16, u8) = buf[i..][0..16].*;
-            buf[i..][0..16].* = v ^ m;
+    const body = buf.len & ~@as(usize, N - 1);
+    if (body >= N) {
+        var m: [N]u8 = undefined;
+        var k: usize = 0;
+        while (k < N) : (k += 4) {
+            m[k] = mask[0];
+            m[k + 1] = mask[1];
+            m[k + 2] = mask[2];
+            m[k + 3] = mask[3];
+        }
+        const mv: V = m;
+        while (i < body) : (i += N) {
+            const v: V = buf[i..][0..N].*;
+            buf[i..][0..N].* = v ^ mv;
         }
     }
     while (i < buf.len) : (i += 1) {
         buf[i] ^= mask[i & 3];
     }
 }
-
 // Server -> client frames are unmasked. Returns header length.
 pub fn buildHeader(out: []u8, opcode: u8, fin: bool, payload_len: usize) u8 {
     out[0] = (if (fin) @as(u8, 0x80) else 0) | (opcode & 0x0f);
@@ -122,18 +125,16 @@ pub fn buildHeader(out: []u8, opcode: u8, fin: bool, payload_len: usize) u8 {
     out[1] = 127;
     var shift: u6 = 56;
     for (0..8) |i| {
-        out[2 + i] = @intCast((payload_len >> @intCast(shift)) & 0xff);
+        out[2 + i] = @intCast((payload_len >> shift) & 0xff);
         shift -%= 8;
     }
     return 10;
 }
-
 test "computeAccept RFC6455 vector" {
     var out: [28]u8 = undefined;
     computeAccept("dGhlIHNhbXBsZSBub25jZQ==", &out);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", out[0..28]);
 }
-
 test "buildHeader lengths" {
     var buf: [14]u8 = undefined;
     try std.testing.expectEqual(@as(u8, 2), buildHeader(&buf, OP_TEXT, true, 100));
@@ -141,7 +142,6 @@ test "buildHeader lengths" {
     try std.testing.expectEqual(@as(u8, 10), buildHeader(&buf, OP_TEXT, true, 70000));
     try std.testing.expectEqual(buf[1], @as(u8, 127));
 }
-
 test "parseHeader roundtrip" {
     var buf: [14]u8 = undefined;
     const h1 = buildHeader(&buf, OP_TEXT, true, 300);
@@ -161,7 +161,6 @@ test "parseHeader roundtrip" {
     try std.testing.expectEqual(@as(usize, 300), hdr.payload_len);
     try std.testing.expectEqual(@as(u8, 8), hdr.header_len);
 }
-
 test "unmask vector equals scalar" {
     const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
     const sizes = [_]usize{ 0, 1, 3, 4, 15, 16, 17, 20, 63, 64, 100, 255, 256 };

@@ -4,6 +4,7 @@ const ws = @import("../net/ws_native.zig");
 
 var sock_ids: [http_native.MAX_CONN]u16 = undefined;
 var str_send: c.Global = .{ .data_ptr = 0 };
+var str_send_binary: c.Global = .{ .data_ptr = 0 };
 var str_id: c.Global = .{ .data_ptr = 0 };
 
 pub fn setupStrings(isolate: ?*c.Isolate) void {
@@ -11,6 +12,7 @@ pub fn setupStrings(isolate: ?*c.Isolate) void {
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);
     defer c.v8__HandleScope__DESTRUCT(&hs);
     c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "send", 0, -1)), &str_send);
+    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "sendBinary", 0, -1)), &str_send_binary);
     c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "id", 0, -1)), &str_id);
 }
 
@@ -38,7 +40,21 @@ pub fn makeSocket(isolate: ?*c.Isolate, context: ?*const c.Context, id: u16) ?*c
         @ptrCast(send),
         &out,
     );
+    const send_bin = c.v8__Function__New__DEFAULT2(ctx, socketSendBinary, @ptrCast(ext)) orelse return null;
+    _ = c.v8__Object__Set(
+        obj,
+        ctx,
+        @ptrCast(c.v8__Global__Get(&str_send_binary, iso)),
+        @ptrCast(send_bin),
+        &out,
+    );
     return obj;
+}
+
+fn slotId(info: ?*const c.FunctionCallbackInfo) ?usize {
+    const data = c.v8__FunctionCallbackInfo__Data(info) orelse return null;
+    const sp: *u16 = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(data))));
+    return sp.*;
 }
 
 fn socketSend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -48,9 +64,7 @@ fn socketSend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
 
-    const data = c.v8__FunctionCallbackInfo__Data(info) orelse return;
-    const sp: *u16 = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(data))));
-    const id: usize = sp.*;
+    const id = slotId(info) orelse return;
 
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
     const arg = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
@@ -63,4 +77,40 @@ fn socketSend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     // separate copy, single pass. Length comes from Utf8Length() so the
     // frame header always matches the bytes actually written.
     http_native.wsSendTextUtf8(id, str, isolate);
+}
+
+// Extracts the readable bytes behind an ArrayBuffer / ArrayBufferView arg.
+fn backingBytes(arg: ?*const c.Value) ?[]const u8 {
+    const v = arg orelse return null;
+    if (c.v8__Value__IsArrayBuffer(v)) {
+        const ab: *const c.ArrayBuffer = @ptrCast(v);
+        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
+        const bs = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return null;
+        const p = c.v8__BackingStore__Data(bs) orelse return null;
+        return @as([*]const u8, @ptrCast(p))[0..c.v8__BackingStore__ByteLength(bs)];
+    }
+    if (c.v8__Value__IsArrayBufferView(v)) {
+        const view: *const c.ArrayBufferView = @ptrCast(v);
+        const ab = c.v8__ArrayBufferView__Buffer(view) orelse return null;
+        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
+        const bs = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return null;
+        const p = c.v8__BackingStore__Data(bs) orelse return null;
+        const off: usize = @intCast(c.v8__ArrayBufferView__ByteOffset(view));
+        const len: usize = @intCast(c.v8__ArrayBufferView__ByteLength(view));
+        return @as([*]const u8, @ptrCast(p))[off .. off + len];
+    }
+    return null;
+}
+
+fn socketSendBinary(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+    var ret: c.ReturnValue = undefined;
+    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
+
+    const id = slotId(info) orelse return;
+
+    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
+    const bytes = backingBytes(c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
+    http_native.wsSendBinary(id, bytes);
 }

@@ -1,36 +1,45 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
-
 const gpa = std.heap.page_allocator;
-
 fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
     const exc = c.v8__Exception__Error(v8_msg);
     _ = c.v8__Isolate__ThrowException(isolate, exc);
 }
-
 fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
     const exc = c.v8__Exception__TypeError(v8_msg);
     _ = c.v8__Isolate__ThrowException(isolate, exc);
 }
-
 fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
     return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
 }
-
-fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
+// Hot-path string extraction: writes into the caller-provided stack buffer
+// when the string fits (typical searchParams names/values), falling back to
+// one direct heap allocation otherwise. Replaces the previous 8KB stack
+// staging buffer + dupeZ, which silently truncated strings >8192 bytes and
+// paid an extra copy per call.
+const ExtractedStr = struct {
+    slice: []const u8,
+    heap: ?[:0]u8 = null,
+    fn deinit(self: ExtractedStr) void {
+        if (self.heap) |h| gpa.free(h);
+    }
+};
+fn extractStringAuto(isolate: ?*c.Isolate, val: ?*const c.Value, stack_buf: []u8) ?ExtractedStr {
     const v = val orelse return null;
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const str = c.v8__Value__ToDetailString(v, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [8192]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+    if (utf8_len <= stack_buf.len) {
+        _ = c.v8__String__WriteUtf8(str, isolate, stack_buf.ptr, utf8_len, 0);
+        return .{ .slice = stack_buf[0..utf8_len] };
+    }
+    const heap_buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
+    _ = c.v8__String__WriteUtf8(str, isolate, heap_buf.ptr, utf8_len, 0);
+    return .{ .slice = heap_buf, .heap = heap_buf };
 }
-
 fn defaultPortForScheme(scheme: []const u8) ?u16 {
     if (std.mem.eql(u8, scheme, "http")) return 80;
     if (std.mem.eql(u8, scheme, "https")) return 443;
@@ -39,75 +48,18 @@ fn defaultPortForScheme(scheme: []const u8) ?u16 {
     if (std.mem.eql(u8, scheme, "ftp")) return 21;
     return null;
 }
-
 fn isSpecialScheme(scheme: []const u8) bool {
     return defaultPortForScheme(scheme) != null or std.mem.eql(u8, scheme, "file");
 }
-
-fn isAlphaNum(c2: u8) bool {
-    return (c2 >= 'a' and c2 <= 'z') or (c2 >= 'A' and c2 <= 'Z') or (c2 >= '0' and c2 <= '9');
-}
-
-fn isFormUnreserved(c2: u8) bool {
-    return isAlphaNum(c2) or c2 == '*' or c2 == '-' or c2 == '.' or c2 == '_';
-}
-
-fn formUrlEncode(input: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    for (input) |b| {
-        if (b == ' ') {
-            try result.append(gpa, '+');
-        } else if (isFormUnreserved(b)) {
-            try result.append(gpa, b);
-        } else {
-            try result.append(gpa, '%');
-            try result.print(gpa, "{X:0>2}", .{b});
-        }
-    }
-    return try result.toOwnedSlice(gpa);
-}
-
-fn formUrlDecode(input: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    var i: usize = 0;
-    while (i < input.len) {
-        if (input[i] == '+') {
-            try result.append(gpa, ' ');
-            i += 1;
-        } else if (input[i] == '%' and i + 2 < input.len) {
-            const hi = std.fmt.charToDigit(input[i + 1], 16) catch {
-                try result.append(gpa, input[i]);
-                i += 1;
-                continue;
-            };
-            const lo = std.fmt.charToDigit(input[i + 2], 16) catch {
-                try result.append(gpa, input[i]);
-                i += 1;
-                continue;
-            };
-            try result.append(gpa, hi * 16 + lo);
-            i += 3;
-        } else {
-            try result.append(gpa, input[i]);
-            i += 1;
-        }
-    }
-    return try result.toOwnedSlice(gpa);
-}
-
 // ============================================================
 // URLSearchParams
 // ============================================================
-
 const Pair = struct { name: []const u8, value: []const u8 };
-
 const URLSearchParamsData = struct {
     pairs: std.ArrayList(Pair),
-
     fn init() URLSearchParamsData {
         return .{ .pairs = std.ArrayList(Pair).empty };
     }
-
     fn deinit(self: *URLSearchParamsData) void {
         for (self.pairs.items) |pair| {
             gpa.free(pair.name);
@@ -115,7 +67,6 @@ const URLSearchParamsData = struct {
         }
         self.pairs.deinit(gpa);
     }
-
     fn parseFromString(self: *URLSearchParamsData, str: []const u8) void {
         if (str.len == 0) return;
         var rest = str;
@@ -136,13 +87,11 @@ const URLSearchParamsData = struct {
             }
         }
     }
-
     fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         const n = gpa.dupe(u8, name) catch return;
         const v = gpa.dupe(u8, value) catch return;
         self.pairs.append(gpa, .{ .name = n, .value = v }) catch return;
     }
-
     fn deleteEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) void {
         var i: usize = 0;
         while (i < self.pairs.items.len) {
@@ -157,14 +106,12 @@ const URLSearchParamsData = struct {
             i += 1;
         }
     }
-
     fn getFirst(self: *const URLSearchParamsData, name: []const u8) ?[]const u8 {
         for (self.pairs.items) |pair| {
             if (std.mem.eql(u8, pair.name, name)) return pair.value;
         }
         return null;
     }
-
     fn getAllValues(self: *const URLSearchParamsData, name: []const u8) [][]const u8 {
         var result = std.ArrayList([]const u8).empty;
         for (self.pairs.items) |pair| {
@@ -174,7 +121,6 @@ const URLSearchParamsData = struct {
         }
         return result.toOwnedSlice(gpa) catch &.{};
     }
-
     fn hasEntry(self: *const URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
         for (self.pairs.items) |pair| {
             if (std.mem.eql(u8, pair.name, name)) {
@@ -183,7 +129,6 @@ const URLSearchParamsData = struct {
         }
         return false;
     }
-
     fn setEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         var found = false;
         var i: usize = 0;
@@ -205,7 +150,6 @@ const URLSearchParamsData = struct {
         }
         if (!found) self.appendPair(name, value);
     }
-
     fn sortPairs(self: *URLSearchParamsData) void {
         std.mem.sort(Pair, self.pairs.items, {}, struct {
             fn lessThan(_: void, a: Pair, b: Pair) bool {
@@ -213,7 +157,6 @@ const URLSearchParamsData = struct {
             }
         }.lessThan);
     }
-
     fn serialize(self: *const URLSearchParamsData) ![]const u8 {
         var result = std.ArrayList(u8).empty;
         for (self.pairs.items, 0..) |pair, i| {
@@ -225,7 +168,6 @@ const URLSearchParamsData = struct {
         return try result.toOwnedSlice(gpa);
     }
 };
-
 fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -237,33 +179,28 @@ fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
 }
-
 fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
-
     const data = gpa.create(URLSearchParamsData) catch {
         throw(isolate, "out of memory");
         return;
     };
     data.* = URLSearchParamsData.init();
-
     if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
         const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
         if (c.v8__Value__IsString(init_val)) {
-            const str = extractStringFromVal(isolate, init_val);
-            if (str) |s| {
-                defer gpa.free(s);
-                data.parseFromString(s);
+            var str_buf: [512]u8 = undefined;
+            if (extractStringAuto(isolate, init_val, &str_buf)) |s| {
+                defer s.deinit();
+                data.parseFromString(s.slice);
             }
         }
     }
-
     const obj = c.v8__Object__New(isolate);
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
     c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
-
     const fns = .{
         .{ "get", spGet },
         .{ "getAll", spGetAll },
@@ -283,12 +220,10 @@ fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
 }
-
 fn spGet(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
@@ -298,15 +233,15 @@ fn spGet(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
         return;
     }
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
-    if (data.getFirst(name)) |v| {
+    var name_buf: [128]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
+    if (data.getFirst(name.slice)) |v| {
         c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, v));
     } else {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
     }
 }
-
 fn spGetAll(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -317,9 +252,10 @@ fn spGetAll(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Array__New(isolate, 0)));
         return;
     }
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
-    const vals = data.getAllValues(name);
+    var name_buf: [128]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
+    const vals = data.getAllValues(name.slice);
     defer gpa.free(vals);
     const arr = c.v8__Array__New(isolate, @intCast(vals.len));
     for (vals, 0..) |v, i| {
@@ -328,7 +264,6 @@ fn spGetAll(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
-
 fn spHas(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
@@ -338,68 +273,71 @@ fn spHas(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
         return;
     }
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
+    var name_buf: [128]u8 = undefined;
+    var val_stack: [256]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
     var val: ?[]const u8 = null;
-    var val_buf: ?[:0]const u8 = null;
+    var val_ex: ?ExtractedStr = null;
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const v = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (!c.v8__Value__IsUndefined(v)) {
-            val_buf = extractStringFromVal(isolate, v);
-            val = val_buf;
+            val_ex = extractStringAuto(isolate, v, &val_stack);
+            if (val_ex) |ex| val = ex.slice;
         }
     }
-    defer if (val_buf) |vb| gpa.free(vb);
-    const result = data.hasEntry(name, val);
+    defer if (val_ex) |ex| ex.deinit();
+    const result = data.hasEntry(name.slice, val);
     c.v8__ReturnValue__Set(ret, if (result) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
 }
-
 fn spSet(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
     if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
-    const value = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1)) orelse return;
-    defer gpa.free(value);
-    data.setEntry(name, value);
+    var name_buf: [128]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
+    const value = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1), &value_buf) orelse return;
+    defer value.deinit();
+    data.setEntry(name.slice, value.slice);
 }
-
 fn spAppend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
     if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
-    const value = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1)) orelse return;
-    defer gpa.free(value);
-    data.appendPair(name, value);
+    var name_buf: [128]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
+    const value = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1), &value_buf) orelse return;
+    defer value.deinit();
+    data.appendPair(name.slice, value.slice);
 }
-
 fn spDelete(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-    const name = extractStringFromVal(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
-    defer gpa.free(name);
+    var name_buf: [128]u8 = undefined;
+    var val_stack: [256]u8 = undefined;
+    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    defer name.deinit();
     var val: ?[]const u8 = null;
-    var val_buf: ?[:0]const u8 = null;
+    var val_ex: ?ExtractedStr = null;
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const v = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (!c.v8__Value__IsUndefined(v)) {
-            val_buf = extractStringFromVal(isolate, v);
-            val = val_buf;
+            val_ex = extractStringAuto(isolate, v, &val_stack);
+            if (val_ex) |ex| val = ex.slice;
         }
     }
-    defer if (val_buf) |vb| gpa.free(vb);
-    data.deleteEntry(name, val);
+    defer if (val_ex) |ex| ex.deinit();
+    data.deleteEntry(name.slice, val);
 }
-
 fn spSort(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     data.sortPairs();
 }
-
 fn spToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
@@ -412,7 +350,6 @@ fn spToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     defer gpa.free(str);
     c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, str));
 }
-
 fn spSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractSPData(info) orelse return;
@@ -421,7 +358,6 @@ fn spSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const num = c.v8__Integer__NewFromUnsigned(isolate, @intCast(data.pairs.items.len));
     c.v8__ReturnValue__Set(ret, @ptrCast(num));
 }
-
 fn spEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -438,7 +374,6 @@ fn spEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
-
 fn spKeys(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -452,7 +387,6 @@ fn spKeys(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
-
 fn spValues(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -466,7 +400,6 @@ fn spValues(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
-
 fn spForEach(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -483,11 +416,9 @@ fn spForEach(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         _ = c.v8__Function__Call(@ptrCast(callback), context, @ptrCast(c.v8__Undefined(isolate)), 3, &argv);
     }
 }
-
 // ============================================================
 // URL
 // ============================================================
-
 const UrlData = struct {
     scheme: []const u8,
     host: []const u8,
@@ -498,7 +429,6 @@ const UrlData = struct {
     username: []const u8,
     password: []const u8,
     search_params: *URLSearchParamsData,
-
     fn deinit(self: *UrlData) void {
         gpa.free(self.scheme);
         gpa.free(self.host);
@@ -510,7 +440,6 @@ const UrlData = struct {
         self.search_params.deinit();
         gpa.destroy(self.search_params);
     }
-
     fn serialize(self: *const UrlData) ![]const u8 {
         var result = std.ArrayList(u8).empty;
         try result.appendSlice(gpa, self.scheme);
@@ -546,7 +475,6 @@ const UrlData = struct {
         }
         return try result.toOwnedSlice(gpa);
     }
-
     fn originStr(self: *const UrlData) ![]const u8 {
         if (std.mem.eql(u8, self.scheme, "file") or !isSpecialScheme(self.scheme)) {
             return try gpa.dupe(u8, "null");
@@ -568,7 +496,6 @@ const UrlData = struct {
         }
         return try result.toOwnedSlice(gpa);
     }
-
     fn hostStr(self: *const UrlData) ![]const u8 {
         var result = std.ArrayList(u8).empty;
         try result.appendSlice(gpa, self.host);
@@ -585,11 +512,9 @@ const UrlData = struct {
         }
         return try result.toOwnedSlice(gpa);
     }
-
     fn protocolStr(self: *const UrlData, buf: *[256]u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s}:", .{self.scheme}) catch self.scheme;
     }
-
     fn portStr(self: *const UrlData) ![]const u8 {
         if (self.port) |port| {
             if (defaultPortForScheme(self.scheme)) |dp| {
@@ -599,14 +524,12 @@ const UrlData = struct {
         }
         return try gpa.dupe(u8, "");
     }
-
     fn searchStr(self: *const UrlData) ![]const u8 {
         if (self.query.len > 0) {
             return try std.fmt.allocPrint(gpa, "?{s}", .{self.query});
         }
         return try gpa.dupe(u8, "");
     }
-
     fn hashStr(self: *const UrlData) ![]const u8 {
         if (self.fragment.len > 0) {
             return try std.fmt.allocPrint(gpa, "#{s}", .{self.fragment});
@@ -614,7 +537,6 @@ const UrlData = struct {
         return try gpa.dupe(u8, "");
     }
 };
-
 fn parseUrlAbsolute(input: []const u8) !UrlData {
     const uri = try std.Uri.parse(input);
     const scheme = try gpa.dupe(u8, uri.scheme);
@@ -628,11 +550,9 @@ fn parseUrlAbsolute(input: []const u8) !UrlData {
     const fragment = if (uri.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
     const username = if (uri.user) |u| (try u.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
     const password = if (uri.password) |p| (try p.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-
     const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
     sp.* = URLSearchParamsData.init();
     sp.parseFromString(query);
-
     return .{
         .scheme = scheme,
         .host = host,
@@ -645,16 +565,9 @@ fn parseUrlAbsolute(input: []const u8) !UrlData {
         .search_params = sp,
     };
 }
-
 fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     const base = try std.Uri.parse(base_url);
-
-    const base_scheme = base.scheme;
-    const base_host = if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else "";
-    defer if (base_host.len > 0 and base.host == null) {};
-    const base_path = try base.path.toRawMaybeAlloc(gpa);
     const base_port = base.port;
-
     var result_scheme: []const u8 = undefined;
     var result_host: []const u8 = undefined;
     var result_port: ?u16 = undefined;
@@ -663,7 +576,6 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     var result_path: []const u8 = undefined;
     var result_query: []const u8 = "";
     var result_fragment: []const u8 = "";
-
     if (std.Uri.parse(input)) |rel| {
         if (rel.scheme.len > 0) {
             result_scheme = try gpa.dupe(u8, rel.scheme);
@@ -677,11 +589,9 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
             result_fragment = if (rel.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
             if (rel.user) |u| result_user = try u.toRawMaybeAlloc(gpa);
             if (rel.password) |p| result_pass = try p.toRawMaybeAlloc(gpa);
-
             const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
-
             return .{
                 .scheme = result_scheme,
                 .host = result_host,
@@ -694,9 +604,8 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
                 .search_params = sp,
             };
         }
-
         if (rel.host) |h| {
-            result_scheme = try gpa.dupe(u8, base_scheme);
+            result_scheme = try gpa.dupe(u8, base.scheme);
             result_host = try h.toRawMaybeAlloc(gpa);
             result_port = rel.port;
             result_path = if (rel.path.isEmpty())
@@ -705,11 +614,9 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
                 try removeDotSegments(try rel.path.toRawMaybeAlloc(gpa));
             result_query = if (rel.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
             result_fragment = if (rel.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-
             const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
-
             return .{
                 .scheme = result_scheme,
                 .host = result_host,
@@ -723,13 +630,18 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
             };
         }
     } else |_| {}
-
-    result_scheme = try gpa.dupe(u8, base_scheme);
+    // Fallthrough (path/query/fragment-only relative resolution). Base host
+    // and path are allocated here rather than up front so the early-return
+    // branches above cannot leak them, and defers guarantee release.
+    const base_host_owned = if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else null;
+    defer if (base_host_owned) |bh| gpa.free(bh);
+    const base_host = base_host_owned orelse "";
+    const base_path = try base.path.toRawMaybeAlloc(gpa);
+    defer gpa.free(base_path);
+    result_scheme = try gpa.dupe(u8, base.scheme);
     result_host = try gpa.dupe(u8, base_host);
     result_port = base_port;
-
     const rel_path = input;
-
     if (rel_path.len == 0) {
         result_path = try gpa.dupe(u8, base_path);
         result_query = if (base.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
@@ -747,11 +659,9 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
         result_path = try removeDotSegments(try mergePaths(base_path, rel_path));
         result_query = "";
     }
-
     const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
     sp.* = URLSearchParamsData.init();
     sp.parseFromString(result_query);
-
     return .{
         .scheme = result_scheme,
         .host = result_host,
@@ -764,7 +674,6 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
         .search_params = sp,
     };
 }
-
 fn mergePaths(base_path: []const u8, rel_path: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     try result.appendSlice(gpa, base_path);
@@ -776,7 +685,6 @@ fn mergePaths(base_path: []const u8, rel_path: []const u8) ![]const u8 {
     try result.appendSlice(gpa, rel_path);
     return try result.toOwnedSlice(gpa);
 }
-
 fn removeDotSegments(input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     var rest = input;
@@ -814,8 +722,6 @@ fn removeDotSegments(input: []const u8) ![]const u8 {
             try result.append(gpa, '/');
         } else if (std.mem.eql(u8, rest, ".")) {
             rest = "";
-        } else if (std.mem.eql(u8, rest, "..")) {
-            rest = "";
         } else if (rest[0] == '/') {
             try result.append(gpa, '/');
             rest = rest[1..];
@@ -830,7 +736,6 @@ fn removeDotSegments(input: []const u8) ![]const u8 {
     }
     return try result.toOwnedSlice(gpa);
 }
-
 fn extractUrlData(info: ?*const c.FunctionCallbackInfo) ?*UrlData {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -842,18 +747,15 @@ fn extractUrlData(info: ?*const c.FunctionCallbackInfo) ?*UrlData {
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
 }
-
 fn setUrlProp(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, name: []const u8, val: []const u8) void {
     var out: c.MaybeBool = undefined;
     c.v8__Object__Set(@ptrCast(obj), context, c.v8__String__NewFromUtf8(isolate, @ptrCast(name.ptr), 0, @intCast(name.len)), zigStringToV8(isolate, val), &out);
 }
-
 fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate) orelse return null;
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
     c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
-
     const href_val = data.serialize() catch "";
     defer if (href_val.len > 0) gpa.free(href_val);
     const origin_val = data.originStr() catch "";
@@ -868,7 +770,6 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
     defer if (search_val.len > 0) gpa.free(search_val);
     const hash_val = data.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
-
     setUrlProp(isolate, context, obj, "href", href_val);
     setUrlProp(isolate, context, obj, "origin", origin_val);
     setUrlProp(isolate, context, obj, "host", host_val);
@@ -888,19 +789,15 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
     const sp_obj = createSPJsObject(isolate, context, data.search_params);
     c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "searchParams", 0, -1), sp_obj, &out);
-
     return obj;
 }
-
 fn createSPJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *URLSearchParamsData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate) orelse return null;
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
     c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
-
     const fns = .{
         .{ "get", spGet },
         .{ "getAll", spGetAll },
@@ -920,57 +817,49 @@ fn createSPJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *URLSearch
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
         c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
     }
-
     return obj;
 }
-
 fn urlConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
-
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
         throwTypeError(isolate, "URL constructor requires at least 1 argument");
         return;
     }
-
+    var input_buf: [512]u8 = undefined;
+    var base_buf: [512]u8 = undefined;
     const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringFromVal(isolate, input_val) orelse return;
-    defer gpa.free(input);
-
-    var base: ?[:0]const u8 = null;
-    defer if (base) |b| gpa.free(b);
-
+    const input = extractStringAuto(isolate, input_val, &input_buf) orelse return;
+    defer input.deinit();
+    var base: ?ExtractedStr = null;
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringFromVal(isolate, base_val);
+            base = extractStringAuto(isolate, base_val, &base_buf);
         }
     }
-
+    defer if (base) |b| b.deinit();
     const data_ptr = gpa.create(UrlData) catch {
         throw(isolate, "out of memory");
         return;
     };
     data_ptr.* = if (base) |b|
-        parseUrlRelative(input, b) catch {
+        parseUrlRelative(input.slice, b.slice) catch {
             gpa.destroy(data_ptr);
             throwTypeError(isolate, "Invalid URL");
             return;
         }
     else
-        parseUrlAbsolute(input) catch {
+        parseUrlAbsolute(input.slice) catch {
             gpa.destroy(data_ptr);
             throwTypeError(isolate, "Invalid URL");
             return;
         };
-
     const obj = createUrlJsObject(isolate, context, data_ptr) orelse return;
-
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
 }
-
 fn urlToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const data = extractUrlData(info) orelse return;
@@ -980,86 +869,75 @@ fn urlToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     defer if (str.len > 0) gpa.free(str);
     c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, str));
 }
-
 fn urlToJSON(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     urlToString(info);
 }
-
 fn urlParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
         return;
     }
-
+    var input_buf: [512]u8 = undefined;
+    var base_buf: [512]u8 = undefined;
     const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringFromVal(isolate, input_val) orelse return;
-    defer gpa.free(input);
-
-    var base: ?[:0]const u8 = null;
-    defer if (base) |b| gpa.free(b);
-
+    const input = extractStringAuto(isolate, input_val, &input_buf) orelse return;
+    defer input.deinit();
+    var base: ?ExtractedStr = null;
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringFromVal(isolate, base_val);
+            base = extractStringAuto(isolate, base_val, &base_buf);
         }
     }
-
+    defer if (base) |b| b.deinit();
     const data_ptr = gpa.create(UrlData) catch return;
     data_ptr.* = if (base) |b|
-        parseUrlRelative(input, b) catch {
+        parseUrlRelative(input.slice, b.slice) catch {
             gpa.destroy(data_ptr);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
             return;
         }
     else
-        parseUrlAbsolute(input) catch {
+        parseUrlAbsolute(input.slice) catch {
             gpa.destroy(data_ptr);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
             return;
         };
-
     const obj = createUrlJsObject(isolate, context, data_ptr) orelse return;
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
 }
-
 fn urlCanParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
         return;
     }
-
+    var input_buf: [512]u8 = undefined;
+    var base_buf: [512]u8 = undefined;
     const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringFromVal(isolate, input_val) orelse {
+    const input = extractStringAuto(isolate, input_val, &input_buf) orelse {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
         return;
     };
-    defer gpa.free(input);
-
-    var base: ?[:0]const u8 = null;
-    defer if (base) |b| gpa.free(b);
-
+    defer input.deinit();
+    var base: ?ExtractedStr = null;
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringFromVal(isolate, base_val);
+            base = extractStringAuto(isolate, base_val, &base_buf);
         }
     }
-
+    defer if (base) |b| b.deinit();
     const valid = if (base) |b|
-        parseUrlRelative(input, b) catch null
+        parseUrlRelative(input.slice, b.slice) catch null
     else
-        parseUrlAbsolute(input) catch null;
-
+        parseUrlAbsolute(input.slice) catch null;
     if (valid) |v| {
         var data = v;
         data.deinit();
@@ -1068,30 +946,23 @@ fn urlCanParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
     }
 }
-
 // ============================================================
 // Setup
 // ============================================================
-
 pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     var hs: c.HandleScope = undefined;
     c.v8__HandleScope__CONSTRUCT(&hs, isolate);
     defer c.v8__HandleScope__DESTRUCT(&hs);
-
     const global = c.v8__Context__Global(context);
     var out: c.MaybeBool = undefined;
-
     const sp_fn = c.v8__Function__New__DEFAULT(context, spConstructor);
     const sp_key = c.v8__String__NewFromUtf8(isolate, "URLSearchParams", 0, -1);
     _ = c.v8__Object__Set(global, context, sp_key, sp_fn, &out);
-
     const url_fn = c.v8__Function__New__DEFAULT(context, urlConstructor);
     const url_key = c.v8__String__NewFromUtf8(isolate, "URL", 0, -1);
     _ = c.v8__Object__Set(global, context, url_key, url_fn, &out);
-
     const parse_fn = c.v8__Function__New__DEFAULT(context, urlParseStatic);
     c.v8__Object__Set(url_fn, context, c.v8__String__NewFromUtf8(isolate, "parse", 0, -1), parse_fn, &out);
-
     const can_parse_fn = c.v8__Function__New__DEFAULT(context, urlCanParseStatic);
     c.v8__Object__Set(url_fn, context, c.v8__String__NewFromUtf8(isolate, "canParse", 0, -1), can_parse_fn, &out);
 }
