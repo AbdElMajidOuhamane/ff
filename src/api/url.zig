@@ -1,6 +1,54 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
+
+// ---- V8 cached strings + functions (rooted once in setup). Previously
+// every URLSearchParams/URL instance created its own "__d" key, all method
+// key strings, and 13 brand-new JSFunction objects — twice over for nested
+// searchParams. Instances now share one rooted set. ----
+var str___d: c.Global = .{ .data_ptr = 0 };
+var str_get: c.Global = .{ .data_ptr = 0 };
+var str_getAll: c.Global = .{ .data_ptr = 0 };
+var str_has: c.Global = .{ .data_ptr = 0 };
+var str_set: c.Global = .{ .data_ptr = 0 };
+var str_append: c.Global = .{ .data_ptr = 0 };
+var str_delete: c.Global = .{ .data_ptr = 0 };
+var str_sort: c.Global = .{ .data_ptr = 0 };
+var str_toString: c.Global = .{ .data_ptr = 0 };
+var str_entries: c.Global = .{ .data_ptr = 0 };
+var str_keys: c.Global = .{ .data_ptr = 0 };
+var str_values: c.Global = .{ .data_ptr = 0 };
+var str_forEach: c.Global = .{ .data_ptr = 0 };
+var str_size: c.Global = .{ .data_ptr = 0 };
+var str_toJSON: c.Global = .{ .data_ptr = 0 };
+var str_href: c.Global = .{ .data_ptr = 0 };
+var str_origin: c.Global = .{ .data_ptr = 0 };
+var str_host: c.Global = .{ .data_ptr = 0 };
+var str_hostname: c.Global = .{ .data_ptr = 0 };
+var str_port: c.Global = .{ .data_ptr = 0 };
+var str_pathname: c.Global = .{ .data_ptr = 0 };
+var str_search: c.Global = .{ .data_ptr = 0 };
+var str_hash: c.Global = .{ .data_ptr = 0 };
+var str_username: c.Global = .{ .data_ptr = 0 };
+var str_password: c.Global = .{ .data_ptr = 0 };
+var str_protocol: c.Global = .{ .data_ptr = 0 };
+var str_searchParams: c.Global = .{ .data_ptr = 0 };
+var fn_spGet: c.Global = .{ .data_ptr = 0 };
+var fn_spGetAll: c.Global = .{ .data_ptr = 0 };
+var fn_spHas: c.Global = .{ .data_ptr = 0 };
+var fn_spSet: c.Global = .{ .data_ptr = 0 };
+var fn_spAppend: c.Global = .{ .data_ptr = 0 };
+var fn_spDelete: c.Global = .{ .data_ptr = 0 };
+var fn_spSort: c.Global = .{ .data_ptr = 0 };
+var fn_spToString: c.Global = .{ .data_ptr = 0 };
+var fn_spEntries: c.Global = .{ .data_ptr = 0 };
+var fn_spKeys: c.Global = .{ .data_ptr = 0 };
+var fn_spValues: c.Global = .{ .data_ptr = 0 };
+var fn_spForEach: c.Global = .{ .data_ptr = 0 };
+var fn_spSize: c.Global = .{ .data_ptr = 0 };
+var fn_urlToString: c.Global = .{ .data_ptr = 0 };
+var fn_urlToJSON: c.Global = .{ .data_ptr = 0 };
+
 fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
     const exc = c.v8__Exception__Error(v8_msg);
@@ -13,6 +61,11 @@ fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
 }
 fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
     return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
+}
+/// Cached-Global accessor with an inline fallback so a missing root can
+/// never turn a hot path into a null-deref.
+fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
+    return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, fallback));
 }
 // Hot-path string extraction: writes into the caller-provided stack buffer
 // when the string fits (typical searchParams names/values), falling back to
@@ -173,11 +226,40 @@ fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const this = c.v8__FunctionCallbackInfo__This(info);
     if (this == null) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, data_key);
+    const ext_val = c.v8__Object__Get(@ptrCast(this), context, globalStr(&str___d, isolate, "__d"));
     if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
+}
+/// Shared by spConstructor and createSPJsObject: attaches the single rooted
+/// function set under the single rooted key set (was: 13 fresh JSFunctions +
+/// 13 fresh key strings per instance, duplicated in two places).
+fn attachSPMethods(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c.Value) void {
+    var out: c.MaybeBool = undefined;
+    const pairs = .{
+        .{ &fn_spGet, &str_get, "get" },
+        .{ &fn_spGetAll, &str_getAll, "getAll" },
+        .{ &fn_spHas, &str_has, "has" },
+        .{ &fn_spSet, &str_set, "set" },
+        .{ &fn_spAppend, &str_append, "append" },
+        .{ &fn_spDelete, &str_delete, "delete" },
+        .{ &fn_spSort, &str_sort, "sort" },
+        .{ &fn_spToString, &str_toString, "toString" },
+        .{ &fn_spEntries, &str_entries, "entries" },
+        .{ &fn_spKeys, &str_keys, "keys" },
+        .{ &fn_spValues, &str_values, "values" },
+        .{ &fn_spForEach, &str_forEach, "forEach" },
+        .{ &fn_spSize, &str_size, "size" },
+    };
+    inline for (pairs) |pair| {
+        c.v8__Object__Set(
+            obj,
+            context,
+            globalStr(pair[1], isolate, pair[2]),
+            @ptrCast(c.v8__Global__Get(pair[0], isolate)),
+            &out,
+        );
+    }
 }
 fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
@@ -200,26 +282,8 @@ fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const obj = c.v8__Object__New(isolate);
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
-    const fns = .{
-        .{ "get", spGet },
-        .{ "getAll", spGetAll },
-        .{ "has", spHas },
-        .{ "set", spSet },
-        .{ "append", spAppend },
-        .{ "delete", spDelete },
-        .{ "sort", spSort },
-        .{ "toString", spToString },
-        .{ "entries", spEntries },
-        .{ "keys", spKeys },
-        .{ "values", spValues },
-        .{ "forEach", spForEach },
-        .{ "size", spSize },
-    };
-    inline for (fns) |entry| {
-        const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
-    }
+    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
+    attachSPMethods(isolate, context, obj);
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
     c.v8__ReturnValue__Set(ret, @ptrCast(obj));
@@ -741,21 +805,20 @@ fn extractUrlData(info: ?*const c.FunctionCallbackInfo) ?*UrlData {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const this = c.v8__FunctionCallbackInfo__This(info);
     if (this == null) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, data_key);
+    const ext_val = c.v8__Object__Get(@ptrCast(this), context, globalStr(&str___d, isolate, "__d"));
     if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
 }
-fn setUrlProp(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, name: []const u8, val: []const u8) void {
+fn setUrlProp(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, g: *c.Global, comptime fallback: []const u8, val: []const u8) void {
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(@ptrCast(obj), context, c.v8__String__NewFromUtf8(isolate, @ptrCast(name.ptr), 0, @intCast(name.len)), zigStringToV8(isolate, val), &out);
+    c.v8__Object__Set(@ptrCast(obj), context, globalStr(g, isolate, fallback), zigStringToV8(isolate, val), &out);
 }
 fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate) orelse return null;
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
+    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
     const href_val = data.serialize() catch "";
     defer if (href_val.len > 0) gpa.free(href_val);
     const origin_val = data.originStr() catch "";
@@ -770,53 +833,40 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
     defer if (search_val.len > 0) gpa.free(search_val);
     const hash_val = data.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
-    setUrlProp(isolate, context, obj, "href", href_val);
-    setUrlProp(isolate, context, obj, "origin", origin_val);
-    setUrlProp(isolate, context, obj, "host", host_val);
-    setUrlProp(isolate, context, obj, "hostname", data.host);
-    setUrlProp(isolate, context, obj, "port", port_val);
-    setUrlProp(isolate, context, obj, "pathname", data.path);
-    setUrlProp(isolate, context, obj, "search", search_val);
-    setUrlProp(isolate, context, obj, "hash", hash_val);
-    setUrlProp(isolate, context, obj, "username", data.username);
-    setUrlProp(isolate, context, obj, "password", data.password);
-    setUrlProp(isolate, context, obj, "protocol", protocol_val);
-    const fns = .{
-        .{ "toString", urlToString },
-        .{ "toJSON", urlToJSON },
+    setUrlProp(isolate, context, obj, &str_href, "href", href_val);
+    setUrlProp(isolate, context, obj, &str_origin, "origin", origin_val);
+    setUrlProp(isolate, context, obj, &str_host, "host", host_val);
+    setUrlProp(isolate, context, obj, &str_hostname, "hostname", data.host);
+    setUrlProp(isolate, context, obj, &str_port, "port", port_val);
+    setUrlProp(isolate, context, obj, &str_pathname, "pathname", data.path);
+    setUrlProp(isolate, context, obj, &str_search, "search", search_val);
+    setUrlProp(isolate, context, obj, &str_hash, "hash", hash_val);
+    setUrlProp(isolate, context, obj, &str_username, "username", data.username);
+    setUrlProp(isolate, context, obj, &str_password, "password", data.password);
+    setUrlProp(isolate, context, obj, &str_protocol, "protocol", protocol_val);
+    const method_pairs = .{
+        .{ &fn_urlToString, &str_toString, "toString" },
+        .{ &fn_urlToJSON, &str_toJSON, "toJSON" },
     };
-    inline for (fns) |entry| {
-        const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
+    inline for (method_pairs) |pair| {
+        c.v8__Object__Set(
+            obj,
+            context,
+            globalStr(pair[1], isolate, pair[2]),
+            @ptrCast(c.v8__Global__Get(pair[0], isolate)),
+            &out,
+        );
     }
     const sp_obj = createSPJsObject(isolate, context, data.search_params);
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "searchParams", 0, -1), sp_obj, &out);
+    c.v8__Object__Set(obj, context, globalStr(&str_searchParams, isolate, "searchParams"), sp_obj, &out);
     return obj;
 }
 fn createSPJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *URLSearchParamsData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate) orelse return null;
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
-    const fns = .{
-        .{ "get", spGet },
-        .{ "getAll", spGetAll },
-        .{ "has", spHas },
-        .{ "set", spSet },
-        .{ "append", spAppend },
-        .{ "delete", spDelete },
-        .{ "sort", spSort },
-        .{ "toString", spToString },
-        .{ "entries", spEntries },
-        .{ "keys", spKeys },
-        .{ "values", spValues },
-        .{ "forEach", spForEach },
-        .{ "size", spSize },
-    };
-    inline for (fns) |entry| {
-        const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
-    }
+    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
+    attachSPMethods(isolate, context, obj);
     return obj;
 }
 fn urlConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -955,6 +1005,41 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     defer c.v8__HandleScope__DESTRUCT(&hs);
     const global = c.v8__Context__Global(context);
     var out: c.MaybeBool = undefined;
+
+    // Root every per-call constant once.
+    inline for (.{
+        .{ "__d", &str___d },
+        .{ "get", &str_get },           .{ "getAll", &str_getAll },
+        .{ "has", &str_has },           .{ "set", &str_set },
+        .{ "append", &str_append },     .{ "delete", &str_delete },
+        .{ "sort", &str_sort },         .{ "toString", &str_toString },
+        .{ "entries", &str_entries },   .{ "keys", &str_keys },
+        .{ "values", &str_values },     .{ "forEach", &str_forEach },
+        .{ "size", &str_size },         .{ "toJSON", &str_toJSON },
+        .{ "href", &str_href },         .{ "origin", &str_origin },
+        .{ "host", &str_host },         .{ "hostname", &str_hostname },
+        .{ "port", &str_port },         .{ "pathname", &str_pathname },
+        .{ "search", &str_search },     .{ "hash", &str_hash },
+        .{ "username", &str_username }, .{ "password", &str_password },
+        .{ "protocol", &str_protocol }, .{ "searchParams", &str_searchParams },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
+
+    // One shared function set for every instance.
+    inline for (.{
+        .{ spGet, &fn_spGet },           .{ spGetAll, &fn_spGetAll },
+        .{ spHas, &fn_spHas },           .{ spSet, &fn_spSet },
+        .{ spAppend, &fn_spAppend },     .{ spDelete, &fn_spDelete },
+        .{ spSort, &fn_spSort },         .{ spToString, &fn_spToString },
+        .{ spEntries, &fn_spEntries },   .{ spKeys, &fn_spKeys },
+        .{ spValues, &fn_spValues },     .{ spForEach, &fn_spForEach },
+        .{ spSize, &fn_spSize },         .{ urlToString, &fn_urlToString },
+        .{ urlToJSON, &fn_urlToJSON },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
+    }
+
     const sp_fn = c.v8__Function__New__DEFAULT(context, spConstructor);
     const sp_key = c.v8__String__NewFromUtf8(isolate, "URLSearchParams", 0, -1);
     _ = c.v8__Object__Set(global, context, sp_key, sp_fn, &out);

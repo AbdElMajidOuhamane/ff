@@ -11,8 +11,25 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
 const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 
+// Thread-safe general-purpose allocator: no mmap/munmap syscall pair per
+// allocation (mirrors fetch.zig's rationale).
+const gpa = std.heap.smp_allocator;
+
 extern fn std__shared_ptr__v8__BackingStore__get(self: *const c.SharedPtr) callconv(.c) ?*c.BackingStore;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
+
+// ---- V8 property-key/value globals (rooted once in setup): every subtle.*
+// callback used to recreate these identical strings on each call. ----
+var str_name: c.Global = .{ .data_ptr = 0 };
+var str_data: c.Global = .{ .data_ptr = 0 };
+var str_salt: c.Global = .{ .data_ptr = 0 };
+var str_type: c.Global = .{ .data_ptr = 0 };
+var str_algorithm: c.Global = .{ .data_ptr = 0 };
+var str_extractable: c.Global = .{ .data_ptr = 0 };
+// static VALUE strings handed to property setters
+var str_secret: c.Global = .{ .data_ptr = 0 };
+var str_aes_gcm: c.Global = .{ .data_ptr = 0 };
+var str_hmac: c.Global = .{ .data_ptr = 0 };
 
 fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
@@ -22,6 +39,12 @@ fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
 
 fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
     return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
+}
+
+/// Cached-Global accessor with an inline fallback so a missing root can
+/// never turn a hot path into a null-deref.
+fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
+    return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, fallback));
 }
 
 fn getBackingStoreData(isolate: ?*c.Isolate, val: *const c.Value) ?struct { ptr: [*]u8, len: usize } {
@@ -66,30 +89,33 @@ fn rejectPromiseWithError(isolate: ?*c.Isolate, context: ?*c.Context, resolver: 
     c.v8__Promise__Resolver__Reject(resolver, context, err_val, &out);
 }
 
-fn getAlgoName(isolate: ?*c.Isolate, algo_val: *const c.Value) ?[:0]const u8 {
-    if (c.v8__Value__IsString(algo_val)) {
-        return extractStringFromVal(isolate, algo_val);
-    }
-    if (c.v8__Value__IsObject(algo_val)) {
-        const context = c.v8__Isolate__GetCurrentContext(isolate);
-        const name_key = c.v8__String__NewFromUtf8(isolate, "name", 0, -1);
-        const name_val = c.v8__Object__Get(@ptrCast(algo_val), context, name_key);
-        if (name_val != null and c.v8__Value__IsString(name_val)) {
-            return extractStringFromVal(isolate, name_val.?);
-        }
-    }
-    return null;
-}
-
-fn extractStringFromVal(isolate: ?*c.Isolate, val: *const c.Value) ?[:0]const u8 {
+/// Extracts an algorithm/format NAME into the CALLER-provided buffer and
+/// returns a borrowed slice — zero heap allocations. Names are short spec
+/// tokens ("SHA-256", "AES-GCM", "raw"); anything longer than the buffer
+/// simply fails the downstream equality checks and is rejected, which is
+/// the same outcome as an unknown algorithm.
+fn extractStrBuf(isolate: ?*c.Isolate, val: *const c.Value, buf: []u8) ?[]const u8 {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const str = c.v8__Value__ToDetailString(val, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [4096]u8 = undefined;
     const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return std.heap.page_allocator.dupeZ(u8, buf[0..len]) catch null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(len), 0);
+    return buf[0..len];
+}
+
+fn getAlgoName(isolate: ?*c.Isolate, algo_val: *const c.Value, buf: []u8) ?[]const u8 {
+    if (c.v8__Value__IsString(algo_val)) {
+        return extractStrBuf(isolate, algo_val, buf);
+    }
+    if (c.v8__Value__IsObject(algo_val)) {
+        const context = c.v8__Isolate__GetCurrentContext(isolate);
+        const name_val = c.v8__Object__Get(@ptrCast(algo_val), context, globalStr(&str_name, isolate, "name"));
+        if (name_val != null and c.v8__Value__IsString(name_val)) {
+            return extractStrBuf(isolate, name_val.?, buf);
+        }
+    }
+    return null;
 }
 
 fn getRandomBytes(buf: []u8) void {
@@ -98,7 +124,13 @@ fn getRandomBytes(buf: []u8) void {
             var off: usize = 0;
             while (off < buf.len) {
                 const n = std.c.getrandom(buf.ptr + off, buf.len - off, 0);
-                if (n < 0) continue;
+                if (n < 0) {
+                    // Retry only on EINTR; anything else falls back once to
+                    // the CSPRNG instead of spinning forever.
+                    if (std.posix.errno(n) == .INTR) continue;
+                    std.crypto.random.bytes(buf[off..]);
+                    return;
+                }
                 off += @intCast(n);
             }
         },
@@ -174,11 +206,11 @@ fn subtleDigestCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void 
     const algo_val = c.v8__FunctionCallbackInfo__INDEX(info, 0).?;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const bs = getBackingStoreData(isolate, data_val) orelse {
         throw(isolate, "invalid data");
@@ -218,11 +250,12 @@ fn subtleGenerateKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) 
     }
 
     const algo_val = c.v8__FunctionCallbackInfo__INDEX(info, 0).?;
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
@@ -233,13 +266,13 @@ fn subtleGenerateKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) 
 
         const ab_val = createArrayBuffer(isolate, &key_data);
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "type", 0, -1), zigStringToV8(isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "data", 0, -1), ab_val, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
 
         const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, c.v8__String__NewFromUtf8(isolate, "name", 0, -1), zigStringToV8(isolate, "AES-GCM"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "algorithm", 0, -1), algo_obj, &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "extractable", 0, -1), @ptrCast(c.v8__True(isolate)), &out);
+        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_aes_gcm, isolate, "AES-GCM"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
 
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else if (std.mem.eql(u8, algo_name, "HMAC")) {
@@ -249,13 +282,13 @@ fn subtleGenerateKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) 
 
         const ab_val = createArrayBuffer(isolate, &key_data);
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "type", 0, -1), zigStringToV8(isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "data", 0, -1), ab_val, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
 
         const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, c.v8__String__NewFromUtf8(isolate, "name", 0, -1), zigStringToV8(isolate, "HMAC"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "algorithm", 0, -1), algo_obj, &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "extractable", 0, -1), @ptrCast(c.v8__True(isolate)), &out);
+        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_hmac, isolate, "HMAC"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
 
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else {
@@ -280,17 +313,17 @@ fn subtleImportKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
     const key_data_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
     const algo_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
 
-    const format = extractStringFromVal(isolate, format_val) orelse {
+    // Format and algorithm are live simultaneously -> two buffers.
+    var fmt_buf: [64]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    const format = extractStrBuf(isolate, format_val, &fmt_buf) orelse {
         throw(isolate, "invalid format");
         return;
     };
-    defer std.heap.page_allocator.free(format);
-
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const bs = getBackingStoreData(isolate, key_data_val) orelse {
         throw(isolate, "invalid keyData");
@@ -303,26 +336,26 @@ fn subtleImportKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
         const key_obj = c.v8__Object__New(isolate);
         const ab_val = createArrayBuffer(isolate, bs.ptr[0..bs.len]);
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "data", 0, -1), ab_val, &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "type", 0, -1), zigStringToV8(isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "extractable", 0, -1), @ptrCast(c.v8__True(isolate)), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
 
         const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, c.v8__String__NewFromUtf8(isolate, "name", 0, -1), zigStringToV8(isolate, "HMAC"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "algorithm", 0, -1), algo_obj, &out);
+        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_hmac, isolate, "HMAC"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
 
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else if (std.mem.eql(u8, algo_name, "AES-GCM") and std.mem.eql(u8, format, "raw")) {
         const key_obj = c.v8__Object__New(isolate);
         const ab_val = createArrayBuffer(isolate, bs.ptr[0..bs.len]);
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "data", 0, -1), ab_val, &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "type", 0, -1), zigStringToV8(isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "extractable", 0, -1), @ptrCast(c.v8__True(isolate)), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
 
         const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, c.v8__String__NewFromUtf8(isolate, "name", 0, -1), zigStringToV8(isolate, "AES-GCM"), &out);
-        c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "algorithm", 0, -1), algo_obj, &out);
+        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_aes_gcm, isolate, "AES-GCM"), &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
 
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else {
@@ -354,8 +387,7 @@ fn subtleExportKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
         return;
     }
 
-    const data_key = c.v8__String__NewFromUtf8(isolate, "data", 0, -1);
-    const data_val = c.v8__Object__Get(@ptrCast(key_val), context, data_key);
+    const data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data"));
 
     if (data_val != null and c.v8__Value__IsArrayBuffer(data_val)) {
         const bstore = getBackingStoreData(isolate, data_val.?);
@@ -386,11 +418,11 @@ fn subtleEncryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
     const key_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const data_bs = getBackingStoreData(isolate, data_val) orelse {
         throw(isolate, "invalid data");
@@ -400,8 +432,7 @@ fn subtleEncryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
     if (std.mem.eql(u8, algo_name, "AES-GCM")) {
-        const key_data_key = c.v8__String__NewFromUtf8(isolate, "data", 0, -1);
-        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, key_data_key) orelse {
+        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
             rejectPromiseWithError(isolate, context, resolver, "key has no data property");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
@@ -421,14 +452,14 @@ fn subtleEncryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
         getRandomBytes(&nonce);
         var tag: [16]u8 = undefined;
 
-        const ciphertext = std.heap.page_allocator.alloc(u8, data_bs.len) catch {
+        const ciphertext = gpa.alloc(u8, data_bs.len) catch {
             rejectPromiseWithError(isolate, context, resolver, "allocation failed");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
             return;
         };
-        defer std.heap.page_allocator.free(ciphertext);
+        defer gpa.free(ciphertext);
 
         if (key_bytes.len == 16) {
             Aes128Gcm.encrypt(ciphertext, &tag, data_bs.ptr[0..data_bs.len], "", nonce, key_bytes[0..16].*);
@@ -442,14 +473,14 @@ fn subtleEncryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
             return;
         }
 
-        const result = std.heap.page_allocator.alloc(u8, 12 + data_bs.len + 16) catch {
+        const result = gpa.alloc(u8, 12 + data_bs.len + 16) catch {
             rejectPromiseWithError(isolate, context, resolver, "allocation failed");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
             return;
         };
-        defer std.heap.page_allocator.free(result);
+        defer gpa.free(result);
 
         @memcpy(result[0..12], &nonce);
         @memcpy(result[12 .. 12 + data_bs.len], ciphertext);
@@ -478,11 +509,11 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
     const key_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const data_bs = getBackingStoreData(isolate, data_val) orelse {
         throw(isolate, "invalid data");
@@ -492,8 +523,7 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
     if (std.mem.eql(u8, algo_name, "AES-GCM")) {
-        const key_data_key = c.v8__String__NewFromUtf8(isolate, "data", 0, -1);
-        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, key_data_key) orelse {
+        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
             rejectPromiseWithError(isolate, context, resolver, "key has no data property");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
@@ -525,14 +555,14 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
         var tag_val: [16]u8 = undefined;
         @memcpy(&tag_val, tag_slice);
 
-        const plaintext = std.heap.page_allocator.alloc(u8, ciphertext.len) catch {
+        const plaintext = gpa.alloc(u8, ciphertext.len) catch {
             rejectPromiseWithError(isolate, context, resolver, "allocation failed");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
             return;
         };
-        defer std.heap.page_allocator.free(plaintext);
+        defer gpa.free(plaintext);
 
         if (key_bytes.len == 16) {
             Aes128Gcm.decrypt(plaintext, ciphertext, tag_val, "", nonce.*, key_bytes[0..16].*) catch {
@@ -581,11 +611,11 @@ fn subtleSignCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const key_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const data_bs = getBackingStoreData(isolate, data_val) orelse {
         throw(isolate, "invalid data");
@@ -595,8 +625,7 @@ fn subtleSignCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
     if (std.mem.eql(u8, algo_name, "HMAC")) {
-        const key_data_key = c.v8__String__NewFromUtf8(isolate, "data", 0, -1);
-        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, key_data_key) orelse {
+        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
             rejectPromiseWithError(isolate, context, resolver, "key has no data property");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
@@ -638,11 +667,11 @@ fn subtleVerifyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void 
     const sig_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 3).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     const data_bs = getBackingStoreData(isolate, data_val) orelse {
         throw(isolate, "invalid data");
@@ -657,8 +686,7 @@ fn subtleVerifyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void 
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
     if (std.mem.eql(u8, algo_name, "HMAC")) {
-        const key_data_key = c.v8__String__NewFromUtf8(isolate, "data", 0, -1);
-        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, key_data_key) orelse {
+        const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
             rejectPromiseWithError(isolate, context, resolver, "key has no data property");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
@@ -708,11 +736,11 @@ fn subtleDeriveBitsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) v
     const key_val = c.v8__FunctionCallbackInfo__INDEX(info, 1).?;
     const len_val = c.v8__FunctionCallbackInfo__INDEX(info, 2).?;
 
-    const algo_name = getAlgoName(isolate, algo_val) orelse {
+    var name_buf: [64]u8 = undefined;
+    const algo_name = getAlgoName(isolate, algo_val, &name_buf) orelse {
         throw(isolate, "invalid algorithm");
         return;
     };
-    defer std.heap.page_allocator.free(algo_name);
 
     var maybe_len: c.MaybeF64 = undefined;
     c.v8__Value__NumberValue(len_val, context, &maybe_len);
@@ -743,8 +771,7 @@ fn subtleDeriveBitsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) v
 
         if (context_obj) |obj| {
             const ctx2 = c.v8__Isolate__GetCurrentContext(isolate);
-            const salt_key = c.v8__String__NewFromUtf8(isolate, "salt", 0, -1);
-            const salt_val = c.v8__Object__Get(@ptrCast(obj), ctx2, salt_key);
+            const salt_val = c.v8__Object__Get(@ptrCast(obj), ctx2, globalStr(&str_salt, isolate, "salt"));
             if (salt_val != null) {
                 const salt_bs = getBackingStoreData(isolate, salt_val.?);
                 if (salt_bs) |sb| {
@@ -754,14 +781,14 @@ fn subtleDeriveBitsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) v
             }
         }
 
-        const derived = std.heap.page_allocator.alloc(u8, byte_len) catch {
+        const derived = gpa.alloc(u8, byte_len) catch {
             rejectPromiseWithError(isolate, context, resolver, "allocation failed");
             var ret: c.ReturnValue = undefined;
             c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
             c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
             return;
         };
-        defer std.heap.page_allocator.free(derived);
+        defer gpa.free(derived);
 
         std.crypto.pwhash.pbkdf2(derived, key_bs.ptr[0..key_bs.len], &salt, 100000, HmacSha256) catch return;
         resolvePromiseWithBuffer(isolate, context, resolver, derived);
@@ -786,8 +813,8 @@ fn subtleDeriveKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
     const resolver = c.v8__Promise__Resolver__New(context).?;
     const key_obj = c.v8__Object__New(isolate);
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "type", 0, -1), zigStringToV8(isolate, "secret"), &out);
-    c.v8__Object__Set(key_obj, context, c.v8__String__NewFromUtf8(isolate, "extractable", 0, -1), @ptrCast(c.v8__True(isolate)), &out);
+    c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+    c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
     c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
 
     var ret: c.ReturnValue = undefined;
@@ -803,6 +830,21 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const global = c.v8__Context__Global(context);
     const crypto_obj = c.v8__Object__New(isolate);
     var out: c.MaybeBool = undefined;
+
+    // Root the per-call constant strings once.
+    inline for (.{
+        .{ "name", &str_name },
+        .{ "data", &str_data },
+        .{ "salt", &str_salt },
+        .{ "type", &str_type },
+        .{ "algorithm", &str_algorithm },
+        .{ "extractable", &str_extractable },
+        .{ "secret", &str_secret },
+        .{ "AES-GCM", &str_aes_gcm },
+        .{ "HMAC", &str_hmac },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
 
     const getRandomValues_fn = c.v8__Function__New__DEFAULT(context, getRandomValuesCallback);
     c.v8__Object__Set(crypto_obj, context, c.v8__String__NewFromUtf8(isolate, "getRandomValues", 0, -1), getRandomValues_fn, &out);

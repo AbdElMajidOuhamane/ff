@@ -4,6 +4,10 @@ const c = @import("../c.zig").c;
 const Io = std.Io;
 const Dir = Io.Dir;
 
+// Thread-safe general-purpose allocator: no mmap/munmap syscall pair per
+// allocation (mirrors fetch.zig's rationale).
+const gpa = std.heap.smp_allocator;
+
 const MAX_PATH = 4096;
 const MAX_READ = 10 * 1024 * 1024;
 
@@ -15,7 +19,10 @@ fn getIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn jsStringToSlice(info: ?*const c.FunctionCallbackInfo, index: c_int) ?[:0]const u8 {
+/// Extracts a string argument into the CALLER-provided buffer and returns a
+/// borrowed slice of it — zero heap allocations on the hot path. All fs
+/// consumers take plain []const u8 (std.Io.Dir APIs), so no sentinel needed.
+fn jsPathArg(info: ?*const c.FunctionCallbackInfo, index: c_int, buf: []u8) ?[]const u8 {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     if (c.v8__FunctionCallbackInfo__Length(info) <= index) return null;
     const val = c.v8__FunctionCallbackInfo__INDEX(info, index);
@@ -24,10 +31,9 @@ fn jsStringToSlice(info: ?*const c.FunctionCallbackInfo, index: c_int) ?[:0]cons
     const str = c.v8__Value__ToDetailString(val, context);
     if (str == null) return null;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [MAX_PATH]u8 = undefined;
     const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return std.heap.page_allocator.dupeZ(u8, buf[0..len]) catch null;
+    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(len), 0);
+    return buf[0..len];
 }
 
 fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
@@ -48,20 +54,20 @@ fn jsBoolArg(info: ?*const c.FunctionCallbackInfo, index: c_int) bool {
 
 fn readFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     const io = getIo();
     const content = Dir.cwd().readFileAlloc(
         io,
         path,
-        std.heap.page_allocator,
+        gpa,
         .limited(MAX_READ),
     ) catch |err| {
         throw(isolate, @errorName(err));
         return;
     };
-    defer std.heap.page_allocator.free(content);
+    defer gpa.free(content);
 
     const result = c.v8__String__NewFromUtf8(
         isolate,
@@ -81,18 +87,25 @@ fn readFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn writeFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
     const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const data_str = c.v8__Value__ToDetailString(data_val, context);
     if (data_str == null) return;
+    // Exact-size allocation from the already-known length: the previous
+    // fixed [MAX_READ] stack buffer risked blowing small stacks and faulted
+    // thousands of pages even for tiny writes.
     const data_len: usize = @intCast(c.v8__String__Utf8Length(data_str, isolate));
-    var data_buf: [MAX_READ]u8 = undefined;
-    const data_final = @min(data_len, data_buf.len);
-    _ = c.v8__String__WriteUtf8(data_str, isolate, &data_buf, @intCast(data_final), 0);
+    const data_final = @min(data_len, MAX_READ);
+    const data_buf = gpa.alloc(u8, data_final) catch {
+        throw(isolate, "OutOfMemory");
+        return;
+    };
+    defer gpa.free(data_buf);
+    _ = c.v8__String__WriteUtf8(data_str, isolate, data_buf.ptr, @intCast(data_final), 0);
 
     const io = getIo();
     Dir.cwd().writeFile(io, .{
@@ -109,8 +122,8 @@ fn writeFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn existsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     const io = getIo();
     const found = if (Dir.cwd().access(io, path, .{})) true else |_| false;
@@ -127,8 +140,8 @@ fn existsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn mkdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     const recursive = jsBoolArg(info, 1);
     const io = getIo();
@@ -150,8 +163,8 @@ fn mkdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn rmCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     const recursive = jsBoolArg(info, 1);
     const io = getIo();
@@ -175,8 +188,8 @@ fn rmCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
 fn readdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(info, 0, &path_buf) orelse return;
 
     const io = getIo();
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
@@ -187,14 +200,14 @@ fn readdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
     var names = std.ArrayList([:0]const u8).empty;
     defer {
-        for (names.items) |n| std.heap.page_allocator.free(n);
-        names.deinit(std.heap.page_allocator);
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
     }
 
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
-        const name = std.heap.page_allocator.dupeZ(u8, entry.name) catch continue;
-        names.append(std.heap.page_allocator, name) catch continue;
+        const name = gpa.dupeZ(u8, entry.name) catch continue;
+        names.append(gpa, name) catch continue;
     }
 
     const context = c.v8__Isolate__GetCurrentContext(isolate);

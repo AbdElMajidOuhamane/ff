@@ -8,8 +8,8 @@ function assert(cond, msg) {
 
 console.log("--- Fetch: GET httpbin ---");
 const r1 = await fetch("https://httpbin.org/get");
-assert(r1.status() === 200, "GET status 200");
-assert(r1.ok() === true, "GET ok is true");
+assert(r1.status === 200, "GET status 200");
+assert(r1.ok === true, "GET ok is true");
 const b1 = await r1.json();
 assert(b1.url === "https://httpbin.org/get", "GET url echoed");
 
@@ -19,7 +19,7 @@ const r2 = await fetch("https://httpbin.org/post", {
   headers: { "Content-Type": "application/json" },
   body: '{"key":"value"}',
 });
-assert(r2.status() === 200, "POST status 200");
+assert(r2.status === 200, "POST status 200");
 const b2 = await r2.json();
 assert(b2.data === '{"key":"value"}', "POST body echoed");
 
@@ -32,22 +32,22 @@ assert(b3.headers["X-Custom"] === "test123", "custom header sent");
 
 console.log("--- Fetch: 404 status ---");
 const r4 = await fetch("https://httpbin.org/status/404");
-assert(r4.status() === 404, "404 status");
-assert(r4.ok() === false, "404 not ok");
+assert(r4.status === 404, "404 status");
+assert(r4.ok === false, "404 not ok");
 
 console.log("--- Fetch: redirect ---");
 const r5 = await fetch("https://httpbin.org/redirect/1");
-assert(r5.status() === 200, "redirect follows to 200");
+assert(r5.status === 200, "redirect follows to 200");
 
 console.log("--- Fetch: bodyUsed tracking ---");
 const r6 = await fetch("https://httpbin.org/get");
-assert(r6.bodyUsed() === false, "bodyUsed false before text");
+assert(r6.bodyUsed === false, "bodyUsed false before text");
 await r6.text();
-assert(r6.bodyUsed() === true, "bodyUsed true after text");
+assert(r6.bodyUsed === true, "bodyUsed true after text");
 
 console.log("--- Fetch: empty response body ---");
 const r7 = await fetch("https://httpbin.org/status/204");
-assert(r7.status() === 204, "204 no content");
+assert(r7.status === 204, "204 no content");
 
 console.log(`\nResults: ${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

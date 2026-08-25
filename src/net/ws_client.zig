@@ -4,7 +4,7 @@ const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 const http = std.http;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 fn getRandomBytes(buf: []u8) void {

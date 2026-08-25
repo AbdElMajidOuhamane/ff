@@ -1,18 +1,49 @@
+
 const std = @import("std");
 const c = @import("../c.zig").c;
 const ws_client = @import("../net/ws_client.zig");
 const ws = @import("../net/ws_native.zig");
 
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 
+// ---- V8 cached strings + integer constants (rooted once in setup):
+// every WebSocket instance previously recreated its five property-key
+// strings and five boxed readyState/constants integers. ----
 var slot_cells: [ws_client.MAX_WS]u16 = undefined;
 var str_send: c.Global = .{ .data_ptr = 0 };
 var str_close: c.Global = .{ .data_ptr = 0 };
+var str_ready_state: c.Global = .{ .data_ptr = 0 };
+var str_connecting: c.Global = .{ .data_ptr = 0 };
+var str_open: c.Global = .{ .data_ptr = 0 };
+var str_closing: c.Global = .{ .data_ptr = 0 };
+var str_closed: c.Global = .{ .data_ptr = 0 };
+var int_connecting: c.Global = .{ .data_ptr = 0 };
+var int_open: c.Global = .{ .data_ptr = 0 };
+var int_closing: c.Global = .{ .data_ptr = 0 };
+var int_closed: c.Global = .{ .data_ptr = 0 };
 
 fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
     const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
     const exc = c.v8__Exception__TypeError(v8_msg);
     _ = c.v8__Isolate__ThrowException(isolate, exc);
+}
+
+/// Cached-Global accessor with an inline fallback so a missing root can
+/// never turn a hot path into a null-deref.
+fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
+    return @ptrCast(c.v8__Global__Get(g, isolate) orelse blk: {
+        const v = c.v8__String__NewFromUtf8(
+            isolate,
+            @ptrCast(fallback.ptr),
+            0,
+            @intCast(fallback.len),
+        );
+        break :blk v orelse c.v8__Undefined(isolate);
+    });
+}
+
+fn globalVal(g: *c.Global, isolate: ?*c.Isolate) ?*const c.Value {
+    return c.v8__Global__Get(g, isolate);
 }
 
 const ParsedUrl = struct { host: []const u8, path: []const u8, port: u16, tls: bool };
@@ -63,9 +94,10 @@ fn extractString(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
     return buf;
 }
 
-fn setIntProp(obj: *const c.Value, context: ?*c.Context, isolate: ?*c.Isolate, key: []const u8, v: i32) void {
+/// Sets a cached-string key to a cached-integer value — zero allocations.
+fn setIntPropG(obj: *const c.Value, context: ?*c.Context, isolate: ?*c.Isolate, g_key: *c.Global, comptime fallback: []const u8, g_val: *c.Global) void {
     var out: c.MaybeBool = undefined;
-    _ = c.v8__Object__Set(@ptrCast(obj), context, c.v8__String__NewFromUtf8(isolate, key.ptr, 0, -1), @ptrCast(c.v8__Integer__New(isolate, v)), &out);
+    _ = c.v8__Object__Set(@ptrCast(obj), context, globalStr(g_key, isolate, fallback), @ptrCast(globalVal(g_val, isolate)), &out);
 }
 
 fn slotFrom(info: ?*const c.FunctionCallbackInfo) ?usize {
@@ -82,13 +114,33 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     defer c.v8__HandleScope__DESTRUCT(&hs);
     const global = c.v8__Context__Global(context);
     var out: c.MaybeBool = undefined;
+
+    // Root property keys, method names, and readyState/constants once.
+    inline for (.{
+        .{ "readyState", &str_ready_state },
+        .{ "CONNECTING", &str_connecting },
+        .{ "OPEN", &str_open },
+        .{ "CLOSING", &str_closing },
+        .{ "CLOSED", &str_closed },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
+    inline for (.{
+        .{ 0, &int_connecting },
+        .{ 1, &int_open },
+        .{ 2, &int_closing },
+        .{ 3, &int_closed },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__Integer__New(isolate, entry[0])), entry[1]);
+    }
+
     const ctor = c.v8__Function__New__DEFAULT(context, wsConstructor) orelse return;
     _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "WebSocket", 0, -1), ctor, &out);
     // static constants on the constructor (browser parity)
-    setIntProp(ctor, context, isolate, "CONNECTING", 0);
-    setIntProp(ctor, context, isolate, "OPEN", 1);
-    setIntProp(ctor, context, isolate, "CLOSING", 2);
-    setIntProp(ctor, context, isolate, "CLOSED", 3);
+    setIntPropG(ctor, context, isolate, &str_connecting, "CONNECTING", &int_connecting);
+    setIntPropG(ctor, context, isolate, &str_open, "OPEN", &int_open);
+    setIntPropG(ctor, context, isolate, &str_closing, "CLOSING", &int_closing);
+    setIntPropG(ctor, context, isolate, &str_closed, "CLOSED", &int_closed);
     // method-name strings
     c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "send", 0, -1)), &str_send);
     c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "close", 0, -1)), &str_close);
@@ -118,11 +170,11 @@ fn wsConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     };
 
     const obj = c.v8__Object__New(isolate) orelse return;
-    setIntProp(@ptrCast(obj), context, isolate, "readyState", 0);
-    setIntProp(@ptrCast(obj), context, isolate, "CONNECTING", 0);
-    setIntProp(@ptrCast(obj), context, isolate, "OPEN", 1);
-    setIntProp(@ptrCast(obj), context, isolate, "CLOSING", 2);
-    setIntProp(@ptrCast(obj), context, isolate, "CLOSED", 3);
+    setIntPropG(@ptrCast(obj), context, isolate, &str_ready_state, "readyState", &int_connecting);
+    setIntPropG(@ptrCast(obj), context, isolate, &str_connecting, "CONNECTING", &int_connecting);
+    setIntPropG(@ptrCast(obj), context, isolate, &str_open, "OPEN", &int_open);
+    setIntPropG(@ptrCast(obj), context, isolate, &str_closing, "CLOSING", &int_closing);
+    setIntPropG(@ptrCast(obj), context, isolate, &str_closed, "CLOSED", &int_closed);
 
     const s = ws_client.submit(isolate, @ptrCast(obj), parsed.host, parsed.path, parsed.port, parsed.tls) catch {
         throwTypeError(isolate, "WebSocket: no connection slots available");
@@ -224,7 +276,15 @@ fn wsClose(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     // readyState -> CLOSING (2) immediately (browser parity)
     if (c.v8__FunctionCallbackInfo__This(info)) |this_val| {
         if (c.v8__Value__IsObject(this_val)) {
-            ws_client.setReadyState(@ptrCast(this_val), context, isolate, 2);
+            // One-off transition: reuse the cached CLOSING key + integer.
+            var out: c.MaybeBool = undefined;
+            _ = c.v8__Object__Set(
+                @ptrCast(this_val),
+                context,
+                globalStr(&str_ready_state, isolate, "readyState"),
+                @ptrCast(globalVal(&int_closing, isolate)),
+                &out,
+            );
         }
     }
     ws_client.closeWs(s, code, reason);

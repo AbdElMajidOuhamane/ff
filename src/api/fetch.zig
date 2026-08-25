@@ -9,6 +9,16 @@ const tls = @import("../net/tls.zig");
 // files. smp_allocator removes the mmap/munmap syscall pair per allocation.
 const gpa = std.heap.smp_allocator;
 const http = std.http;
+// ---- V8 string globals (rooted once in setup): property keys and static
+// reject messages are identical on every fetch() call, so they are created
+// exactly once instead of 4-7 times per invocation. ----
+var str___d: c.Global = .{ .data_ptr = 0 };
+var str_url: c.Global = .{ .data_ptr = 0 };
+var str_method: c.Global = .{ .data_ptr = 0 };
+var str_headers: c.Global = .{ .data_ptr = 0 };
+var str_body: c.Global = .{ .data_ptr = 0 };
+var str_invalid_url: c.Global = .{ .data_ptr = 0 };
+var str_start_failed: c.Global = .{ .data_ptr = 0 };
 // ============================================================
 // Helpers
 // ============================================================
@@ -19,6 +29,11 @@ fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
 }
 fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
     return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
+}
+/// Cached-Global accessor with an inline fallback so a missing root can
+/// never turn a rejection path into a crash.
+fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
+    return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, fallback));
 }
 fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
     const v = val orelse return null;
@@ -79,8 +94,7 @@ fn collectHeadersFromJS(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const
 fn extractRequestData(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c.Value) ?*request_mod.RequestData {
     if (obj == null) return null;
     if (!c.v8__Value__IsObject(obj)) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-    const ext_val = c.v8__Object__Get(@ptrCast(obj), context, data_key);
+    const ext_val = c.v8__Object__Get(@ptrCast(obj), context, globalStr(&str___d, isolate, "__d"));
     if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
     return @ptrCast(@alignCast(ptr));
@@ -144,7 +158,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
                 };
             }
         } else {
-            const url_val = c.v8__Object__Get(@ptrCast(arg0), context, c.v8__String__NewFromUtf8(isolate, "url", 0, -1));
+            const url_val = c.v8__Object__Get(@ptrCast(arg0), context, globalStr(&str_url, isolate, "url"));
             url_str = extractStringFromVal(isolate, url_val);
         }
     } else {
@@ -155,17 +169,17 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
         const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
         if (c.v8__Value__IsObject(init_val)) {
-            const method_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "method", 0, -1));
+            const method_val = c.v8__Object__Get(@ptrCast(init_val), context, globalStr(&str_method, isolate, "method"));
             if (extractStringFromVal(isolate, method_val)) |m| {
                 method_override = m;
                 owned_method = m;
             }
-            const headers_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "headers", 0, -1));
+            const headers_val = c.v8__Object__Get(@ptrCast(init_val), context, globalStr(&str_headers, isolate, "headers"));
             if (extra_headers == null) {
                 extra_headers = .empty;
             }
             collectHeadersFromJS(isolate, context, headers_val, &extra_headers.?);
-            const body_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "body", 0, -1));
+            const body_val = c.v8__Object__Get(@ptrCast(init_val), context, globalStr(&str_body, isolate, "body"));
             if (body_val != null and !c.v8__Value__IsUndefined(body_val) and !c.v8__Value__IsNull(body_val)) {
                 body_payload = extractStringFromVal(isolate, body_val);
             }
@@ -173,7 +187,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     }
     const url = url_str orelse {
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid URL")), &out);
+        _ = c.v8__Promise__Resolver__Reject(resolver, context, globalStr(&str_invalid_url, isolate, "Invalid URL"), &out);
         c.v8__ReturnValue__Set(ret, @ptrCast(promise));
         return;
     };
@@ -184,7 +198,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const method = parseMethod(method_str);
     const uri = std.Uri.parse(url) catch {
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid URL")), &out);
+        _ = c.v8__Promise__Resolver__Reject(resolver, context, globalStr(&str_invalid_url, isolate, "Invalid URL"), &out);
         c.v8__ReturnValue__Set(ret, @ptrCast(promise));
         return;
     };
@@ -198,7 +212,7 @@ fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     url_str = null;
     async_fetch.submit(isolate, @ptrCast(resolver), url_copy, uri, method, header_list, body_copy) catch {
         var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to start fetch")), &out);
+        _ = c.v8__Promise__Resolver__Reject(resolver, context, globalStr(&str_start_failed, isolate, "Failed to start fetch"), &out);
         c.v8__ReturnValue__Set(ret, @ptrCast(promise));
         return;
     };
@@ -219,6 +233,18 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     defer c.v8__HandleScope__DESTRUCT(&hs);
     const global = c.v8__Context__Global(context);
     var out: c.MaybeBool = undefined;
+    // Root the per-call constant strings once.
+    inline for (.{
+        .{ "__d", &str___d },
+        .{ "url", &str_url },
+        .{ "method", &str_method },
+        .{ "headers", &str_headers },
+        .{ "body", &str_body },
+        .{ "Invalid URL", &str_invalid_url },
+        .{ "Failed to start fetch", &str_start_failed },
+    }) |entry| {
+        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
+    }
     const fetch_func = c.v8__Function__New__DEFAULT(context, fetchCallback);
     const key = c.v8__String__NewFromUtf8(isolate, "fetch", 0, -1);
     _ = c.v8__Object__Set(global, context, key, fetch_func, &out);

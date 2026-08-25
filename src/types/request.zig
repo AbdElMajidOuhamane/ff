@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 // ============================================================
 // Cached V8 strings + functions (created once in setup)
 // ============================================================

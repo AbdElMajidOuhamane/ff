@@ -1,6 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 const simd = std.simd;
 // ============================================================
 // Helpers

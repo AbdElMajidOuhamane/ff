@@ -4,6 +4,9 @@ const builtin = @import("builtin");
 
 const Io = std.Io;
 
+// Thread-safe general-purpose allocator (no syscall pair per alloc).
+const gpa = std.heap.smp_allocator;
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -34,7 +37,7 @@ fn extractString(info: ?*const c.FunctionCallbackInfo, index: c_int) ?[:0]const 
     var buf: [4096]u8 = undefined;
     const len = @min(utf8_len, buf.len);
     _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return std.heap.page_allocator.dupeZ(u8, buf[0..len]) catch null;
+    return gpa.dupeZ(u8, buf[0..len]) catch null;
 }
 
 // ============================================================
@@ -85,7 +88,7 @@ fn chdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         throw(isolate, "chdir requires a path argument");
         return;
     };
-    defer std.heap.page_allocator.free(path);
+    defer gpa.free(path);
 
     const io = getIo();
     std.process.setCurrentPath(io, path) catch {

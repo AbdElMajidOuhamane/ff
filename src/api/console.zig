@@ -4,6 +4,9 @@ const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 const GREEN = "\x1b[32m";
+// Thread-safe general-purpose allocator: no mmap/munmap syscall pair per
+// oversized-log-line allocation (mirrors fetch.zig's rationale).
+const gpa = std.heap.smp_allocator;
 // Stack staging for typical log lines; longer payloads fall back to one
 // heap allocation instead of being silently cut at 4096 bytes.
 const STACK_LOG_MAX = 4096;
@@ -16,14 +19,14 @@ fn printString(isolate: ?*c.Isolate, str: ?*const c.String) void {
         std.debug.print("{s}", .{buf[0..utf8_len]});
         return;
     }
-    const heap_buf = std.heap.page_allocator.alloc(u8, utf8_len) catch {
+    const heap_buf = gpa.alloc(u8, utf8_len) catch {
         // OOM fallback: preserve old truncated behavior rather than dropping.
         var buf: [STACK_LOG_MAX]u8 = undefined;
         _ = c.v8__String__WriteUtf8(s, isolate, &buf, @intCast(STACK_LOG_MAX), 0);
         std.debug.print("{s}", .{buf});
         return;
     };
-    defer std.heap.page_allocator.free(heap_buf);
+    defer gpa.free(heap_buf);
     _ = c.v8__String__WriteUtf8(s, isolate, heap_buf.ptr, @intCast(utf8_len), 0);
     std.debug.print("{s}", .{heap_buf});
 }
@@ -76,4 +79,3 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const console_key = c.v8__String__NewFromUtf8(isolate, "console", 0, -1);
     _ = c.v8__Object__Set(global, context, console_key, console_obj, &out);
 }
-
