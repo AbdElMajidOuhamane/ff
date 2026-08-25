@@ -4,46 +4,66 @@ const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 const GREEN = "\x1b[32m";
-// Thread-safe general-purpose allocator: no mmap/munmap syscall pair per
-// oversized-log-line allocation (mirrors fetch.zig's rationale).
-const gpa = std.heap.smp_allocator;
-// Stack staging for typical log lines; longer payloads fall back to one
-// heap allocation instead of being silently cut at 4096 bytes.
-const STACK_LOG_MAX = 4096;
-fn printString(isolate: ?*c.Isolate, str: ?*const c.String) void {
+
+// Single-write staging (buffer-reuse rule): one log call stages color,
+// arguments, separators, and the trailing newline into a fixed buffer and
+// issues exactly ONE write — previously N+2 separate writes per call.
+// Lines longer than the buffer stream as chunked continuations (the cap is
+// now per-line rather than silently truncating each argument).
+const LINE_MAX = 4096;
+
+fn appendChunk(buf: []u8, len: *usize, s: []const u8) void {
+    const space = buf.len - len.*;
+    const n = @min(s.len, space);
+    @memcpy(buf[len.*..][0..n], s[0..n]);
+    len.* += n;
+}
+
+fn flush(buf: []u8, len: *usize) void {
+    if (len.* == 0) return;
+    std.debug.print("{s}", .{buf[0..len.*]});
+    len.* = 0;
+}
+
+/// Stages one JS string argument into the line buffer, flushing mid-token
+/// when the buffer fills so arbitrarily long payloads stream completely.
+fn stageString(isolate: ?*c.Isolate, str: ?*const c.String, buf: []u8, len: *usize) void {
     const s = str orelse return;
     const utf8_len: usize = @intCast(c.v8__String__Utf8Length(s, isolate));
-    if (utf8_len <= STACK_LOG_MAX) {
-        var buf: [STACK_LOG_MAX]u8 = undefined;
-        _ = c.v8__String__WriteUtf8(s, isolate, &buf, @intCast(utf8_len), 0);
-        std.debug.print("{s}", .{buf[0..utf8_len]});
-        return;
+    var written: usize = 0;
+    while (written < utf8_len) {
+        if (len.* == buf.len) flush(buf, len);
+        const capacity = @min(utf8_len - written, buf.len - len.*);
+        const n = c.v8__String__WriteUtf8(
+            s,
+            isolate,
+            buf[len.*..].ptr,
+            @intCast(capacity),
+            0,
+        );
+        if (n <= 0) break; // encode failure: drop remainder, keep prior output
+        const advanced: usize = @intCast(n);
+        len.* += advanced;
+        written += advanced;
     }
-    const heap_buf = gpa.alloc(u8, utf8_len) catch {
-        // OOM fallback: preserve old truncated behavior rather than dropping.
-        var buf: [STACK_LOG_MAX]u8 = undefined;
-        _ = c.v8__String__WriteUtf8(s, isolate, &buf, @intCast(STACK_LOG_MAX), 0);
-        std.debug.print("{s}", .{buf});
-        return;
-    };
-    defer gpa.free(heap_buf);
-    _ = c.v8__String__WriteUtf8(s, isolate, heap_buf.ptr, @intCast(utf8_len), 0);
-    std.debug.print("{s}", .{heap_buf});
 }
+
 fn consoleLogCallbackWithColor(info: ?*const c.FunctionCallbackInfo, color: []const u8) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const argc = c.v8__FunctionCallbackInfo__Length(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
+    var buf: [LINE_MAX]u8 = undefined;
+    var len: usize = 0;
+    if (color.len > 0) appendChunk(&buf, &len, color);
+    const argc = c.v8__FunctionCallbackInfo__Length(info);
     var i: c_int = 0;
-    if (color.len > 0) std.debug.print("{s}", .{color});
     while (i < argc) : (i += 1) {
-        if (i > 0) std.debug.print(" ", .{});
+        if (i > 0) appendChunk(&buf, &len, " ");
         const val = c.v8__FunctionCallbackInfo__INDEX(info, i);
-        const str = c.v8__Value__ToString(val, context);
-        printString(isolate, str);
+        stageString(isolate, c.v8__Value__ToString(val, context), &buf, &len);
     }
-    if (color.len > 0) std.debug.print("{s}", .{RESET});
-    std.debug.print("\n", .{});
+    if (color.len > 0) appendChunk(&buf, &len, RESET);
+    appendChunk(&buf, &len, "\n");
+    flush(&buf, &len);
 }
 fn consoleLogCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     consoleLogCallbackWithColor(info, "");
@@ -76,6 +96,24 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const detail_func = c.v8__Function__New__DEFAULT(context, consoleDetailCallback);
     const detail_key = c.v8__String__NewFromUtf8(isolate, "detail", 0, -1);
     c.v8__Object__Set(console_obj, context, detail_key, detail_func, &out);
+
+    // ---- Browser-standard aliases (map onto existing handlers) ----
+    const error_fn = c.v8__Function__New__DEFAULT(context, consoleRedbalCallback);
+    const error_key = c.v8__String__NewFromUtf8(isolate, "error", 0, -1);
+    c.v8__Object__Set(console_obj, context, error_key, error_fn, &out);
+
+    const std_warn_fn = c.v8__Function__New__DEFAULT(context, consoleSlopsCallback);
+    const std_warn_key = c.v8__String__NewFromUtf8(isolate, "warn", 0, -1);
+    c.v8__Object__Set(console_obj, context, std_warn_key, std_warn_fn, &out);
+
+    const info_fn = c.v8__Function__New__DEFAULT(context, consoleLogCallback);
+    const info_key = c.v8__String__NewFromUtf8(isolate, "info", 0, -1);
+    c.v8__Object__Set(console_obj, context, info_key, info_fn, &out);
+
+    const debug_fn = c.v8__Function__New__DEFAULT(context, consoleLogCallback);
+    const debug_key = c.v8__String__NewFromUtf8(isolate, "debug", 0, -1);
+    c.v8__Object__Set(console_obj, context, debug_key, debug_fn, &out);
+
     const console_key = c.v8__String__NewFromUtf8(isolate, "console", 0, -1);
     _ = c.v8__Object__Set(global, context, console_key, console_obj, &out);
 }

@@ -69,9 +69,7 @@ fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) 
 }
 // Hot-path string extraction: writes into the caller-provided stack buffer
 // when the string fits (typical searchParams names/values), falling back to
-// one direct heap allocation otherwise. Replaces the previous 8KB stack
-// staging buffer + dupeZ, which silently truncated strings >8192 bytes and
-// paid an extra copy per call.
+// one direct heap allocation otherwise.
 const ExtractedStr = struct {
     slice: []const u8,
     heap: ?[:0]u8 = null,
@@ -105,20 +103,77 @@ fn isSpecialScheme(scheme: []const u8) bool {
     return defaultPortForScheme(scheme) != null or std.mem.eql(u8, scheme, "file");
 }
 // ============================================================
-// URLSearchParams
+// URLSearchParams — DOD / SoA: contiguous string log + offset index
+//
+//   names/values : one contiguous buffer each (append-only)
+//   entries      : dense index of {offset,len} pairs into the logs
+//
+// Per-pair heap allocations are gone: parse/append/set are amortized
+// buffer appends; deleted bytes stay in the log until deinit (the classic
+// append-log tradeoff — cache-friendly and allocation-free hot path).
+// getAllValues/serialize return BORROWED views into reusable scratch,
+// valid until the next mutating call on this object. Comparisons are
+// case-sensitive (spec: unlike Headers).
 // ============================================================
 const Pair = struct { name: []const u8, value: []const u8 };
+const SPEntry = struct {
+    name_off: usize,
+    name_len: usize,
+    val_off: usize,
+    val_len: usize,
+};
 const URLSearchParamsData = struct {
-    pairs: std.ArrayList(Pair),
+    names: std.ArrayList(u8),
+    values: std.ArrayList(u8),
+    entries: std.ArrayList(SPEntry),
+    // Reusable scratch (buffer-reuse rule): joined multi-value output and
+    // the view list for getAllValues, plus serialize staging.
+    merge_buf: std.ArrayList(u8),
+    view_buf: std.ArrayList([]const u8),
+    ser_buf: std.ArrayList(u8),
     fn init() URLSearchParamsData {
-        return .{ .pairs = std.ArrayList(Pair).empty };
+        return .{
+            .names = std.ArrayList(u8).empty,
+            .values = std.ArrayList(u8).empty,
+            .entries = std.ArrayList(SPEntry).empty,
+            .merge_buf = std.ArrayList(u8).empty,
+            .view_buf = std.ArrayList([]const u8).empty,
+            .ser_buf = std.ArrayList(u8).empty,
+        };
     }
     fn deinit(self: *URLSearchParamsData) void {
-        for (self.pairs.items) |pair| {
-            gpa.free(pair.name);
-            gpa.free(pair.value);
-        }
-        self.pairs.deinit(gpa);
+        self.names.deinit(gpa);
+        self.values.deinit(gpa);
+        self.entries.deinit(gpa);
+        self.merge_buf.deinit(gpa);
+        self.view_buf.deinit(gpa);
+        self.ser_buf.deinit(gpa);
+    }
+    fn nameOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
+        return self.names.items[e.name_off .. e.name_off + e.name_len];
+    }
+    fn valueOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
+        return self.values.items[e.val_off .. e.val_off + e.val_len];
+    }
+    // Append an entry. Zero heap allocations beyond amortized log growth.
+    fn appendEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
+        const nbase = self.names.items.len;
+        self.names.appendSlice(gpa, name) catch return;
+        const vbase = self.values.items.len;
+        self.values.appendSlice(gpa, value) catch {
+            self.names.items.len = nbase;
+            return;
+        };
+        self.entries.append(gpa, .{
+            .name_off = nbase,
+            .name_len = name.len,
+            .val_off = vbase,
+            .val_len = value.len,
+        }) catch {
+            self.names.items.len = nbase;
+            self.values.items.len = vbase;
+            return;
+        };
     }
     fn parseFromString(self: *URLSearchParamsData, str: []const u8) void {
         if (str.len == 0) return;
@@ -127,12 +182,10 @@ const URLSearchParamsData = struct {
             const amp = std.mem.indexOf(u8, rest, "&");
             const pair_str = if (amp) |a| rest[0..a] else rest;
             const eq = std.mem.indexOf(u8, pair_str, "=");
-            const name = gpa.dupe(u8, pair_str[0 .. eq orelse pair_str.len]) catch return;
-            const value = if (eq) |e|
-                gpa.dupe(u8, pair_str[e + 1 ..]) catch return
-            else
-                gpa.dupe(u8, "") catch return;
-            self.pairs.append(gpa, .{ .name = name, .value = value }) catch return;
+            self.appendEntry(
+                pair_str[0 .. eq orelse pair_str.len],
+                if (eq) |e| pair_str[e + 1 ..] else "",
+            );
             if (amp) |a| {
                 rest = rest[a + 1 ..];
             } else {
@@ -140,19 +193,20 @@ const URLSearchParamsData = struct {
             }
         }
     }
-    fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
-        const n = gpa.dupe(u8, name) catch return;
-        const v = gpa.dupe(u8, value) catch return;
-        self.pairs.append(gpa, .{ .name = n, .value = v }) catch return;
+    // O(1) removal: swap the last entry into the removed slot. Bytes stay
+    // in the append-only logs until deinit.
+    fn removeSwap(self: *URLSearchParamsData, i: usize) void {
+        const last = self.entries.items.len - 1;
+        if (i != last) self.entries.items[i] = self.entries.items[last];
+        self.entries.items.len -= 1;
     }
     fn deleteEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) void {
         var i: usize = 0;
-        while (i < self.pairs.items.len) {
-            if (std.mem.eql(u8, self.pairs.items[i].name, name)) {
-                if (value == null or std.mem.eql(u8, self.pairs.items[i].value, value.?)) {
-                    gpa.free(self.pairs.items[i].name);
-                    gpa.free(self.pairs.items[i].value);
-                    _ = self.pairs.orderedRemove(i);
+        while (i < self.entries.items.len) {
+            const e = self.entries.items[i];
+            if (std.mem.eql(u8, self.nameOf(e), name)) {
+                if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) {
+                    self.removeSwap(i);
                     continue;
                 }
             }
@@ -160,42 +214,47 @@ const URLSearchParamsData = struct {
         }
     }
     fn getFirst(self: *const URLSearchParamsData, name: []const u8) ?[]const u8 {
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, name)) return pair.value;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), name)) return self.valueOf(e);
         }
         return null;
     }
-    fn getAllValues(self: *const URLSearchParamsData, name: []const u8) [][]const u8 {
-        var result = std.ArrayList([]const u8).empty;
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, name)) {
-                result.append(gpa, pair.value) catch break;
+    // Returns borrowed views into the reusable view list. Valid until the
+    // next mutating call on this object.
+    fn getAllValues(self: *URLSearchParamsData, name: []const u8) [][]const u8 {
+        self.view_buf.clearRetainingCapacity();
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), name)) {
+                self.view_buf.append(gpa, self.valueOf(e)) catch break;
             }
         }
-        return result.toOwnedSlice(gpa) catch &.{};
+        return self.view_buf.items;
     }
     fn hasEntry(self: *const URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
-        for (self.pairs.items) |pair| {
-            if (std.mem.eql(u8, pair.name, name)) {
-                if (value == null or std.mem.eql(u8, pair.value, value.?)) return true;
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, self.nameOf(e), name)) {
+                if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) return true;
             }
         }
         return false;
     }
+    // Replace-first semantics with duplicate collapse, zero temp allocations:
+    // first match repoints at freshly appended value bytes; duplicates are
+    // swap-removed.
     fn setEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         var found = false;
         var i: usize = 0;
-        while (i < self.pairs.items.len) {
-            if (std.mem.eql(u8, self.pairs.items[i].name, name)) {
+        while (i < self.entries.items.len) {
+            if (std.mem.eql(u8, self.nameOf(self.entries.items[i]), name)) {
                 if (!found) {
-                    gpa.free(self.pairs.items[i].value);
-                    self.pairs.items[i].value = gpa.dupe(u8, value) catch return;
+                    const vbase = self.values.items.len;
+                    self.values.appendSlice(gpa, value) catch return;
+                    self.entries.items[i].val_off = vbase;
+                    self.entries.items[i].val_len = value.len;
                     found = true;
                     i += 1;
                 } else {
-                    gpa.free(self.pairs.items[i].name);
-                    gpa.free(self.pairs.items[i].value);
-                    _ = self.pairs.orderedRemove(i);
+                    self.removeSwap(i);
                 }
             } else {
                 i += 1;
@@ -203,22 +262,28 @@ const URLSearchParamsData = struct {
         }
         if (!found) self.appendPair(name, value);
     }
+    fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
+        self.appendEntry(name, value);
+    }
+    // Sorts the dense index by name slice; log bytes never move.
     fn sortPairs(self: *URLSearchParamsData) void {
-        std.mem.sort(Pair, self.pairs.items, {}, struct {
-            fn lessThan(_: void, a: Pair, b: Pair) bool {
-                return std.mem.order(u8, a.name, b.name) == .lt;
+        std.mem.sort(SPEntry, self.entries.items, self, struct {
+            fn lessThan(ctx: *URLSearchParamsData, a: SPEntry, b: SPEntry) bool {
+                return std.mem.order(u8, ctx.nameOf(a), ctx.nameOf(b)) == .lt;
             }
         }.lessThan);
     }
-    fn serialize(self: *const URLSearchParamsData) ![]const u8 {
-        var result = std.ArrayList(u8).empty;
-        for (self.pairs.items, 0..) |pair, i| {
-            if (i > 0) try result.append(gpa, '&');
-            try result.appendSlice(gpa, pair.name);
-            try result.append(gpa, '=');
-            try result.appendSlice(gpa, pair.value);
+    // Returns a borrowed slice into the reusable staging buffer — callers
+    // must NOT free it. Valid until the next mutating call on this object.
+    fn serialize(self: *URLSearchParamsData) []const u8 {
+        self.ser_buf.clearRetainingCapacity();
+        for (self.entries.items, 0..) |pair, i| {
+            if (i > 0) self.ser_buf.append(gpa, '&') catch break;
+            self.ser_buf.appendSlice(gpa, self.nameOf(pair)) catch break;
+            self.ser_buf.append(gpa, '=') catch break;
+            self.ser_buf.appendSlice(gpa, self.valueOf(pair)) catch break;
         }
-        return try result.toOwnedSlice(gpa);
+        return self.ser_buf.items;
     }
 };
 fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
@@ -232,8 +297,7 @@ fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
     return @ptrCast(@alignCast(ptr));
 }
 /// Shared by spConstructor and createSPJsObject: attaches the single rooted
-/// function set under the single rooted key set (was: 13 fresh JSFunctions +
-/// 13 fresh key strings per instance, duplicated in two places).
+/// function set under the single rooted key set.
 fn attachSPMethods(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c.Value) void {
     var out: c.MaybeBool = undefined;
     const pairs = .{
@@ -320,7 +384,6 @@ fn spGetAll(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
     defer name.deinit();
     const vals = data.getAllValues(name.slice);
-    defer gpa.free(vals);
     const arr = c.v8__Array__New(isolate, @intCast(vals.len));
     for (vals, 0..) |v, i| {
         var el_out: c.MaybeBool = undefined;
@@ -407,11 +470,7 @@ fn spToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const str = data.serialize() catch {
-        c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, ""));
-        return;
-    };
-    defer gpa.free(str);
+    const str = data.serialize();
     c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, str));
 }
 fn spSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -419,7 +478,7 @@ fn spSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const num = c.v8__Integer__NewFromUnsigned(isolate, @intCast(data.pairs.items.len));
+    const num = c.v8__Integer__NewFromUnsigned(isolate, @intCast(data.entries.items.len));
     c.v8__ReturnValue__Set(ret, @ptrCast(num));
 }
 fn spEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
@@ -428,12 +487,12 @@ fn spEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.pairs.items.len));
-    for (data.pairs.items, 0..) |pair, i| {
+    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+    for (data.entries.items, 0..) |e, i| {
         const pair_arr = c.v8__Array__New(isolate, 2);
         var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 0, zigStringToV8(isolate, pair.name), &el_out);
-        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 1, zigStringToV8(isolate, pair.value), &el_out);
+        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 0, zigStringToV8(isolate, data.nameOf(e)), &el_out);
+        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 1, zigStringToV8(isolate, data.valueOf(e)), &el_out);
         c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), @ptrCast(pair_arr), &el_out);
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
@@ -444,10 +503,10 @@ fn spKeys(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.pairs.items.len));
-    for (data.pairs.items, 0..) |pair, i| {
+    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+    for (data.entries.items, 0..) |e, i| {
         var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, pair.name), &el_out);
+        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, data.nameOf(e)), &el_out);
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
@@ -457,10 +516,10 @@ fn spValues(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const data = extractSPData(info) orelse return;
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.pairs.items.len));
-    for (data.pairs.items, 0..) |pair, i| {
+    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+    for (data.entries.items, 0..) |e, i| {
         var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, pair.value), &el_out);
+        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, data.valueOf(e)), &el_out);
     }
     c.v8__ReturnValue__Set(ret, @ptrCast(arr));
 }
@@ -471,10 +530,10 @@ fn spForEach(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
     const callback = c.v8__FunctionCallbackInfo__INDEX(info, 0);
     if (!c.v8__Value__IsFunction(callback)) return;
-    for (data.pairs.items) |pair| {
+    for (data.entries.items) |e| {
         var argv: [3]?*const c.Value = .{
-            zigStringToV8(isolate, pair.value),
-            zigStringToV8(isolate, pair.name),
+            zigStringToV8(isolate, data.valueOf(e)),
+            zigStringToV8(isolate, data.nameOf(e)),
             @ptrCast(c.v8__FunctionCallbackInfo__This(info)),
         };
         _ = c.v8__Function__Call(@ptrCast(callback), context, @ptrCast(c.v8__Undefined(isolate)), 3, &argv);

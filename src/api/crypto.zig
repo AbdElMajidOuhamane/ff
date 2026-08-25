@@ -89,11 +89,19 @@ fn rejectPromiseWithError(isolate: ?*c.Isolate, context: ?*c.Context, resolver: 
     c.v8__Promise__Resolver__Reject(resolver, context, err_val, &out);
 }
 
+/// Reject-and-return-the-promise epilogue shared by subtle.* early-exit
+/// paths (replaces seven repeated 5-line blocks).
+fn rejectAndReturn(info: ?*const c.FunctionCallbackInfo, isolate: ?*c.Isolate, context: ?*c.Context, resolver: *const c.PromiseResolver, msg: []const u8) void {
+    rejectPromiseWithError(isolate, context, resolver, msg);
+    var ret: c.ReturnValue = undefined;
+    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+}
+
 /// Extracts an algorithm/format NAME into the CALLER-provided buffer and
 /// returns a borrowed slice — zero heap allocations. Names are short spec
 /// tokens ("SHA-256", "AES-GCM", "raw"); anything longer than the buffer
-/// simply fails the downstream equality checks and is rejected, which is
-/// the same outcome as an unknown algorithm.
+/// simply fails the downstream equality checks and is rejected.
 fn extractStrBuf(isolate: ?*c.Isolate, val: *const c.Value, buf: []u8) ?[]const u8 {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const str = c.v8__Value__ToDetailString(val, context);
@@ -194,6 +202,26 @@ fn randomUUIDCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, &uuid));
 }
 
+/// Shared CryptoKey-object builder for generateKey/importKey/deriveKey:
+/// attaches rooted strings in one place (was: five inline recreations per
+/// branch). Pass algo_value=null for deriveKey's bare secret key.
+fn buildCryptoKeyObject(
+    isolate: ?*c.Isolate,
+    context: ?*c.Context,
+    algo_value: ?*const c.Value,
+) ?*const c.Value {
+    const key_obj = c.v8__Object__New(isolate) orelse return null;
+    var out: c.MaybeBool = undefined;
+    c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
+    if (algo_value) |av| {
+        const algo_obj = c.v8__Object__New(isolate) orelse return null;
+        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), av, &out);
+        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
+    }
+    c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
+    return key_obj;
+}
+
 fn subtleDigestCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
     const context = c.v8__Isolate__GetCurrentContext(isolate);
@@ -259,37 +287,22 @@ fn subtleGenerateKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) 
 
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
-    if (std.mem.eql(u8, algo_name, "AES-GCM")) {
-        const key_obj = c.v8__Object__New(isolate);
+    if (std.mem.eql(u8, algo_name, "AES-GCM") or std.mem.eql(u8, algo_name, "HMAC")) {
         var key_data: [32]u8 = undefined;
         getRandomBytes(&key_data);
-
         const ab_val = createArrayBuffer(isolate, &key_data);
+
+        const algo_value: *const c.Value = if (algo_name[0] == 'A')
+            globalStr(&str_aes_gcm, isolate, "AES-GCM")
+        else
+            globalStr(&str_hmac, isolate, "HMAC");
+
+        const key_obj = buildCryptoKeyObject(isolate, context, algo_value) orelse {
+            rejectAndReturn(info, isolate, context, resolver, "allocation failed");
+            return;
+        };
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
         c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
-
-        const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_aes_gcm, isolate, "AES-GCM"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
-
-        c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
-    } else if (std.mem.eql(u8, algo_name, "HMAC")) {
-        const key_obj = c.v8__Object__New(isolate);
-        var key_data: [32]u8 = undefined;
-        getRandomBytes(&key_data);
-
-        const ab_val = createArrayBuffer(isolate, &key_data);
-        var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
-
-        const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_hmac, isolate, "HMAC"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
-
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else {
         rejectPromiseWithError(isolate, context, resolver, "unsupported algorithm for generateKey");
@@ -332,31 +345,19 @@ fn subtleImportKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
 
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
-    if (std.mem.eql(u8, algo_name, "HMAC") and std.mem.eql(u8, format, "raw")) {
-        const key_obj = c.v8__Object__New(isolate);
-        const ab_val = createArrayBuffer(isolate, bs.ptr[0..bs.len]);
+    if ((std.mem.eql(u8, algo_name, "HMAC") or std.mem.eql(u8, algo_name, "AES-GCM")) and std.mem.eql(u8, format, "raw")) {
+        const algo_value: *const c.Value = if (algo_name[0] == 'A')
+            globalStr(&str_aes_gcm, isolate, "AES-GCM")
+        else
+            globalStr(&str_hmac, isolate, "HMAC");
+
+        const key_obj = buildCryptoKeyObject(isolate, context, algo_value) orelse {
+            rejectAndReturn(info, isolate, context, resolver, "allocation failed");
+            return;
+        };
         var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
-
-        const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_hmac, isolate, "HMAC"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
-
-        c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
-    } else if (std.mem.eql(u8, algo_name, "AES-GCM") and std.mem.eql(u8, format, "raw")) {
-        const key_obj = c.v8__Object__New(isolate);
         const ab_val = createArrayBuffer(isolate, bs.ptr[0..bs.len]);
-        var out: c.MaybeBool = undefined;
         c.v8__Object__Set(key_obj, context, globalStr(&str_data, isolate, "data"), ab_val, &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
-
-        const algo_obj = c.v8__Object__New(isolate);
-        c.v8__Object__Set(algo_obj, context, globalStr(&str_name, isolate, "name"), globalStr(&str_aes_gcm, isolate, "AES-GCM"), &out);
-        c.v8__Object__Set(key_obj, context, globalStr(&str_algorithm, isolate, "algorithm"), algo_obj, &out);
-
         c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
     } else {
         rejectPromiseWithError(isolate, context, resolver, "unsupported algorithm/format for importKey");
@@ -380,10 +381,7 @@ fn subtleExportKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
     const resolver = c.v8__Promise__Resolver__New(context).?;
 
     if (!c.v8__Value__IsObject(key_val)) {
-        rejectPromiseWithError(isolate, context, resolver, "argument must be a CryptoKey object");
-        var ret: c.ReturnValue = undefined;
-        c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+        rejectAndReturn(info, isolate, context, resolver, "argument must be a CryptoKey object");
         return;
     }
 
@@ -433,60 +431,47 @@ fn subtleEncryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
 
     if (std.mem.eql(u8, algo_name, "AES-GCM")) {
         const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "key has no data property");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "key has no data property");
             return;
         };
         const key_bs = getBackingStoreData(isolate, key_data_val) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "invalid key");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid key");
             return;
         };
 
         const key_bytes = key_bs.ptr[0..key_bs.len];
-        var nonce: [12]u8 = undefined;
-        getRandomBytes(&nonce);
-        var tag: [16]u8 = undefined;
-
-        const ciphertext = gpa.alloc(u8, data_bs.len) catch {
-            rejectPromiseWithError(isolate, context, resolver, "allocation failed");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
-            return;
-        };
-        defer gpa.free(ciphertext);
-
-        if (key_bytes.len == 16) {
-            Aes128Gcm.encrypt(ciphertext, &tag, data_bs.ptr[0..data_bs.len], "", nonce, key_bytes[0..16].*);
-        } else if (key_bytes.len == 32) {
-            Aes256Gcm.encrypt(ciphertext, &tag, data_bs.ptr[0..data_bs.len], "", nonce, key_bytes[0..32].*);
-        } else {
-            rejectPromiseWithError(isolate, context, resolver, "invalid AES key length");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+        if (key_bytes.len != 16 and key_bytes.len != 32) {
+            rejectAndReturn(info, isolate, context, resolver, "invalid AES key length");
             return;
         }
 
-        const result = gpa.alloc(u8, 12 + data_bs.len + 16) catch {
-            rejectPromiseWithError(isolate, context, resolver, "allocation failed");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+        var nonce: [12]u8 = undefined;
+        getRandomBytes(&nonce);
+
+        // Single output allocation: nonce | ciphertext | tag, written
+        // straight into the ArrayBuffer backing store — no intermediates,
+        // no extra copies. The resolved value IS this buffer.
+        const out_len = 12 + data_bs.len + 16;
+        const ab = c.v8__ArrayBuffer__New(isolate, out_len);
+        const store = c.v8__ArrayBuffer__GetBackingStore(ab);
+        const backing_o = std__shared_ptr__v8__BackingStore__get(&store);
+        if (backing_o == null or c.v8__BackingStore__Data(backing_o.?) == null) {
+            rejectAndReturn(info, isolate, context, resolver, "allocation failed");
             return;
-        };
-        defer gpa.free(result);
+        }
+        const out: [*]u8 = @ptrCast(c.v8__BackingStore__Data(backing_o.?).?);
+        @memcpy(out[0..12], &nonce); // ship the nonce we actually encrypted with
+        const tag: *[16]u8 = @ptrCast(out + out_len - 16);
+        const ciphertext = out[12 .. 12 + data_bs.len];
 
-        @memcpy(result[0..12], &nonce);
-        @memcpy(result[12 .. 12 + data_bs.len], ciphertext);
-        @memcpy(result[12 + data_bs.len ..], &tag);
+        if (key_bytes.len == 16) {
+            Aes128Gcm.encrypt(ciphertext, tag, data_bs.ptr[0..data_bs.len], "", nonce, key_bytes[0..16].*);
+        } else {
+            Aes256Gcm.encrypt(ciphertext, tag, data_bs.ptr[0..data_bs.len], "", nonce, key_bytes[0..32].*);
+        }
 
-        resolvePromiseWithBuffer(isolate, context, resolver, result);
+        var out_b: c.MaybeBool = undefined;
+        c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out_b);
     } else {
         rejectPromiseWithError(isolate, context, resolver, "unsupported algorithm for encrypt");
     }
@@ -524,17 +509,11 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
 
     if (std.mem.eql(u8, algo_name, "AES-GCM")) {
         const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "key has no data property");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "key has no data property");
             return;
         };
         const key_bs = getBackingStoreData(isolate, key_data_val) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "invalid key");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid key");
             return;
         };
 
@@ -542,10 +521,7 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
         const all_data = data_bs.ptr[0..data_bs.len];
 
         if (all_data.len < 28) {
-            rejectPromiseWithError(isolate, context, resolver, "ciphertext too short");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "ciphertext too short");
             return;
         }
 
@@ -555,40 +531,34 @@ fn subtleDecryptCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void
         var tag_val: [16]u8 = undefined;
         @memcpy(&tag_val, tag_slice);
 
-        const plaintext = gpa.alloc(u8, ciphertext.len) catch {
-            rejectPromiseWithError(isolate, context, resolver, "allocation failed");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+        // Plaintext decrypts straight into the returned ArrayBuffer.
+        const ab = c.v8__ArrayBuffer__New(isolate, ciphertext.len);
+        const store = c.v8__ArrayBuffer__GetBackingStore(ab);
+        const backing_o = std__shared_ptr__v8__BackingStore__get(&store);
+        if (backing_o == null or c.v8__BackingStore__Data(backing_o.?) == null) {
+            rejectAndReturn(info, isolate, context, resolver, "allocation failed");
             return;
-        };
-        defer gpa.free(plaintext);
+        }
+        const out: [*]u8 = @ptrCast(c.v8__BackingStore__Data(backing_o.?).?);
+        const plaintext = out[0..ciphertext.len];
 
         if (key_bytes.len == 16) {
             Aes128Gcm.decrypt(plaintext, ciphertext, tag_val, "", nonce.*, key_bytes[0..16].*) catch {
-                rejectPromiseWithError(isolate, context, resolver, "decryption failed");
-                var ret: c.ReturnValue = undefined;
-                c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-                c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+                rejectAndReturn(info, isolate, context, resolver, "decryption failed");
                 return;
             };
         } else if (key_bytes.len == 32) {
             Aes256Gcm.decrypt(plaintext, ciphertext, tag_val, "", nonce.*, key_bytes[0..32].*) catch {
-                rejectPromiseWithError(isolate, context, resolver, "decryption failed");
-                var ret: c.ReturnValue = undefined;
-                c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-                c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+                rejectAndReturn(info, isolate, context, resolver, "decryption failed");
                 return;
             };
         } else {
-            rejectPromiseWithError(isolate, context, resolver, "invalid AES key length");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid AES key length");
             return;
         }
 
-        resolvePromiseWithBuffer(isolate, context, resolver, plaintext);
+        var out_b: c.MaybeBool = undefined;
+        c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out_b);
     } else {
         rejectPromiseWithError(isolate, context, resolver, "unsupported algorithm for decrypt");
     }
@@ -626,17 +596,11 @@ fn subtleSignCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
 
     if (std.mem.eql(u8, algo_name, "HMAC")) {
         const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "key has no data property");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "key has no data property");
             return;
         };
         const key_bs = getBackingStoreData(isolate, key_data_val) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "invalid key");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid key");
             return;
         };
 
@@ -687,17 +651,11 @@ fn subtleVerifyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void 
 
     if (std.mem.eql(u8, algo_name, "HMAC")) {
         const key_data_val = c.v8__Object__Get(@ptrCast(key_val), context, globalStr(&str_data, isolate, "data")) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "key has no data property");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "key has no data property");
             return;
         };
         const key_bs = getBackingStoreData(isolate, key_data_val) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "invalid key");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid key");
             return;
         };
 
@@ -755,10 +713,7 @@ fn subtleDeriveBitsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) v
 
     if (std.mem.eql(u8, algo_name, "PBKDF2")) {
         const key_bs = getBackingStoreData(isolate, key_val) orelse {
-            rejectPromiseWithError(isolate, context, resolver, "invalid key");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+            rejectAndReturn(info, isolate, context, resolver, "invalid key");
             return;
         };
 
@@ -781,17 +736,25 @@ fn subtleDeriveBitsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) v
             }
         }
 
-        const derived = gpa.alloc(u8, byte_len) catch {
-            rejectPromiseWithError(isolate, context, resolver, "allocation failed");
-            var ret: c.ReturnValue = undefined;
-            c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
+        // Derived bits expand straight into the returned ArrayBuffer.
+        // (Also fixes the old silent `catch return`, which left the promise
+        // pending forever on derivation failure.)
+        const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
+        const store = c.v8__ArrayBuffer__GetBackingStore(ab);
+        const backing_o = std__shared_ptr__v8__BackingStore__get(&store);
+        if (backing_o == null or c.v8__BackingStore__Data(backing_o.?) == null) {
+            rejectAndReturn(info, isolate, context, resolver, "allocation failed");
+            return;
+        }
+        const derived = @as([*]u8, @ptrCast(c.v8__BackingStore__Data(backing_o.?).?))[0..byte_len];
+
+        std.crypto.pwhash.pbkdf2(derived, key_bs.ptr[0..key_bs.len], &salt, 100000, HmacSha256) catch {
+            rejectAndReturn(info, isolate, context, resolver, "derivation failed");
             return;
         };
-        defer gpa.free(derived);
 
-        std.crypto.pwhash.pbkdf2(derived, key_bs.ptr[0..key_bs.len], &salt, 100000, HmacSha256) catch return;
-        resolvePromiseWithBuffer(isolate, context, resolver, derived);
+        var out_b: c.MaybeBool = undefined;
+        c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out_b);
     } else {
         rejectPromiseWithError(isolate, context, resolver, "unsupported algorithm for deriveBits");
     }
@@ -811,10 +774,11 @@ fn subtleDeriveKeyCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) vo
     }
 
     const resolver = c.v8__Promise__Resolver__New(context).?;
-    const key_obj = c.v8__Object__New(isolate);
+    const key_obj = buildCryptoKeyObject(isolate, context, null) orelse {
+        rejectAndReturn(info, isolate, context, resolver, "allocation failed");
+        return;
+    };
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(key_obj, context, globalStr(&str_type, isolate, "type"), globalStr(&str_secret, isolate, "secret"), &out);
-    c.v8__Object__Set(key_obj, context, globalStr(&str_extractable, isolate, "extractable"), @ptrCast(c.v8__True(isolate)), &out);
     c.v8__Promise__Resolver__Resolve(resolver, context, key_obj, &out);
 
     var ret: c.ReturnValue = undefined;
