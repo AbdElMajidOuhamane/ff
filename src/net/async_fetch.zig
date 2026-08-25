@@ -248,10 +248,11 @@ pub fn submit(
     var hl = header_list; // deinit()/items take *Self — the param is const
     poolLock();
     defer poolUnlock();
-    const s = acquireSlot() orelse {
+        const s = acquireSlot() orelse {
         // we own the pieces — free them before reporting capacity exhaustion
-        gpa.free(url_buf);
-        for (hl.items) |h| {
+        if (builtin.mode == .Debug)
+            std.debug.print("[submit] rejected: pool full\n", .{}); // DIAGNOSTIC (W4)
+        gpa.free(url_buf);        for (hl.items) |h| {
             gpa.free(h.name);
             gpa.free(h.value);
         }
@@ -494,6 +495,8 @@ fn runJob(slot_id: u16) void {
 }
 
 fn failSlot(s: usize, comptime msg: []const u8) void {
+    if (builtin.mode == .Debug)
+        std.debug.print("[fail] slot {d}: {s}\n", .{ s, msg }); // DIAGNOSTIC (W4)
     errs[s] = msg;
     finishSlot(s);
 }

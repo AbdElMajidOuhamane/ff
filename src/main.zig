@@ -23,6 +23,7 @@ fn parseCommand(arg: []const u8) Command {
     return .file;
 }
 fn shutdownRuntime(runtime: *engine.Runtime) void {
+    engine.deinitNetwork();
     runtime.event_loop.deinit();
     std.heap.page_allocator.destroy(runtime.event_loop);
     runtime.deinit();

@@ -34,8 +34,9 @@ pub fn run(io: std.Io,init:std.process.Init) !void {
     defer allocator.free(js_content);
     const source: [:0]const u8 = js_content.ptr[0..js_content.len :0];
     // 5. Run it
-    const runtime = try engine.Runtime.init(init.minimal.args);
+     const runtime = try engine.Runtime.init(init.minimal.args);
     defer {
+        engine.deinitNetwork();                         
         runtime.event_loop.deinit();
         std.heap.page_allocator.destroy(runtime.event_loop);
         runtime.deinit();

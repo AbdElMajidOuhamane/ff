@@ -14,10 +14,9 @@ fn getRandomBytes(buf: []u8) void {
             while (off < buf.len) {
                 const n = std.c.getrandom(buf.ptr + off, buf.len - off, 0);
                 if (n < 0) {
-                    // Retry only on EINTR; anything else falls back once to
-                    // the CSPRNG instead of spinning forever.
                     if (std.posix.errno(n) == .INTR) continue;
-                    std.crypto.random.bytes(buf[off..]);
+                    std.Io.Threaded.global_single_threaded.io().random(buf[off..]);
+// if compiler still says "use '.*'", use: std.Io.Threaded.global_single_threaded.*.io().random(buf[off..]);)
                     return;
                 }
                 off += @intCast(n);

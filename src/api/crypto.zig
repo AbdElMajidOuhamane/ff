@@ -11,22 +11,17 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
 const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 
-// Thread-safe general-purpose allocator: no mmap/munmap syscall pair per
-// allocation (mirrors fetch.zig's rationale).
 const gpa = std.heap.smp_allocator;
 
 extern fn std__shared_ptr__v8__BackingStore__get(self: *const c.SharedPtr) callconv(.c) ?*c.BackingStore;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 
-// ---- V8 property-key/value globals (rooted once in setup): every subtle.*
-// callback used to recreate these identical strings on each call. ----
 var str_name: c.Global = .{ .data_ptr = 0 };
 var str_data: c.Global = .{ .data_ptr = 0 };
 var str_salt: c.Global = .{ .data_ptr = 0 };
 var str_type: c.Global = .{ .data_ptr = 0 };
 var str_algorithm: c.Global = .{ .data_ptr = 0 };
 var str_extractable: c.Global = .{ .data_ptr = 0 };
-// static VALUE strings handed to property setters
 var str_secret: c.Global = .{ .data_ptr = 0 };
 var str_aes_gcm: c.Global = .{ .data_ptr = 0 };
 var str_hmac: c.Global = .{ .data_ptr = 0 };
@@ -41,8 +36,6 @@ fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
     return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
 }
 
-/// Cached-Global accessor with an inline fallback so a missing root can
-/// never turn a hot path into a null-deref.
 fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
     return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, fallback));
 }
@@ -89,8 +82,6 @@ fn rejectPromiseWithError(isolate: ?*c.Isolate, context: ?*c.Context, resolver: 
     c.v8__Promise__Resolver__Reject(resolver, context, err_val, &out);
 }
 
-/// Reject-and-return-the-promise epilogue shared by subtle.* early-exit
-/// paths (replaces seven repeated 5-line blocks).
 fn rejectAndReturn(info: ?*const c.FunctionCallbackInfo, isolate: ?*c.Isolate, context: ?*c.Context, resolver: *const c.PromiseResolver, msg: []const u8) void {
     rejectPromiseWithError(isolate, context, resolver, msg);
     var ret: c.ReturnValue = undefined;
@@ -98,10 +89,6 @@ fn rejectAndReturn(info: ?*const c.FunctionCallbackInfo, isolate: ?*c.Isolate, c
     c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Promise__Resolver__GetPromise(resolver)));
 }
 
-/// Extracts an algorithm/format NAME into the CALLER-provided buffer and
-/// returns a borrowed slice — zero heap allocations. Names are short spec
-/// tokens ("SHA-256", "AES-GCM", "raw"); anything longer than the buffer
-/// simply fails the downstream equality checks and is rejected.
 fn extractStrBuf(isolate: ?*c.Isolate, val: *const c.Value, buf: []u8) ?[]const u8 {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const str = c.v8__Value__ToDetailString(val, context);
@@ -133,10 +120,8 @@ fn getRandomBytes(buf: []u8) void {
             while (off < buf.len) {
                 const n = std.c.getrandom(buf.ptr + off, buf.len - off, 0);
                 if (n < 0) {
-                    // Retry only on EINTR; anything else falls back once to
-                    // the CSPRNG instead of spinning forever.
                     if (std.posix.errno(n) == .INTR) continue;
-                    std.crypto.random.bytes(buf[off..]);
+                    std.Io.Threaded.global_single_threaded.io().random(buf[off..]);
                     return;
                 }
                 off += @intCast(n);

@@ -15,6 +15,7 @@ const request = @import("../types/request.zig");
 const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
 const websocket_client = @import("../api/websocket_client.zig");
+const http_native = @import("../net/http_native.zig");
 const simd = std.simd;
 // Dependency work item: registry key plus a handle to the already-parsed,
 // cache-owned Module. No duplicate source copy, no second parse pass.
@@ -38,6 +39,12 @@ fn initGlobal() void {
 }
 pub fn getEventLoop() ?*EventLoop {
     if (g_runtime) |rt| return rt.event_loop else return null;
+}
+/// Shuts down the network stack while the event loop is still alive:
+/// listener close + connection closes are xev completions on that loop,
+/// so this MUST run before event_loop.deinit().
+pub fn deinitNetwork() void {
+    http_native.deinit();
 }
 pub const Runtime = struct {
     isolate: ?*c.Isolate,
