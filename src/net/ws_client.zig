@@ -232,7 +232,7 @@ pub fn submit(
     c.v8__Global__New(isolate, @ptrCast(obj), &socks[s]);
     _ = pending.fetchAdd(1, .acq_rel);
     const s16: u16 = @intCast(s);
-    const th = std.Thread.spawn(.{}, workerMain, .{s16}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerMain, .{s16}) catch {
         _ = pending.fetchSub(1, .acq_rel);
         c.v8__Global__Reset(&socks[s]);
         socks[s] = .{ .data_ptr = 0 };

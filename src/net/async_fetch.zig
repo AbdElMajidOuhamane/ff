@@ -44,23 +44,24 @@ const http = std.http;
 // v8 is touched ONLY on the main thread (drainCompleted/completeJob).
 // ============================================================
 
-pub const MAX_FETCH = 64; // matches tls.MAX_CONN; == u64 mask lanes
+pub const MAX_FETCH = 16; // matches tls.MAX_CONN; == u64 mask lanes
 
 const JOB_FREE: u8 = 0;
 const JOB_BUSY: u8 = 1;
 const JOB_DONE: u8 = 2;
 const JOB_CLAIMED: u8 = 3;
 
-// ---- SoA hot state (one contiguous block per field) ----
+// ---- Hot state (touched every tick: state machine + V8 resolvers) ----
 var states:    [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
+var resolvers: [MAX_FETCH]c.Global = undefined;
+var results:   [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
+var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
+// ---- Cold data (touched only on submit/complete, not every tick) ----
 var url_bufs:  [MAX_FETCH][:0]const u8 = undefined;
 var uris:      [MAX_FETCH]std.Uri = undefined;
 var methods:   [MAX_FETCH]http.Method = undefined;
 var headers:   [MAX_FETCH]std.ArrayList(http.Header) = undefined;
 var bodies:    [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
-var resolvers: [MAX_FETCH]c.Global = undefined;
-var results:   [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
-var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
 
 // ---- O(1) slot allocator (spinlock-guarded) ----
 var free_list: [MAX_FETCH]u16 = undefined;
@@ -161,7 +162,7 @@ pub fn init() void {
     // Best-effort spawn: a partial pool is fine — excess jobs simply wait
     // in the ring until a worker frees up.
     for (&worker_threads) |*t| {
-        t.* = std.Thread.spawn(.{}, workerLoop, .{}) catch {
+            t.* = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerLoop, .{}) catch {
             t.* = null;
             break;
         };
@@ -548,11 +549,11 @@ fn asyncCb(
 // "vector wide, then scalar per-element" hybrid as findCrLf in tls.zig.
 
 fn doneMask() u64 {
-    var raw: [MAX_FETCH]u8 = undefined;
-    for (0..MAX_FETCH) |i| raw[i] = states[i].raw; // scalar gather; ordering not needed (hint only)
-    const v: @Vector(MAX_FETCH, u8) = @bitCast(raw);
-    const eq = v == @as(@Vector(MAX_FETCH, u8), @splat(JOB_DONE));
-    return @bitCast(eq); // 64 x u1 lanes -> u64 bitmask
+    var mask: u64 = 0;
+    inline for (0..MAX_FETCH) |i| {
+        if (states[i].raw == JOB_DONE) mask |= @as(u64, 1) << @intCast(i);
+    }
+    return mask;
 }
 
 fn claimSlot(s: usize) bool {

@@ -19,7 +19,7 @@ else
 const counting = @import("../util/counting_allocator.zig");
 
 pub const MAX_CONN = 512;
-const READ_BUF_SIZE = 16384;
+const READ_BUF_SIZE = 4096;
 const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
 
@@ -84,7 +84,7 @@ var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // ---- Cold bulk data: out-of-line so hot state stays dense ----
 var read_bufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
 var write_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
-var ws_partial: [MAX_CONN][ws.WS_MSG_SIZE]u8 = undefined;
+var ws_partial: [MAX_CONN]?*[ws.WS_MSG_SIZE]u8 = [_]?*[ws.WS_MSG_SIZE]u8{null} ** MAX_CONN;
 // ---- O(1) free-list slot allocator ----
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = 0;
@@ -769,8 +769,8 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         }
         // Fragmented message begins: remember its type until assembly.
         ws_partial_binary[id] = hdr.opcode == ws.OP_BINARY;
-        @memcpy(ws_partial[id][0..payload.len], payload);
-        ws_partial_len[id] = payload.len;
+        if (ws_partial[id] == null) ws_partial[id] = gpa.create([ws.WS_MSG_SIZE]u8) catch return false;
+        @memcpy(ws_partial[id].?[0..payload.len], payload);
         return true;
     }
     if (ws_partial_len[id] == 0) {
@@ -781,11 +781,12 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         wsSendClose(id, 1009);
         return false;
     }
-    @memcpy(ws_partial[id][ws_partial_len[id]..][0..payload.len], payload);
+        if (ws_partial[id] == null) ws_partial[id] = gpa.create([ws.WS_MSG_SIZE]u8) catch return false;
+        @memcpy(ws_partial[id].?[ws_partial_len[id]..][0..payload.len], payload);
     ws_partial_len[id] += payload.len;
     if (hdr.fin) {
-        wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]], ws_partial_binary[id]);
-        ws_partial_len[id] = 0;
+                wsNotifyMessage(id, ws_partial[id].?[0..ws_partial_len[id]], ws_partial_binary[id]);
+                ws_partial_len[id] = 0;
     }
     return true;
 }
@@ -838,6 +839,7 @@ fn wsShutdown(id: usize) void {
     ws_sockets[id] = .{ .data_ptr = 0 };
     cflags[id].ws_open = false;
     ws_partial_len[id] = 0;
+    if (ws_partial[id]) |p| { gpa.destroy(p); ws_partial[id] = null; }
     ws_partial_binary[id] = false;
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_writing = false;

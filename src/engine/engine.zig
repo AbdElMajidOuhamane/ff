@@ -60,7 +60,7 @@ pub const Runtime = struct {
         c.v8__Isolate__CreateParams__CONSTRUCT(&params);
         params.array_buffer_allocator = c.v8__ArrayBuffer__Allocator__NewDefaultAllocator();
         var constraints: c.ResourceConstraints = undefined;
-        c.v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(&constraints, 0, 256 * 1024 * 1024);
+       c.v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(&constraints, 0, 64 * 1024 * 1024);
         params.constraints = constraints;
         const isolate = c.v8__Isolate__New(&params);
         c.v8__Isolate__Enter(isolate);

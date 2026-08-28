@@ -33,6 +33,11 @@ var str_username: c.Global = .{ .data_ptr = 0 };
 var str_password: c.Global = .{ .data_ptr = 0 };
 var str_protocol: c.Global = .{ .data_ptr = 0 };
 var str_searchParams: c.Global = .{ .data_ptr = 0 };
+var str_empty_val: c.Global = .{ .data_ptr = 0 };
+var str_https: c.Global = .{ .data_ptr = 0 };
+var str_http: c.Global = .{ .data_ptr = 0 };
+var str_443: c.Global = .{ .data_ptr = 0 };
+var str_80: c.Global = .{ .data_ptr = 0 };
 var fn_spGet: c.Global = .{ .data_ptr = 0 };
 var fn_spGetAll: c.Global = .{ .data_ptr = 0 };
 var fn_spHas: c.Global = .{ .data_ptr = 0 };
@@ -117,11 +122,14 @@ fn isSpecialScheme(scheme: []const u8) bool {
 // ============================================================
 const Pair = struct { name: []const u8, value: []const u8 };
 const SPEntry = struct {
-    name_off: usize,
-    name_len: usize,
-    val_off: usize,
-    val_len: usize,
+    name_off: u32,
+    name_len: u32,
+    val_off: u32,
+    val_len: u32,
 };
+comptime {
+    std.debug.assert(@sizeOf(SPEntry) == 16);
+}
 const URLSearchParamsData = struct {
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
@@ -165,10 +173,10 @@ const URLSearchParamsData = struct {
             return;
         };
         self.entries.append(gpa, .{
-            .name_off = nbase,
-            .name_len = name.len,
-            .val_off = vbase,
-            .val_len = value.len,
+            .name_off = @intCast(nbase),
+            .name_len = @intCast(name.len),
+            .val_off = @intCast(vbase),
+            .val_len = @intCast(value.len),
         }) catch {
             self.names.items.len = nbase;
             self.values.items.len = vbase;
@@ -249,8 +257,8 @@ const URLSearchParamsData = struct {
                 if (!found) {
                     const vbase = self.values.items.len;
                     self.values.appendSlice(gpa, value) catch return;
-                    self.entries.items[i].val_off = vbase;
-                    self.entries.items[i].val_len = value.len;
+                    self.entries.items[i].val_off = @intCast(vbase);
+                    self.entries.items[i].val_len = @intCast(value.len);
                     found = true;
                     i += 1;
                 } else {
@@ -873,6 +881,23 @@ fn setUrlProp(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, g
     var out: c.MaybeBool = undefined;
     c.v8__Object__Set(@ptrCast(obj), context, globalStr(g, isolate, fallback), zigStringToV8(isolate, val), &out);
 }
+fn setUrlPropCached(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, key_v8: *const c.Value, val: []const u8) void {
+    const val_v8 = if (val.len == 0)
+        globalStr(&str_empty_val, isolate, "")
+    else if (std.mem.eql(u8, val, "https:"))
+        globalStr(&str_https, isolate, "https:")
+    else if (std.mem.eql(u8, val, "http:"))
+        globalStr(&str_http, isolate, "http:")
+    else if (std.mem.eql(u8, val, "443"))
+        globalStr(&str_443, isolate, "443")
+    else if (std.mem.eql(u8, val, "80"))
+        globalStr(&str_80, isolate, "80")
+    else
+        zigStringToV8(isolate, val);
+
+    var out: c.MaybeBool = undefined;
+    c.v8__Object__Set(@ptrCast(obj), context, key_v8, val_v8, &out);
+}
 fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData) ?*const c.Value {
     const obj = c.v8__Object__New(isolate) orelse return null;
     const ext = c.v8__External__New(isolate, @ptrCast(data));
@@ -892,17 +917,18 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
     defer if (search_val.len > 0) gpa.free(search_val);
     const hash_val = data.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
-    setUrlProp(isolate, context, obj, &str_href, "href", href_val);
-    setUrlProp(isolate, context, obj, &str_origin, "origin", origin_val);
-    setUrlProp(isolate, context, obj, &str_host, "host", host_val);
-    setUrlProp(isolate, context, obj, &str_hostname, "hostname", data.host);
-    setUrlProp(isolate, context, obj, &str_port, "port", port_val);
-    setUrlProp(isolate, context, obj, &str_pathname, "pathname", data.path);
-    setUrlProp(isolate, context, obj, &str_search, "search", search_val);
-    setUrlProp(isolate, context, obj, &str_hash, "hash", hash_val);
-    setUrlProp(isolate, context, obj, &str_username, "username", data.username);
-    setUrlProp(isolate, context, obj, &str_password, "password", data.password);
-    setUrlProp(isolate, context, obj, &str_protocol, "protocol", protocol_val);
+   
+setUrlPropCached(isolate, context, obj, globalStr(&str_href, isolate, "href"), data.serialize() catch "");
+setUrlPropCached(isolate, context, obj, globalStr(&str_origin, isolate, "origin"), origin_val);
+setUrlPropCached(isolate, context, obj, globalStr(&str_host, isolate, "host"), host_val);
+setUrlPropCached(isolate, context, obj, globalStr(&str_hostname, isolate, "hostname"), data.host);
+setUrlPropCached(isolate, context, obj, globalStr(&str_port, isolate, "port"), port_val);
+setUrlPropCached(isolate, context, obj, globalStr(&str_pathname, isolate, "pathname"), data.path);
+setUrlPropCached(isolate, context, obj, globalStr(&str_search, isolate, "search"), search_val);
+setUrlPropCached(isolate, context, obj, globalStr(&str_hash, isolate, "hash"), hash_val);
+setUrlPropCached(isolate, context, obj, globalStr(&str_username, isolate, "username"), data.username);
+setUrlPropCached(isolate, context, obj, globalStr(&str_password, isolate, "password"), data.password);
+setUrlPropCached(isolate, context, obj, globalStr(&str_protocol, isolate, "protocol"), protocol_val);
     const method_pairs = .{
         .{ &fn_urlToString, &str_toString, "toString" },
         .{ &fn_urlToJSON, &str_toJSON, "toJSON" },
@@ -1084,7 +1110,16 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     }) |entry| {
         c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
     }
-
+inline for (&.{
+    .{ &str_empty_val, "" },
+    .{ &str_https, "https:" },
+    .{ &str_http, "http:" },
+    .{ &str_443, "443" },
+    .{ &str_80, "80" },
+}) |pair| {
+    const s = c.v8__String__NewFromUtf8(isolate, pair[1], 0, -1);
+    c.v8__Global__New(isolate, @ptrCast(s), pair[0]);
+}
     // One shared function set for every instance.
     inline for (.{
         .{ spGet, &fn_spGet },           .{ spGetAll, &fn_spGetAll },

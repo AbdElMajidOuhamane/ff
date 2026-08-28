@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
+const pool_slice_mod = @import("pool_slice.zig");
 const gpa = std.heap.smp_allocator;
 // ============================================================
 // Cached V8 strings + functions (created once in setup)
@@ -282,7 +283,7 @@ pub const RedirectMode = enum(u8) {
 // ============================================================
 // RequestData — DOD: contiguous string pool + interned scalars
 // ============================================================
-const PoolSlice = struct { off: usize = 0, len: usize = 0 };
+const PoolSlice = pool_slice_mod.PoolSlice;
 pub const RequestData = struct {
     pool: std.ArrayList(u8),
     _url: PoolSlice,
@@ -372,7 +373,7 @@ pub const RequestData = struct {
         if (owned.len == 0) return;
         const off = self.pool.items.len;
         self.pool.appendSlice(gpa, owned) catch return;
-        dst.* = .{ .off = off, .len = owned.len };
+        dst.* = .{ .off = @intCast(off), .len = @intCast(owned.len) };
     }
     pub fn setUrl(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);

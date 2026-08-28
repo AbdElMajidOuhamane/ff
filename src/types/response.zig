@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
+const pool_slice_mod = @import("pool_slice.zig");
 const gpa = std.heap.smp_allocator;
 // ============================================================
 // Cached V8 strings + functions (created once in setup)
@@ -166,7 +167,7 @@ pub const ResponseType = enum(u8) {
 // ============================================================
 // ResponseData — DOD: contiguous string pool + interned scalars
 // ============================================================
-const PoolSlice = struct { off: usize = 0, len: usize = 0 };
+const PoolSlice = pool_slice_mod.PoolSlice;
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
     status: u16,
@@ -226,7 +227,7 @@ pub const ResponseData = struct {
         }
         const off = self.pool.items.len;
         self.pool.appendSlice(gpa, s) catch return;
-        dst.* = .{ .off = off, .len = s.len };
+        dst.* = .{ .off = @intCast(off), .len = @intCast(s.len) };
     }
     pub fn setStatusText(self: *ResponseData, s: []const u8) void {
         self.storeString(s, &self.status_text);

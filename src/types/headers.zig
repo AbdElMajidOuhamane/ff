@@ -2,6 +2,21 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
 const simd = std.simd;
+
+
+var str___d: c.Global = .{ .data_ptr = 0 };
+var str_get: c.Global = .{ .data_ptr = 0 };
+var str_getAll: c.Global = .{ .data_ptr = 0 };
+var str_has: c.Global = .{ .data_ptr = 0 };
+var str_set: c.Global = .{ .data_ptr = 0 };
+var str_append: c.Global = .{ .data_ptr = 0 };
+var str_delete: c.Global = .{ .data_ptr = 0 };
+var str_entries: c.Global = .{ .data_ptr = 0 };
+var str_keys: c.Global = .{ .data_ptr = 0 };
+var str_values: c.Global = .{ .data_ptr = 0 };
+var str_forEach: c.Global = .{ .data_ptr = 0 };
+var str_toString: c.Global = .{ .data_ptr = 0 };
+var str_size: c.Global = .{ .data_ptr = 0 };
 // ============================================================
 // Helpers
 // ============================================================
@@ -53,6 +68,9 @@ fn extractStringAuto(isolate: ?*c.Isolate, val: ?*const c.Value, stack_buf: []u8
     _ = c.v8__String__WriteUtf8(str, isolate, heap_buf.ptr, utf8_len, 0);
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
+fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime key: []const u8) *const c.Value {
+    return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, key));
+}
 // Vectorized ASCII lowercase: lanes in 'A'..'Z' get += 0x20.
 fn lowerAsciiSimd(buf: []u8) void {
     const N = simd.suggestVectorLength(u8) orelse 16;
@@ -95,11 +113,14 @@ fn lowerAsciiSimd(buf: []u8) void {
 // ============================================================
 pub const Pair = struct { name: []const u8, value: []const u8 };
 const Entry = struct {
-    name_off: usize,
-    name_len: usize,
-    val_off: usize,
-    val_len: usize,
+    name_off: u32,
+    name_len: u32,
+    val_off: u32,
+    val_len: u32,
 };
+comptime {
+    std.debug.assert(@sizeOf(Entry) == 16);
+}
 pub const HeadersData = struct {
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
@@ -158,10 +179,10 @@ pub const HeadersData = struct {
             return;
         };
         self.entries.append(gpa, .{
-            .name_off = nbase,
-            .name_len = ln.len,
-            .val_off = vbase,
-            .val_len = value.len,
+            .name_off = @intCast(nbase),
+            .name_len = @intCast(ln.len),
+            .val_off = @intCast(vbase),
+            .val_len = @intCast(value.len),
         }) catch {
             self.names.items.len = nbase;
             self.values.items.len = vbase;
@@ -179,10 +200,10 @@ pub const HeadersData = struct {
             return;
         };
         self.entries.append(gpa, .{
-            .name_off = nbase,
-            .name_len = name.len,
-            .val_off = vbase,
-            .val_len = value.len,
+            .name_off = @intCast(nbase),
+            .name_len = @intCast(name.len),
+            .val_off = @intCast(vbase),
+            .val_len = @intCast(value.len),
         }) catch {
             self.names.items.len = nbase;
             self.values.items.len = vbase;
@@ -201,8 +222,8 @@ pub const HeadersData = struct {
                     first = i;
                     const vbase = self.values.items.len;
                     self.values.appendSlice(gpa, value) catch return;
-                    self.entries.items[i].val_off = vbase;
-                    self.entries.items[i].val_len = value.len;
+                    self.entries.items[i].val_off = @intCast(vbase);
+                    self.entries.items[i].val_len = @intCast(value.len);
                     i += 1;
                 } else {
                     self.removeSwap(i);
@@ -330,7 +351,7 @@ fn extractHeadersData(info: ?*const c.FunctionCallbackInfo) ?*HeadersData {
     const context = c.v8__Isolate__GetCurrentContext(isolate);
     const this = c.v8__FunctionCallbackInfo__This(info);
     if (this == null) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
+    const data_key = globalStr(&str___d, isolate, "__d");
     const ext_val = c.v8__Object__Get(@ptrCast(this), context, data_key);
     if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
     const ptr = c.v8__External__Value(@ptrCast(ext_val));
@@ -352,7 +373,7 @@ fn headersConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         if (init_val == null or c.v8__Value__IsUndefined(init_val) or c.v8__Value__IsNull(init_val)) {
             // empty
         } else if (c.v8__Value__IsObject(init_val)) {
-            const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
+            const data_key = globalStr(&str___d, isolate, "__d");
             const ext_val = c.v8__Object__Get(@ptrCast(init_val), context, data_key);
             if (ext_val != null and c.v8__Value__IsExternal(ext_val)) {
                 const src: *HeadersData = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(ext_val))));
@@ -434,7 +455,7 @@ fn headersConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     const obj = c.v8__Object__New(isolate);
     const ext = c.v8__External__New(isolate, @ptrCast(data));
     var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, "__d", 0, -1), ext, &out);
+        c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
     const fns = .{
         .{ "get", headersGet },
         .{ "getAll", headersGetAll },
@@ -449,9 +470,13 @@ fn headersConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
         .{ "toString", headersToString },
         .{ "size", headersSize },
     };
-    inline for (fns) |entry| {
+        const str_globals = .{
+        &str_get, &str_getAll, &str_has, &str_set, &str_append, &str_delete,
+        &str_entries, &str_keys, &str_values, &str_forEach, &str_toString, &str_size,
+    };
+    inline for (fns, 0..) |entry, i| {
         const fn_val = c.v8__Function__New__DEFAULT(context, entry[1]);
-        c.v8__Object__Set(obj, context, c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1), fn_val, &out);
+        c.v8__Object__Set(obj, context, globalStr(str_globals[i], isolate, entry[0]), fn_val, &out);
     }
     var ret: c.ReturnValue = undefined;
     c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
@@ -667,4 +692,18 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
     const fn_val = c.v8__Function__New__DEFAULT(context, headersConstructor);
     const key = c.v8__String__NewFromUtf8(isolate, "Headers", 0, -1);
     _ = c.v8__Object__Set(global, context, key, fn_val, &out);
+    // Pre-root globals so globalStr() never hits the fallback path
+    const pairs = .{
+        .{ &str___d, "__d" },
+        .{ &str_get, "get" },       .{ &str_getAll, "getAll" },
+        .{ &str_has, "has" },       .{ &str_set, "set" },
+        .{ &str_append, "append" }, .{ &str_delete, "delete" },
+        .{ &str_entries, "entries" },.{ &str_keys, "keys" },
+        .{ &str_values, "values" }, .{ &str_forEach, "forEach" },
+        .{ &str_toString, "toString" },.{ &str_size, "size" },
+    };
+    inline for (pairs) |pair| {
+        const s = c.v8__String__NewFromUtf8(isolate, pair[1], 0, -1);
+        c.v8__Global__New(isolate, @ptrCast(s), pair[0]);
+    }
 }
