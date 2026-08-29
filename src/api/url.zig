@@ -2,79 +2,16 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
 
-// ---- V8 cached strings + functions (rooted once in setup). Previously
-// every URLSearchParams/URL instance created its own "__d" key, all method
-// key strings, and 13 brand-new JSFunction objects — twice over for nested
-// searchParams. Instances now share one rooted set. ----
-var str___d: c.Global = .{ .data_ptr = 0 };
-var str_get: c.Global = .{ .data_ptr = 0 };
-var str_getAll: c.Global = .{ .data_ptr = 0 };
-var str_has: c.Global = .{ .data_ptr = 0 };
-var str_set: c.Global = .{ .data_ptr = 0 };
-var str_append: c.Global = .{ .data_ptr = 0 };
-var str_delete: c.Global = .{ .data_ptr = 0 };
-var str_sort: c.Global = .{ .data_ptr = 0 };
-var str_toString: c.Global = .{ .data_ptr = 0 };
-var str_entries: c.Global = .{ .data_ptr = 0 };
-var str_keys: c.Global = .{ .data_ptr = 0 };
-var str_values: c.Global = .{ .data_ptr = 0 };
-var str_forEach: c.Global = .{ .data_ptr = 0 };
-var str_size: c.Global = .{ .data_ptr = 0 };
-var str_toJSON: c.Global = .{ .data_ptr = 0 };
-var str_href: c.Global = .{ .data_ptr = 0 };
-var str_origin: c.Global = .{ .data_ptr = 0 };
-var str_host: c.Global = .{ .data_ptr = 0 };
-var str_hostname: c.Global = .{ .data_ptr = 0 };
-var str_port: c.Global = .{ .data_ptr = 0 };
-var str_pathname: c.Global = .{ .data_ptr = 0 };
-var str_search: c.Global = .{ .data_ptr = 0 };
-var str_hash: c.Global = .{ .data_ptr = 0 };
-var str_username: c.Global = .{ .data_ptr = 0 };
-var str_password: c.Global = .{ .data_ptr = 0 };
-var str_protocol: c.Global = .{ .data_ptr = 0 };
-var str_searchParams: c.Global = .{ .data_ptr = 0 };
-var str_empty_val: c.Global = .{ .data_ptr = 0 };
-var str_https: c.Global = .{ .data_ptr = 0 };
-var str_http: c.Global = .{ .data_ptr = 0 };
-var str_443: c.Global = .{ .data_ptr = 0 };
-var str_80: c.Global = .{ .data_ptr = 0 };
-var fn_spGet: c.Global = .{ .data_ptr = 0 };
-var fn_spGetAll: c.Global = .{ .data_ptr = 0 };
-var fn_spHas: c.Global = .{ .data_ptr = 0 };
-var fn_spSet: c.Global = .{ .data_ptr = 0 };
-var fn_spAppend: c.Global = .{ .data_ptr = 0 };
-var fn_spDelete: c.Global = .{ .data_ptr = 0 };
-var fn_spSort: c.Global = .{ .data_ptr = 0 };
-var fn_spToString: c.Global = .{ .data_ptr = 0 };
-var fn_spEntries: c.Global = .{ .data_ptr = 0 };
-var fn_spKeys: c.Global = .{ .data_ptr = 0 };
-var fn_spValues: c.Global = .{ .data_ptr = 0 };
-var fn_spForEach: c.Global = .{ .data_ptr = 0 };
-var fn_spSize: c.Global = .{ .data_ptr = 0 };
-var fn_urlToString: c.Global = .{ .data_ptr = 0 };
-var fn_urlToJSON: c.Global = .{ .data_ptr = 0 };
+var url_class_id: c.ClassID = 0;
+var sp_class_id: c.ClassID = 0;
 
-fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__Error(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+// ============================================================
+// Helpers
+// ============================================================
+fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
+    return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
-fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__TypeError(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
-}
-fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
-    return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
-}
-/// Cached-Global accessor with an inline fallback so a missing root can
-/// never turn a hot path into a null-deref.
-fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
-    return @ptrCast(c.v8__Global__Get(g, isolate) orelse zigStringToV8(isolate, fallback));
-}
-// Hot-path string extraction: writes into the caller-provided stack buffer
-// when the string fits (typical searchParams names/values), falling back to
-// one direct heap allocation otherwise.
+
 const ExtractedStr = struct {
     slice: []const u8,
     heap: ?[:0]u8 = null,
@@ -82,20 +19,21 @@ const ExtractedStr = struct {
         if (self.heap) |h| gpa.free(h);
     }
 };
-fn extractStringAuto(isolate: ?*c.Isolate, val: ?*const c.Value, stack_buf: []u8) ?ExtractedStr {
-    const v = val orelse return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(v, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    if (utf8_len <= stack_buf.len) {
-        _ = c.v8__String__WriteUtf8(str, isolate, stack_buf.ptr, utf8_len, 0);
-        return .{ .slice = stack_buf[0..utf8_len] };
+
+fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    if (len == 0) return .{ .slice = "" };
+    if (len <= stack_buf.len) {
+        @memcpy(stack_buf[0..len], cstr[0..len]);
+        return .{ .slice = stack_buf[0..len] };
     }
-    const heap_buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
-    _ = c.v8__String__WriteUtf8(str, isolate, heap_buf.ptr, utf8_len, 0);
+    const heap_buf = gpa.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(heap_buf[0..len], cstr[0..len]);
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
+
 fn defaultPortForScheme(scheme: []const u8) ?u16 {
     if (std.mem.eql(u8, scheme, "http")) return 80;
     if (std.mem.eql(u8, scheme, "https")) return 443;
@@ -104,21 +42,13 @@ fn defaultPortForScheme(scheme: []const u8) ?u16 {
     if (std.mem.eql(u8, scheme, "ftp")) return 21;
     return null;
 }
+
 fn isSpecialScheme(scheme: []const u8) bool {
     return defaultPortForScheme(scheme) != null or std.mem.eql(u8, scheme, "file");
 }
+
 // ============================================================
-// URLSearchParams — DOD / SoA: contiguous string log + offset index
-//
-//   names/values : one contiguous buffer each (append-only)
-//   entries      : dense index of {offset,len} pairs into the logs
-//
-// Per-pair heap allocations are gone: parse/append/set are amortized
-// buffer appends; deleted bytes stay in the log until deinit (the classic
-// append-log tradeoff — cache-friendly and allocation-free hot path).
-// getAllValues/serialize return BORROWED views into reusable scratch,
-// valid until the next mutating call on this object. Comparisons are
-// case-sensitive (spec: unlike Headers).
+// URLSearchParamsData
 // ============================================================
 const Pair = struct { name: []const u8, value: []const u8 };
 const SPEntry = struct {
@@ -134,11 +64,10 @@ const URLSearchParamsData = struct {
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
     entries: std.ArrayList(SPEntry),
-    // Reusable scratch (buffer-reuse rule): joined multi-value output and
-    // the view list for getAllValues, plus serialize staging.
     merge_buf: std.ArrayList(u8),
     view_buf: std.ArrayList([]const u8),
     ser_buf: std.ArrayList(u8),
+    owned: bool = true,
     fn init() URLSearchParamsData {
         return .{
             .names = std.ArrayList(u8).empty,
@@ -163,7 +92,6 @@ const URLSearchParamsData = struct {
     fn valueOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
         return self.values.items[e.val_off .. e.val_off + e.val_len];
     }
-    // Append an entry. Zero heap allocations beyond amortized log growth.
     fn appendEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         const nbase = self.names.items.len;
         self.names.appendSlice(gpa, name) catch return;
@@ -201,8 +129,6 @@ const URLSearchParamsData = struct {
             }
         }
     }
-    // O(1) removal: swap the last entry into the removed slot. Bytes stay
-    // in the append-only logs until deinit.
     fn removeSwap(self: *URLSearchParamsData, i: usize) void {
         const last = self.entries.items.len - 1;
         if (i != last) self.entries.items[i] = self.entries.items[last];
@@ -227,8 +153,6 @@ const URLSearchParamsData = struct {
         }
         return null;
     }
-    // Returns borrowed views into the reusable view list. Valid until the
-    // next mutating call on this object.
     fn getAllValues(self: *URLSearchParamsData, name: []const u8) [][]const u8 {
         self.view_buf.clearRetainingCapacity();
         for (self.entries.items) |e| {
@@ -246,9 +170,6 @@ const URLSearchParamsData = struct {
         }
         return false;
     }
-    // Replace-first semantics with duplicate collapse, zero temp allocations:
-    // first match repoints at freshly appended value bytes; duplicates are
-    // swap-removed.
     fn setEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         var found = false;
         var i: usize = 0;
@@ -268,12 +189,11 @@ const URLSearchParamsData = struct {
                 i += 1;
             }
         }
-        if (!found) self.appendPair(name, value);
+        if (!found) self.appendEntry(name, value);
     }
     fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         self.appendEntry(name, value);
     }
-    // Sorts the dense index by name slice; log bytes never move.
     fn sortPairs(self: *URLSearchParamsData) void {
         std.mem.sort(SPEntry, self.entries.items, self, struct {
             fn lessThan(ctx: *URLSearchParamsData, a: SPEntry, b: SPEntry) bool {
@@ -281,8 +201,6 @@ const URLSearchParamsData = struct {
             }
         }.lessThan);
     }
-    // Returns a borrowed slice into the reusable staging buffer — callers
-    // must NOT free it. Valid until the next mutating call on this object.
     fn serialize(self: *URLSearchParamsData) []const u8 {
         self.ser_buf.clearRetainingCapacity();
         for (self.entries.items, 0..) |pair, i| {
@@ -294,261 +212,200 @@ const URLSearchParamsData = struct {
         return self.ser_buf.items;
     }
 };
-fn extractSPData(info: ?*const c.FunctionCallbackInfo) ?*URLSearchParamsData {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const this = c.v8__FunctionCallbackInfo__This(info);
-    if (this == null) return null;
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, globalStr(&str___d, isolate, "__d"));
-    if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
-    const ptr = c.v8__External__Value(@ptrCast(ext_val));
+
+fn extractSPData(ctx: ?*c.Context, this_val: c.Value) ?*URLSearchParamsData {
+    const ptr = c.getOpaque2(ctx, this_val, sp_class_id) orelse return null;
     return @ptrCast(@alignCast(ptr));
 }
-/// Shared by spConstructor and createSPJsObject: attaches the single rooted
-/// function set under the single rooted key set.
-fn attachSPMethods(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c.Value) void {
-    var out: c.MaybeBool = undefined;
-    const pairs = .{
-        .{ &fn_spGet, &str_get, "get" },
-        .{ &fn_spGetAll, &str_getAll, "getAll" },
-        .{ &fn_spHas, &str_has, "has" },
-        .{ &fn_spSet, &str_set, "set" },
-        .{ &fn_spAppend, &str_append, "append" },
-        .{ &fn_spDelete, &str_delete, "delete" },
-        .{ &fn_spSort, &str_sort, "sort" },
-        .{ &fn_spToString, &str_toString, "toString" },
-        .{ &fn_spEntries, &str_entries, "entries" },
-        .{ &fn_spKeys, &str_keys, "keys" },
-        .{ &fn_spValues, &str_values, "values" },
-        .{ &fn_spForEach, &str_forEach, "forEach" },
-        .{ &fn_spSize, &str_size, "size" },
-    };
-    inline for (pairs) |pair| {
-        c.v8__Object__Set(
-            obj,
-            context,
-            globalStr(pair[1], isolate, pair[2]),
-            @ptrCast(c.v8__Global__Get(pair[0], isolate)),
-            &out,
-        );
-    }
-}
-fn spConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = gpa.create(URLSearchParamsData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
-    data.* = URLSearchParamsData.init();
-    if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
-        const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-        if (c.v8__Value__IsString(init_val)) {
-            var str_buf: [512]u8 = undefined;
-            if (extractStringAuto(isolate, init_val, &str_buf)) |s| {
-                defer s.deinit();
-                data.parseFromString(s.slice);
-            }
-        }
-    }
-    const obj = c.v8__Object__New(isolate);
-    const ext = c.v8__External__New(isolate, @ptrCast(data));
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
-    attachSPMethods(isolate, context, obj);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(obj));
-}
-fn spGet(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
-        return;
-    }
+
+// ============================================================
+// URLSearchParams callbacks
+// ============================================================
+fn spGet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.JS_NULL;
+    if (argc < 1) return c.JS_NULL;
     var name_buf: [128]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.JS_NULL;
     defer name.deinit();
     if (data.getFirst(name.slice)) |v| {
-        c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, v));
-    } else {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
+        return zigStringToJS(ctx, v);
     }
+    return c.JS_NULL;
 }
-fn spGetAll(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Array__New(isolate, 0)));
-        return;
-    }
+
+fn spGetAll(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.newArray(ctx);
+    if (argc < 1) return c.newArray(ctx);
     var name_buf: [128]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.newArray(ctx);
     defer name.deinit();
     const vals = data.getAllValues(name.slice);
-    const arr = c.v8__Array__New(isolate, @intCast(vals.len));
+    const arr = c.newArray(ctx);
     for (vals, 0..) |v, i| {
-        var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, v), &el_out);
+        _ = c.definePropertyValueUint32(ctx, arr, @intCast(i), zigStringToJS(ctx, v), c.PROP_C_W_E);
     }
-    c.v8__ReturnValue__Set(ret, @ptrCast(arr));
+    return arr;
 }
-fn spHas(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    }
+
+fn spHas(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.JS_FALSE;
+    if (argc < 1) return c.JS_FALSE;
     var name_buf: [128]u8 = undefined;
     var val_stack: [256]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.JS_FALSE;
     defer name.deinit();
     var val: ?[]const u8 = null;
     var val_ex: ?ExtractedStr = null;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const v = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (!c.v8__Value__IsUndefined(v)) {
-            val_ex = extractStringAuto(isolate, v, &val_stack);
+    if (argc > 1) {
+        if (c.isUndefined(argv[1]) == 0) {
+            val_ex = extractStringAuto(ctx, argv[1], &val_stack);
             if (val_ex) |ex| val = ex.slice;
         }
     }
     defer if (val_ex) |ex| ex.deinit();
-    const result = data.hasEntry(name.slice, val);
-    c.v8__ReturnValue__Set(ret, if (result) @ptrCast(c.v8__True(isolate)) else @ptrCast(c.v8__False(isolate)));
+    return if (data.hasEntry(name.slice, val)) c.JS_TRUE else c.JS_FALSE;
 }
-fn spSet(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
+
+fn spSet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    
+    const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 2) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
     var value_buf: [256]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.JS_UNDEFINED;
     defer name.deinit();
-    const value = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1), &value_buf) orelse return;
+    const value = extractStringAuto(ctx, argv[1], &value_buf) orelse return c.JS_UNDEFINED;
     defer value.deinit();
     data.setEntry(name.slice, value.slice);
+    return c.JS_UNDEFINED;
 }
-fn spAppend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
+
+fn spAppend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    
+    const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 2) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
     var value_buf: [256]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.JS_UNDEFINED;
     defer name.deinit();
-    const value = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 1), &value_buf) orelse return;
+    const value = extractStringAuto(ctx, argv[1], &value_buf) orelse return c.JS_UNDEFINED;
     defer value.deinit();
     data.appendPair(name.slice, value.slice);
+    return c.JS_UNDEFINED;
 }
-fn spDelete(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
+
+fn spDelete(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    
+    const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
     var val_stack: [256]u8 = undefined;
-    const name = extractStringAuto(isolate, c.v8__FunctionCallbackInfo__INDEX(info, 0), &name_buf) orelse return;
+    const name = extractStringAuto(ctx, argv[0], &name_buf) orelse return c.JS_UNDEFINED;
     defer name.deinit();
     var val: ?[]const u8 = null;
     var val_ex: ?ExtractedStr = null;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const v = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (!c.v8__Value__IsUndefined(v)) {
-            val_ex = extractStringAuto(isolate, v, &val_stack);
+    if (argc > 1) {
+        if (c.isUndefined(argv[1]) == 0) {
+            val_ex = extractStringAuto(ctx, argv[1], &val_stack);
             if (val_ex) |ex| val = ex.slice;
         }
     }
     defer if (val_ex) |ex| ex.deinit();
     data.deleteEntry(name.slice, val);
+    return c.JS_UNDEFINED;
 }
-fn spSort(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const data = extractSPData(info) orelse return;
+
+fn spSort(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
     data.sortPairs();
+    return c.JS_UNDEFINED;
 }
-fn spToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const str = data.serialize();
-    c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, str));
+
+fn spToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return zigStringToJS(ctx, "");
+    return zigStringToJS(ctx, data.serialize());
 }
-fn spSize(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const num = c.v8__Integer__NewFromUnsigned(isolate, @intCast(data.entries.items.len));
-    c.v8__ReturnValue__Set(ret, @ptrCast(num));
+
+fn spSize(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.newInt32(ctx, 0);
+    return c.newInt32(ctx, @intCast(data.entries.items.len));
 }
-fn spEntries(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+
+fn spEntries(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.newArray(ctx);
+    const arr = c.newArray(ctx);
     for (data.entries.items, 0..) |e, i| {
-        const pair_arr = c.v8__Array__New(isolate, 2);
-        var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 0, zigStringToV8(isolate, data.nameOf(e)), &el_out);
-        c.v8__Object__SetAtIndex(@ptrCast(pair_arr), context, 1, zigStringToV8(isolate, data.valueOf(e)), &el_out);
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), @ptrCast(pair_arr), &el_out);
+        const pair_arr = c.newArray(ctx);
+        _ = c.definePropertyValueUint32(ctx, pair_arr, 0, zigStringToJS(ctx, data.nameOf(e)), c.PROP_C_W_E);
+        _ = c.definePropertyValueUint32(ctx, pair_arr, 1, zigStringToJS(ctx, data.valueOf(e)), c.PROP_C_W_E);
+        _ = c.definePropertyValueUint32(ctx, arr, @intCast(i), pair_arr, c.PROP_C_W_E);
     }
-    c.v8__ReturnValue__Set(ret, @ptrCast(arr));
+    return arr;
 }
-fn spKeys(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+
+fn spKeys(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.newArray(ctx);
+    const arr = c.newArray(ctx);
     for (data.entries.items, 0..) |e, i| {
-        var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, data.nameOf(e)), &el_out);
+        _ = c.definePropertyValueUint32(ctx, arr, @intCast(i), zigStringToJS(ctx, data.nameOf(e)), c.PROP_C_W_E);
     }
-    c.v8__ReturnValue__Set(ret, @ptrCast(arr));
+    return arr;
 }
-fn spValues(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = extractSPData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const arr = c.v8__Array__New(isolate, @intCast(data.entries.items.len));
+
+fn spValues(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.newArray(ctx);
+    const arr = c.newArray(ctx);
     for (data.entries.items, 0..) |e, i| {
-        var el_out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(@ptrCast(arr), context, @intCast(i), zigStringToV8(isolate, data.valueOf(e)), &el_out);
+        _ = c.definePropertyValueUint32(ctx, arr, @intCast(i), zigStringToJS(ctx, data.valueOf(e)), c.PROP_C_W_E);
     }
-    c.v8__ReturnValue__Set(ret, @ptrCast(arr));
+    return arr;
 }
-fn spForEach(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data = extractSPData(info) orelse return;
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-    const callback = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    if (!c.v8__Value__IsFunction(callback)) return;
+
+fn spForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
+    const callback = argv[0];
+    if (c.isFunction(ctx, callback) == 0) return c.JS_UNDEFINED;
     for (data.entries.items) |e| {
-        var argv: [3]?*const c.Value = .{
-            zigStringToV8(isolate, data.valueOf(e)),
-            zigStringToV8(isolate, data.nameOf(e)),
-            @ptrCast(c.v8__FunctionCallbackInfo__This(info)),
+        var args = [_]c.Value{
+            zigStringToJS(ctx, data.valueOf(e)),
+            zigStringToJS(ctx, data.nameOf(e)),
+            this_val,
         };
-        _ = c.v8__Function__Call(@ptrCast(callback), context, @ptrCast(c.v8__Undefined(isolate)), 3, &argv);
+        _ = c.call(ctx, callback, c.JS_UNDEFINED, 3, &args);
+    }
+    return c.JS_UNDEFINED;
+}
+
+fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    _ = rt;
+    if (c.getOpaque(val, sp_class_id)) |ptr| {
+        const data: *URLSearchParamsData = @ptrCast(@alignCast(ptr));
+        if (data.owned) {
+            data.deinit();
+            gpa.destroy(data);
+        }
     }
 }
+
+fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const data = gpa.create(URLSearchParamsData) catch return c.throwOutOfMemory(ctx);
+    data.* = URLSearchParamsData.init();
+    if (argc > 0) {
+        if (c.isString(argv[0]) != 0) {
+            var str_buf: [512]u8 = undefined;
+            if (extractStringAuto(ctx, argv[0], &str_buf)) |s| {
+                defer s.deinit();
+                data.parseFromString(s.slice);
+            }
+        }
+    }
+    c.setOpaque(this_val, data);
+    return this_val;
+}
+
 // ============================================================
-// URL
+// UrlData
 // ============================================================
 const UrlData = struct {
     scheme: []const u8,
@@ -560,6 +417,7 @@ const UrlData = struct {
     username: []const u8,
     password: []const u8,
     search_params: *URLSearchParamsData,
+    owned: bool = true,
     fn deinit(self: *UrlData) void {
         gpa.free(self.scheme);
         gpa.free(self.host);
@@ -668,6 +526,15 @@ const UrlData = struct {
         return try gpa.dupe(u8, "");
     }
 };
+
+fn extractUrlData(ctx: ?*c.Context, this_val: c.Value) ?*UrlData {
+    const ptr = c.getOpaque2(ctx, this_val, url_class_id) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+// ============================================================
+// URL parsing (unchanged)
+// ============================================================
 fn parseUrlAbsolute(input: []const u8) !UrlData {
     const uri = try std.Uri.parse(input);
     const scheme = try gpa.dupe(u8, uri.scheme);
@@ -696,6 +563,7 @@ fn parseUrlAbsolute(input: []const u8) !UrlData {
         .search_params = sp,
     };
 }
+
 fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     const base = try std.Uri.parse(base_url);
     const base_port = base.port;
@@ -724,15 +592,9 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
             return .{
-                .scheme = result_scheme,
-                .host = result_host,
-                .port = result_port,
-                .path = result_path,
-                .query = result_query,
-                .fragment = result_fragment,
-                .username = result_user,
-                .password = result_pass,
-                .search_params = sp,
+                .scheme = result_scheme, .host = result_host, .port = result_port,
+                .path = result_path, .query = result_query, .fragment = result_fragment,
+                .username = result_user, .password = result_pass, .search_params = sp,
             };
         }
         if (rel.host) |h| {
@@ -749,21 +611,12 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
             return .{
-                .scheme = result_scheme,
-                .host = result_host,
-                .port = result_port,
-                .path = result_path,
-                .query = result_query,
-                .fragment = result_fragment,
-                .username = result_user,
-                .password = result_pass,
-                .search_params = sp,
+                .scheme = result_scheme, .host = result_host, .port = result_port,
+                .path = result_path, .query = result_query, .fragment = result_fragment,
+                .username = result_user, .password = result_pass, .search_params = sp,
             };
         }
     } else |_| {}
-    // Fallthrough (path/query/fragment-only relative resolution). Base host
-    // and path are allocated here rather than up front so the early-return
-    // branches above cannot leak them, and defers guarantee release.
     const base_host_owned = if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else null;
     defer if (base_host_owned) |bh| gpa.free(bh);
     const base_host = base_host_owned orelse "";
@@ -794,17 +647,12 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     sp.* = URLSearchParamsData.init();
     sp.parseFromString(result_query);
     return .{
-        .scheme = result_scheme,
-        .host = result_host,
-        .port = result_port,
-        .path = result_path,
-        .query = result_query,
-        .fragment = result_fragment,
-        .username = result_user,
-        .password = result_pass,
-        .search_params = sp,
+        .scheme = result_scheme, .host = result_host, .port = result_port,
+        .path = result_path, .query = result_query, .fragment = result_fragment,
+        .username = result_user, .password = result_pass, .search_params = sp,
     };
 }
+
 fn mergePaths(base_path: []const u8, rel_path: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     try result.appendSlice(gpa, base_path);
@@ -816,6 +664,7 @@ fn mergePaths(base_path: []const u8, rel_path: []const u8) ![]const u8 {
     try result.appendSlice(gpa, rel_path);
     return try result.toOwnedSlice(gpa);
 }
+
 fn removeDotSegments(input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     var rest = input;
@@ -867,42 +716,23 @@ fn removeDotSegments(input: []const u8) ![]const u8 {
     }
     return try result.toOwnedSlice(gpa);
 }
-fn extractUrlData(info: ?*const c.FunctionCallbackInfo) ?*UrlData {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const this = c.v8__FunctionCallbackInfo__This(info);
-    if (this == null) return null;
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, globalStr(&str___d, isolate, "__d"));
-    if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
-    const ptr = c.v8__External__Value(@ptrCast(ext_val));
-    return @ptrCast(@alignCast(ptr));
-}
-fn setUrlProp(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, g: *c.Global, comptime fallback: []const u8, val: []const u8) void {
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(@ptrCast(obj), context, globalStr(g, isolate, fallback), zigStringToV8(isolate, val), &out);
-}
-fn setUrlPropCached(isolate: ?*c.Isolate, context: ?*c.Context, obj: *const c.Value, key_v8: *const c.Value, val: []const u8) void {
-    const val_v8 = if (val.len == 0)
-        globalStr(&str_empty_val, isolate, "")
-    else if (std.mem.eql(u8, val, "https:"))
-        globalStr(&str_https, isolate, "https:")
-    else if (std.mem.eql(u8, val, "http:"))
-        globalStr(&str_http, isolate, "http:")
-    else if (std.mem.eql(u8, val, "443"))
-        globalStr(&str_443, isolate, "443")
-    else if (std.mem.eql(u8, val, "80"))
-        globalStr(&str_80, isolate, "80")
-    else
-        zigStringToV8(isolate, val);
 
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(@ptrCast(obj), context, key_v8, val_v8, &out);
+// ============================================================
+// Build URLSearchParams JS object
+// ============================================================
+fn createSPJsObject(ctx: ?*c.Context, data: *URLSearchParamsData) c.Value {
+    const obj = c.newObjectClass(ctx, @intCast(sp_class_id));
+    c.setOpaque(obj, data);
+    return obj;
 }
-fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData) ?*const c.Value {
-    const obj = c.v8__Object__New(isolate) orelse return null;
-    const ext = c.v8__External__New(isolate, @ptrCast(data));
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
+
+// ============================================================
+// Build URL JS object
+// ============================================================
+fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value {
+    const obj = c.newObjectClass(ctx, @intCast(url_class_id));
+    c.setOpaque(obj, data);
+
     const href_val = data.serialize() catch "";
     defer if (href_val.len > 0) gpa.free(href_val);
     const origin_val = data.originStr() catch "";
@@ -917,156 +747,144 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
     defer if (search_val.len > 0) gpa.free(search_val);
     const hash_val = data.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
-   
-setUrlPropCached(isolate, context, obj, globalStr(&str_href, isolate, "href"), href_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_origin, isolate, "origin"), origin_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_host, isolate, "host"), host_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_hostname, isolate, "hostname"), data.host);
-setUrlPropCached(isolate, context, obj, globalStr(&str_port, isolate, "port"), port_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_pathname, isolate, "pathname"), data.path);
-setUrlPropCached(isolate, context, obj, globalStr(&str_search, isolate, "search"), search_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_hash, isolate, "hash"), hash_val);
-setUrlPropCached(isolate, context, obj, globalStr(&str_username, isolate, "username"), data.username);
-setUrlPropCached(isolate, context, obj, globalStr(&str_password, isolate, "password"), data.password);
-setUrlPropCached(isolate, context, obj, globalStr(&str_protocol, isolate, "protocol"), protocol_val);
-    const method_pairs = .{
-        .{ &fn_urlToString, &str_toString, "toString" },
-        .{ &fn_urlToJSON, &str_toJSON, "toJSON" },
-    };
-    inline for (method_pairs) |pair| {
-        c.v8__Object__Set(
-            obj,
-            context,
-            globalStr(pair[1], isolate, pair[2]),
-            @ptrCast(c.v8__Global__Get(pair[0], isolate)),
-            &out,
-        );
-    }
-    const sp_obj = createSPJsObject(isolate, context, data.search_params);
-    c.v8__Object__Set(obj, context, globalStr(&str_searchParams, isolate, "searchParams"), sp_obj, &out);
+
+    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "hostname", zigStringToJS(ctx, data.host), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "pathname", zigStringToJS(ctx, data.path), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "username", zigStringToJS(ctx, data.username), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "password", zigStringToJS(ctx, data.password), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
+    data.search_params.owned = false;
+    const sp_obj = createSPJsObject(ctx, data.search_params);
+    _ = c.definePropertyValueStr(ctx, obj, "searchParams", sp_obj, c.PROP_C_W_E);
     return obj;
 }
-fn createSPJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *URLSearchParamsData) ?*const c.Value {
-    const obj = c.v8__Object__New(isolate) orelse return null;
-    const ext = c.v8__External__New(isolate, @ptrCast(data));
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, globalStr(&str___d, isolate, "__d"), ext, &out);
-    attachSPMethods(isolate, context, obj);
-    return obj;
-}
-fn urlConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        throwTypeError(isolate, "URL constructor requires at least 1 argument");
-        return;
-    }
-    var input_buf: [512]u8 = undefined;
-    var base_buf: [512]u8 = undefined;
-    const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringAuto(isolate, input_val, &input_buf) orelse return;
-    defer input.deinit();
-    var base: ?ExtractedStr = null;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringAuto(isolate, base_val, &base_buf);
-        }
-    }
-    defer if (base) |b| b.deinit();
-    const data_ptr = gpa.create(UrlData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
-    data_ptr.* = if (base) |b|
-        parseUrlRelative(input.slice, b.slice) catch {
-            gpa.destroy(data_ptr);
-            throwTypeError(isolate, "Invalid URL");
-            return;
-        }
-    else
-        parseUrlAbsolute(input.slice) catch {
-            gpa.destroy(data_ptr);
-            throwTypeError(isolate, "Invalid URL");
-            return;
-        };
-    const obj = createUrlJsObject(isolate, context, data_ptr) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(obj));
-}
-fn urlToString(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const data = extractUrlData(info) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const str = data.serialize() catch "";
+
+// ============================================================
+// URL callbacks
+// ============================================================
+fn urlToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return zigStringToJS(ctx, "");
+    const str = data.serialize() catch return zigStringToJS(ctx, "");
     defer if (str.len > 0) gpa.free(str);
-    c.v8__ReturnValue__Set(ret, zigStringToV8(isolate, str));
+    return zigStringToJS(ctx, str);
 }
-fn urlToJSON(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    urlToString(info);
+
+fn urlToJSON(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    return urlToString(ctx, this_val, argc, argv);
 }
-fn urlParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
-        return;
+
+fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    _ = rt;
+    if (c.getOpaque(val, url_class_id)) |ptr| {
+        const data: *UrlData = @ptrCast(@alignCast(ptr));
+        if (data.owned) {
+            data.deinit();
+            gpa.destroy(data);
+        }
+    }
+}
+
+fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) {
+        _ = c.throwTypeError(ctx, "URL constructor requires at least 1 argument");
+        return c.JS_EXCEPTION;
     }
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
-    const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringAuto(isolate, input_val, &input_buf) orelse return;
+    const input = extractStringAuto(ctx, argv[0], &input_buf) orelse return c.JS_EXCEPTION;
     defer input.deinit();
     var base: ?ExtractedStr = null;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringAuto(isolate, base_val, &base_buf);
-        }
+    if (argc > 1 and c.isUndefined(argv[1]) == 0 and c.isNull(argv[1]) == 0) {
+        base = extractStringAuto(ctx, argv[1], &base_buf);
     }
     defer if (base) |b| b.deinit();
-    const data_ptr = gpa.create(UrlData) catch return;
+    const data_ptr = gpa.create(UrlData) catch return c.throwOutOfMemory(ctx);
     data_ptr.* = if (base) |b|
         parseUrlRelative(input.slice, b.slice) catch {
             gpa.destroy(data_ptr);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
-            return;
+            _ = c.throwTypeError(ctx, "Invalid URL");
+            return c.JS_EXCEPTION;
         }
     else
         parseUrlAbsolute(input.slice) catch {
             gpa.destroy(data_ptr);
-            c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Null(isolate)));
-            return;
+            _ = c.throwTypeError(ctx, "Invalid URL");
+            return c.JS_EXCEPTION;
         };
-    const obj = createUrlJsObject(isolate, context, data_ptr) orelse return;
-    c.v8__ReturnValue__Set(ret, @ptrCast(obj));
+    c.setOpaque(this_val, data_ptr);
+    data_ptr.search_params.owned = false;
+    const sp_obj = createSPJsObject(ctx, data_ptr.search_params);
+
+    const href_val = data_ptr.serialize() catch "";
+    defer if (href_val.len > 0) gpa.free(href_val);
+    const origin_val = data_ptr.originStr() catch "";
+    defer if (origin_val.len > 0) gpa.free(origin_val);
+    const host_val = data_ptr.hostStr() catch "";
+    defer if (host_val.len > 0) gpa.free(host_val);
+    var protocol_buf: [256]u8 = undefined;
+    const protocol_val = data_ptr.protocolStr(&protocol_buf);
+    const port_val = data_ptr.portStr() catch "";
+    defer if (port_val.len > 0) gpa.free(port_val);
+    const search_val = data_ptr.searchStr() catch "";
+    defer if (search_val.len > 0) gpa.free(search_val);
+    const hash_val = data_ptr.hashStr() catch "";
+    defer if (hash_val.len > 0) gpa.free(hash_val);
+
+    _ = c.definePropertyValueStr(ctx, this_val, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "hostname", zigStringToJS(ctx, data_ptr.host), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "pathname", zigStringToJS(ctx, data_ptr.path), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "username", zigStringToJS(ctx, data_ptr.username), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "password", zigStringToJS(ctx, data_ptr.password), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, this_val, "searchParams", sp_obj, c.PROP_C_W_E);
+    return this_val;
 }
-fn urlCanParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    }
+
+fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) return c.JS_NULL;
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
-    const input_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    const input = extractStringAuto(isolate, input_val, &input_buf) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
-        return;
-    };
+    const input = extractStringAuto(ctx, argv[0], &input_buf) orelse return c.JS_NULL;
     defer input.deinit();
     var base: ?ExtractedStr = null;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const base_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (!c.v8__Value__IsUndefined(base_val) and !c.v8__Value__IsNull(base_val)) {
-            base = extractStringAuto(isolate, base_val, &base_buf);
+    if (argc > 1 and c.isUndefined(argv[1]) == 0 and c.isNull(argv[1]) == 0) {
+        base = extractStringAuto(ctx, argv[1], &base_buf);
+    }
+    defer if (base) |b| b.deinit();
+    const data_ptr = gpa.create(UrlData) catch return c.JS_NULL;
+    data_ptr.* = if (base) |b|
+        parseUrlRelative(input.slice, b.slice) catch {
+            gpa.destroy(data_ptr);
+            return c.JS_NULL;
         }
+    else
+        parseUrlAbsolute(input.slice) catch {
+            gpa.destroy(data_ptr);
+            return c.JS_NULL;
+        };
+    return createUrlJsObject(ctx, data_ptr);
+}
+
+fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) return c.JS_FALSE;
+    var input_buf: [512]u8 = undefined;
+    var base_buf: [512]u8 = undefined;
+    const input = extractStringAuto(ctx, argv[0], &input_buf) orelse return c.JS_FALSE;
+    defer input.deinit();
+    var base: ?ExtractedStr = null;
+    if (argc > 1 and c.isUndefined(argv[1]) == 0 and c.isNull(argv[1]) == 0) {
+        base = extractStringAuto(ctx, argv[1], &base_buf);
     }
     defer if (base) |b| b.deinit();
     const valid = if (base) |b|
@@ -1076,72 +894,75 @@ fn urlCanParseStatic(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
     if (valid) |v| {
         var data = v;
         data.deinit();
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__True(isolate)));
-    } else {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__False(isolate)));
+        return c.JS_TRUE;
     }
+    return c.JS_FALSE;
 }
+
 // ============================================================
 // Setup
 // ============================================================
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-    const global = c.v8__Context__Global(context);
-    var out: c.MaybeBool = undefined;
-
-    // Root every per-call constant once.
-    inline for (.{
-        .{ "__d", &str___d },
-        .{ "get", &str_get },           .{ "getAll", &str_getAll },
-        .{ "has", &str_has },           .{ "set", &str_set },
-        .{ "append", &str_append },     .{ "delete", &str_delete },
-        .{ "sort", &str_sort },         .{ "toString", &str_toString },
-        .{ "entries", &str_entries },   .{ "keys", &str_keys },
-        .{ "values", &str_values },     .{ "forEach", &str_forEach },
-        .{ "size", &str_size },         .{ "toJSON", &str_toJSON },
-        .{ "href", &str_href },         .{ "origin", &str_origin },
-        .{ "host", &str_host },         .{ "hostname", &str_hostname },
-        .{ "port", &str_port },         .{ "pathname", &str_pathname },
-        .{ "search", &str_search },     .{ "hash", &str_hash },
-        .{ "username", &str_username }, .{ "password", &str_password },
-        .{ "protocol", &str_protocol }, .{ "searchParams", &str_searchParams },
-    }) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
-    }
-inline for (&.{
-    .{ &str_empty_val, "" },
-    .{ &str_https, "https:" },
-    .{ &str_http, "http:" },
-    .{ &str_443, "443" },
-    .{ &str_80, "80" },
-}) |pair| {
-    const s = c.v8__String__NewFromUtf8(isolate, pair[1], 0, -1);
-    c.v8__Global__New(isolate, @ptrCast(s), pair[0]);
-}
-    // One shared function set for every instance.
-    inline for (.{
-        .{ spGet, &fn_spGet },           .{ spGetAll, &fn_spGetAll },
-        .{ spHas, &fn_spHas },           .{ spSet, &fn_spSet },
-        .{ spAppend, &fn_spAppend },     .{ spDelete, &fn_spDelete },
-        .{ spSort, &fn_spSort },         .{ spToString, &fn_spToString },
-        .{ spEntries, &fn_spEntries },   .{ spKeys, &fn_spKeys },
-        .{ spValues, &fn_spValues },     .{ spForEach, &fn_spForEach },
-        .{ spSize, &fn_spSize },         .{ urlToString, &fn_urlToString },
-        .{ urlToJSON, &fn_urlToJSON },
-    }) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
+pub fn setup(ctx: ?*c.Context) void {
+    {
+        var sp_def = c.ClassDef{
+            .class_name = "URLSearchParams",
+            .finalizer = spFinalizer,
+        };
+        _ = c.newClassID(&sp_class_id);
+        _ = c.newClass(c.getRuntime(ctx), sp_class_id, &sp_def);
+        const sp_proto = c.newObject(ctx);
+        const sp_methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
+            .{ .name = "get", .func = &spGet, .len = 1 },
+            .{ .name = "getAll", .func = &spGetAll, .len = 1 },
+            .{ .name = "has", .func = &spHas, .len = 1 },
+            .{ .name = "set", .func = &spSet, .len = 2 },
+            .{ .name = "append", .func = &spAppend, .len = 2 },
+            .{ .name = "delete", .func = &spDelete, .len = 1 },
+            .{ .name = "sort", .func = &spSort, .len = 0 },
+            .{ .name = "toString", .func = &spToString, .len = 0 },
+            .{ .name = "entries", .func = &spEntries, .len = 0 },
+            .{ .name = "keys", .func = &spKeys, .len = 0 },
+            .{ .name = "values", .func = &spValues, .len = 0 },
+            .{ .name = "forEach", .func = &spForEach, .len = 1 },
+            .{ .name = "size", .func = &spSize, .len = 0 },
+        };
+        for (sp_methods) |m| {
+            const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
+            _ = c.definePropertyValueStr(ctx, sp_proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+        }
+        c.setClassProto(ctx, sp_class_id, sp_proto);
     }
 
-    const sp_fn = c.v8__Function__New__DEFAULT(context, spConstructor);
-    const sp_key = c.v8__String__NewFromUtf8(isolate, "URLSearchParams", 0, -1);
-    _ = c.v8__Object__Set(global, context, sp_key, sp_fn, &out);
-    const url_fn = c.v8__Function__New__DEFAULT(context, urlConstructor);
-    const url_key = c.v8__String__NewFromUtf8(isolate, "URL", 0, -1);
-    _ = c.v8__Object__Set(global, context, url_key, url_fn, &out);
-    const parse_fn = c.v8__Function__New__DEFAULT(context, urlParseStatic);
-    c.v8__Object__Set(url_fn, context, c.v8__String__NewFromUtf8(isolate, "parse", 0, -1), parse_fn, &out);
-    const can_parse_fn = c.v8__Function__New__DEFAULT(context, urlCanParseStatic);
-    c.v8__Object__Set(url_fn, context, c.v8__String__NewFromUtf8(isolate, "canParse", 0, -1), can_parse_fn, &out);
+    {
+        var url_def = c.ClassDef{
+            .class_name = "URL",
+            .finalizer = urlFinalizer,
+        };
+        _ = c.newClassID(&url_class_id);
+        _ = c.newClass(c.getRuntime(ctx), url_class_id, &url_def);
+        const url_proto = c.newObject(ctx);
+        const url_methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
+            .{ .name = "toString", .func = &urlToString, .len = 0 },
+            .{ .name = "toJSON", .func = &urlToJSON, .len = 0 },
+        };
+        for (url_methods) |m| {
+            const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
+            _ = c.definePropertyValueStr(ctx, url_proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+        }
+        c.setClassProto(ctx, url_class_id, url_proto);
+    }
+
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+
+    const sp_ctor = c.newCFunction(ctx, &spConstructor, "URLSearchParams", 1);
+    _ = c.definePropertyValueStr(ctx, global, "URLSearchParams", sp_ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+
+    const url_ctor = c.newCFunction(ctx, &urlConstructor, "URL", 2);
+    _ = c.definePropertyValueStr(ctx, global, "URL", url_ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+
+    const parse_fn = c.newCFunction(ctx, &urlParseStatic, "parse", 2);
+    _ = c.definePropertyValueStr(ctx, url_ctor, "parse", parse_fn, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    const can_parse_fn = c.newCFunction(ctx, &urlCanParseStatic, "canParse", 2);
+    _ = c.definePropertyValueStr(ctx, url_ctor, "canParse", can_parse_fn, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

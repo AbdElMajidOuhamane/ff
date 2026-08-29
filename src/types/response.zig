@@ -3,95 +3,16 @@ const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
 const pool_slice_mod = @import("pool_slice.zig");
 const gpa = std.heap.smp_allocator;
-// ============================================================
-// Cached V8 strings + functions (created once in setup)
-// ============================================================
-var str___d: c.Global = .{ .data_ptr = 0 };
-var str_headers: c.Global = .{ .data_ptr = 0 };
-var str_bodyUsed: c.Global = .{ .data_ptr = 0 };
-var str_ok: c.Global = .{ .data_ptr = 0 };
-var str_status: c.Global = .{ .data_ptr = 0 };
-var str_statusText: c.Global = .{ .data_ptr = 0 };
-var str_url: c.Global = .{ .data_ptr = 0 };
-var str_type: c.Global = .{ .data_ptr = 0 };
-var str_redirected: c.Global = .{ .data_ptr = 0 };
-var str_text: c.Global = .{ .data_ptr = 0 };
-var str_json: c.Global = .{ .data_ptr = 0 };
-var str_arrayBuffer: c.Global = .{ .data_ptr = 0 };
-var str_blob: c.Global = .{ .data_ptr = 0 };
-var str_formData: c.Global = .{ .data_ptr = 0 };
-var str_bytes: c.Global = .{ .data_ptr = 0 };
-var str_clone: c.Global = .{ .data_ptr = 0 };
-var fn_text: c.Global = .{ .data_ptr = 0 };
-var fn_json: c.Global = .{ .data_ptr = 0 };
-var fn_arrayBuffer: c.Global = .{ .data_ptr = 0 };
-var fn_blob: c.Global = .{ .data_ptr = 0 };
-var fn_formData: c.Global = .{ .data_ptr = 0 };
-var fn_bytes: c.Global = .{ .data_ptr = 0 };
-var fn_clone: c.Global = .{ .data_ptr = 0 };
-// Cached Headers strings + functions
-var h_str___d: c.Global = .{ .data_ptr = 0 };
-var h_str_get: c.Global = .{ .data_ptr = 0 };
-var h_str_getAll: c.Global = .{ .data_ptr = 0 };
-var h_str_has: c.Global = .{ .data_ptr = 0 };
-var h_str_set: c.Global = .{ .data_ptr = 0 };
-var h_str_append: c.Global = .{ .data_ptr = 0 };
-var h_str_delete: c.Global = .{ .data_ptr = 0 };
-var h_str_entries: c.Global = .{ .data_ptr = 0 };
-var h_str_keys: c.Global = .{ .data_ptr = 0 };
-var h_str_values: c.Global = .{ .data_ptr = 0 };
-var h_str_forEach: c.Global = .{ .data_ptr = 0 };
-var h_str_toString: c.Global = .{ .data_ptr = 0 };
-var h_str_size: c.Global = .{ .data_ptr = 0 };
-var h_fn_get: c.Global = .{ .data_ptr = 0 };
-var h_fn_getAll: c.Global = .{ .data_ptr = 0 };
-var h_fn_has: c.Global = .{ .data_ptr = 0 };
-var h_fn_set: c.Global = .{ .data_ptr = 0 };
-var h_fn_append: c.Global = .{ .data_ptr = 0 };
-var h_fn_delete: c.Global = .{ .data_ptr = 0 };
-var h_fn_entries: c.Global = .{ .data_ptr = 0 };
-var h_fn_keys: c.Global = .{ .data_ptr = 0 };
-var h_fn_values: c.Global = .{ .data_ptr = 0 };
-var h_fn_forEach: c.Global = .{ .data_ptr = 0 };
-var h_fn_toString: c.Global = .{ .data_ptr = 0 };
-var h_fn_size: c.Global = .{ .data_ptr = 0 };
-// Interned-field V8 strings: one Global per non-"other" ResponseType variant,
-// plus a shared empty string for zero-length url/statusText fast paths.
-var type_strs: [@typeInfo(ResponseType).@"enum".fields.len - 1]c.Global = undefined;
-var str_empty_v8: c.Global = .{ .data_ptr = 0 };
+
+var response_class_id: c.ClassID = 0;
+
 // ============================================================
 // Helpers
 // ============================================================
-fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__Error(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
+    return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
-fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__TypeError(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
-}
-fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
-    return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
-}
-// Empty-string fast path: cached V8 "" instead of a fresh allocation.
-fn emptyOrStringToV8(isolate: ?*c.Isolate, s: []const u8) *const c.Value {
-    if (s.len == 0) {
-        if (c.v8__Global__Get(&str_empty_v8, isolate)) |v| return @ptrCast(v);
-    }
-    return zigStringToV8(isolate, s);
-}
-// Interned-field accessor: cached Global when the tag is a known variant,
-// fresh string from the pool slice only for custom (.other) values.
-fn typeToV8(isolate: ?*c.Isolate, d: *const ResponseData) *const c.Value {
-    if (d.response_type != .other) {
-        if (c.v8__Global__Get(&type_strs[@intFromEnum(d.response_type)], isolate)) |v| return @ptrCast(v);
-    }
-    return zigStringToV8(isolate, d.responseType());
-}
-// Hot-path string extraction: writes into the caller-provided stack buffer
-// when the string fits, falling back to one heap allocation otherwise.
+
 const ExtractedStr = struct {
     slice: []const u8,
     heap: ?[:0]u8 = null,
@@ -99,39 +20,50 @@ const ExtractedStr = struct {
         if (self.heap) |h| gpa.free(h);
     }
 };
-fn extractStringAuto(isolate: ?*c.Isolate, val: ?*const c.Value, stack_buf: []u8) ?ExtractedStr {
-    const v = val orelse return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(v, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    if (utf8_len <= stack_buf.len) {
-        _ = c.v8__String__WriteUtf8(str, isolate, stack_buf.ptr, utf8_len, 0);
-        return .{ .slice = stack_buf[0..utf8_len] };
+
+fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    if (len == 0) return .{ .slice = "" };
+    if (len <= stack_buf.len) {
+        @memcpy(stack_buf[0..len], cstr[0..len]);
+        return .{ .slice = stack_buf[0..len] };
     }
-    const heap_buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
-    _ = c.v8__String__WriteUtf8(str, isolate, heap_buf.ptr, utf8_len, 0);
+    const heap_buf = gpa.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(heap_buf[0..len], cstr[0..len]);
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
-// Setup-time extraction (heap-allocated), retained for non-hot paths.
-fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
-    const v = val orelse return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(v, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
-    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+
+fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    const len = std.mem.len(cstr);
+    if (len == 0) {
+        c.freeCString(ctx, cstr);
+        return gpa.dupeZ(u8, "") catch return null;
+    }
+    const buf = gpa.allocSentinel(u8, len, 0) catch {
+        c.freeCString(ctx, cstr);
+        return null;
+    };
+    @memcpy(buf[0..len], cstr[0..len]);
+    buf[len] = 0;
+    c.freeCString(ctx, cstr);
     return buf;
 }
-fn extractIntFromVal(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, default: u16) u16 {
-    _ = isolate;
-    const v = val orelse return default;
-    if (c.v8__Value__IsUndefined(v) or c.v8__Value__IsNull(v)) return default;
-    var out: c.MaybeI32 = undefined;
-    c.v8__Value__Int32Value(v, context, &out);
-    return @intCast(out.value);
+
+fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
+    var out: i32 = 0;
+    _ = c.toInt32(ctx, &out, val);
+    return @intCast(out);
 }
+
+fn extractResponseData(ctx: ?*c.Context, this_val: c.Value) ?*ResponseData {
+    const ptr = c.getOpaque2(ctx, this_val, response_class_id) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
 // ============================================================
 // Interning — spec-constrained Response.type as a dense enum
 // ============================================================
@@ -164,6 +96,7 @@ pub const ResponseType = enum(u8) {
         };
     }
 };
+
 // ============================================================
 // ResponseData — DOD: contiguous string pool + interned scalars
 // ============================================================
@@ -278,566 +211,361 @@ pub const ResponseData = struct {
         }
     }
 };
-// ============================================================
-// Extract ResponseData from JS this.__d
-// ============================================================
-fn extractResponseData(info: ?*const c.FunctionCallbackInfo) ?*ResponseData {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const this = c.v8__FunctionCallbackInfo__This(info);
-    if (this == null) return null;
-    const ext_val = c.v8__Object__Get(@ptrCast(this), context, @ptrCast(c.v8__Global__Get(&str___d, isolate)));
-    if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
-    const ptr = c.v8__External__Value(@ptrCast(ext_val));
-    return @ptrCast(@alignCast(ptr));
-}
-// ============================================================
-// Build Headers JS object (cached)
-// ============================================================
-fn createHeadersJSObject(isolate: ?*c.Isolate, context: ?*c.Context, hdr_data: *headers_mod.HeadersData) ?*const c.Value {
-    const obj = c.v8__Object__New(isolate);
-    const ext = c.v8__External__New(isolate, @ptrCast(hdr_data));
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&h_str___d, isolate)), ext, &out);
-    const pairs = .{
-        .{ &h_fn_get, &h_str_get },
-        .{ &h_fn_getAll, &h_str_getAll },
-        .{ &h_fn_has, &h_str_has },
-        .{ &h_fn_set, &h_str_set },
-        .{ &h_fn_append, &h_str_append },
-        .{ &h_fn_delete, &h_str_delete },
-        .{ &h_fn_entries, &h_str_entries },
-        .{ &h_fn_keys, &h_str_keys },
-        .{ &h_fn_values, &h_str_values },
-        .{ &h_fn_forEach, &h_str_forEach },
-        .{ &h_fn_toString, &h_str_toString },
-        .{ &h_fn_size, &h_str_size },
-    };
-    inline for (pairs) |pair| {
-        c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(pair[1], isolate)), @ptrCast(c.v8__Global__Get(pair[0], isolate)), &out);
-    }
-    return obj;
-}
-// ============================================================
-// Headers stubs
-// ============================================================
-fn headersGetStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersGet(info);
-}
-fn headersGetAllStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersGetAll(info);
-}
-fn headersHasStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersHas(info);
-}
-fn headersSetStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersSet(info);
-}
-fn headersAppendStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersAppend(info);
-}
-fn headersDeleteStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersDelete(info);
-}
-fn headersEntriesStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersEntries(info);
-}
-fn headersKeysStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersKeys(info);
-}
-fn headersValuesStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersValues(info);
-}
-fn headersForEachStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersForEach(info);
-}
-fn headersToStringStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersToString(info);
-}
-fn headersSizeStub(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    headers_mod.headersSize(info);
-}
+
 // ============================================================
 // Headers init parsing
 // ============================================================
-fn parseHeadersInit(isolate: ?*c.Isolate, context: ?*c.Context, init_val: ?*const c.Value, target: *headers_mod.HeadersData) void {
-    if (init_val == null) return;
-    if (c.v8__Value__IsUndefined(init_val) or c.v8__Value__IsNull(init_val)) return;
-    if (c.v8__Value__IsObject(init_val)) {
-        const ext_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str___d, isolate)));
-        if (ext_val != null and c.v8__Value__IsExternal(ext_val)) {
-            const src: *headers_mod.HeadersData = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(ext_val))));
-            for (0..src.len()) |i| {
-                const p = src.getPair(i);
-                target.appendEntry(p.name, p.value);
-            }
-            return;
+fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) void {
+    if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) return;
+    if (c.isObject(init_val) == 0) return;
+    if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
+        const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
+        for (0..src.len()) |i| {
+            const p = src.getPair(i);
+            target.appendEntry(p.name, p.value);
         }
-        if (c.v8__Value__IsArray(init_val)) {
-            const len: usize = @intCast(c.v8__Array__Length(init_val));
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                const idx = c.v8__Integer__NewFromUnsigned(isolate, @intCast(i));
-                const item = c.v8__Object__Get(@ptrCast(init_val), context, idx);
-                if (item == null) continue;
-                if (!c.v8__Value__IsObject(item)) continue;
-                const item_obj: *const c.Object = @ptrCast(item);
-                const key = c.v8__Integer__NewFromUnsigned(isolate, 0);
-                const val = c.v8__Integer__NewFromUnsigned(isolate, 1);
-                const name_val = c.v8__Object__Get(item_obj, context, key);
-                const val_val = c.v8__Object__Get(item_obj, context, val);
-                const name_z = extractStringFromVal(isolate, name_val);
-                const val_z = extractStringFromVal(isolate, val_val);
-                if (name_z) |n| {
-                    if (val_z) |v| {
-                        target.appendEntry(n, v);
-                        gpa.free(v);
-                    }
-                    gpa.free(n);
+        return;
+    }
+    if (c.isArray(ctx, init_val) != 0) {
+        const len_val = c.getPropertyStr(ctx, init_val, "length");
+        defer c.freeValue(ctx, len_val);
+        var len: c_int = 0;
+        _ = c.toInt32(ctx, &len, len_val);
+        var i: c_uint = 0;
+        while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+            const item = c.getPropertyUint32(ctx, init_val, i);
+            if (c.isObject(item) == 0) continue;
+            const name_val = c.getPropertyUint32(ctx, item, 0);
+            const val_val = c.getPropertyUint32(ctx, item, 1);
+            const name_z = extractStringFromVal(ctx, name_val);
+            const val_z = extractStringFromVal(ctx, val_val);
+            if (name_z) |n| {
+                if (val_z) |v| {
+                    target.appendEntry(n, v);
+                    gpa.free(v);
                 }
+                gpa.free(n);
             }
-            return;
         }
-        const names_arr = c.v8__Object__GetPropertyNames(@ptrCast(init_val), context);
-        if (names_arr != null) {
-            const names_len: usize = @intCast(c.v8__Array__Length(names_arr));
-            var i: usize = 0;
-            while (i < names_len) : (i += 1) {
-                const idx = c.v8__Integer__NewFromUnsigned(isolate, @intCast(i));
-                const name_val = c.v8__Object__Get(@ptrCast(names_arr), context, idx);
-                if (name_val == null) continue;
-                const val_val = c.v8__Object__Get(@ptrCast(init_val), context, name_val);
-                const name_z = extractStringFromVal(isolate, name_val);
-                const val_z = extractStringFromVal(isolate, val_val);
-                if (name_z) |n| {
-                    if (val_z) |v| {
-                        target.appendEntry(n, v);
-                        gpa.free(v);
-                    }
-                    gpa.free(n);
+        return;
+    }
+    var p: [*c]c.PropertyEnum = null;
+    var count: c_uint = 0;
+    if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        for (0..count) |idx| {
+            const name_atom = p[idx].atom;
+            const name_val = c.atomToString(ctx, name_atom);
+            defer c.freeValue(ctx, name_val);
+            const val_val = c.getProperty(ctx, init_val, name_atom);
+            defer c.freeValue(ctx, val_val);
+            const name_z = extractStringFromVal(ctx, name_val);
+            const val_z = extractStringFromVal(ctx, val_val);
+            if (name_z) |n| {
+                if (val_z) |v| {
+                    target.appendEntry(n, v);
+                    gpa.free(v);
                 }
+                gpa.free(n);
             }
         }
+        c.freePropertyEnum(ctx, p, count);
     }
 }
-fn parseHeadersInitFromObj(isolate: ?*c.Isolate, context: ?*c.Context, init_obj: ?*const c.Value, target: *headers_mod.HeadersData) void {
-    if (init_obj == null) return;
-    const headers_val = c.v8__Object__Get(@ptrCast(init_obj), context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)));
-    if (headers_val != null and !c.v8__Value__IsUndefined(headers_val) and !c.v8__Value__IsNull(headers_val)) {
-        parseHeadersInit(isolate, context, headers_val, target);
+
+fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers_mod.HeadersData) void {
+    const headers_val = c.getPropertyStr(ctx, init_obj, "headers");
+    defer c.freeValue(ctx, headers_val);
+    if (c.isUndefined(headers_val) == 0 and c.isNull(headers_val) == 0) {
+        parseHeadersInit(ctx, headers_val, target);
     }
 }
+
 // ============================================================
-// JS Callbacks — Instance body methods
+// Embedded headers helper — heap-allocates a copy
 // ============================================================
-fn responseText(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
+fn createEmbeddedHeaders(ctx: ?*c.Context, src: *headers_mod.HeadersData) c.Value {
+    const data = gpa.create(headers_mod.HeadersData) catch return c.throwOutOfMemory(ctx);
+    data.* = headers_mod.HeadersData.init();
+    for (0..src.len()) |i| {
+        const p = src.getPair(i);
+        data.appendEntry(p.name, p.value);
     }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-    data.body_used = true;
-    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
-    const body_text = data.body() orelse "";
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(zigStringToV8(isolate, body_text)), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    return headers_mod.createJSObject(ctx, data);
 }
-fn responseJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
+
+// ============================================================
+// Set data properties on Response instance
+// ============================================================
+fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
+    _ = c.definePropertyValueStr(ctx, obj, "bodyUsed", if (data.body_used) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "ok", if (data.status >= 200 and data.status <= 299) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "redirected", if (data.redirected) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "status", c.newInt32(ctx, @intCast(data.status)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "statusText", zigStringToJS(ctx, data.statusText()), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "type", zigStringToJS(ctx, data.responseType()), c.PROP_C_W_E);
+    const hdr_obj = createEmbeddedHeaders(ctx, &data.headers);
+    _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
+}
+
+// ============================================================
+// Body method callbacks
+// ============================================================
+fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
-    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_text = data.body() orelse "";
-    const js_str = c.v8__String__NewFromUtf8(isolate, @ptrCast(body_text.ptr), 0, @intCast(body_text.len));
-    const parsed = c.v8__JSON__Parse(context, js_str);
-    var out: c.MaybeBool = undefined;
-    if (parsed != null) {
-        _ = c.v8__Promise__Resolver__Resolve(resolver, context, parsed, &out);
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    var result = zigStringToJS(ctx, body_text);
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
+    return promise;
+}
+
+fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
+    data.body_used = true;
+    const body_text = data.body() orelse "";
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (body_text.len == 0) {
+        var msg = zigStringToJS(ctx, "Unexpected end of JSON input");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    }
+    var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    if (c.isException(parsed) != 0) {
+        var exc = c.getException(ctx);
+        defer c.freeValue(ctx, exc);
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &exc);
     } else {
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid JSON")), &out);
+        _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &parsed);
     }
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    return promise;
 }
-fn responseArrayBuffer(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
+
+fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
-    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_bytes = data.body() orelse "";
-    const byte_len: usize = body_bytes.len;
-    const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
-    if (ab != null and byte_len > 0) {
-        const backing = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const store_ptr = c.std__shared_ptr__v8__BackingStore__get(&backing);
-        if (store_ptr != null) {
-            const data_ptr: [*]u8 = @ptrCast(@alignCast(c.v8__BackingStore__Data(store_ptr)));
-            @memcpy(data_ptr[0..byte_len], body_bytes);
-        }
-    }
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
+    return promise;
 }
-fn responseBlob(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Blob not supported")), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+
+fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    _ = this_val;
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    var msg = zigStringToJS(ctx, "Blob not supported");
+    _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+    return promise;
 }
-fn responseFormData(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "FormData not supported")), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+
+fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    _ = this_val;
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    var msg = zigStringToJS(ctx, "FormData not supported");
+    _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+    return promise;
 }
-fn responseBytes(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
+
+fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
-    refreshBodyUsed(isolate, context, c.v8__FunctionCallbackInfo__This(info), true);
     const body_bytes = data.body() orelse "";
-    const byte_len: usize = body_bytes.len;
-    const ab = c.v8__ArrayBuffer__New(isolate, byte_len);
-    if (ab != null and byte_len > 0) {
-        const backing = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const store_ptr = c.std__shared_ptr__v8__BackingStore__get(&backing);
-        if (store_ptr != null) {
-            const data_ptr: [*]u8 = @ptrCast(@alignCast(c.v8__BackingStore__Data(store_ptr)));
-            @memcpy(data_ptr[0..byte_len], body_bytes);
-        }
-    }
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(ab), &out);
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
+    return promise;
 }
-fn responseClone(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = extractResponseData(info) orelse {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
-    const new_data = gpa.create(ResponseData) catch {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    };
+
+fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
+    const new_data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     new_data.* = ResponseData.init();
     new_data.cloneFrom(data);
-    const obj = buildResponseJSObject(isolate, context, new_data);
-    if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
+    return buildResponseJSObject(ctx, new_data);
 }
+
 // ============================================================
-// JS Callbacks — Static methods
+// Static methods
 // ============================================================
-fn responseStaticJson(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var scratch: [256]u8 = undefined;
-    const data = gpa.create(ResponseData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
+    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
-    if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
-        const arg0 = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-        const json_str = c.v8__JSON__Stringify(context, arg0, null);
-        if (json_str != null) {
-            if (extractStringAuto(isolate, json_str, &scratch)) |owned| {
-                defer owned.deinit();
-                data.setBody(owned.slice);
-            }
+    if (argc > 0) {
+        const json_str = c.jsonStringify(ctx, argv[0], c.JS_UNDEFINED, c.JS_UNDEFINED);
+        if (c.isException(json_str) != 0) {
+            gpa.destroy(data);
+            return c.JS_EXCEPTION;
+        }
+        defer c.freeValue(ctx, json_str);
+        if (extractStringAuto(ctx, json_str, &scratch)) |owned| {
+            defer owned.deinit();
+            data.setBody(owned.slice);
         }
         data.headers.appendEntry("content-type", "application/json");
     }
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (c.v8__Value__IsObject(init_val)) {
-            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_status, isolate)));
-            data.status = extractIntFromVal(isolate, context, status_val, 200);
-            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)));
-            if (extractStringAuto(isolate, status_text_val, &scratch)) |st| {
-                defer st.deinit();
-                data.setStatusText(st.slice);
-            }
-            parseHeadersInitFromObj(isolate, context, init_val, &data.headers);
+    if (argc > 1 and c.isObject(argv[1]) != 0) {
+        const init_val = argv[1];
+        const status_val = c.getPropertyStr(ctx, init_val, "status");
+        defer c.freeValue(ctx, status_val);
+        data.status = extractIntFromVal(ctx, status_val, 200);
+        const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
+        defer c.freeValue(ctx, status_text_val);
+        if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
+            defer st.deinit();
+            data.setStatusText(st.slice);
         }
+        parseHeadersInitFromObj(ctx, init_val, &data.headers);
     }
-    const obj = buildResponseJSObject(isolate, context, data);
-    if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
+    return buildResponseJSObject(ctx, data);
 }
-fn responseStaticRedirect(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        throwTypeError(isolate, "Response.redirect requires a URL");
-        return;
+
+fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) {
+        _ = c.throwTypeError(ctx, "Response.redirect requires a URL");
+        return c.JS_EXCEPTION;
     }
     var url_buf: [512]u8 = undefined;
-    const data = gpa.create(ResponseData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
+    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
-    const url_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    if (extractStringAuto(isolate, url_val, &url_buf)) |u| {
+    if (extractStringAuto(ctx, argv[0], &url_buf)) |u| {
         defer u.deinit();
         data.setUrl(u.slice);
     }
     data.status = 302;
     data.setStatusText("Found");
     data.redirected = true;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const status_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        data.status = extractIntFromVal(isolate, context, status_val, 302);
+    if (argc > 1) {
+        data.status = extractIntFromVal(ctx, argv[1], 302);
     }
-    const obj = buildResponseJSObject(isolate, context, data);
-    if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
+    return buildResponseJSObject(ctx, data);
 }
-fn responseStaticError(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const data = gpa.create(ResponseData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
+
+fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     data.status = 0;
     data.setStatusText("");
     data.setResponseType("error");
-    const obj = buildResponseJSObject(isolate, context, data);
-    if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
+    return buildResponseJSObject(ctx, data);
 }
+
 // ============================================================
-// Helper: set scalar data properties + cached functions
+// Finalizer
 // ============================================================
-fn setDataProps(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate, data: *ResponseData) void {
-    var out: c.MaybeBool = undefined;
-    const body_used = if (data.body_used) c.v8__True(isolate) else c.v8__False(isolate);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(body_used), &out);
-    const ok = if (data.status >= 200 and data.status <= 299) c.v8__True(isolate) else c.v8__False(isolate);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_ok, isolate)), @ptrCast(ok), &out);
-    const redirected = if (data.redirected) c.v8__True(isolate) else c.v8__False(isolate);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_redirected, isolate)), @ptrCast(redirected), &out);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_status, isolate)), @ptrCast(c.v8__Integer__NewFromUnsigned(isolate, data.status)), &out);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)), @ptrCast(emptyOrStringToV8(isolate, data.statusText())), &out);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_url, isolate)), @ptrCast(emptyOrStringToV8(isolate, data.url())), &out);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_type, isolate)), @ptrCast(typeToV8(isolate, data)), &out);
-}
-fn refreshBodyUsed(isolate: ?*c.Isolate, context: ?*c.Context, this_val: ?*const c.Value, value: bool) void {
-    if (this_val == null) return;
-    var out: c.MaybeBool = undefined;
-    const bv = if (value) c.v8__True(isolate) else c.v8__False(isolate);
-    c.v8__Object__Set(@ptrCast(this_val), context, @ptrCast(c.v8__Global__Get(&str_bodyUsed, isolate)), @ptrCast(bv), &out);
-}
-fn setCachedFns(obj: ?*const c.Object, context: ?*c.Context, isolate: ?*c.Isolate) void {
-    var out: c.MaybeBool = undefined;
-    const pairs = .{
-        .{ &fn_text, &str_text },               .{ &fn_json, &str_json },
-        .{ &fn_arrayBuffer, &str_arrayBuffer }, .{ &fn_blob, &str_blob },
-        .{ &fn_formData, &str_formData },       .{ &fn_bytes, &str_bytes },
-        .{ &fn_clone, &str_clone },
-    };
-    inline for (pairs) |pair| {
-        c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(pair[1], isolate)), @ptrCast(c.v8__Global__Get(pair[0], isolate)), &out);
+fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    _ = rt;
+    if (c.getOpaque(val, response_class_id)) |ptr| {
+        const data: *ResponseData = @ptrCast(@alignCast(ptr));
+        data.deinit();
+        gpa.destroy(data);
     }
 }
-// ============================================================
-// buildResponseJSObject (cached)
-// ============================================================
-pub fn buildResponseJSObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *ResponseData) ?*const c.Object {
-    const obj = c.v8__Object__New(isolate);
-    const ext = c.v8__External__New(isolate, @ptrCast(data));
-    var out: c.MaybeBool = undefined;
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str___d, isolate)), ext, &out);
-    const headers_obj = createHeadersJSObject(isolate, context, &data.headers);
-    c.v8__Object__Set(obj, context, @ptrCast(c.v8__Global__Get(&str_headers, isolate)), @ptrCast(headers_obj), &out);
-    setDataProps(obj, context, isolate, data);
-    setCachedFns(obj, context, isolate);
-    return obj;
-}
+
 // ============================================================
 // Constructor: new Response(body?, init?)
 // ============================================================
-fn responseConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
-    const data = gpa.create(ResponseData) catch {
-        throw(isolate, "out of memory");
-        return;
-    };
+    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
-    if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
-        const body_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-        if (!c.v8__Value__IsUndefined(body_val) and !c.v8__Value__IsNull(body_val)) {
-            if (extractStringAuto(isolate, body_val, &body_buf)) |owned| {
-                defer owned.deinit();
-                data.setBody(owned.slice);
-            }
+
+    if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {
+        if (extractStringAuto(ctx, argv[0], &body_buf)) |owned| {
+            defer owned.deinit();
+            data.setBody(owned.slice);
         }
     }
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (c.v8__Value__IsObject(init_val)) {
-            const status_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_status, isolate)));
-            data.status = extractIntFromVal(isolate, context, status_val, 200);
-            const status_text_val = c.v8__Object__Get(@ptrCast(init_val), context, @ptrCast(c.v8__Global__Get(&str_statusText, isolate)));
-            if (extractStringAuto(isolate, status_text_val, &scratch)) |st| {
-                defer st.deinit();
-                data.setStatusText(st.slice);
-            }
-            parseHeadersInitFromObj(isolate, context, init_val, &data.headers);
+    if (argc > 1 and c.isObject(argv[1]) != 0) {
+        const init_val = argv[1];
+        const status_val = c.getPropertyStr(ctx, init_val, "status");
+        defer c.freeValue(ctx, status_val);
+        data.status = extractIntFromVal(ctx, status_val, 200);
+        const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
+        defer c.freeValue(ctx, status_text_val);
+        if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
+            defer st.deinit();
+            data.setStatusText(st.slice);
         }
+        parseHeadersInitFromObj(ctx, init_val, &data.headers);
     }
-    const obj = buildResponseJSObject(isolate, context, data);
-    if (obj) |o| c.v8__ReturnValue__Set(ret, @ptrCast(o));
+
+    c.setOpaque(this_val, data);
+    setResponseProps(ctx, this_val, data);
+    return this_val;
 }
+
 // ============================================================
-// Setup
+// Public: build Response JS object from ResponseData
 // ============================================================
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-    const global = c.v8__Context__Global(context);
-    var out: c.MaybeBool = undefined;
-    // Cache strings
-    const strings = .{
-        .{ "__d", &str___d },       .{ "headers", &str_headers },   .{ "bodyUsed", &str_bodyUsed },
-        .{ "ok", &str_ok },         .{ "status", &str_status },      .{ "statusText", &str_statusText },
-        .{ "url", &str_url },       .{ "type", &str_type },          .{ "redirected", &str_redirected },
-        .{ "text", &str_text },     .{ "json", &str_json },          .{ "arrayBuffer", &str_arrayBuffer },
-        .{ "blob", &str_blob },     .{ "formData", &str_formData },  .{ "bytes", &str_bytes },
-        .{ "clone", &str_clone },
+pub fn buildResponseJSObject(ctx: ?*c.Context, data: *ResponseData) c.Value {
+    const obj = c.newObjectClass(ctx, @intCast(response_class_id));
+    c.setOpaque(obj, data);
+    setResponseProps(ctx, obj, data);
+    return obj;
+}
+
+// ============================================================
+// Setup — register Response class + constructor + static methods
+// ============================================================
+pub fn setup(ctx: ?*c.Context) void {
+    var class_def = c.ClassDef{
+        .class_name = "Response",
+        .finalizer = responseFinalizer,
     };
-    inline for (strings) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
-    }
-    // Cache functions
-    const funcs = .{
-        .{ responseText, &fn_text },                 .{ responseJson, &fn_json },
-        .{ responseArrayBuffer, &fn_arrayBuffer },   .{ responseBlob, &fn_blob },
-        .{ responseFormData, &fn_formData },         .{ responseBytes, &fn_bytes },
-        .{ responseClone, &fn_clone },
+    _ = c.newClassID(&response_class_id);
+    _ = c.newClass(c.getRuntime(ctx), response_class_id, &class_def);
+
+    const proto = c.newObject(ctx);
+    const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
+        .{ .name = "text", .func = &responseText, .len = 0 },
+        .{ .name = "json", .func = &responseJson, .len = 0 },
+        .{ .name = "arrayBuffer", .func = &responseArrayBuffer, .len = 0 },
+        .{ .name = "blob", .func = &responseBlob, .len = 0 },
+        .{ .name = "formData", .func = &responseFormData, .len = 0 },
+        .{ .name = "bytes", .func = &responseBytes, .len = 0 },
+        .{ .name = "clone", .func = &responseClone, .len = 0 },
     };
-    inline for (funcs) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
+    for (methods) |m| {
+        const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
+        _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
-    // Cache headers strings
-    const h_strings = .{
-        .{ "__d", &h_str___d },   .{ "get", &h_str_get },   .{ "getAll", &h_str_getAll },
-        .{ "has", &h_str_has },   .{ "set", &h_str_set },   .{ "append", &h_str_append },
-        .{ "delete", &h_str_delete }, .{ "entries", &h_str_entries }, .{ "keys", &h_str_keys },
-        .{ "values", &h_str_values }, .{ "forEach", &h_str_forEach }, .{ "toString", &h_str_toString },
-        .{ "size", &h_str_size },
-    };
-    inline for (h_strings) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
-    }
-    // Cache headers functions
-    const h_funcs = .{
-        .{ headersGetStub, &h_fn_get },           .{ headersGetAllStub, &h_fn_getAll },
-        .{ headersHasStub, &h_fn_has },           .{ headersSetStub, &h_fn_set },
-        .{ headersAppendStub, &h_fn_append },     .{ headersDeleteStub, &h_fn_delete },
-        .{ headersEntriesStub, &h_fn_entries },   .{ headersKeysStub, &h_fn_keys },
-        .{ headersValuesStub, &h_fn_values },     .{ headersForEachStub, &h_fn_forEach },
-        .{ headersToStringStub, &h_fn_toString }, .{ headersSizeStub, &h_fn_size },
-    };
-    inline for (h_funcs) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__Function__New__DEFAULT(context, entry[0])), entry[1]);
-    }
-    // Interned ResponseType variant strings (one per non-"other" variant).
-    inline for (std.enums.values(ResponseType)) |rt| {
-        if (rt != .other) {
-            const s = rt.string();
-            c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(s.ptr), 0, @intCast(s.len))), &type_strs[@intFromEnum(rt)]);
-        }
-    }
-    // Shared empty-string Global for zero-length url/statusText fast paths.
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "", 0, -1)), &str_empty_v8);
-    // Register Response constructor + static methods
-    const constructor = c.v8__Function__New__DEFAULT(context, responseConstructor);
-    const ctor_obj: *const c.Object = @ptrCast(constructor);
-    const json_fn = c.v8__Function__New__DEFAULT(context, responseStaticJson);
-    _ = c.v8__Object__Set(ctor_obj, context, c.v8__String__NewFromUtf8(isolate, "json", 0, -1), @ptrCast(json_fn), &out);
-    const redirect_fn = c.v8__Function__New__DEFAULT(context, responseStaticRedirect);
-    _ = c.v8__Object__Set(ctor_obj, context, c.v8__String__NewFromUtf8(isolate, "redirect", 0, -1), @ptrCast(redirect_fn), &out);
-    const error_fn = c.v8__Function__New__DEFAULT(context, responseStaticError);
-    _ = c.v8__Object__Set(ctor_obj, context, c.v8__String__NewFromUtf8(isolate, "error", 0, -1), @ptrCast(error_fn), &out);
-    _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "Response", 0, -1), constructor, &out);
+    c.setClassProto(ctx, response_class_id, proto);
+
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+    const ctor = c.newCFunction(ctx, &responseConstructor, "Response", 2);
+    _ = c.definePropertyValueStr(ctx, global, "Response", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+
+    const static_json = c.newCFunction(ctx, &responseStaticJson, "json", 2);
+    _ = c.definePropertyValueStr(ctx, ctor, "json", static_json, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    const static_redirect = c.newCFunction(ctx, &responseStaticRedirect, "redirect", 2);
+    _ = c.definePropertyValueStr(ctx, ctor, "redirect", static_redirect, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    const static_error = c.newCFunction(ctx, &responseStaticError, "error", 0);
+    _ = c.definePropertyValueStr(ctx, ctor, "error", static_error, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

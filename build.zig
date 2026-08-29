@@ -4,18 +4,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const v8_linux = b.option(bool, "v8-linux", "link prebuilt Linux x86_64 V8 archive (vendor/v8/linux/libc_v8.a)") orelse false;
-    const v8_lib_path = if (v8_linux) "vendor/v8/linux" else "vendor/v8/lib";
+    // ── QuickJS C translation (auto-generates types + inline functions) ──
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/quickjs/quickjs.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate.addIncludePath(b.path("vendor/quickjs"));
+    const c_mod = translate.createModule();
 
+    // ── Fairyfly library module ──
     const mod = b.addModule("fairyfly", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{.{
+            .name = "quickjs_c",
+            .module = c_mod,
+        }},
     });
+
     const httpz = b.dependency("httpz", .{
         .target = target,
         .optimize = optimize,
     });
 
+    // ── Executable ──
     const exe = b.addExecutable(.{
         .name = "ff",
         .root_module = b.createModule(.{
@@ -26,52 +39,37 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "fairyfly", .module = mod },
                 .{ .name = "xev", .module = b.addModule("xev-shim", .{
-    .root_source_file = b.path("src/xev.zig"),
-    .imports = &.{ .{ .name = "xev-inner",
-    .module = b.dependency("libxev", .{}).module("xev") } },
-}) },                .{ .name = "httpz", .module = httpz.module("httpz") },
+                    .root_source_file = b.path("src/xev.zig"),
+                    .imports = &.{.{ .name = "xev-inner",
+                        .module = b.dependency("libxev", .{}).module("xev"),
+                    } },
+                }) },
+                .{ .name = "httpz", .module = httpz.module("httpz") },
+                .{ .name = "quickjs_c", .module = c_mod },
             },
         }),
     });
 
-    // Include path for @cImport in engine.zig
-    exe.root_module.addIncludePath(.{ .cwd_relative = "vendor/v8/include" });
+    // ── Compile QuickJS C sources ──
+    const qjs_flags: []const []const u8 = &.{
+        "-DCONFIG_VERSION=\"2024_01_13\"",
+        "-DCONFIG_BIGNUM",
+        "-DCONFIG_CHECK_OPTIONS",
+        "-D_GNU_SOURCE",
+    };
 
-    // Add C stubs for V8 inspector and memory allocator
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("src/engine/stubs.c"),
-        .flags = &.{},
-    });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs.c"), .flags = qjs_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/cutils.c"), .flags = qjs_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libregexp.c"), .flags = qjs_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libunicode.c"), .flags = qjs_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/dtoa.c"), .flags = qjs_flags });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs-libc.c"), .flags = qjs_flags });
 
-    // Link V8 C bindings library (macOS arm64 by default, Linux x86_64 with -Dv8-linux)
-    exe.root_module.addLibraryPath(.{ .cwd_relative = v8_lib_path });
-    exe.root_module.linkSystemLibrary("c_v8", .{
-        .preferred_link_mode = .static,
-    });
+    exe.root_module.addIncludePath(b.path("vendor/quickjs"));
 
-    // System libraries needed by V8
     exe.root_module.link_libc = true;
-    exe.root_module.linkSystemLibrary("pthread", .{});
     exe.root_module.linkSystemLibrary("m", .{});
-    exe.root_module.linkSystemLibrary("dl", .{});
-     if (target.result.os.tag == .linux) {
-        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor/cross" });
-        if (target.result.abi == .musl) {
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/engine/musl_shims.c"),
-                .flags = &.{},
-            });
-        }
-    }
 
-    // macOS frameworks needed by V8
-    if (target.result.os.tag == .macos) {
-        exe.root_module.linkFramework("CoreFoundation", .{});
-        exe.root_module.linkFramework("CoreServices", .{});
-        exe.root_module.linkFramework("Security", .{});
-        exe.root_module.linkFramework("IOKit", .{});
-        exe.root_module.linkFramework("Foundation", .{});
-    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -82,14 +80,10 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
-    });
+    const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");

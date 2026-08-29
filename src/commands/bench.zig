@@ -34,7 +34,8 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
             continue;
         };
         defer allocator.free(content);
-        const source: [:0]const u8 = content.ptr[0..content.len :0];
+        const source: [:0]const u8 = allocator.dupeZ(u8, content) catch continue;
+        defer allocator.free(source);
 
         var path_z_buf = allocator.alloc(u8, path.len + 1) catch continue;
         defer allocator.free(path_z_buf);

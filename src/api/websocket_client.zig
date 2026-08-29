@@ -1,4 +1,5 @@
 
+
 const std = @import("std");
 const c = @import("../c.zig").c;
 const ws_client = @import("../net/ws_client.zig");
@@ -6,44 +7,18 @@ const ws = @import("../net/ws_native.zig");
 
 const gpa = std.heap.smp_allocator;
 
-// ---- V8 cached strings + integer constants (rooted once in setup):
-// every WebSocket instance previously recreated its five property-key
-// strings and five boxed readyState/constants integers. ----
-var slot_cells: [ws_client.MAX_WS]u16 = undefined;
-var str_send: c.Global = .{ .data_ptr = 0 };
-var str_close: c.Global = .{ .data_ptr = 0 };
-var str_ready_state: c.Global = .{ .data_ptr = 0 };
-var str_connecting: c.Global = .{ .data_ptr = 0 };
-var str_open: c.Global = .{ .data_ptr = 0 };
-var str_closing: c.Global = .{ .data_ptr = 0 };
-var str_closed: c.Global = .{ .data_ptr = 0 };
-var int_connecting: c.Global = .{ .data_ptr = 0 };
-var int_open: c.Global = .{ .data_ptr = 0 };
-var int_closing: c.Global = .{ .data_ptr = 0 };
-var int_closed: c.Global = .{ .data_ptr = 0 };
+pub var ws_client_class_id: c.ClassID = 0;
 
-fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__TypeError(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
-}
+const WsClientData = struct {
+    slot_id: u16,
+};
 
-/// Cached-Global accessor with an inline fallback so a missing root can
-/// never turn a hot path into a null-deref.
-fn globalStr(g: *c.Global, isolate: ?*c.Isolate, comptime fallback: []const u8) *const c.Value {
-    return @ptrCast(c.v8__Global__Get(g, isolate) orelse blk: {
-        const v = c.v8__String__NewFromUtf8(
-            isolate,
-            @ptrCast(fallback.ptr),
-            0,
-            @intCast(fallback.len),
-        );
-        break :blk v orelse c.v8__Undefined(isolate);
-    });
-}
-
-fn globalVal(g: *c.Global, isolate: ?*c.Isolate) ?*const c.Value {
-    return c.v8__Global__Get(g, isolate);
+fn wsClientFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    _ = rt;
+    if (c.getOpaque(val, ws_client_class_id)) |ptr| {
+        const data: *WsClientData = @ptrCast(@alignCast(ptr));
+        gpa.destroy(data);
+    }
 }
 
 const ParsedUrl = struct { host: []const u8, path: []const u8, port: u16, tls: bool };
@@ -57,11 +32,9 @@ fn parseWsUrl(url: []const u8) ?ParsedUrl {
     } else if (std.mem.startsWith(u8, rest, "ws://")) {
         rest = rest[5..];
     } else return null;
-
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const hostport = if (slash) |i| rest[0..i] else rest;
     if (hostport.len == 0) return null;
-
     var host: []const u8 = hostport;
     var port: u16 = if (tls_flag) 443 else 80;
     if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |ci| {
@@ -71,8 +44,7 @@ fn parseWsUrl(url: []const u8) ?ParsedUrl {
         if (ps.len == 0) return null;
         port = std.fmt.parseInt(u16, ps, 10) catch return null;
     }
-    if (host.len > 255) return null; // std HostName.max_len
-
+    if (host.len > 255) return null;
     var path: []const u8 = "/";
     if (slash) |i| {
         path = rest[i..];
@@ -83,209 +55,179 @@ fn parseWsUrl(url: []const u8) ?ParsedUrl {
     return .{ .host = host, .path = path, .port = port, .tls = tls_flag };
 }
 
-fn extractString(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
-    const v = val orelse return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(v, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
-    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
+    _ = c.throwTypeError(ctx, "WebSocket: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
+}
+
+fn extractString(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    const buf = gpa.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(buf[0..len], cstr[0..len]);
     return buf;
 }
 
-/// Sets a cached-string key to a cached-integer value — zero allocations.
-fn setIntPropG(obj: *const c.Value, context: ?*c.Context, isolate: ?*c.Isolate, g_key: *c.Global, comptime fallback: []const u8, g_val: *c.Global) void {
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Object__Set(@ptrCast(obj), context, globalStr(g_key, isolate, fallback), @ptrCast(globalVal(g_val, isolate)), &out);
+fn slotFromThis(ctx: ?*c.Context, this_val: c.Value) ?usize {
+    const data_ptr = c.getOpaque2(ctx, this_val, ws_client_class_id) orelse return null;
+    const data: *WsClientData = @ptrCast(@alignCast(data_ptr));
+    return data.slot_id;
 }
 
-fn slotFrom(info: ?*const c.FunctionCallbackInfo) ?usize {
-    const data = c.v8__FunctionCallbackInfo__Data(info) orelse return null;
-    const sp: *u16 = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(data))));
-    return sp.*;
+fn slotFromArg(ctx: ?*c.Context, arg: c.Value) ?usize {
+    // Try opaque first
+    if (c.isObject(arg) != 0) {
+        if (c.getOpaque2(ctx, arg, ws_client_class_id)) |ptr| {
+            const data: *WsClientData = @ptrCast(@alignCast(ptr));
+            return data.slot_id;
+        }
+    }
+    return null;
 }
 
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
+pub fn setup(ctx: ?*c.Context) void {
     ws_client.init();
-    ws_client.setupStrings(isolate);
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-    const global = c.v8__Context__Global(context);
-    var out: c.MaybeBool = undefined;
 
-    // Root property keys, method names, and readyState/constants once.
-    inline for (.{
-        .{ "readyState", &str_ready_state },
-        .{ "CONNECTING", &str_connecting },
-        .{ "OPEN", &str_open },
-        .{ "CLOSING", &str_closing },
-        .{ "CLOSED", &str_closed },
-    }) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, entry[0], 0, -1)), entry[1]);
-    }
-    inline for (.{
-        .{ 0, &int_connecting },
-        .{ 1, &int_open },
-        .{ 2, &int_closing },
-        .{ 3, &int_closed },
-    }) |entry| {
-        c.v8__Global__New(isolate, @ptrCast(c.v8__Integer__New(isolate, entry[0])), entry[1]);
-    }
+    var def = c.ClassDef{
+        .class_name = "WebSocket",
+        .finalizer = wsClientFinalizer,
+    };
+    _ = c.newClassID(&ws_client_class_id);
+    _ = c.newClass(c.getRuntime(ctx), ws_client_class_id, &def);
 
-    const ctor = c.v8__Function__New__DEFAULT(context, wsConstructor) orelse return;
-    _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "WebSocket", 0, -1), ctor, &out);
-    // static constants on the constructor (browser parity)
-    setIntPropG(ctor, context, isolate, &str_connecting, "CONNECTING", &int_connecting);
-    setIntPropG(ctor, context, isolate, &str_open, "OPEN", &int_open);
-    setIntPropG(ctor, context, isolate, &str_closing, "CLOSING", &int_closing);
-    setIntPropG(ctor, context, isolate, &str_closed, "CLOSED", &int_closed);
-    // method-name strings
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "send", 0, -1)), &str_send);
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "close", 0, -1)), &str_close);
+    const proto = c.newObject(ctx);
+    const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
+        .{ .name = "send", .func = &wsSend, .len = 1 },
+        .{ .name = "close", .func = &wsClose, .len = 0 },
+    };
+    for (methods) |m| {
+        const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
+        _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    }
+    c.setClassProto(ctx, ws_client_class_id, proto);
+
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+
+    const ctor = c.newCFunction(ctx, &wsConstructor, "WebSocket", 2);
+    _ = c.definePropertyValueStr(ctx, global, "WebSocket", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    // Static constants
+    _ = c.definePropertyValueStr(ctx, ctor, "CONNECTING", c.newInt32(ctx, 0), c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    _ = c.definePropertyValueStr(ctx, ctor, "OPEN", c.newInt32(ctx, 1), c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    _ = c.definePropertyValueStr(ctx, ctor, "CLOSING", c.newInt32(ctx, 2), c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    _ = c.definePropertyValueStr(ctx, ctor, "CLOSED", c.newInt32(ctx, 3), c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }
 
-fn wsConstructor(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
-
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        throwTypeError(isolate, "WebSocket constructor requires a URL");
-        return;
+fn wsConstructor(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) {
+        throwTypeError(ctx, "WebSocket constructor requires a URL");
+        return c.JS_EXCEPTION;
     }
-    const url_arg = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
-    if (!c.v8__Value__IsString(url_arg)) {
-        throwTypeError(isolate, "WebSocket URL must be a string");
-        return;
+    const url_arg = argv[0];
+    if (c.isString(url_arg) == 0) {
+        throwTypeError(ctx, "WebSocket URL must be a string");
+        return c.JS_EXCEPTION;
     }
-    const url_buf = extractString(isolate, @ptrCast(url_arg)) orelse {
-        throwTypeError(isolate, "WebSocket URL too long");
-        return;
+    const url_buf = extractString(ctx, url_arg) orelse {
+        throwTypeError(ctx, "WebSocket URL too long");
+        return c.JS_EXCEPTION;
     };
     defer gpa.free(url_buf);
     const parsed = parseWsUrl(url_buf) orelse {
-        throwTypeError(isolate, "invalid WebSocket URL (expected ws:// or wss://)");
-        return;
+        throwTypeError(ctx, "invalid WebSocket URL (expected ws:// or wss://)");
+        return c.JS_EXCEPTION;
     };
 
-    const obj = c.v8__Object__New(isolate) orelse return;
-    setIntPropG(@ptrCast(obj), context, isolate, &str_ready_state, "readyState", &int_connecting);
-    setIntPropG(@ptrCast(obj), context, isolate, &str_connecting, "CONNECTING", &int_connecting);
-    setIntPropG(@ptrCast(obj), context, isolate, &str_open, "OPEN", &int_open);
-    setIntPropG(@ptrCast(obj), context, isolate, &str_closing, "CLOSING", &int_closing);
-    setIntPropG(@ptrCast(obj), context, isolate, &str_closed, "CLOSED", &int_closed);
+    const obj = c.newObjectClass(ctx, @intCast(ws_client_class_id));
+    _ = c.definePropertyValueStr(ctx, obj, "readyState", c.newInt32(ctx, 0), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "CONNECTING", c.newInt32(ctx, 0), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "OPEN", c.newInt32(ctx, 1), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "CLOSING", c.newInt32(ctx, 2), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "CLOSED", c.newInt32(ctx, 3), c.PROP_C_W_E);
 
-    const s = ws_client.submit(isolate, @ptrCast(obj), parsed.host, parsed.path, parsed.port, parsed.tls) catch {
-        throwTypeError(isolate, "WebSocket: no connection slots available");
-        return;
+    const s = ws_client.submit(ctx, obj, parsed.host, parsed.path, parsed.port, parsed.tls) catch {
+        throwTypeError(ctx, "WebSocket: no connection slots available");
+        return c.JS_EXCEPTION;
     };
-    slot_cells[s] = @intCast(s);
-    const ext = c.v8__External__New(isolate, @ptrCast(&slot_cells[s]));
-    const send_fn = c.v8__Function__New__DEFAULT2(context, wsSend, @ptrCast(ext)) orelse return;
-    const close_fn = c.v8__Function__New__DEFAULT2(context, wsClose, @ptrCast(ext)) orelse return;
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Object__Set(@ptrCast(obj), context, @ptrCast(c.v8__Global__Get(&str_send, isolate)), @ptrCast(send_fn), &out);
-    _ = c.v8__Object__Set(@ptrCast(obj), context, @ptrCast(c.v8__Global__Get(&str_close, isolate)), @ptrCast(close_fn), &out);
 
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(obj));
+    const data = gpa.create(WsClientData) catch return c.throwOutOfMemory(ctx);
+    data.* = .{ .slot_id = @intCast(s) };
+    c.setOpaque(obj, data);
+
+    return obj;
 }
 
-fn wsSend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
+fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const s = slotFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
+    const arg = argv[0];
 
-    const s = slotFrom(info) orelse return;
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-    const arg = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
-
-    if (c.v8__Value__IsString(arg)) {
-        const str: *const c.Value = @ptrCast(arg);
-        const ulen = c.v8__String__Utf8Length(str, isolate);
-        if (ulen <= 0) return;
-        const cap = @min(@as(usize, @intCast(ulen)), ws.WS_MSG_SIZE);
-        var buf: [ws.WS_MSG_SIZE]u8 = undefined;
-        const wrote = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(cap), 0);
-        if (wrote <= 0) return;
-        ws_client.sendBytes(s, buf[0..@intCast(wrote)], false);
-        return;
+    if (c.isString(arg) != 0) {
+        const cstr = c.toCString(ctx, arg) orelse return c.JS_UNDEFINED;
+        defer c.freeCString(ctx, cstr);
+        const len = std.mem.len(cstr);
+        if (len == 0) return c.JS_UNDEFINED;
+        const cap = @min(len, ws.WS_MSG_SIZE);
+        ws_client.sendBytes(s, cstr[0..cap], false);
+        return c.JS_UNDEFINED;
     }
-    if (c.v8__Value__IsArrayBuffer(arg)) {
-        const ab: *const c.ArrayBuffer = @ptrCast(arg);
-        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const backing = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return;
-        const data = @as([*]u8, @ptrCast(c.v8__BackingStore__Data(backing) orelse return));
-        const len = c.v8__BackingStore__ByteLength(backing);
-        ws_client.sendBytes(s, data[0..@min(len, ws.WS_MSG_SIZE)], true);
-        return;
+    // ArrayBuffer
+    var size: usize = 0;
+    const p = c.getArrayBuffer(ctx, &size, arg);
+    if (p != null and size > 0) {
+    ws_client.sendBytes(s, p[0..@min(size, ws.WS_MSG_SIZE)], true);
+        return c.JS_UNDEFINED;
     }
-    if (c.v8__Value__IsArrayBufferView(arg)) {
-        const view: *const c.Value = @ptrCast(arg);
-        const ab = c.v8__ArrayBufferView__Buffer(@ptrCast(@constCast(view))) orelse return;
-        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const backing = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return;
-        const data = @as([*]u8, @ptrCast(c.v8__BackingStore__Data(backing) orelse return));
-        const offset = c.v8__ArrayBufferView__ByteOffset(view);
-        const len = c.v8__ArrayBufferView__ByteLength(view);
-        ws_client.sendBytes(s, data[offset .. offset + @min(len, ws.WS_MSG_SIZE)], true);
+    // ArrayBufferView — try buffer property
+    const buf_val = c.getPropertyStr(ctx, arg, "buffer");
+    if (c.isObject(buf_val) != 0) {
+        const p2 = c.getArrayBuffer(ctx, &size, buf_val);
+        if (p2 != null and size > 0) {
+            const offset_val = c.getPropertyStr(ctx, arg, "byteOffset");
+            var offset: i32 = 0;
+            _ = c.toInt32(ctx, &offset, offset_val);
+            const len_val = c.getPropertyStr(ctx, arg, "byteLength");
+            var view_len: i32 = 0;
+            _ = c.toInt32(ctx, &view_len, len_val);
+           const start = @as(usize, @intCast(@max(offset, 0)));
+            const end = @min(start + @as(usize, @intCast(@max(view_len, 0))), size);
+            if (end > start) ws_client.sendBytes(s, p2[start..end], true);
+        }
     }
+    return c.JS_UNDEFINED;
 }
 
-fn wsClose(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-
-    const s = slotFrom(info) orelse return;
+fn wsClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const s = slotFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
 
     var code: u16 = 1000;
-    if (c.v8__FunctionCallbackInfo__Length(info) >= 1) {
-        if (c.v8__FunctionCallbackInfo__INDEX(info, 0)) |code_val| {
-            var maybe: c.MaybeI32 = undefined;
-            c.v8__Value__Int32Value(code_val, context, &maybe);
-            if (maybe.has_value and maybe.value >= 0) {
-                code = @intCast(@min(@as(i64, @intCast(maybe.value)), 65535));
-            }
+    if (argc >= 1) {
+        var maybe: i32 = 0;
+        if (c.toInt32(ctx, &maybe, argv[0]) != -1 and maybe >= 0) {
+            code = @intCast(@min(@as(i64, @intCast(maybe)), 65535));
         }
     }
     var reason: []const u8 = "";
     var reason_buf: [123]u8 = undefined;
-    if (c.v8__FunctionCallbackInfo__Length(info) >= 2) {
-        if (c.v8__FunctionCallbackInfo__INDEX(info, 1)) |reason_arg| {
-            const str: ?*const c.Value = if (c.v8__Value__IsString(reason_arg))
-                @ptrCast(reason_arg)
-            else
-                c.v8__Value__ToDetailString(reason_arg, context);
-            if (str) |strv| {
-                const ulen = c.v8__String__Utf8Length(strv, isolate);
-                if (ulen > 0) {
-                    const cap = @min(@as(usize, @intCast(ulen)), reason_buf.len);
-                    const wrote = c.v8__String__WriteUtf8(strv, isolate, &reason_buf, @intCast(cap), 0);
-                    if (wrote > 0) reason = reason_buf[0..@intCast(wrote)];
-                }
-            }
-        }
+    if (argc >= 2) {
+        if (c.isString(argv[1]) != 0) {
+    const cstr = c.toCString(ctx, argv[1]) orelse return c.JS_UNDEFINED;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    if (len > 0) {
+        const cap = @min(len, reason_buf.len);
+        @memcpy(reason_buf[0..cap], cstr[0..cap]);
+        reason = reason_buf[0..cap];
+    }
+}
     }
 
-    // readyState -> CLOSING (2) immediately (browser parity)
-    if (c.v8__FunctionCallbackInfo__This(info)) |this_val| {
-        if (c.v8__Value__IsObject(this_val)) {
-            // One-off transition: reuse the cached CLOSING key + integer.
-            var out: c.MaybeBool = undefined;
-            _ = c.v8__Object__Set(
-                @ptrCast(this_val),
-                context,
-                globalStr(&str_ready_state, isolate, "readyState"),
-                @ptrCast(globalVal(&int_closing, isolate)),
-                &out,
-            );
-        }
-    }
+    // readyState -> CLOSING (2) immediately
+    setReadyState(ctx, this_val, 2);
     ws_client.closeWs(s, code, reason);
+    return c.JS_UNDEFINED;
+}
+
+fn setReadyState(ctx: ?*c.Context, obj: c.Value, v: i32) void {
+    _ = c.definePropertyValueStr(ctx, obj, "readyState", c.newInt32(ctx, v), c.PROP_C_W_E);
 }

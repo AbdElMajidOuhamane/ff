@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
             _ = runtime.eval(code, "<eval>");
-            runtime.event_loop.runWithMicrotasks(runtime.isolate);
+            runtime.event_loop.runWithMicrotasks(runtime.ctx);
         },
         .file => {
             const runtime = try engine.Runtime.init(init.minimal.args);
@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
             _ = c.fread(buf.ptr, 1, size, file);
             const source: [:0]const u8 = buf;
             _ = runtime.evalModule(source, first_arg);
-            runtime.event_loop.runWithMicrotasks(runtime.isolate);
+            runtime.event_loop.runWithMicrotasks(runtime.ctx);
         },
         .none => printUsage(),
     }

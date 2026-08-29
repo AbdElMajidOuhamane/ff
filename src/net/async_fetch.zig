@@ -5,9 +5,6 @@ const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
 const builtin = @import("builtin");
 
-// Debug builds route job allocations through a counter: per-job reports
-// prove the allocation budget and catch leaks mechanically (balanced()
-// asserted at job end). ReleaseFast binds straight to smp_allocator.
 var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
     job_counter.allocator()
@@ -17,77 +14,43 @@ else
 const counting = @import("../util/counting_allocator.zig");
 const http = std.http;
 
-// ============================================================
-// Async fetch — DOD/SoA slot pool over a PERSISTENT WORKER POOL.
-//
-// No per-fetch heap structs. Every live fetch is an integer slot id into
-// dense per-field arrays; slots come from an O(1) free-list. The pool
-// doubles as the concurrency cap: at most MAX_FETCH jobs are in flight,
-// so submit fails fast with error.NoConnectionAvailable.
-//
-// PHASE 4: threads are spawned ONCE at init() and consume slot ids from a
-// preallocated MPSC ring. Workers PARK on a blocking read of a shared
-// wakeup pipe (Zig 0.16 removed Thread.Mutex/Condition; the Io-bound ones
-// don't fit raw pooled threads). submit() is enqueue-only — the
-// per-request std.Thread.spawn (syscall + stack map + scheduler churn) is
-// gone. `pending` counts IN-FLIGHT JOBS rather than live threads; the
-// event loop's arm/drain gating semantics are unchanged.
-//
-// Worker completion is detected with a SIMD sweep over the state vector
-// (doneMask), then each candidate is confirmed with a per-slot acquire
-// CAS — vector front-end for cheap batching, atomics for correctness.
-//
-// Wakeup: a single xev.Async (mach port). Worker notify() wakes the loop;
-// the callback re-arms while pending > 0 and disarms at 0. drainCompleted()
-// also runs every tick as a safety net against a coalesced/missed notify.
-//
-// v8 is touched ONLY on the main thread (drainCompleted/completeJob).
-// ============================================================
-
-pub const MAX_FETCH = 16; // matches tls.MAX_CONN; == u64 mask lanes
+pub const MAX_FETCH = 16;
 
 const JOB_FREE: u8 = 0;
 const JOB_BUSY: u8 = 1;
 const JOB_DONE: u8 = 2;
 const JOB_CLAIMED: u8 = 3;
 
-// ---- Hot state (touched every tick: state machine + V8 resolvers) ----
 var states:    [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
-var resolvers: [MAX_FETCH]c.Global = undefined;
+var resolve_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
+var reject_funcs:  [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var results:   [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
 var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
-// ---- Cold data (touched only on submit/complete, not every tick) ----
 var url_bufs:  [MAX_FETCH][:0]const u8 = undefined;
 var uris:      [MAX_FETCH]std.Uri = undefined;
 var methods:   [MAX_FETCH]http.Method = undefined;
 var headers:   [MAX_FETCH]std.ArrayList(http.Header) = undefined;
 var bodies:    [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
 
-// ---- O(1) slot allocator (spinlock-guarded) ----
 var free_list: [MAX_FETCH]u16 = undefined;
 var free_count: usize = MAX_FETCH;
 var pool_lock: std.atomic.Mutex = .unlocked;
 
-// ---- persistent worker pool: MPSC job ring (spinlock + wakeup pipe) ----
-const RING_CAP = MAX_FETCH; // >= slot count: enqueue cannot overflow
+const RING_CAP = MAX_FETCH;
 var job_ring: [RING_CAP]u16 = undefined;
-var ring_head: usize = 0; // consumer index (workers)
-var ring_tail: usize = 0; // producer index (main thread)
+var ring_head: usize = 0;
+var ring_tail: usize = 0;
 var ring_lock: std.atomic.Mutex = .unlocked;
 var shutdown_requested = false;
 var pool_started = false;
 var worker_threads: [MAX_FETCH]?std.Thread = [_]?std.Thread{null} ** MAX_FETCH;
-// Wakeup pipe: workers block on read(job_pipe[0]); each enqueued job /
-// shutdown broadcast writes one byte.
 var job_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
-// ---- cross-thread wakeup ----
 const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
 var async_armed = false;
 
-// main-thread/pump-visible wip counter; 0 => all jobs done
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 
 fn poolLock() void {
@@ -126,11 +89,22 @@ fn releaseSlot(s: usize) void {
     methods[s] = undefined;
     headers[s] = undefined;
     bodies[s] = null;
-    resolvers[s] = undefined;
+    freeResolvers(s);
     results[s] = null;
     errs[s] = null;
     free_list[free_count] = @intCast(s);
     free_count += 1;
+}
+
+fn freeResolvers(s: usize) void {
+    if (resolve_funcs[s]) |v| {
+        c.freeValue(undefined, v);
+        resolve_funcs[s] = null;
+    }
+    if (reject_funcs[s]) |v| {
+        c.freeValue(undefined, v);
+        reject_funcs[s] = null;
+    }
 }
 
 // ---- lifecycle ----
@@ -141,7 +115,6 @@ fn makeJobPipe() !void {
     job_pipe = fds;
 }
 
-/// Wakes every parked worker: one byte each so all of them re-check state.
 fn wakeAllWorkers() void {
     if (job_pipe[1] < 0) return;
     var b: [MAX_FETCH]u8 = [_]u8{1} ** MAX_FETCH;
@@ -159,8 +132,6 @@ pub fn init() void {
         async_h.deinit();
         return;
     };
-    // Best-effort spawn: a partial pool is fine — excess jobs simply wait
-    // in the ring until a worker frees up.
     for (&worker_threads) |*t| {
             t.* = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerLoop, .{}) catch {
             t.* = null;
@@ -175,7 +146,7 @@ pub fn deinit() void {
         ringLock();
         shutdown_requested = true;
         ringUnlock();
-        wakeAllWorkers(); // one byte per parked worker
+        wakeAllWorkers();
         for (&worker_threads) |*t| {
             if (t.*) |*tt| {
                 tt.join();
@@ -184,15 +155,13 @@ pub fn deinit() void {
         }
         pool_started = false;
     }
-    if (job_pipe[0] >= 0) _ = c.close(job_pipe[0]);
-    if (job_pipe[1] >= 0) _ = c.close(job_pipe[1]);
+    if (job_pipe[0] >= 0) _ = std.c.close(job_pipe[0]);
+    if (job_pipe[1] >= 0) _ = std.c.close(job_pipe[1]);
     job_pipe = .{ -1, -1 };
     async_h.deinit();
-    // Loop only exits once pending==0 and everything is drained, so slots
-    // should all be free. Safety: reclaim anything that leaked regardless.
     for (0..MAX_FETCH) |s| {
         if (states[s].load(.acquire) != JOB_FREE) {
-            c.v8__Global__Reset(&resolvers[s]);
+            freeResolvers(s);
             freeOwned(s);
         }
     }
@@ -212,10 +181,9 @@ fn freeOwned(s: usize) void {
 
 fn workerLoop() void {
     while (true) {
-        // Park until a job byte arrives (blocking read — zero idle CPU).
         var wake: [1]u8 = undefined;
         const n = std.c.read(job_pipe[0], &wake, 1);
-        if (n <= 0) return; // pipe closed => hard shutdown
+        if (n <= 0) return;
 
         var got: ?u16 = null;
         ringLock();
@@ -226,33 +194,29 @@ fn workerLoop() void {
         const stop = shutdown_requested and ring_head == ring_tail;
         ringUnlock();
 
-        // Always run a claimed job first — even during shutdown — then exit
-        // if the ring drained under a shutdown request.
         if (got) |slot_id| runJob(slot_id);
         if (stop) return;
     }
 }
 
 // ---- submission (main thread, from fetchCallback) ----
-// Takes ownership of url_buf/headers/body on success; frees them on failure.
-// ENQUEUE-ONLY: hands the slot id to the persistent pool — no thread spawn.
 
 pub fn submit(
-    isolate: ?*c.Isolate,
-    resolver: *const c.PromiseResolver,
+    ctx: ?*c.Context,
+    resolve_func: c.Value,
+    reject_func: c.Value,
     url_buf: [:0]const u8,
     uri: std.Uri,
     method: http.Method,
     header_list: std.ArrayList(http.Header),
     body: ?[:0]const u8,
 ) !void {
-    var hl = header_list; // deinit()/items take *Self — the param is const
+    var hl = header_list;
     poolLock();
     defer poolUnlock();
         const s = acquireSlot() orelse {
-        // we own the pieces — free them before reporting capacity exhaustion
         if (builtin.mode == .Debug)
-            std.debug.print("[submit] rejected: pool full\n", .{}); // DIAGNOSTIC (W4)
+            std.debug.print("[submit] rejected: pool full\n", .{});
         gpa.free(url_buf);        for (hl.items) |h| {
             gpa.free(h.name);
             gpa.free(h.value);
@@ -269,18 +233,16 @@ pub fn submit(
     bodies[s] = body;
     results[s] = null;
     errs[s] = null;
-    c.v8__Global__New(isolate, @ptrCast(resolver), &resolvers[s]);
+    resolve_funcs[s] = c.dupValue(ctx, resolve_func);
+    reject_funcs[s] = c.dupValue(ctx, reject_func);
 
-    // Count the job BEFORE signaling so the worker's completion decrement
-    // can never race ahead of our increment.
     _ = pending.fetchAdd(1, .acq_rel);
 
-    // Enqueue for the persistent pool, then poke one parked worker.
     ringLock();
     if (shutdown_requested) {
         ringUnlock();
         _ = pending.fetchSub(1, .acq_rel);
-        c.v8__Global__Reset(&resolvers[s]);
+        freeResolvers(s);
         freeOwned(s);
         releaseSlot(s);
         return error.NoConnectionAvailable;
@@ -291,11 +253,11 @@ pub fn submit(
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
 }
 
-// ---- job execution (worker threads, never touches v8) ----
+// ---- job execution (worker threads, never touches JS) ----
 
 fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
-    if (builtin.mode == .Debug) job_counter.reset(); // DIAGNOSTIC (W3)
+    if (builtin.mode == .Debug) job_counter.reset();
 
     var req = tls.client().request(methods[s], uris[s], .{
         .extra_headers = headers[s].items,
@@ -305,9 +267,6 @@ fn runJob(slot_id: u16) void {
     };
     defer req.deinit();
 
-    // Register the connection in the transport pool (records fd + TLS flag,
-    // applies TCP_NODELAY). TLS handshake runs lazily on first read/write,
-    // so NODELAY covers ClientHello -> Finished -> request.
     var slot: ?usize = null;
     if (req.connection) |cn| slot = tls.attach(cn);
     defer if (slot) |sl| tls.detach(sl);
@@ -353,9 +312,6 @@ fn runJob(slot_id: u16) void {
         req.connection.?.closing = true;
     }
 
-    // ---- Build ResponseData + copy headers FIRST (pristine head).
-    // Creating response.reader() below mutates head/buffering state, so
-    // iterateHeaders must run before it (else it spins on stale offsets). ----
     const resp_data = gpa.create(response_mod.ResponseData) catch {
         failSlot(s, "Out of memory");
         return;
@@ -370,7 +326,6 @@ fn runJob(slot_id: u16) void {
         resp_data.headers.appendEntry(h.name, h.value);
     }
 
-    // ---- Stream the body AFTER headers are captured ----
     if (has_body) {
         var transfer_buf: [8192]u8 = undefined;
         const content_encoding = response.head.content_encoding;
@@ -396,8 +351,6 @@ fn runJob(slot_id: u16) void {
             break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
         };
 
-        // Tracks whether a Content-Length'd body under-delivered — such a
-        // connection's framing state is unreliable and must never be reused.
         var body_incomplete = false;
         const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
 
@@ -421,7 +374,7 @@ fn runJob(slot_id: u16) void {
                     } else {
                         owned_body = gpa.realloc(b, n) catch null;
                         if (owned_body == null) gpa.free(b);
-                        body_incomplete = true; // promised bytes never arrived
+                        body_incomplete = true;
                     }
                 }
             }
@@ -451,10 +404,6 @@ fn runJob(slot_id: u16) void {
         }
 
         if (compressed) {
-            // readerDecompressing stops at the gzip EOF; for te=chunked the
-            // final chunk terminator is left unread. Draining the framing
-            // reader to its deterministic end-of-message (no extra RTT) keeps
-            // the connection reusable.
             var plain_reader = response.reader(&transfer_buf);
             var drain: [2048]u8 = undefined;
             while (true) {
@@ -464,20 +413,18 @@ fn runJob(slot_id: u16) void {
         }
 
         if (body_incomplete) {
-            // Content-Length unmet: this connection's framing state is
-            // unreliable — never hand it back to the keep-alive pool.
             req.connection.?.closing = true;
         }
     }
 
     if (owned_body) |b| {
         resp_data.setBodyOwned(b);
-        owned_body = null; // transferred; the Response owns it now
+        owned_body = null;
     } else if (response.head.content_length != null and has_body) {
         resp_data.setBody("");
     }
 
-    if (builtin.mode == .Debug) { // DIAGNOSTIC (W3): budget proof + leak assert
+    if (builtin.mode == .Debug) {
         std.debug.print(
             "[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
             .{
@@ -489,7 +436,7 @@ fn runJob(slot_id: u16) void {
                 job_counter.balanced(),
             },
         );
-        std.debug.assert(job_counter.balanced()); // leak => loud failure
+        std.debug.assert(job_counter.balanced());
     }
 
     okSlot(s, resp_data);
@@ -497,7 +444,7 @@ fn runJob(slot_id: u16) void {
 
 fn failSlot(s: usize, comptime msg: []const u8) void {
     if (builtin.mode == .Debug)
-        std.debug.print("[fail] slot {d}: {s}\n", .{ s, msg }); // DIAGNOSTIC (W4)
+        std.debug.print("[fail] slot {d}: {s}\n", .{ s, msg });
     errs[s] = msg;
     finishSlot(s);
 }
@@ -515,7 +462,6 @@ fn finishSlot(s: usize) void {
 
 // ---- event-loop integration (main thread only) ----
 
-/// Arm the cross-thread wakeup if jobs are in flight. Called each tick.
 pub fn arm(loop: *xev.Loop) void {
     if (async_armed) return;
     async_armed = true;
@@ -541,12 +487,6 @@ fn asyncCb(
 }
 
 // ---- SIMD done-sweep ----
-//
-// Single vectorized pass builds a u64 bitmask of candidate DONE slots; each
-// set bit is then confirmed with a per-slot acquire CAS. The vector load is
-// only a cheap *detector* (may lag a tick), never the data hand-off — the
-// per-slot CAS provides the memory ordering for the result arrays. Same
-// "vector wide, then scalar per-element" hybrid as findCrLf in tls.zig.
 
 fn doneMask() u64 {
     var mask: u64 = 0;
@@ -560,47 +500,41 @@ fn claimSlot(s: usize) bool {
     return states[s].cmpxchgStrong(JOB_DONE, JOB_CLAIMED, .acq_rel, .acquire) == null;
 }
 
-/// Resolve/reject every finished job. Call each loop tick (after loop.run,
-/// before pumping microtasks) so the `await` continuation runs promptly.
-pub fn drainCompleted(isolate: ?*c.Isolate) void {
+pub fn drainCompleted(ctx: ?*c.Context) void {
     var mask = doneMask();
     while (mask != 0) {
         const s: usize = @ctz(mask);
         mask &= mask - 1;
-        if (claimSlot(s)) completeJob(isolate, s);
+        if (claimSlot(s)) completeJob(ctx, s);
     }
 }
 
-fn completeJob(isolate: ?*c.Isolate, s: usize) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-
-    const resolver: *const c.PromiseResolver = @ptrCast(
-        c.v8__Global__Get(&resolvers[s], isolate) orelse {
-            c.v8__Global__Reset(&resolvers[s]);
-            freeOwned(s);
-            releaseSlot(s);
-            return;
-        },
-    );
-    var out: c.MaybeBool = undefined;
+fn completeJob(ctx: ?*c.Context, s: usize) void {
+    const resolve = resolve_funcs[s] orelse {
+        freeResolvers(s);
+        freeOwned(s);
+        releaseSlot(s);
+        return;
+    };
+    const reject = reject_funcs[s] orelse {
+        freeResolvers(s);
+        freeOwned(s);
+        releaseSlot(s);
+        return;
+    };
 
     if (results[s]) |data| {
-        if (response_mod.buildResponseJSObject(isolate, context, data)) |obj| {
-            c.v8__Promise__Resolver__Resolve(resolver, context, @ptrCast(obj), &out);
-        }
-        // data is deliberately NOT freed: buildResponseJSObject stashed it as
-        // the __d external on the JS Response, which owns it for its lifetime.
+    const obj = response_mod.buildResponseJSObject(ctx, data);
+    var args = [_]c.Value{obj};
+    _ = c.call(ctx, resolve, c.JS_UNDEFINED, 1, &args);
     } else {
         const msg = errs[s] orelse "fetch failed";
-        const ev = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-        c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(ev), &out);
+        const ev = c.newStringLen(ctx, msg.ptr, @intCast(msg.len));
+        var args = [_]c.Value{ev};
+        _ = c.call(ctx, reject, c.JS_UNDEFINED, 1, &args);
     }
 
-    c.v8__Global__Reset(&resolvers[s]);
+    freeResolvers(s);
     freeOwned(s);
     releaseSlot(s);
 }

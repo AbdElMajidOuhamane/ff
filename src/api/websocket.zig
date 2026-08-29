@@ -1,116 +1,84 @@
 const c = @import("../c.zig").c;
 const http_native = @import("../net/http_native.zig");
 const ws = @import("../net/ws_native.zig");
+const std =@import("std");
 
-var sock_ids: [http_native.MAX_CONN]u16 = undefined;
-var str_send: c.Global = .{ .data_ptr = 0 };
-var str_send_binary: c.Global = .{ .data_ptr = 0 };
-var str_id: c.Global = .{ .data_ptr = 0 };
+pub var ws_class_id: c.ClassID = 0;
 
-pub fn setupStrings(isolate: ?*c.Isolate) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "send", 0, -1)), &str_send);
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "sendBinary", 0, -1)), &str_send_binary);
-    c.v8__Global__New(isolate, @ptrCast(c.v8__String__NewFromUtf8(isolate, "id", 0, -1)), &str_id);
+const WsData = struct {
+    slot_id: u16,
+};
+
+fn wsFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    _ = rt;
+    if (c.getOpaque(val, ws_class_id)) |ptr| {
+        const data: *WsData = @ptrCast(@alignCast(ptr));
+        std.heap.smp_allocator.destroy(data);
+    }
 }
 
-// Caller must be inside an active HandleScope + entered context.
-pub fn makeSocket(isolate: ?*c.Isolate, context: ?*const c.Context, id: u16) ?*const c.Object {
-    const iso = isolate orelse return null;
-    const ctx = context orelse return null;
-    sock_ids[id] = id;
-
-    const obj = c.v8__Object__New(iso) orelse return null;
-    var out: c.MaybeBool = undefined;
-    _ = c.v8__Object__Set(
-        obj,
-        ctx,
-        @ptrCast(c.v8__Global__Get(&str_id, iso)),
-        @ptrCast(c.v8__Integer__NewFromUnsigned(iso, id)),
-        &out,
-    );
-    const ext = c.v8__External__New(iso, @ptrCast(&sock_ids[id]));
-    const send = c.v8__Function__New__DEFAULT2(ctx, socketSend, @ptrCast(ext)) orelse return null;
-    _ = c.v8__Object__Set(
-        obj,
-        ctx,
-        @ptrCast(c.v8__Global__Get(&str_send, iso)),
-        @ptrCast(send),
-        &out,
-    );
-    const send_bin = c.v8__Function__New__DEFAULT2(ctx, socketSendBinary, @ptrCast(ext)) orelse return null;
-    _ = c.v8__Object__Set(
-        obj,
-        ctx,
-        @ptrCast(c.v8__Global__Get(&str_send_binary, iso)),
-        @ptrCast(send_bin),
-        &out,
-    );
+pub fn makeSocket(ctx: ?*c.Context, id: u16) ?c.Value {
+    const obj = c.newObjectClass(ctx, @intCast(ws_class_id));
+    const data = std.heap.smp_allocator.create(WsData) catch return null;
+    data.* = .{ .slot_id = id };
+    c.setOpaque(obj, data);
     return obj;
 }
 
-fn slotId(info: ?*const c.FunctionCallbackInfo) ?usize {
-    const data = c.v8__FunctionCallbackInfo__Data(info) orelse return null;
-    const sp: *u16 = @ptrCast(@alignCast(c.v8__External__Value(@ptrCast(data))));
-    return sp.*;
+fn slotIdFromThis(ctx: ?*c.Context, this_val: c.Value) ?usize {
+    const data_ptr = c.getOpaque2(ctx, this_val, ws_class_id) orelse return null;
+    const data: *WsData = @ptrCast(@alignCast(data_ptr));
+    return data.slot_id;
 }
 
-fn socketSend(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate) orelse return;
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-
-    const id = slotId(info) orelse return;
-
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-    const arg = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
-    const str: ?*const c.Value = if (c.v8__Value__IsString(arg))
-        arg
-    else
-        c.v8__Value__ToDetailString(arg, context) orelse return;
-
-    // Encode straight into the slot's write buffer: no temp array, no
-    // separate copy, single pass. Length comes from Utf8Length() so the
-    // frame header always matches the bytes actually written.
-    http_native.wsSendTextUtf8(id, str, isolate);
-}
-
-// Extracts the readable bytes behind an ArrayBuffer / ArrayBufferView arg.
-fn backingBytes(arg: ?*const c.Value) ?[]const u8 {
-    const v = arg orelse return null;
-    if (c.v8__Value__IsArrayBuffer(v)) {
-        const ab: *const c.ArrayBuffer = @ptrCast(v);
-        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const bs = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return null;
-        const p = c.v8__BackingStore__Data(bs) orelse return null;
-        return @as([*]const u8, @ptrCast(p))[0..c.v8__BackingStore__ByteLength(bs)];
+fn socketSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const id = slotIdFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
+    const arg = argv[0];
+    if (c.isString(arg) != 0) {
+        http_native.wsSendTextUtf8(id, arg, ctx);
     }
-    if (c.v8__Value__IsArrayBufferView(v)) {
-        const view: *const c.ArrayBufferView = @ptrCast(v);
-        const ab = c.v8__ArrayBufferView__Buffer(view) orelse return null;
-        var store = c.v8__ArrayBuffer__GetBackingStore(ab);
-        const bs = c.std__shared_ptr__v8__BackingStore__get(&store) orelse return null;
-        const p = c.v8__BackingStore__Data(bs) orelse return null;
-        const off: usize = @intCast(c.v8__ArrayBufferView__ByteOffset(view));
-        const len: usize = @intCast(c.v8__ArrayBufferView__ByteLength(view));
-        return @as([*]const u8, @ptrCast(p))[off .. off + len];
+    return c.JS_UNDEFINED;
+}
+
+fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
+    if (c.isObject(arg) == 0) return null;
+    var size: usize = 0;
+    const p = c.getArrayBuffer(ctx, &size, arg);
+    if (p != null and size > 0) return p[0..size];
+    const buf_val = c.getPropertyStr(ctx, arg, "buffer");
+    if (c.isObject(buf_val) != 0) {
+        var size2: usize = 0;
+        const p2 = c.getArrayBuffer(ctx, &size2, buf_val);
+        if (p2 != null and size2 > 0) return p2[0..size2];
     }
     return null;
 }
 
-fn socketSendBinary(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-
-    const id = slotId(info) orelse return;
-
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-    const bytes = backingBytes(c.v8__FunctionCallbackInfo__INDEX(info, 0)) orelse return;
+fn socketSendBinary(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const id = slotIdFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
+    const bytes = backingBytes(ctx, argv[0]) orelse return c.JS_UNDEFINED;
     http_native.wsSendBinary(id, bytes);
+    return c.JS_UNDEFINED;
+}
+
+pub fn setup(ctx: ?*c.Context) void {
+    var def = c.ClassDef{
+        .class_name = "ServerWebSocket",
+        .finalizer = wsFinalizer,
+    };
+    _ = c.newClassID(&ws_class_id);
+    _ = c.newClass(c.getRuntime(ctx), ws_class_id, &def);
+
+    const proto = c.newObject(ctx);
+    const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
+        .{ .name = "send", .func = &socketSend, .len = 1 },
+        .{ .name = "sendBinary", .func = &socketSendBinary, .len = 1 },
+    };
+    for (methods) |m| {
+        const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
+        _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    }
+    c.setClassProto(ctx, ws_class_id, proto);
 }

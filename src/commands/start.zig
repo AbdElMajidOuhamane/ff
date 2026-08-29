@@ -32,7 +32,8 @@ pub fn run(io: std.Io,init:std.process.Init) !void {
         return;
     };
     defer allocator.free(js_content);
-    const source: [:0]const u8 = js_content.ptr[0..js_content.len :0];
+    const source: [:0]const u8 = allocator.dupeZ(u8, js_content) catch return;
+    defer allocator.free(source);
     // 5. Run it
      const runtime = try engine.Runtime.init(init.minimal.args);
     defer {
