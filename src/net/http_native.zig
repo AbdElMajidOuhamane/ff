@@ -349,9 +349,14 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         c.newStringLen(ctx, body.ptr, @intCast(body.len))
     else
         c.newStringLen(ctx, "", 0);
+    // argv is borrowed by c.call — we still own these three references.
+    defer c.freeValue(ctx, url_val);
+    defer c.freeValue(ctx, method_val);
+    defer c.freeValue(ctx, body_val);
 
     var argv = [_]c.Value{ url_val, method_val, body_val };
     var result = c.call(ctx, handler, global, 3, &argv);
+    defer c.freeValue(ctx, result);
 
     if (c.isObject(result) != 0) {
         const tag = c.getTag(result);
@@ -363,7 +368,9 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
                 _ = c.executePendingJob(c.getRuntime(ctx), @ptrCast(&ctx_mut));
             }
             if (c.promiseState(ctx, result) == 1) {
-                result = c.promiseResult(ctx, result);
+                const pr = c.promiseResult(ctx, result);
+                c.freeValue(ctx, result); // free the promise object ref before overwrite
+                result = pr;
             } else {
                 buildResponse(id, 500, "");
                 return;
@@ -377,8 +384,10 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     }
 
     const status_val = c.getPropertyStr(ctx, result, "status");
+    defer c.freeValue(ctx, status_val);
     const status = extractInt(ctx, status_val, 200);
     const body_out_val = c.getPropertyStr(ctx, result, "body");
+    defer c.freeValue(ctx, body_out_val);
 
     const suppress = !wantsBodyBytes(id, status);
     const keep_alive = cflags[id].keep_alive;
@@ -494,6 +503,7 @@ fn wsNotifyMessage(id: usize, msg: []const u8, binary: bool) void {
         c.newArrayBufferCopy(ctx, msg.ptr, msg.len)
     else
         c.newStringLen(ctx, msg.ptr, @intCast(msg.len));
+    defer c.freeValue(ctx, data_val);
     var argv = [_]c.Value{ sock, data_val };
     _ = c.call(ctx, cb, c.JS_UNDEFINED, 2, &argv);
 }

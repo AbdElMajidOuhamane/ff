@@ -3,6 +3,6 @@ zig-cache
 zig-out
 zig-pkg
 .DS_Store
-vendor/v8/lib
+vendor/quickjs/
 bench
 examples

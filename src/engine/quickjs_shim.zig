@@ -95,6 +95,8 @@ pub const JS_EXCEPTION: qjs_c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = qjs_c.J
 pub const JS_UNINITIALIZED: qjs_c.JSValue = .{ .u = .{ .uint64 = 0 }, .tag = qjs_c.JS_TAG_UNINITIALIZED };
 
 // ─── Runtime ─────────────────────────────────────────────────────
+//pub const newRuntime2 = qjs_c.JS_NewRuntime2;
+//pub const MallocFunctions = qjs_c.JSMallocFunctions;
 pub const newRuntime = qjs_c.JS_NewRuntime;
 pub const freeRuntime = qjs_c.JS_FreeRuntime;
 pub const setMemoryLimit = qjs_c.JS_SetMemoryLimit;
