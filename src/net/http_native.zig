@@ -54,7 +54,10 @@ const ConnFlags = packed struct(u8) {
     _pad: u2 = 0,
 };
 comptime {
-    assert(@sizeOf(ConnFlags) == 1); // skill: verify packed layout claims
+    assert(@sizeOf(ConnFlags) == 1);
+    assert(@sizeOf(Method) == 1);
+    assert(@sizeOf(ParsedRequest) <= 64);
+    assert(@sizeOf(ConnState) == 1);
 }
 const assert = std.debug.assert;
 

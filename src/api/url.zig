@@ -918,7 +918,7 @@ fn createUrlJsObject(isolate: ?*c.Isolate, context: ?*c.Context, data: *UrlData)
     const hash_val = data.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
    
-setUrlPropCached(isolate, context, obj, globalStr(&str_href, isolate, "href"), data.serialize() catch "");
+setUrlPropCached(isolate, context, obj, globalStr(&str_href, isolate, "href"), href_val);
 setUrlPropCached(isolate, context, obj, globalStr(&str_origin, isolate, "origin"), origin_val);
 setUrlPropCached(isolate, context, obj, globalStr(&str_host, isolate, "host"), host_val);
 setUrlPropCached(isolate, context, obj, globalStr(&str_hostname, isolate, "hostname"), data.host);
