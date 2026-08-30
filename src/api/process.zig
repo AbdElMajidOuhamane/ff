@@ -56,6 +56,38 @@ fn cwdCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     };
     return zigStringToVal(ctx, buf[0..len]);
 }
+fn memoryUsageCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    var mu: c.MemoryUsage = undefined;
+    c.computeMemoryUsage(c.getRuntime(ctx), &mu);
+    const obj = c.newObject(ctx);
+    _ = c.setPropertyStr(ctx, obj, "rss", c.newInt32(ctx, 0));
+    _ = c.setPropertyStr(ctx, obj, "heapTotal", c.newInt64(ctx, mu.malloc_size));
+    _ = c.setPropertyStr(ctx, obj, "heapUsed", c.newInt64(ctx, mu.memory_used_size));
+    _ = c.setPropertyStr(ctx, obj, "external", c.newInt32(ctx, 0));
+    return obj;
+}
+fn nCpusCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    const n = std.Thread.getCpuCount() catch 1;
+    return c.newInt64(ctx, @intCast(n));
+}
+
+fn hostnameCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    var buf: [256]u8 = undefined;
+    if (std.c.gethostname(&buf, buf.len) == 0) {
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(&buf)));
+        return zigStringToVal(ctx, span);
+    }
+    return c.JS_UNDEFINED;
+}
 
 fn chdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
@@ -130,6 +162,13 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
         arg_idx += 1;
     }
     _ = c.definePropertyValueStr(ctx, process_obj, "argv", argv_arr, c.PROP_C_W_E);
+        const mem_usage_fn = c.newCFunction(ctx, memoryUsageCallback, "memoryUsage", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "memoryUsage", mem_usage_fn, c.PROP_C_W_E);
+        const n_cpus_fn = c.newCFunction(ctx, nCpusCallback, "_nCpus", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "_nCpus", n_cpus_fn, c.PROP_C_W_E);
+
+    const hostname_fn = c.newCFunction(ctx, hostnameCallback, "_hostname", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "_hostname", hostname_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "process", process_obj, c.PROP_C_W_E);
 }

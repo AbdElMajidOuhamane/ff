@@ -1,3 +1,4 @@
+
 const std = @import("std");
 const simd = std.simd;
 const xev = @import("xev");
@@ -320,6 +321,46 @@ fn buildResponse(id: usize, status: u16, body: []const u8) void {
     }
     write_lens[id] = pos;
 }
+
+// Node-mode response: verbatim adapter headers + connection header + body.
+// Fast path is zero-alloc (write_bufs); spill mirrors the big_write mechanics.
+fn buildResponseRaw(id: usize, status: u16, raw_headers: []const u8, body: []const u8) void {
+    const suppress = !wantsBodyBytes(id, status);
+    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
+    var pos: usize = 0;
+    pushStr(w, &pos, "HTTP/1.1 ");
+    appendUInt(w, &pos, status);
+    pushStr(w, &pos, " ");
+    pushStr(w, &pos, statusReason(status));
+    pushStr(w, &pos, "\r\n");
+    if (raw_headers.len > 0 and pos + raw_headers.len <= WRITE_BUF_SIZE) {
+        @memcpy(w[pos..][0..raw_headers.len], raw_headers);
+        pos += raw_headers.len;
+    }
+    if (cflags[id].keep_alive) pushStr(w, &pos, "Connection: keep-alive\r\n")
+    else pushStr(w, &pos, "Connection: close\r\n");
+    pushStr(w, &pos, "\r\n");
+    const header_len = pos;
+    if (suppress) {
+        write_lens[id] = header_len;
+        return;
+    }
+    if (header_len + body.len <= WRITE_BUF_SIZE) {
+        @memcpy(w[header_len..][0..body.len], body);
+        write_lens[id] = header_len + body.len;
+        return;
+    }
+    const out = gpa.alloc(u8, header_len + body.len) catch {
+        write_lens[id] = 0;
+        return;
+    };
+    @memcpy(out[0..header_len], w[0..header_len]);
+    @memcpy(out[header_len..][0..body.len], body);
+    big_write[id] = out;
+    write_lens[id] = header_len + body.len;
+    write_offsets[id] = 0;
+}
+
 fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
@@ -330,7 +371,7 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
 // ============================================================
 // QuickJS handler invocation (replaces callV8Handler)
 // ============================================================
-fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
+fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8, raw_headers: []const u8) void {
     if (builtin.mode == .Debug) req_counter.reset();
     const ctx = handler_ctx orelse {
         buildResponse(id, 500, "");
@@ -354,28 +395,34 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     defer c.freeValue(ctx, method_val);
     defer c.freeValue(ctx, body_val);
 
-    var argv = [_]c.Value{ url_val, method_val, body_val };
-    var result = c.call(ctx, handler, global, 3, &argv);
+    const headers_val = c.newStringLen(ctx, raw_headers.ptr, raw_headers.len);
+    defer c.freeValue(ctx, headers_val);
+
+    var argv = [_]c.Value{ url_val, method_val, body_val, headers_val };
+    var result = c.call(ctx, handler, global, 4, &argv);
     defer c.freeValue(ctx, result);
 
-    if (c.isObject(result) != 0) {
-        const tag = c.getTag(result);
-        if (tag == 7) {
+        if (c.isObject(result) != 0) {
+        // Promises are OBJECTS in QuickJS (JS_CLASS_PROMISE, tag -1) — detect
+        // via JS_PromiseState (-1 = not a promise, 0 = pending, 1 = fulfilled, 2 = rejected).
+        var st = c.promiseState(ctx, result);
+        if (st == 0) {
             var pi: u32 = 0;
-            while (pi < 1000) : (pi += 1) {
-                if (c.promiseState(ctx, result) != 0) break;
+            while (st == 0 and pi < 1000) : (pi += 1) {
                 var ctx_mut = ctx;
                 _ = c.executePendingJob(c.getRuntime(ctx), @ptrCast(&ctx_mut));
-            }
-            if (c.promiseState(ctx, result) == 1) {
-                const pr = c.promiseResult(ctx, result);
-                c.freeValue(ctx, result); // free the promise object ref before overwrite
-                result = pr;
-            } else {
-                buildResponse(id, 500, "");
-                return;
+                st = c.promiseState(ctx, result);
             }
         }
+        if (st == 1) {
+            const pr = c.promiseResult(ctx, result);
+            c.freeValue(ctx, result); // free the promise object ref before overwrite
+            result = pr;
+        } else if (st == 2) {
+            buildResponse(id, 500, "");
+            return;
+        }
+        // st == -1: not a promise — the regular {status, body} contract proceeds
     }
 
     if (c.isObject(result) == 0) {
@@ -388,9 +435,39 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     const status = extractInt(ctx, status_val, 200);
     const body_out_val = c.getPropertyStr(ctx, result, "body");
     defer c.freeValue(ctx, body_out_val);
+    const raw_out_val = c.getPropertyStr(ctx, result, "headersRaw");
+    defer c.freeValue(ctx, raw_out_val);
 
     const suppress = !wantsBodyBytes(id, status);
     const keep_alive = cflags[id].keep_alive;
+
+    // Node-mode: the JS adapter supplied verbatim headers — write as-is.
+    if (c.isString(raw_out_val) != 0) {
+        var raw_len: usize = 0;
+        const raw_ptr = c.toCStringLen(ctx, &raw_len, raw_out_val) orelse {
+            buildResponse(id, 500, "");
+            return;
+        };
+        defer c.freeCString(ctx, raw_ptr);
+        const raw = raw_ptr[0..raw_len];
+
+        var out_body: []const u8 = "";
+        if (c.isString(body_out_val) != 0) {
+            if (c.toCString(ctx, body_out_val)) |cs| {
+                defer c.freeCString(ctx, cs);
+                out_body = cs[0..std.mem.len(cs)];
+            }
+        } else if (c.isObject(body_out_val) != 0) {
+            var size: usize = 0;
+            const p = c.getArrayBuffer(ctx, &size, body_out_val);
+            if (p != null and size > 0) out_body = p[0..size];
+        }
+
+        buildResponseRaw(id, status, raw, if (suppress) "" else out_body);
+        if (builtin.mode == .Debug) std.debug.assert(req_counter.balanced());
+        return;
+    }
+
     var done = false;
     body_pipeline: {
         if (c.isUndefined(body_out_val) != 0 or c.isNull(body_out_val) != 0) break :body_pipeline;
@@ -407,9 +484,9 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         } else if (c.isObject(body_out_val) != 0) {
             var size: usize = 0;
             const p = c.getArrayBuffer(ctx, &size, body_out_val);
-            if (p != null and size > 0) {
+                        if (p != null and size > 0) {
                 blen = size;
-                body_ptr = p.?;
+                body_ptr = p;
             } else break :body_pipeline;
         } else break :body_pipeline;
 
@@ -895,7 +972,7 @@ fn readCb(
         buildResponse(id, 200, "{\"message\":\"ok\"}");
     } else {
         const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
-        callHandler(id, &pr, body);
+        callHandler(id, &pr, body, read_bufs[id][0..headers_end]);
     }
     states[id] = .writing;
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);

@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const qjs = @import("quickjs_shim.zig");
 const mod = @import("../modules/mod.zig");
@@ -17,7 +16,7 @@ const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
 const websocket_client = @import("../api/websocket_client.zig");
 const http_native = @import("../net/http_native.zig");
-//const qjs_malloc = @import("qjs_malloc.zig");
+const node_compat = @import("../node_compat/registry.zig");
 const simd = std.simd;
 
 const DepEntry = struct {
@@ -43,7 +42,6 @@ pub const Runtime = struct {
     timer_manager: TimerManager,
 
     pub fn init(args: std.process.Args) !*Runtime {
-        //const rt = qjs.newRuntime2(&qjs_malloc.functions, null) orelse return error.InitFailed;
         const rt = qjs.newRuntime() orelse return error.InitFailed;
         qjs.setMaxStackSize(rt, 1024 * 1024);
         qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
@@ -66,6 +64,7 @@ pub const Runtime = struct {
         response.setup(ctx);
         http.setup(ctx);
         websocket_client.setup(ctx);
+        node_compat.setup(ctx);
 
         const global = qjs.getGlobalObject(ctx);
         defer qjs.freeValue(ctx, global);

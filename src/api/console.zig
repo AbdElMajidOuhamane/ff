@@ -1,3 +1,4 @@
+
 const std = @import("std");
 const c = @import("../c.zig").c;
 const RED = "\x1b[31m";
@@ -21,7 +22,6 @@ fn flush(buf: []u8, len: *usize) void {
 }
 
 fn stageString(ctx: ?*c.Context, val: c.Value, buf: []u8, len: *usize) void {
-    if (c.isString(val) == 0) return;
     var str_len: usize = 0;
     const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return;
     defer c.freeCString(ctx, str_ptr);
@@ -35,6 +35,48 @@ fn stageString(ctx: ?*c.Context, val: c.Value, buf: []u8, len: *usize) void {
     }
 }
 
+fn stageValue(ctx: ?*c.Context, val: c.Value, buf: []u8, len: *usize) void {
+    if (c.isString(val) != 0) {
+        stageString(ctx, val, buf, len);
+        return;
+    }
+    if (c.isBool(val) != 0) {
+        appendChunk(buf, len, if (c.toBool(ctx, val) != 0) "true" else "false");
+        return;
+    }
+    if (c.isNumber(val) != 0) {
+        var tmp: [64]u8 = undefined;
+        if (c.getTag(val) == c.TAG_INT) {
+            var i: i64 = 0;
+            _ = c.toInt64(ctx, &i, val);
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch return;
+            appendChunk(buf, len, s);
+        } else {
+            var d: f64 = 0;
+            _ = c.toFloat64(ctx, &d, val);
+            const s = if (std.math.isNan(d)) "NaN"
+                else if (std.math.isInf(d)) (if (d < 0) "-Infinity" else "Infinity")
+                else std.fmt.bufPrint(&tmp, "{d}", .{d}) catch return;
+            appendChunk(buf, len, s);
+        }
+        return;
+    }
+    const tag = c.getTag(val);
+    if (tag == c.TAG_NULL) {
+        appendChunk(buf, len, "null");
+        return;
+    }
+    if (tag == c.TAG_UNDEFINED) {
+        appendChunk(buf, len, "undefined");
+        return;
+    }
+    if (c.isFunction(ctx, val) != 0) {
+        appendChunk(buf, len, "[Function]");
+        return;
+    }
+    appendChunk(buf, len, "[object Object]");
+}
+
 fn consoleLogCallbackWithColor(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, color: []const u8) void {
     var buf: [LINE_MAX]u8 = undefined;
     var len: usize = 0;
@@ -42,7 +84,7 @@ fn consoleLogCallbackWithColor(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.
     var i: c_int = 0;
     while (i < argc) : (i += 1) {
         if (i > 0) appendChunk(&buf, &len, " ");
-        stageString(ctx, argv[@intCast(i)], &buf, &len);
+        stageValue(ctx, argv[@intCast(i)], &buf, &len);
     }
     if (color.len > 0) appendChunk(&buf, &len, RESET);
     appendChunk(&buf, &len, "\n");
