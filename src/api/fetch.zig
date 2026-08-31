@@ -7,27 +7,40 @@ const tls = @import("../net/tls.zig");
 const gpa = std.heap.smp_allocator;
 const http = std.http;
 
-// ============================================================
-// Helpers
-// ============================================================
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
 
-fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    const cstr = c.toCString(ctx, val) orelse return null;
-    const len = std.mem.len(cstr);
-    if (len == 0) {
-        c.freeCString(ctx, cstr);
-        return gpa.dupeZ(u8, "") catch return null;
+const ExtractedStr = struct {
+    slice: []const u8,
+    heap: ?[:0]u8 = null,
+    fn deinit(self: ExtractedStr) void {
+        if (self.heap) |h| gpa.free(h);
     }
-    const buf = gpa.allocSentinel(u8, len, 0) catch {
-        c.freeCString(ctx, cstr);
-        return null;
-    };
-    @memcpy(buf[0..len], cstr[0..len]);
-    buf[len] = 0;
-    c.freeCString(ctx, cstr);
+};
+
+fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    if (len == 0) return .{ .slice = "" };
+    if (len <= stack_buf.len) {
+        @memcpy(stack_buf[0..len], cstr[0..len]);
+        return .{ .slice = stack_buf[0..len] };
+    }
+    const heap_buf = gpa.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(heap_buf[0..len], cstr[0..len]);
+    return .{ .slice = heap_buf, .heap = heap_buf };
+}
+
+// DOD-FIX 2 (corrected): heap case returns the [:0]u8 directly.
+fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    var stack_buf: [256]u8 = undefined;
+    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
+    if (ex.heap) |h| return h;
+    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
+    @memcpy(buf[0..ex.slice.len], ex.slice);
+    buf[ex.slice.len] = 0;
     return buf;
 }
 
@@ -58,22 +71,18 @@ fn parseMethod(method_str: []const u8) http.Method {
     };
 }
 
-fn collectHeadersFromJS(ctx: ?*c.Context, val: c.Value, list: *std.ArrayList(http.Header)) void {
+fn collectHeadersFromJS(
+    ctx: ?*c.Context,
+    val: c.Value,
+    target: *headers_mod.HeadersData,
+) void {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return;
     if (c.isObject(val) == 0) return;
     if (c.getOpaque2(ctx, val, headers_mod.headers_class_id)) |ptr| {
         const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
         for (0..src.len()) |i| {
             const p = src.getPair(i);
-            const n = gpa.dupe(u8, p.name) catch continue;
-            const v = gpa.dupe(u8, p.value) catch {
-                gpa.free(n);
-                continue;
-            };
-            list.append(gpa, .{ .name = n, .value = v }) catch {
-                gpa.free(n);
-                gpa.free(v);
-            };
+            target.appendEntry(p.name, p.value);
         }
         return;
     }
@@ -87,22 +96,21 @@ fn collectHeadersFromJS(ctx: ?*c.Context, val: c.Value, list: *std.ArrayList(htt
             defer c.freeValue(ctx, name_val);
             const prop_val = c.getProperty(ctx, val, name_atom);
             defer c.freeValue(ctx, prop_val);
-            const name_z = extractStringFromVal(ctx, name_val) orelse continue;
-            const val_z = extractStringFromVal(ctx, prop_val) orelse {
-                gpa.free(name_z);
-                continue;
-            };
-            list.append(gpa, .{ .name = name_z, .value = val_z }) catch {
-                gpa.free(name_z);
-                gpa.free(val_z);
-            };
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, prop_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
+                }
+            }
         }
     }
 }
 
-// ============================================================
-// Main fetch callback
-// ============================================================
 fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
@@ -114,41 +122,19 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     var url_str: ?[:0]const u8 = null;
     var method_override: ?[]const u8 = null;
     var owned_method: ?[:0]const u8 = null;
-    var extra_headers: ?std.ArrayList(http.Header) = null;
     var body_payload: ?[:0]const u8 = null;
     defer {
         if (url_str) |u| gpa.free(u);
         if (owned_method) |m| gpa.free(m);
         if (body_payload) |b| gpa.free(b);
-        if (extra_headers) |*h| {
-            for (h.items) |hdr| {
-                gpa.free(hdr.name);
-                gpa.free(hdr.value);
-            }
-            h.deinit(gpa);
-        }
     }
     if (c.isString(arg0) != 0) {
         url_str = extractStringFromVal(ctx, arg0);
     } else if (c.isObject(arg0) != 0) {
-        const req_data = extractRequestData(ctx, arg0);
-        if (req_data) |rd| {
+        if (extractRequestData(ctx, arg0)) |rd| {
             url_str = gpa.dupeZ(u8, rd.url()) catch null;
             method_override = rd.method();
             body_payload = if (rd.body()) |b| gpa.dupeZ(u8, b) catch null else null;
-            extra_headers = .empty;
-            for (0..rd.headers.len()) |i| {
-                const pair = rd.headers.getPair(i);
-                const n = gpa.dupe(u8, pair.name) catch continue;
-                const v = gpa.dupe(u8, pair.value) catch {
-                    gpa.free(n);
-                    continue;
-                };
-                extra_headers.?.append(gpa, .{ .name = n, .value = v }) catch {
-                    gpa.free(n);
-                    gpa.free(v);
-                };
-            }
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
             defer c.freeValue(ctx, url_val);
@@ -158,6 +144,19 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
         return c.JS_EXCEPTION;
     }
+
+    // DOD-FIX 5: build a single dense HeadersData in-place.
+    var in_flight_headers = headers_mod.HeadersData.init();
+    errdefer in_flight_headers.deinit();
+
+    // If arg0 is a Request, copy its headers into the in-flight pool.
+    if (extractRequestData(ctx, arg0)) |rd| {
+        for (0..rd.headers.len()) |i| {
+            const pair = rd.headers.getPair(i);
+            in_flight_headers.appendEntry(pair.name, pair.value);
+        }
+    }
+
     if (argc > 1 and c.isObject(argv[1]) != 0) {
         const init_val = argv[1];
         const method_val = c.getPropertyStr(ctx, init_val, "method");
@@ -168,16 +167,14 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
         const headers_val = c.getPropertyStr(ctx, init_val, "headers");
         defer c.freeValue(ctx, headers_val);
-        if (extra_headers == null) {
-            extra_headers = .empty;
-        }
-        collectHeadersFromJS(ctx, headers_val, &extra_headers.?);
+        collectHeadersFromJS(ctx, headers_val, &in_flight_headers);
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
             body_payload = extractStringFromVal(ctx, body_val);
         }
     }
+
     const url = url_str orelse {
         var msg = zigStringToJS(ctx, "Invalid URL");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
@@ -193,13 +190,23 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
-    const header_list: std.ArrayList(http.Header) = if (extra_headers) |*h| h.* else .empty;
-    extra_headers = null;
-    const body_copy = body_payload;
-    body_payload = null;
     const url_copy = url;
     url_str = null;
-    async_fetch.submit(ctx, cap[0], cap[1], url_copy, uri, method, header_list, body_copy) catch {
+    const body_copy = body_payload;
+    body_payload = null;
+
+    // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
+    // heap-allocated HeadersData so async_fetch can hold a stable pointer.
+    // The wrapper is destroyed by runJob once its contents are moved into
+    // the response's HeadersData.
+    const hdr_ptr = gpa.create(headers_mod.HeadersData) catch {
+        var msg = zigStringToJS(ctx, "Out of memory");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    };
+    hdr_ptr.* = in_flight_headers;
+    async_fetch.submit(ctx, cap[0], cap[1], url_copy, uri, method, hdr_ptr, body_copy) catch {
+        hdr_ptr.release();
         var msg = zigStringToJS(ctx, "Failed to start fetch");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
@@ -207,9 +214,6 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     return promise;
 }
 
-// ============================================================
-// Setup / teardown
-// ============================================================
 pub fn deinitClient() void {
     async_fetch.deinit();
     tls.deinit();

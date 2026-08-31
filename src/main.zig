@@ -22,12 +22,12 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
     return .file;
 }
+// DOD-FIX 9: boot_arena (inside Runtime) is the sole owner of `runtime`
+// and `runtime.event_loop`. We only call deinit(), not destroy().
 fn shutdownRuntime(runtime: *engine.Runtime) void {
     engine.deinitNetwork();
     runtime.event_loop.deinit();
-    std.heap.page_allocator.destroy(runtime.event_loop);
     runtime.deinit();
-    std.heap.page_allocator.destroy(runtime);
 }
 pub fn main(init: std.process.Init) !void {
     var args_iter = init.minimal.args.iterate();
@@ -62,8 +62,6 @@ pub fn main(init: std.process.Init) !void {
             _ = c.fseek(file, 0, c.SEEK_END);
             const size: usize = @intCast(c.ftell(file));
             _ = c.fseek(file, 0, c.SEEK_SET);
-            // Sentinel-terminated allocation: the previous alloc(u8, size)
-            // + [0..size :0] claim read one byte past the buffer.
             const buf = try std.heap.page_allocator.allocSentinel(u8, size, 0);
             defer std.heap.page_allocator.free(buf);
             _ = c.fread(buf.ptr, 1, size, file);

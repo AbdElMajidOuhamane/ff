@@ -3,6 +3,10 @@ const Allocator = std.mem.Allocator;
 const loader = @import("loader.zig");
 const Module = loader.Module;
 
+// NOTE: DOD-FIX 8 (u32-keyed cache) was reverted. The cross-Module
+// key coordination required a shared arena that the codebase doesn't
+// have, and the StringHashMap is fine in practice for the cache sizes
+// this runtime sees.
 pub const ModuleCache = struct {
     map: std.StringHashMap(*Module),
 
@@ -14,7 +18,6 @@ pub const ModuleCache = struct {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
-            //self.allocator.destroy(entry.value_ptr.*);
         }
         self.map.deinit();
     }

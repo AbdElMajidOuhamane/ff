@@ -6,9 +6,6 @@ const gpa = std.heap.smp_allocator;
 
 pub var request_class_id: c.ClassID = 0;
 
-// ============================================================
-// Helpers
-// ============================================================
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
@@ -36,19 +33,12 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 }
 
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    const cstr = c.toCString(ctx, val) orelse return null;
-    const len = std.mem.len(cstr);
-    if (len == 0) {
-        c.freeCString(ctx, cstr);
-        return gpa.dupeZ(u8, "") catch return null;
-    }
-    const buf = gpa.allocSentinel(u8, len, 0) catch {
-        c.freeCString(ctx, cstr);
-        return null;
-    };
-    @memcpy(buf[0..len], cstr[0..len]);
-    buf[len] = 0;
-    c.freeCString(ctx, cstr);
+    var stack_buf: [256]u8 = undefined;
+    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
+    if (ex.heap) |h| return h;
+    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
+    @memcpy(buf[0..ex.slice.len], ex.slice);
+    buf[ex.slice.len] = 0;
     return buf;
 }
 
@@ -57,18 +47,8 @@ fn extractRequestData(ctx: ?*c.Context, this_val: c.Value) ?*RequestData {
     return @ptrCast(@alignCast(ptr));
 }
 
-// ============================================================
-// Interning — spec-constrained string fields as dense enums
-// ============================================================
 pub const Method = enum(u8) {
-    GET,
-    POST,
-    PUT,
-    DELETE,
-    HEAD,
-    OPTIONS,
-    PATCH,
-    other,
+    GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH, other,
     pub fn fromSlice(s: []const u8) Method {
         if (std.mem.eql(u8, s, "GET")) return .GET;
         if (std.mem.eql(u8, s, "POST")) return .POST;
@@ -81,25 +61,14 @@ pub const Method = enum(u8) {
     }
     pub fn string(self: Method) []const u8 {
         return switch (self) {
-            .GET => "GET",
-            .POST => "POST",
-            .PUT => "PUT",
-            .DELETE => "DELETE",
-            .HEAD => "HEAD",
-            .OPTIONS => "OPTIONS",
-            .PATCH => "PATCH",
+            .GET => "GET", .POST => "POST", .PUT => "PUT", .DELETE => "DELETE",
+            .HEAD => "HEAD", .OPTIONS => "OPTIONS", .PATCH => "PATCH",
             .other => unreachable,
         };
     }
 };
 pub const CacheMode = enum(u8) {
-    default,
-    no_store,
-    reload,
-    no_cache,
-    force_cache,
-    only_if_cached,
-    other,
+    default, no_store, reload, no_cache, force_cache, only_if_cached, other,
     pub fn fromSlice(s: []const u8) CacheMode {
         if (std.mem.eql(u8, s, "default")) return .default;
         if (std.mem.eql(u8, s, "no-store")) return .no_store;
@@ -111,21 +80,14 @@ pub const CacheMode = enum(u8) {
     }
     pub fn string(self: CacheMode) []const u8 {
         return switch (self) {
-            .default => "default",
-            .no_store => "no-store",
-            .reload => "reload",
-            .no_cache => "no-cache",
-            .force_cache => "force-cache",
-            .only_if_cached => "only-if-cached",
-            .other => unreachable,
+            .default => "default", .no_store => "no-store", .reload => "reload",
+            .no_cache => "no-cache", .force_cache => "force-cache",
+            .only_if_cached => "only-if-cached", .other => unreachable,
         };
     }
 };
 pub const CredMode = enum(u8) {
-    same_origin,
-    include,
-    omit,
-    other,
+    same_origin, include, omit, other,
     pub fn fromSlice(s: []const u8) CredMode {
         if (std.mem.eql(u8, s, "same-origin")) return .same_origin;
         if (std.mem.eql(u8, s, "include")) return .include;
@@ -134,19 +96,13 @@ pub const CredMode = enum(u8) {
     }
     pub fn string(self: CredMode) []const u8 {
         return switch (self) {
-            .same_origin => "same-origin",
-            .include => "include",
-            .omit => "omit",
-            .other => unreachable,
+            .same_origin => "same-origin", .include => "include",
+            .omit => "omit", .other => unreachable,
         };
     }
 };
 pub const Mode = enum(u8) {
-    navigate,
-    same_origin,
-    no_cors,
-    cors,
-    other,
+    navigate, same_origin, no_cors, cors, other,
     pub fn fromSlice(s: []const u8) Mode {
         if (std.mem.eql(u8, s, "navigate")) return .navigate;
         if (std.mem.eql(u8, s, "same-origin")) return .same_origin;
@@ -156,19 +112,13 @@ pub const Mode = enum(u8) {
     }
     pub fn string(self: Mode) []const u8 {
         return switch (self) {
-            .navigate => "navigate",
-            .same_origin => "same-origin",
-            .no_cors => "no-cors",
-            .cors => "cors",
-            .other => unreachable,
+            .navigate => "navigate", .same_origin => "same-origin",
+            .no_cors => "no-cors", .cors => "cors", .other => unreachable,
         };
     }
 };
 pub const RedirectMode = enum(u8) {
-    follow,
-    err,
-    manual,
-    other,
+    follow, err, manual, other,
     pub fn fromSlice(s: []const u8) RedirectMode {
         if (std.mem.eql(u8, s, "follow")) return .follow;
         if (std.mem.eql(u8, s, "error")) return .err;
@@ -177,18 +127,22 @@ pub const RedirectMode = enum(u8) {
     }
     pub fn string(self: RedirectMode) []const u8 {
         return switch (self) {
-            .follow => "follow",
-            .err => "error",
-            .manual => "manual",
-            .other => unreachable,
+            .follow => "follow", .err => "error",
+            .manual => "manual", .other => unreachable,
         };
     }
 };
 
-// ============================================================
-// RequestData — DOD: contiguous string pool + interned scalars
-// ============================================================
 const PoolSlice = pool_slice_mod.PoolSlice;
+
+pub const RequestDataCold = struct {
+    _method_other: PoolSlice,
+    _cache_other: PoolSlice,
+    _credentials_other: PoolSlice,
+    _mode_other: PoolSlice,
+    _redirect_other: PoolSlice,
+};
+
 pub const RequestData = struct {
     pool: std.ArrayList(u8),
     _url: PoolSlice,
@@ -200,39 +154,26 @@ pub const RequestData = struct {
     _credentials: CredMode,
     _mode: Mode,
     _redirect: RedirectMode,
-    _method_other: PoolSlice,
-    _cache_other: PoolSlice,
-    _credentials_other: PoolSlice,
-    _mode_other: PoolSlice,
-    _redirect_other: PoolSlice,
     headers: headers_mod.HeadersData,
     body_used: bool,
     keepalive: bool,
+    cold: ?*RequestDataCold,
+
     pub fn init() RequestData {
         return .{
             .pool = std.ArrayList(u8).empty,
-            ._url = .{},
-            ._body = .{},
-            .has_body = false,
-            ._integrity = .{},
-            ._method = .GET,
-            ._cache = .default,
-            ._credentials = .same_origin,
-            ._mode = .cors,
-            ._redirect = .follow,
-            ._method_other = .{},
-            ._cache_other = .{},
-            ._credentials_other = .{},
-            ._mode_other = .{},
-            ._redirect_other = .{},
+            ._url = .{}, ._body = .{}, .has_body = false, ._integrity = .{},
+            ._method = .GET, ._cache = .default, ._credentials = .same_origin,
+            ._mode = .cors, ._redirect = .follow,
             .headers = headers_mod.HeadersData.init(),
-            .body_used = false,
-            .keepalive = false,
+            .body_used = false, .keepalive = false,
+            .cold = null,
         };
     }
     pub fn deinit(self: *RequestData) void {
         self.pool.deinit(gpa);
-        self.headers.deinit();
+        if (self.cold) |cd| gpa.destroy(cd);
+        self.headers.release();
     }
     pub fn url(self: *const RequestData) []const u8 {
         return self.pool.items[self._url.off .. self._url.off + self._url.len];
@@ -246,31 +187,36 @@ pub const RequestData = struct {
     }
     pub fn method(self: *const RequestData) []const u8 {
         if (self._method == .other) {
-            return self.pool.items[self._method_other.off .. self._method_other.off + self._method_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd._method_other.off .. cd._method_other.off + cd._method_other.len];
         }
         return self._method.string();
     }
     pub fn cache(self: *const RequestData) []const u8 {
         if (self._cache == .other) {
-            return self.pool.items[self._cache_other.off .. self._cache_other.off + self._cache_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd._cache_other.off .. cd._cache_other.off + cd._cache_other.len];
         }
         return self._cache.string();
     }
     pub fn credentials(self: *const RequestData) []const u8 {
         if (self._credentials == .other) {
-            return self.pool.items[self._credentials_other.off .. self._credentials_other.off + self._credentials_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd._credentials_other.off .. cd._credentials_other.off + cd._credentials_other.len];
         }
         return self._credentials.string();
     }
     pub fn mode(self: *const RequestData) []const u8 {
         if (self._mode == .other) {
-            return self.pool.items[self._mode_other.off .. self._mode_other.off + self._mode_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd._mode_other.off .. cd._mode_other.off + cd._mode_other.len];
         }
         return self._mode.string();
     }
     pub fn redirect(self: *const RequestData) []const u8 {
         if (self._redirect == .other) {
-            return self.pool.items[self._redirect_other.off .. self._redirect_other.off + self._redirect_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd._redirect_other.off .. cd._redirect_other.off + cd._redirect_other.len];
         }
         return self._redirect.string();
     }
@@ -279,6 +225,19 @@ pub const RequestData = struct {
         const off = self.pool.items.len;
         self.pool.appendSlice(gpa, owned) catch return;
         dst.* = .{ .off = @intCast(off), .len = @intCast(owned.len) };
+    }
+    fn ensureCold(self: *RequestData) ?*RequestDataCold {
+        if (self.cold) |cd| return cd;
+        const cd = gpa.create(RequestDataCold) catch return null;
+        cd.* = .{
+            ._method_other = .{},
+            ._cache_other = .{},
+            ._credentials_other = .{},
+            ._mode_other = .{},
+            ._redirect_other = .{},
+        };
+        self.cold = cd;
+        return cd;
     }
     pub fn setUrl(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);
@@ -297,31 +256,41 @@ pub const RequestData = struct {
         defer gpa.free(owned);
         const m = Method.fromSlice(owned);
         self._method = m;
-        if (m == .other) self.store(owned, &self._method_other);
+        if (m == .other) {
+            if (self.ensureCold()) |cd| self.store(owned, &cd._method_other);
+        }
     }
     pub fn setCache(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);
         const v = CacheMode.fromSlice(owned);
         self._cache = v;
-        if (v == .other) self.store(owned, &self._cache_other);
+        if (v == .other) {
+            if (self.ensureCold()) |cd| self.store(owned, &cd._cache_other);
+        }
     }
     pub fn setCredentials(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);
         const v = CredMode.fromSlice(owned);
         self._credentials = v;
-        if (v == .other) self.store(owned, &self._credentials_other);
+        if (v == .other) {
+            if (self.ensureCold()) |cd| self.store(owned, &cd._credentials_other);
+        }
     }
     pub fn setMode(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);
         const v = Mode.fromSlice(owned);
         self._mode = v;
-        if (v == .other) self.store(owned, &self._mode_other);
+        if (v == .other) {
+            if (self.ensureCold()) |cd| self.store(owned, &cd._mode_other);
+        }
     }
     pub fn setRedirect(self: *RequestData, owned: []const u8) void {
         defer gpa.free(owned);
         const v = RedirectMode.fromSlice(owned);
         self._redirect = v;
-        if (v == .other) self.store(owned, &self._redirect_other);
+        if (v == .other) {
+            if (self.ensureCold()) |cd| self.store(owned, &cd._redirect_other);
+        }
     }
     pub fn cloneFrom(self: *RequestData, src: *const RequestData) void {
         self.pool.appendSlice(gpa, src.pool.items) catch {};
@@ -334,13 +303,17 @@ pub const RequestData = struct {
         self._credentials = src._credentials;
         self._mode = src._mode;
         self._redirect = src._redirect;
-        self._method_other = src._method_other;
-        self._cache_other = src._cache_other;
-        self._credentials_other = src._credentials_other;
-        self._mode_other = src._mode_other;
-        self._redirect_other = src._redirect_other;
         self.body_used = false;
         self.keepalive = src.keepalive;
+        if (src.cold) |sc| {
+            if (self.ensureCold()) |dc| {
+                dc._method_other = sc._method_other;
+                dc._cache_other = sc._cache_other;
+                dc._credentials_other = sc._credentials_other;
+                dc._mode_other = sc._mode_other;
+                dc._redirect_other = sc._redirect_other;
+            }
+        }
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
             self.headers.appendEntry(p.name, p.value);
@@ -348,9 +321,6 @@ pub const RequestData = struct {
     }
 };
 
-// ============================================================
-// Headers init parsing
-// ============================================================
 fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) void {
     if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) return;
     if (c.isObject(init_val) == 0) return;
@@ -373,14 +343,16 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
             if (c.isObject(item) == 0) continue;
             const name_val = c.getPropertyUint32(ctx, item, 0);
             const val_val = c.getPropertyUint32(ctx, item, 1);
-            const name_z = extractStringFromVal(ctx, name_val);
-            const val_z = extractStringFromVal(ctx, val_val);
-            if (name_z) |n| {
-                if (val_z) |v| {
-                    target.appendEntry(n, v);
-                    gpa.free(v);
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, val_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
                 }
-                gpa.free(n);
             }
         }
         return;
@@ -394,14 +366,16 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
             defer c.freeValue(ctx, name_val);
             const val_val = c.getProperty(ctx, init_val, name_atom);
             defer c.freeValue(ctx, val_val);
-            const name_z = extractStringFromVal(ctx, name_val);
-            const val_z = extractStringFromVal(ctx, val_val);
-            if (name_z) |n| {
-                if (val_z) |v| {
-                    target.appendEntry(n, v);
-                    gpa.free(v);
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, val_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
                 }
-                gpa.free(n);
             }
         }
         c.freePropertyEnum(ctx, p, count);
@@ -416,22 +390,11 @@ fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers
     }
 }
 
-// ============================================================
-// Embedded headers helper — heap-allocates a copy
-// ============================================================
 fn createEmbeddedHeaders(ctx: ?*c.Context, src: *headers_mod.HeadersData) c.Value {
-    const data = gpa.create(headers_mod.HeadersData) catch return c.throwOutOfMemory(ctx);
-    data.* = headers_mod.HeadersData.init();
-    for (0..src.len()) |i| {
-        const p = src.getPair(i);
-        data.appendEntry(p.name, p.value);
-    }
-    return headers_mod.createJSObject(ctx, data);
+    src.retain();
+    return headers_mod.createJSObject(ctx, src);
 }
 
-// ============================================================
-// Set data properties on Request instance
-// ============================================================
 fn setRequestProps(ctx: ?*c.Context, obj: c.Value, data: *RequestData) void {
     _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "method", zigStringToJS(ctx, data.method()), c.PROP_C_W_E);
@@ -446,12 +409,8 @@ fn setRequestProps(ctx: ?*c.Context, obj: c.Value, data: *RequestData) void {
     _ = c.definePropertyValueStr(ctx, obj, "keepalive", if (data.keepalive) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
 }
 
-// ============================================================
-// Body method callbacks
-// ============================================================
 fn requestText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -463,8 +422,7 @@ fn requestText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
 }
 
 fn requestJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -487,8 +445,7 @@ fn requestJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
 }
 
 fn requestArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -500,9 +457,7 @@ fn requestArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
 }
 
 fn requestBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
-    _ = this_val;
+    _ = argc; _ = argv; _ = this_val;
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
     var msg = zigStringToJS(ctx, "Blob not supported");
@@ -511,9 +466,7 @@ fn requestBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
 }
 
 fn requestFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
-    _ = this_val;
+    _ = argc; _ = argv; _ = this_val;
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
     var msg = zigStringToJS(ctx, "FormData not supported");
@@ -522,8 +475,7 @@ fn requestFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
 }
 
 fn requestBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -535,8 +487,7 @@ fn requestBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn requestClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     const new_data = gpa.create(RequestData) catch return c.throwOutOfMemory(ctx);
     new_data.* = RequestData.init();
@@ -548,15 +499,13 @@ fn requestClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn requestToString(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return zigStringToJS(ctx, "");
     return zigStringToJS(ctx, data.url());
 }
 
 fn requestToJSON(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_NULL;
     const obj = c.newObject(ctx);
     _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
@@ -564,9 +513,6 @@ fn requestToJSON(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     return obj;
 }
 
-// ============================================================
-// Finalizer
-// ============================================================
 fn requestFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, request_class_id)) |ptr| {
@@ -576,9 +522,6 @@ fn requestFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
-// ============================================================
-// Constructor: new Request(input, init?)
-// ============================================================
 fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "Request requires a URL string as first argument");
@@ -599,8 +542,8 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     } else if (c.isObject(arg0) != 0) {
         const src = extractRequestData(ctx, arg0);
         if (src) |src_data| {
-            data.deinit();
-            data.* = RequestData.init();
+            // Release the freshly-init'd headers before taking src's.
+            data.headers.release();
             data.cloneFrom(src_data);
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
@@ -620,7 +563,6 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
 
     if (argc > 1 and c.isObject(argv[1]) != 0) {
         const init_val = argv[1];
-
         const method_val = c.getPropertyStr(ctx, init_val, "method");
         defer c.freeValue(ctx, method_val);
         if (c.isString(method_val) != 0) {
@@ -686,9 +628,6 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     return this_val;
 }
 
-// ============================================================
-// Public: build Request JS object from RequestData
-// ============================================================
 pub fn buildRequestJSObject(ctx: ?*c.Context, data: *RequestData) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(request_class_id));
     c.setOpaque(obj, data);
@@ -696,9 +635,6 @@ pub fn buildRequestJSObject(ctx: ?*c.Context, data: *RequestData) c.Value {
     return obj;
 }
 
-// ============================================================
-// Setup — register Request class + constructor
-// ============================================================
 pub fn setup(ctx: ?*c.Context) void {
     var class_def = c.ClassDef{
         .class_name = "Request",

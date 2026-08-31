@@ -14,20 +14,8 @@ fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
 }
 
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    const cstr = c.toCString(ctx, val) orelse return null;
-    const len = std.mem.len(cstr);
-    if (len == 0) {
-        c.freeCString(ctx, cstr);
-        return gpa.dupeZ(u8, "") catch return null;
-    }
-    const buf = gpa.allocSentinel(u8, len, 0) catch {
-        c.freeCString(ctx, cstr);
-        return null;
-    };
-    @memcpy(buf[0..len], cstr[0..len]);
-    buf[len] = 0;
-    c.freeCString(ctx, cstr);
-    return buf;
+    var stack_buf: [256]u8 = undefined;
+    return extractStringAuto(ctx, val, &stack_buf) orelse null;
 }
 
 const ExtractedStr = struct {
@@ -84,13 +72,17 @@ const Entry = struct {
 comptime {
     std.debug.assert(@sizeOf(Entry) == 16);
 }
+
+// DOD-FIX 1: refcounted HeadersData. Strict-compliance layout assertion.
 pub const HeadersData = struct {
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
     entries: std.ArrayList(Entry),
     merge_buf: std.ArrayList(u8),
     view_buf: std.ArrayList([]const u8),
+    refcount: std.atomic.Value(usize),
     pub const PairView = struct { name: []const u8, value: []const u8 };
+
     pub fn init() HeadersData {
         return .{
             .names = std.ArrayList(u8).empty,
@@ -98,6 +90,7 @@ pub const HeadersData = struct {
             .entries = std.ArrayList(Entry).empty,
             .merge_buf = std.ArrayList(u8).empty,
             .view_buf = std.ArrayList([]const u8).empty,
+            .refcount = .{ .raw = 1 },
         };
     }
     pub fn deinit(self: *HeadersData) void {
@@ -106,6 +99,15 @@ pub const HeadersData = struct {
         self.entries.deinit(gpa);
         self.merge_buf.deinit(gpa);
         self.view_buf.deinit(gpa);
+    }
+    pub fn retain(self: *HeadersData) void {
+        _ = self.refcount.fetchAdd(1, .acq_rel);
+    }
+    pub fn release(self: *HeadersData) void {
+        if (self.refcount.fetchSub(1, .acq_rel) == 1) {
+            self.deinit();
+            gpa.destroy(self);
+        }
     }
     fn nameOf(self: *const HeadersData, e: Entry) []const u8 {
         return self.names.items[e.name_off .. e.name_off + e.name_len];
@@ -272,7 +274,6 @@ pub const HeadersData = struct {
         }
     }
 };
-
 fn extractHeadersData(ctx: ?*c.Context, this_val: c.Value) ?*HeadersData {
     const ptr = c.getOpaque2(ctx, this_val, headers_class_id) orelse return null;
     return @ptrCast(@alignCast(ptr));
@@ -422,8 +423,7 @@ fn headersFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, headers_class_id)) |ptr| {
         const data: *HeadersData = @ptrCast(@alignCast(ptr));
-        data.deinit();
-        gpa.destroy(data);
+        data.release();
     }
 }
 
@@ -454,25 +454,20 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                     if (c.isObject(item) == 0) continue;
                     const name_val = c.getPropertyUint32(ctx, item, 0);
                     const val_val = c.getPropertyUint32(ctx, item, 1);
-                    const name_z = extractStringFromVal(ctx, name_val);
-                    const val_z = extractStringFromVal(ctx, val_val);
+                    var nbuf: [128]u8 = undefined;
+                    var vbuf: [256]u8 = undefined;
+                    const name_z = extractStringAuto(ctx, name_val, &nbuf);
+                    const val_z = extractStringAuto(ctx, val_val, &vbuf);
                     if (name_z) |n| {
+                        defer n.deinit();
                         if (val_z) |v| {
-                            pairs_buf.append(gpa, .{ .name = n, .value = v }) catch {
-                                gpa.free(n);
-                                gpa.free(v);
-                            };
-                        } else {
-                            gpa.free(n);
+                            defer v.deinit();
+                            pairs_buf.append(gpa, .{ .name = n.slice, .value = v.slice }) catch {};
                         }
                     }
                 }
                 if (pairs_buf.items.len > 0) {
                     data.fromPairs(pairs_buf.items);
-                }
-                for (pairs_buf.items) |pair| {
-                    gpa.free(pair.name);
-                    gpa.free(pair.value);
                 }
                 pairs_buf.deinit(gpa);
             } else {
@@ -486,16 +481,15 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                         defer c.freeValue(ctx, name_val);
                         const val_val = c.getProperty(ctx, init_val, name_atom);
                         defer c.freeValue(ctx, val_val);
-                        const name_z = extractStringFromVal(ctx, name_val);
-                        const val_z = extractStringFromVal(ctx, val_val);
+                        var nbuf: [128]u8 = undefined;
+                        var vbuf: [256]u8 = undefined;
+                        const name_z = extractStringAuto(ctx, name_val, &nbuf);
+                        const val_z = extractStringAuto(ctx, val_val, &vbuf);
                         if (name_z) |n| {
+                            defer n.deinit();
                             if (val_z) |v| {
-                                pairs_buf.append(gpa, .{ .name = n, .value = v }) catch {
-                                    gpa.free(n);
-                                    gpa.free(v);
-                                };
-                            } else {
-                                gpa.free(n);
+                                defer v.deinit();
+                                pairs_buf.append(gpa, .{ .name = n.slice, .value = v.slice }) catch {};
                             }
                         }
                     }
@@ -503,10 +497,6 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 }
                 if (pairs_buf.items.len > 0) {
                     data.fromPairs(pairs_buf.items);
-                }
-                for (pairs_buf.items) |pair| {
-                    gpa.free(pair.name);
-                    gpa.free(pair.value);
                 }
                 pairs_buf.deinit(gpa);
             }

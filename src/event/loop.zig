@@ -12,6 +12,10 @@ pub const EventLoop = struct {
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
         return .{ .loop = try xev.Loop.init(.{ .thread_pool = &g_thread_pool }) };
     }
+    pub fn initInto(self: *EventLoop) void {
+        g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
+        self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch unreachable };
+    }
     pub fn initHeap(allocator: std.mem.Allocator) !*EventLoop {
         const ptr = try allocator.create(EventLoop);
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
@@ -39,10 +43,12 @@ pub const EventLoop = struct {
     const GC_MIN_HEAP = 8 * 1024 * 1024;
     const IDLE_MIN_NS: u64 = 100_000;
     const IDLE_MAX_NS: u64 = 8_000_000;
+
     pub fn runWithMicrotasks(self: *EventLoop, ctx: *c.Context) void {
         var gc_ticks: usize = 0;
         var next_gc_check: usize = GC_POLICE;
         var idle_delay_ns: u64 = IDLE_MIN_NS;
+
         while (true) {
             var did_work = false;
             if (hasWork(&self.loop)) {

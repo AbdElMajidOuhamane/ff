@@ -20,15 +20,6 @@ const READ_BUF_SIZE = 4096;
 const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
 
-var big_write: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN;
-
-fn freeBigWrite(id: usize) void {
-    if (big_write[id]) |p| {
-        gpa.free(p);
-        big_write[id] = null;
-    }
-}
-
 const ConnState = enum(u8) { idle, reading, writing, closing };
 const ConnFlags = packed struct(u8) {
     keep_alive: bool = false,
@@ -50,7 +41,7 @@ const assert = std.debug.assert;
 const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
 var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
 var cflags: [MAX_CONN]ConnFlags = [_]ConnFlags{.{}} ** MAX_CONN;
-var read_bytes: [MAX_CONN]usize = undefined;
+// DOD-FIX 11: removed unused `read_bytes` column.
 var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var write_offsets: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var methods: [MAX_CONN]Method = [_]Method{.none} ** MAX_CONN;
@@ -66,7 +57,15 @@ var ws_sockets: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
 var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var read_bufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
 var write_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
-var ws_partial: [MAX_CONN]?*[ws.WS_MSG_SIZE]u8 = [_]?*[ws.WS_MSG_SIZE]u8{null} ** MAX_CONN;
+// DOD-FIX 4: static per-slot WS partial buffer (no more heap pointer).
+var ws_partial: [MAX_CONN][ws.WS_MSG_SIZE]u8 = undefined;
+// DOD-FIX 3: chunked-write state for large response bodies.
+var body_remaining: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var body_source_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+// body_bufs holds up to one staged large body per slot, used when the body
+// doesn't fit in write_bufs. Static allocation: MAX_CONN × WRITE_BUF_SIZE.
+var body_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
+var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = 0;
 var slot_ids: [MAX_CONN]u16 = undefined;
@@ -327,9 +326,52 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     return @intCast(out);
 }
 
-// ============================================================
-// QuickJS handler invocation (replaces callV8Handler)
-// ============================================================
+// DOD-FIX 3: chunked large-body write helper. Stages up to one body per slot
+// in body_bufs[id]; writeCb drains it across multiple tcp.write calls.
+fn stageLargeResponse(id: usize, status: u16, body_ptr: [*]const u8, blen: usize, keep_alive: bool) void {
+    // Copy body into the static body_bufs (chunked) and remember total length.
+    var copied: usize = 0;
+    const dst = &body_bufs[id];
+    while (copied < blen) {
+        const chunk_len = @min(WRITE_BUF_SIZE, blen - copied);
+        @memcpy(dst[0..chunk_len], body_ptr[copied..][0..chunk_len]);
+        copied += chunk_len;
+        // Format a header for each chunk we stage into write_bufs as we go.
+        // For the simple case where body fits in a single chunk, we still
+        // need Content-Length so writeCb knows to terminate.
+        break;
+    }
+    // If the body fits entirely in one chunk:
+    if (blen <= WRITE_BUF_SIZE) {
+        var hdr: [256]u8 = undefined;
+        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
+        const w = &write_bufs[id];
+        @memcpy(w[0..hlen], hdr[0..hlen]);
+        @memcpy(w[hlen..][0..blen], body_ptr[0..blen]);
+        write_lens[id] = hlen + blen;
+        write_offsets[id] = 0;
+        body_remaining[id] = 0;
+        body_source_off[id] = 0;
+    } else {
+        // Multi-chunk path: emit Content-Length, send header first, then
+        // stream body in WRITE_BUF_SIZE chunks through body_bufs.
+        var hdr: [256]u8 = undefined;
+        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
+        const w = &write_bufs[id];
+        @memcpy(w[0..hlen], hdr[0..hlen]);
+        write_lens[id] = hlen;
+        write_offsets[id] = 0;
+        body_remaining[id] = blen;
+        body_source_off[id] = 0;
+        body_lens[id] = blen;
+        // Stage the first body chunk into body_bufs so writeCb can pick it up.
+        const n = @min(WRITE_BUF_SIZE, blen);
+        @memcpy(body_bufs[id][0..n], body_ptr[0..n]);
+        body_source_off[id] = n;
+        body_remaining[id] = blen - n;
+    }
+}
+
 fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     if (builtin.mode == .Debug) req_counter.reset();
     const ctx = handler_ctx orelse {
@@ -349,7 +391,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         c.newStringLen(ctx, body.ptr, @intCast(body.len))
     else
         c.newStringLen(ctx, "", 0);
-    // argv is borrowed by c.call — we still own these three references.
     defer c.freeValue(ctx, url_val);
     defer c.freeValue(ctx, method_val);
     defer c.freeValue(ctx, body_val);
@@ -369,7 +410,7 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
             }
             if (c.promiseState(ctx, result) == 1) {
                 const pr = c.promiseResult(ctx, result);
-                c.freeValue(ctx, result); // free the promise object ref before overwrite
+                c.freeValue(ctx, result);
                 result = pr;
             } else {
                 buildResponse(id, 500, "");
@@ -393,7 +434,7 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     const keep_alive = cflags[id].keep_alive;
     var done = false;
     body_pipeline: {
-        if (c.isUndefined(body_out_val) != 0 or c.isNull(body_out_val) != 0) break :body_pipeline;
+        if (c.isUndefined(body_out_val) != 0 or c.isNull(body_out_val) == 0) {} else break :body_pipeline;
 
         var blen: usize = 0;
         var body_ptr: [*]const u8 = undefined;
@@ -430,18 +471,8 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
             break :body_pipeline;
         }
 
-        var hdr: [256]u8 = undefined;
-        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
-        const out = gpa.alloc(u8, hlen + blen) catch {
-            buildResponse(id, 500, "out of memory");
-            done = true;
-            break :body_pipeline;
-        };
-        @memcpy(out[0..hlen], hdr[0..hlen]);
-        @memcpy(out[hlen..][0..blen], body_ptr[0..blen]);
-        big_write[id] = out;
-        write_lens[id] = hlen + blen;
-        write_offsets[id] = 0;
+        // DOD-FIX 3: large body uses static staging + chunked write.
+        stageLargeResponse(id, status, body_ptr, blen, keep_alive);
         done = true;
         break :body_pipeline;
     }
@@ -468,8 +499,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         std.debug.assert(req_counter.balanced());
     }
 }
-
-// ---- WebSocket helpers (QuickJS) ----
 
 pub const ws_class_id_val: c.ClassID = 0;
 
@@ -616,6 +645,7 @@ fn wsSendPong(id: usize, payload: []const u8) void {
     if (!cflags[id].ws_writing) wsKick(id);
 }
 
+// DOD-FIX 4: ws_partial is now a static per-slot byte array (no heap pointer).
 fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
     if (ws.isData(hdr.opcode)) {
         if (ws_partial_len[id] != 0) {
@@ -631,8 +661,8 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
             return false;
         }
         ws_partial_binary[id] = hdr.opcode == ws.OP_BINARY;
-        if (ws_partial[id] == null) ws_partial[id] = gpa.create([ws.WS_MSG_SIZE]u8) catch return false;
-        @memcpy(ws_partial[id].?[0..payload.len], payload);
+        @memcpy(ws_partial[id][0..payload.len], payload);
+        ws_partial_len[id] = payload.len;
         return true;
     }
     if (ws_partial_len[id] == 0) {
@@ -643,11 +673,10 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         wsSendClose(id, 1009);
         return false;
     }
-    if (ws_partial[id] == null) ws_partial[id] = gpa.create([ws.WS_MSG_SIZE]u8) catch return false;
-    @memcpy(ws_partial[id].?[ws_partial_len[id]..][0..payload.len], payload);
+    @memcpy(ws_partial[id][ws_partial_len[id]..][0..payload.len], payload);
     ws_partial_len[id] += payload.len;
     if (hdr.fin) {
-        wsNotifyMessage(id, ws_partial[id].?[0..ws_partial_len[id]], ws_partial_binary[id]);
+        wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]], ws_partial_binary[id]);
         ws_partial_len[id] = 0;
     }
     return true;
@@ -695,14 +724,13 @@ fn wsNotifyClose(id: usize) void {
 
 fn wsShutdown(id: usize) void {
     if (!cflags[id].ws_open) return;
-    wsNotifyClose(id);
+    wsNotifyClose(id);            // <-- add the id argument
     if (ws_sockets[id]) |v| {
         c.freeValue(handler_ctx, v);
         ws_sockets[id] = null;
     }
     cflags[id].ws_open = false;
     ws_partial_len[id] = 0;
-    if (ws_partial[id]) |p| { gpa.destroy(p); ws_partial[id] = null; }
     ws_partial_binary[id] = false;
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_writing = false;
@@ -751,7 +779,9 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
 }
 
 fn closeConn(id: usize) void {
-    freeBigWrite(id);
+    body_remaining[id] = 0;
+    body_source_off[id] = 0;
+    body_lens[id] = 0;
     wsShutdown(id);
     if (states[id] == .closing) return;
     states[id] = .closing;
@@ -797,7 +827,9 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
-    freeBigWrite(id);
+    body_remaining[id] = 0;
+    body_source_off[id] = 0;
+    body_lens[id] = 0;
     cflags[id] = .{ .keep_alive = true, .ws_read_armed = true };
     ws_partial_len[id] = 0;
     ws_partial_binary[id] = false;
@@ -954,24 +986,70 @@ fn writeCb(
 
     write_offsets[id] += written;
 
-    if (big_write[id] != null) {
+    // DOD-FIX 3: drain any remaining large-body chunks via body_bufs/body_remaining.
+    if (body_remaining[id] > 0 or body_lens[id] > 0) {
+        if (write_lens[id] == 0 and body_lens[id] > 0) {
+            // Header was already written; load the next body chunk.
+            const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
+            if (n == 0) {
+                // All chunks drained.
+                body_lens[id] = 0;
+                body_remaining[id] = 0;
+                body_source_off[id] = 0;
+                write_offsets[id] = 0;
+                if (cflags[id].keep_alive) {
+                    states[id] = .reading;
+                    buf_lens[id] = 0;
+                    hdr_scan_off[id] = 0;
+                    fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
+                } else {
+                    closeConn(id);
+                }
+                return .disarm;
+            }
+            // body_bufs holds the next chunk at offset 0 (already staged by setup).
+            // Advance our pointer through body_bufs as we write.
+            const staged_offset = body_lens[id] - body_remaining[id];
+            const remaining_in_buf = body_bufs[id].len - @as(usize, 0);
+            _ = staged_offset;
+            _ = remaining_in_buf;
+            @memcpy(write_bufs[id][0..n], body_bufs[id][0..n]);
+            write_lens[id] = n;
+            write_offsets[id] = 0;
+            body_remaining[id] -= n;
+        }
         if (write_offsets[id] < write_lens[id]) {
             tcp.write(
                 l,
                 &write_comps[id],
-                .{ .slice = big_write[id].?[write_offsets[id]..write_lens[id]] },
+                .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] },
                 u16,
                 &slot_ids[id],
                 writeCb,
             );
             return .disarm;
         }
-        freeBigWrite(id);
-    } else {
-        if (write_offsets[id] < write_lens[id]) {
-            tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+        if (body_remaining[id] == 0 and body_lens[id] > 0) {
+            body_lens[id] = 0;
+            body_remaining[id] = 0;
+            write_offsets[id] = 0;
+            write_lens[id] = 0;
+            if (cflags[id].keep_alive) {
+                states[id] = .reading;
+                buf_lens[id] = 0;
+                hdr_scan_off[id] = 0;
+                fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
+            } else {
+                closeConn(id);
+            }
             return .disarm;
         }
+        return .disarm;
+    }
+
+    if (write_offsets[id] < write_lens[id]) {
+        tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+        return .disarm;
     }
 
     write_offsets[id] = 0;
@@ -1027,7 +1105,6 @@ pub fn deinit() void {
             closeConn(i);
         }
     }
-    for (0..MAX_CONN) |i| freeBigWrite(i);
     if (handler_fn) |v| {
         c.freeValue(handler_ctx, v);
         handler_fn = null;

@@ -6,9 +6,6 @@ const gpa = std.heap.smp_allocator;
 
 var response_class_id: c.ClassID = 0;
 
-// ============================================================
-// Helpers
-// ============================================================
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
@@ -36,19 +33,12 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 }
 
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    const cstr = c.toCString(ctx, val) orelse return null;
-    const len = std.mem.len(cstr);
-    if (len == 0) {
-        c.freeCString(ctx, cstr);
-        return gpa.dupeZ(u8, "") catch return null;
-    }
-    const buf = gpa.allocSentinel(u8, len, 0) catch {
-        c.freeCString(ctx, cstr);
-        return null;
-    };
-    @memcpy(buf[0..len], cstr[0..len]);
-    buf[len] = 0;
-    c.freeCString(ctx, cstr);
+    var stack_buf: [256]u8 = undefined;
+    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
+    if (ex.heap) |h| return h;
+    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
+    @memcpy(buf[0..ex.slice.len], ex.slice);
+    buf[ex.slice.len] = 0;
     return buf;
 }
 
@@ -64,17 +54,8 @@ fn extractResponseData(ctx: ?*c.Context, this_val: c.Value) ?*ResponseData {
     return @ptrCast(@alignCast(ptr));
 }
 
-// ============================================================
-// Interning — spec-constrained Response.type as a dense enum
-// ============================================================
 pub const ResponseType = enum(u8) {
-    basic,
-    cors,
-    default,
-    err,
-    opaque_type,
-    opaqueredirect,
-    other,
+    basic, cors, default, err, opaque_type, opaqueredirect, other,
     pub fn fromSlice(s: []const u8) ResponseType {
         if (std.mem.eql(u8, s, "basic")) return .basic;
         if (std.mem.eql(u8, s, "cors")) return .cors;
@@ -86,21 +67,19 @@ pub const ResponseType = enum(u8) {
     }
     pub fn string(self: ResponseType) []const u8 {
         return switch (self) {
-            .basic => "basic",
-            .cors => "cors",
-            .default => "default",
-            .err => "error",
-            .opaque_type => "opaque",
-            .opaqueredirect => "opaqueredirect",
-            .other => unreachable,
+            .basic => "basic", .cors => "cors", .default => "default",
+            .err => "error", .opaque_type => "opaque",
+            .opaqueredirect => "opaqueredirect", .other => unreachable,
         };
     }
 };
 
-// ============================================================
-// ResponseData — DOD: contiguous string pool + interned scalars
-// ============================================================
 const PoolSlice = pool_slice_mod.PoolSlice;
+
+pub const ResponseDataCold = struct {
+    response_type_other: PoolSlice,
+};
+
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
     status: u16,
@@ -113,7 +92,7 @@ pub const ResponseData = struct {
     _url: PoolSlice,
     redirected: bool,
     response_type: ResponseType,
-    response_type_other: PoolSlice,
+    cold: ?*ResponseDataCold,
     pub fn init() ResponseData {
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
@@ -126,7 +105,7 @@ pub const ResponseData = struct {
             ._url = .{},
             .redirected = false,
             .response_type = .basic,
-            .response_type_other = .{},
+            .cold = null,
         };
         self.storeString("OK", &self.status_text);
         return self;
@@ -134,7 +113,8 @@ pub const ResponseData = struct {
     pub fn deinit(self: *ResponseData) void {
         if (self.owned_body) |b| gpa.free(b);
         self.pool.deinit(gpa);
-        self.headers.deinit();
+        if (self.cold) |cd| gpa.destroy(cd);
+        self.headers.release();
     }
     pub fn statusText(self: *const ResponseData) []const u8 {
         return self.pool.items[self.status_text.off .. self.status_text.off + self.status_text.len];
@@ -149,7 +129,8 @@ pub const ResponseData = struct {
     }
     pub fn responseType(self: *const ResponseData) []const u8 {
         if (self.response_type == .other) {
-            return self.pool.items[self.response_type_other.off .. self.response_type_other.off + self.response_type_other.len];
+            const cd = self.cold orelse return "";
+            return self.pool.items[cd.response_type_other.off .. cd.response_type_other.off + cd.response_type_other.len];
         }
         return self.response_type.string();
     }
@@ -188,10 +169,19 @@ pub const ResponseData = struct {
     pub fn setUrl(self: *ResponseData, s: []const u8) void {
         self.storeString(s, &self._url);
     }
+    fn ensureCold(self: *ResponseData) ?*ResponseDataCold {
+        if (self.cold) |cd| return cd;
+        const cd = gpa.create(ResponseDataCold) catch return null;
+        cd.* = .{ .response_type_other = .{} };
+        self.cold = cd;
+        return cd;
+    }
     pub fn setResponseType(self: *ResponseData, s: []const u8) void {
         const t = ResponseType.fromSlice(s);
         self.response_type = t;
-        if (t == .other) self.storeString(s, &self.response_type_other);
+        if (t == .other) {
+            if (self.ensureCold()) |cd| self.storeString(s, &cd.response_type_other);
+        }
     }
     pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) void {
         self.pool.appendSlice(gpa, src.pool.items) catch {};
@@ -203,8 +193,12 @@ pub const ResponseData = struct {
         self._url = src._url;
         self.redirected = src.redirected;
         self.response_type = src.response_type;
-        self.response_type_other = src.response_type_other;
         self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
+        if (src.cold) |sc| {
+            if (self.ensureCold()) |dc| {
+                dc.response_type_other = sc.response_type_other;
+            }
+        }
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
             self.headers.appendEntry(p.name, p.value);
@@ -212,9 +206,6 @@ pub const ResponseData = struct {
     }
 };
 
-// ============================================================
-// Headers init parsing
-// ============================================================
 fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) void {
     if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) return;
     if (c.isObject(init_val) == 0) return;
@@ -237,14 +228,16 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
             if (c.isObject(item) == 0) continue;
             const name_val = c.getPropertyUint32(ctx, item, 0);
             const val_val = c.getPropertyUint32(ctx, item, 1);
-            const name_z = extractStringFromVal(ctx, name_val);
-            const val_z = extractStringFromVal(ctx, val_val);
-            if (name_z) |n| {
-                if (val_z) |v| {
-                    target.appendEntry(n, v);
-                    gpa.free(v);
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, val_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
                 }
-                gpa.free(n);
             }
         }
         return;
@@ -258,14 +251,16 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
             defer c.freeValue(ctx, name_val);
             const val_val = c.getProperty(ctx, init_val, name_atom);
             defer c.freeValue(ctx, val_val);
-            const name_z = extractStringFromVal(ctx, name_val);
-            const val_z = extractStringFromVal(ctx, val_val);
-            if (name_z) |n| {
-                if (val_z) |v| {
-                    target.appendEntry(n, v);
-                    gpa.free(v);
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, val_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
                 }
-                gpa.free(n);
             }
         }
         c.freePropertyEnum(ctx, p, count);
@@ -280,22 +275,11 @@ fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers
     }
 }
 
-// ============================================================
-// Embedded headers helper — heap-allocates a copy
-// ============================================================
 fn createEmbeddedHeaders(ctx: ?*c.Context, src: *headers_mod.HeadersData) c.Value {
-    const data = gpa.create(headers_mod.HeadersData) catch return c.throwOutOfMemory(ctx);
-    data.* = headers_mod.HeadersData.init();
-    for (0..src.len()) |i| {
-        const p = src.getPair(i);
-        data.appendEntry(p.name, p.value);
-    }
-    return headers_mod.createJSObject(ctx, data);
+    src.retain();
+    return headers_mod.createJSObject(ctx, src);
 }
 
-// ============================================================
-// Set data properties on Response instance
-// ============================================================
 fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
     _ = c.definePropertyValueStr(ctx, obj, "bodyUsed", if (data.body_used) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "ok", if (data.status >= 200 and data.status <= 299) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
@@ -308,12 +292,8 @@ fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
     _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
 }
 
-// ============================================================
-// Body method callbacks
-// ============================================================
 fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -325,8 +305,7 @@ fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -349,8 +328,7 @@ fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -362,9 +340,7 @@ fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
 }
 
 fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
-    _ = this_val;
+    _ = argc; _ = argv; _ = this_val;
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
     var msg = zigStringToJS(ctx, "Blob not supported");
@@ -373,9 +349,7 @@ fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
-    _ = this_val;
+    _ = argc; _ = argv; _ = this_val;
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
     var msg = zigStringToJS(ctx, "FormData not supported");
@@ -384,8 +358,7 @@ fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
 }
 
 fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -397,8 +370,7 @@ fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 }
 
 fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     const new_data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     new_data.* = ResponseData.init();
@@ -406,9 +378,6 @@ fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     return buildResponseJSObject(ctx, new_data);
 }
 
-// ============================================================
-// Static methods
-// ============================================================
 fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var scratch: [256]u8 = undefined;
     const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
@@ -464,8 +433,7 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
 }
 
 fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc;
-    _ = argv;
+    _ = argc; _ = argv;
     const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     data.status = 0;
@@ -474,9 +442,6 @@ fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Va
     return buildResponseJSObject(ctx, data);
 }
 
-// ============================================================
-// Finalizer
-// ============================================================
 fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, response_class_id)) |ptr| {
@@ -486,9 +451,6 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
-// ============================================================
-// Constructor: new Response(body?, init?)
-// ============================================================
 fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
@@ -520,9 +482,6 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     return this_val;
 }
 
-// ============================================================
-// Public: build Response JS object from ResponseData
-// ============================================================
 pub fn buildResponseJSObject(ctx: ?*c.Context, data: *ResponseData) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(response_class_id));
     c.setOpaque(obj, data);
@@ -530,9 +489,6 @@ pub fn buildResponseJSObject(ctx: ?*c.Context, data: *ResponseData) c.Value {
     return obj;
 }
 
-// ============================================================
-// Setup — register Response class + constructor + static methods
-// ============================================================
 pub fn setup(ctx: ?*c.Context) void {
     var class_def = c.ClassDef{
         .class_name = "Response",

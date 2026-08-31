@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const qjs = @import("quickjs_shim.zig");
 const mod = @import("../modules/mod.zig");
@@ -17,13 +16,16 @@ const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
 const websocket_client = @import("../api/websocket_client.zig");
 const http_native = @import("../net/http_native.zig");
-//const qjs_malloc = @import("qjs_malloc.zig");
-const simd = std.simd;
 
 const DepEntry = struct {
     key: [:0]const u8,
     module: *mod.Module,
 };
+
+// DOD-FIX 9: single boot arena; runtime struct + EventLoop + module cache
+// live inside it instead of being individually page_allocator-allocated.
+var boot_arena: std.heap.ArenaAllocator = undefined;
+var boot_inited: bool = false;
 
 pub fn getEventLoop() ?*EventLoop {
     if (g_runtime) |rt| return rt.event_loop else return null;
@@ -37,22 +39,16 @@ var g_runtime: ?*Runtime = null;
 
 pub const Runtime = struct {
     ctx: *qjs.Context,
-    module_cache: mod.ModuleCache,
+    module_cache: *mod.ModuleCache,
     modules_initialized: bool,
     event_loop: *EventLoop,
     timer_manager: TimerManager,
 
     pub fn init(args: std.process.Args) !*Runtime {
-        //const rt = qjs.newRuntime2(&qjs_malloc.functions, null) orelse return error.InitFailed;
         const rt = qjs.newRuntime() orelse return error.InitFailed;
         qjs.setMaxStackSize(rt, 1024 * 1024);
         qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
 
-        // JS_NewContext already registers ALL intrinsics:
-        // BaseObjects, Date, Eval, StringNormalize, RegExp, JSON,
-        // Proxy, MapSet, TypedArrays, Promise, WeakRef.
-        // Calling addIntrinsic* again aborts inside QuickJS
-        // (JS_DefineAutoInitProperty: "property already exists").
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
 
         console_api.setup(ctx);
@@ -80,11 +76,21 @@ pub const Runtime = struct {
         _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", clearTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "clearInterval", clearInterval_func, qjs.PROP_C_W_E);
 
-        const loop_ptr = try EventLoop.initHeap(std.heap.page_allocator);
-        const runtime = try std.heap.page_allocator.create(Runtime);
+        if (!boot_inited) {
+            boot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            boot_inited = true;
+        }
+        const boot = boot_arena.allocator();
+
+        const loop_ptr = try boot.create(EventLoop);
+        EventLoop.initInto(loop_ptr);
+        const cache_ptr = try boot.create(mod.ModuleCache);
+        cache_ptr.* = mod.ModuleCache.init(boot);
+
+        const runtime = try boot.create(Runtime);
         runtime.* = .{
             .ctx = ctx,
-            .module_cache = mod.ModuleCache.init(std.heap.page_allocator),
+            .module_cache = cache_ptr,
             .modules_initialized = false,
             .event_loop = loop_ptr,
             .timer_manager = TimerManager.init(&loop_ptr.loop),
@@ -147,6 +153,12 @@ pub const Runtime = struct {
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
         qjs.freeRuntime(rt);
+        // Boot arena is the sole owner of `self`, the EventLoop, and the
+        // ModuleCache. Free it LAST so all references stay valid above.
+        if (boot_inited) {
+            boot_arena.deinit();
+            boot_inited = false;
+        }
     }
 
     pub fn eval(self: *Runtime, source: [:0]const u8, filename: [:0]const u8) bool {
@@ -182,7 +194,7 @@ pub const Runtime = struct {
         self.setupModuleRegistry() catch return false;
         std.mem.reverse(DepEntry, sources.items);
         for (sources.items) |s| {
-            const wrapped = self.wrapModule(scratch, s.module.source, s.key, s.module) catch continue;
+              const wrapped = self.wrapModule(scratch, s.module.source, s.key, s.module) catch continue;
             _ = self.eval(wrapped, s.key);
         }
         var m = mod.Module.init(scratch, source, filename, std.fs.path.dirname(filename) orelse ".");
@@ -202,47 +214,37 @@ pub const Runtime = struct {
         filename: [:0]const u8,
         out: *std.ArrayList(DepEntry),
     ) !void {
-        const persist = std.heap.page_allocator;
         const dir = std.fs.path.dirname(filename) orelse ".";
         try out.ensureTotalCapacity(scratch, 16);
         var m = mod.Module.init(scratch, source, filename, dir);
         defer m.deinit();
         m.parseImports() catch return;
         for (m.imports.items) |imp| {
-            const resolved = mod.resolveSpec(scratch, dir, imp.specifier) catch continue;
+            const resolved = mod.resolveSpec(scratch, dir, m.sliceAt(imp.specifier)) catch continue;
             defer scratch.free(resolved);
+            // Cache is StringHashMap keyed by resolved path (DOD-FIX 8 reverted).
             if (self.module_cache.get(resolved) != null) continue;
-            const dep_source = mod.readFile(persist, resolved) catch continue;
-            const path_z = persist.dupeZ(u8, resolved) catch {
-                persist.free(dep_source);
+            const dep_source = mod.readFile(scratch, resolved) catch continue;
+            const path_z = scratch.dupeZ(u8, resolved) catch {
                 continue;
             };
             const dep_dir = std.fs.path.dirname(path_z) orelse ".";
-            var dep = mod.Module.init(persist, dep_source, path_z, dep_dir);
+            var dep = mod.Module.init(scratch, dep_source, path_z, dep_dir);
             dep.parseImports() catch {
-                persist.free(dep_source);
-                persist.free(path_z);
                 continue;
             };
             dep.parseExports() catch {
-                persist.free(dep_source);
-                persist.free(path_z);
                 continue;
             };
-            const dep_ptr = persist.create(mod.Module) catch {
-                persist.free(dep_source);
-                persist.free(path_z);
+            const dep_ptr = scratch.create(mod.Module) catch {
                 continue;
             };
             dep_ptr.* = dep;
             self.module_cache.put(path_z, dep_ptr) catch {
                 dep_ptr.deinit();
-                persist.destroy(dep_ptr);
-                persist.free(dep_source);
-                persist.free(path_z);
                 continue;
             };
-            const key_z = scratch.dupeZ(u8, imp.specifier) catch continue;
+            const key_z = scratch.dupeZ(u8, dep_ptr.path) catch continue;
             out.append(scratch, .{ .key = key_z, .module = dep_ptr }) catch continue;
             self.collectDeps(scratch, dep_source, path_z, out) catch {};
         }

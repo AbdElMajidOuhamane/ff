@@ -3,6 +3,7 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
+const headers_mod = @import("../types/headers.zig");
 const builtin = @import("builtin");
 
 var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
@@ -29,7 +30,11 @@ var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
 var url_bufs:  [MAX_FETCH][:0]const u8 = undefined;
 var uris:      [MAX_FETCH]std.Uri = undefined;
 var methods:   [MAX_FETCH]http.Method = undefined;
-var headers:   [MAX_FETCH]std.ArrayList(http.Header) = undefined;
+// DOD-FIX 5: in-flight headers now stored in the shared dense HeadersData.
+// We keep a pointer per slot and transfer ownership to the ResponseData on
+// success (the worker drops its reference). The pool slot is reset to
+// undefined on release; the pointer is owned by ResponseData after okSlot.
+var headers:   [MAX_FETCH]?*headers_mod.HeadersData = [_]?*headers_mod.HeadersData{null} ** MAX_FETCH;
 var bodies:    [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
 
 var free_list: [MAX_FETCH]u16 = undefined;
@@ -87,7 +92,7 @@ fn releaseSlot(s: usize) void {
     url_bufs[s] = undefined;
     uris[s] = undefined;
     methods[s] = undefined;
-    headers[s] = undefined;
+    headers[s] = null;
     bodies[s] = null;
     freeResolvers(s);
     results[s] = null;
@@ -106,8 +111,6 @@ fn freeResolvers(s: usize) void {
         reject_funcs[s] = null;
     }
 }
-
-// ---- lifecycle ----
 
 fn makeJobPipe() !void {
     var fds: [2]std.posix.fd_t = undefined;
@@ -169,15 +172,11 @@ pub fn deinit() void {
 
 fn freeOwned(s: usize) void {
     gpa.free(url_bufs[s]);
-    for (headers[s].items) |h| {
-        gpa.free(h.name);
-        gpa.free(h.value);
-    }
-    headers[s].deinit(gpa);
+    // headers are transferred to ResponseData on okSlot; only release if still here.
+    if (headers[s]) |h| h.release();
+    headers[s] = null;
     if (bodies[s]) |b| gpa.free(b);
 }
-
-// ---- persistent worker loop ----
 
 fn workerLoop() void {
     while (true) {
@@ -199,8 +198,8 @@ fn workerLoop() void {
     }
 }
 
-// ---- submission (main thread, from fetchCallback) ----
-
+// DOD-FIX 5: caller passes a pre-built HeadersData (dense SoA pool);
+// we transfer ownership to the ResponseData on success and release on failure.
 pub fn submit(
     ctx: ?*c.Context,
     resolve_func: c.Value,
@@ -208,20 +207,16 @@ pub fn submit(
     url_buf: [:0]const u8,
     uri: std.Uri,
     method: http.Method,
-    header_list: std.ArrayList(http.Header),
+    headers_ptr: *headers_mod.HeadersData,
     body: ?[:0]const u8,
 ) !void {
-    var hl = header_list;
     poolLock();
     defer poolUnlock();
-        const s = acquireSlot() orelse {
+    const s = acquireSlot() orelse {
         if (builtin.mode == .Debug)
             std.debug.print("[submit] rejected: pool full\n", .{});
-        gpa.free(url_buf);        for (hl.items) |h| {
-            gpa.free(h.name);
-            gpa.free(h.value);
-        }
-        hl.deinit(gpa);
+        gpa.free(url_buf);
+        headers_ptr.release();
         if (body) |b| gpa.free(b);
         return error.NoConnectionAvailable;
     };
@@ -229,7 +224,7 @@ pub fn submit(
     url_bufs[s] = url_buf;
     uris[s] = uri;
     methods[s] = method;
-    headers[s] = hl;
+    headers[s] = headers_ptr;
     bodies[s] = body;
     results[s] = null;
     errs[s] = null;
@@ -253,14 +248,39 @@ pub fn submit(
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
 }
 
-// ---- job execution (worker threads, never touches JS) ----
-
 fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
     if (builtin.mode == .Debug) job_counter.reset();
 
+    // DOD-FIX 5: stage http.Header slice from the HeadersData without copying.
+    var hdr_view: std.ArrayList(http.Header) = .empty;
+    defer hdr_view.deinit(gpa);
+    const n_headers = headers[s].?.len();
+    hdr_view.ensureTotalCapacity(gpa, n_headers) catch {
+        failSlot(s, "Out of memory");
+        return;
+    };
+    var http_hdrs_buf: [64]http.Header = undefined;
+    var http_hdrs: []http.Header = &[_]http.Header{};
+    if (n_headers <= http_hdrs_buf.len) {
+        for (0..n_headers) |i| {
+            const p = headers[s].?.getPair(i);
+            http_hdrs_buf[i] = .{ .name = p.name, .value = p.value };
+        }
+        http_hdrs = http_hdrs_buf[0..n_headers];
+    } else {
+        for (0..n_headers) |i| {
+            const p = headers[s].?.getPair(i);
+            hdr_view.append(gpa, .{ .name = p.name, .value = p.value }) catch {
+                failSlot(s, "Out of memory");
+                return;
+            };
+        }
+        http_hdrs = hdr_view.items;
+    }
+
     var req = tls.client().request(methods[s], uris[s], .{
-        .extra_headers = headers[s].items,
+        .extra_headers = http_hdrs,
     }) catch {
         failSlot(s, "Network error");
         return;
@@ -312,11 +332,19 @@ fn runJob(slot_id: u16) void {
         req.connection.?.closing = true;
     }
 
+    // DOD-FIX 5: build ResponseData on the shared headers so the JS object
+    // returned to user code reuses the dense pool (one HeadersData alloc per
+    // request, not three).
     const resp_data = gpa.create(response_mod.ResponseData) catch {
         failSlot(s, "Out of memory");
         return;
     };
     resp_data.* = response_mod.ResponseData.init();
+    // Transfer ownership of headers[s] to ResponseData; replace with the
+    // freshly-init'd HeadersData so the slot is sane on error paths.
+    const owned_headers = headers[s].?;
+    headers[s] = &resp_data.headers;
+    resp_data.headers = owned_headers.*;
 
     resp_data.status = status_code;
     resp_data.setStatusText(response.head.status.phrase() orelse "OK");
@@ -379,8 +407,10 @@ fn runJob(slot_id: u16) void {
                 }
             }
         } else {
+            // DOD-FIX 6: single-capacity ArrayList to avoid reallocation thrash.
             var acc: std.ArrayList(u8) = .empty;
             defer acc.deinit(gpa);
+            acc.ensureTotalCapacity(gpa, 64 * 1024) catch {};
             var chunk: [16 * 1024]u8 = undefined;
             var total: usize = 0;
             while (true) {
@@ -439,6 +469,8 @@ fn runJob(slot_id: u16) void {
         std.debug.assert(job_counter.balanced());
     }
 
+    // okSlot stores resp_data; releaseSlot will skip headers since headers[s]==null
+    // after the transfer above.
     okSlot(s, resp_data);
 }
 
@@ -459,8 +491,6 @@ fn finishSlot(s: usize) void {
     _ = pending.fetchSub(1, .release);
     async_h.notify() catch {};
 }
-
-// ---- event-loop integration (main thread only) ----
 
 pub fn arm(loop: *xev.Loop) void {
     if (async_armed) return;
@@ -485,8 +515,6 @@ fn asyncCb(
     async_armed = false;
     return .disarm;
 }
-
-// ---- SIMD done-sweep ----
 
 fn doneMask() u64 {
     var mask: u64 = 0;
@@ -524,9 +552,9 @@ fn completeJob(ctx: ?*c.Context, s: usize) void {
     };
 
     if (results[s]) |data| {
-    const obj = response_mod.buildResponseJSObject(ctx, data);
-    var args = [_]c.Value{obj};
-    _ = c.call(ctx, resolve, c.JS_UNDEFINED, 1, &args);
+        const obj = response_mod.buildResponseJSObject(ctx, data);
+        var args = [_]c.Value{obj};
+        _ = c.call(ctx, resolve, c.JS_UNDEFINED, 1, &args);
     } else {
         const msg = errs[s] orelse "fetch failed";
         const ev = c.newStringLen(ctx, msg.ptr, @intCast(msg.len));
@@ -535,6 +563,15 @@ fn completeJob(ctx: ?*c.Context, s: usize) void {
     }
 
     freeResolvers(s);
-    freeOwned(s);
+    // results[s] is the ResponseData; ownership passed to JS, JS finalizer
+    // (responseFinalizer) will call data.deinit() which releases headers.
+    // We must not double-free here.
+    results[s] = null;
+    url_bufs[s] = undefined;
+    uris[s] = undefined;
+    methods[s] = undefined;
+    headers[s] = null;
+    bodies[s] = null;
+    errs[s] = null;
     releaseSlot(s);
 }

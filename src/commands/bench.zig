@@ -19,11 +19,11 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     std.debug.print("\n  Fairyfly Bench\n\n", .{});
 
     const runtime = try engine.Runtime.init(init.minimal.args);
+    // DOD-FIX 9: boot_arena is the sole owner of `runtime` and
+    // `runtime.event_loop`. Runtime.deinit() frees the arena.
     defer {
         runtime.event_loop.deinit();
-        std.heap.page_allocator.destroy(runtime.event_loop);
         runtime.deinit();
-        std.heap.page_allocator.destroy(runtime);
     }
     var total_ms: i64 = 0;
     var bench_count: u32 = 0;
