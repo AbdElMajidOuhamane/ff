@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
     // ── Build-options module (ffcfg) ──
     const ffcfg_opts = b.addOptions();
     ffcfg_opts.addOption(bool, "bearssl", bearssl);
+    const ff_version = b.option([]const u8, "version", "Runtime version string") orelse "0.1.0-canary";
+    ffcfg_opts.addOption([]const u8, "version", ff_version);
     const ffcfg_mod = ffcfg_opts.createModule();
 
     // ── QuickJS C translation (auto-generates types + inline functions) ──

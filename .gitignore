@@ -7,3 +7,4 @@ vendor/quickjs/
 bench
 examples
 vendor/bearssl 
+tests
