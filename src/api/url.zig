@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
+const PoolSlice = @import("../types/pool_slice.zig").PoolSlice; // CHANGED
 
 var url_class_id: c.ClassID = 0;
 var sp_class_id: c.ClassID = 0;
@@ -67,7 +68,7 @@ const URLSearchParamsData = struct {
     merge_buf: std.ArrayList(u8),
     view_buf: std.ArrayList([]const u8),
     ser_buf: std.ArrayList(u8),
-    owned: bool = true,
+    block: ?*UrlBlock = null, // CHANGED: null = standalone; set when embedded in a URL block
     fn init() URLSearchParamsData {
         return .{
             .names = std.ArrayList(u8).empty,
@@ -267,7 +268,6 @@ fn spHas(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) ca
 }
 
 fn spSet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    
     const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 2) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
@@ -281,7 +281,6 @@ fn spSet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) ca
 }
 
 fn spAppend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    
     const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 2) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
@@ -295,7 +294,6 @@ fn spAppend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
 }
 
 fn spDelete(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    
     const data = extractSPData(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 1) return c.JS_UNDEFINED;
     var name_buf: [128]u8 = undefined;
@@ -377,13 +375,15 @@ fn spForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value
     return c.JS_UNDEFINED;
 }
 
-fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void { // CHANGED
     _ = rt;
     if (c.getOpaque(val, sp_class_id)) |ptr| {
         const data: *URLSearchParamsData = @ptrCast(@alignCast(ptr));
-        if (data.owned) {
+        if (data.block) |b| {
+            b.release(); // embedded in a URL block
+        } else {
             data.deinit();
-            gpa.destroy(data);
+            gpa.destroy(data); // standalone new URLSearchParams()
         }
     }
 }
@@ -407,268 +407,307 @@ fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 }
 
 // ============================================================
-// UrlData
+// UrlData + UrlBlock — single allocation per URL (CHANGED)
 // ============================================================
 const UrlData = struct {
-    scheme: []const u8,
-    host: []const u8,
-    port: ?u16,
-    path: []const u8,
-    query: []const u8,
-    fragment: []const u8,
-    username: []const u8,
-    password: []const u8,
-    search_params: *URLSearchParamsData,
-    owned: bool = true,
-        fn deinit(self: *UrlData) void {
-        gpa.free(self.scheme);
-        gpa.free(self.host);
-        gpa.free(self.path);
-        gpa.free(self.query);
-        gpa.free(self.fragment);
-        gpa.free(self.username);
-        gpa.free(self.password);
-        // search_params is owned by its URLSearchParams JS object
-        // (spFinalizer frees it — do NOT free it here).
-    }
-    fn serialize(self: *const UrlData) ![]const u8 {
-        var result = std.ArrayList(u8).empty;
-        try result.appendSlice(gpa, self.scheme);
-        try result.appendSlice(gpa, "://");
-        if (self.username.len > 0 or self.password.len > 0) {
-            try result.appendSlice(gpa, self.username);
-            if (self.password.len > 0) {
-                try result.append(gpa, ':');
-                try result.appendSlice(gpa, self.password);
-            }
-            try result.append(gpa, '@');
-        }
-        try result.appendSlice(gpa, self.host);
-        if (self.port) |port| {
-            if (defaultPortForScheme(self.scheme)) |dp| {
-                if (port != dp) {
-                    try result.append(gpa, ':');
-                    try result.print(gpa, "{d}", .{port});
-                }
-            } else {
-                try result.append(gpa, ':');
-                try result.print(gpa, "{d}", .{port});
-            }
-        }
-        try result.appendSlice(gpa, self.path);
-        if (self.query.len > 0) {
-            try result.append(gpa, '?');
-            try result.appendSlice(gpa, self.query);
-        }
-        if (self.fragment.len > 0) {
-            try result.append(gpa, '#');
-            try result.appendSlice(gpa, self.fragment);
-        }
-        return try result.toOwnedSlice(gpa);
-    }
-    fn originStr(self: *const UrlData) ![]const u8 {
-        if (std.mem.eql(u8, self.scheme, "file") or !isSpecialScheme(self.scheme)) {
-            return try gpa.dupe(u8, "null");
-        }
-        var result = std.ArrayList(u8).empty;
-        try result.appendSlice(gpa, self.scheme);
-        try result.appendSlice(gpa, "://");
-        try result.appendSlice(gpa, self.host);
-        if (self.port) |port| {
-            if (defaultPortForScheme(self.scheme)) |dp| {
-                if (port != dp) {
-                    try result.append(gpa, ':');
-                    try result.print(gpa, "{d}", .{port});
-                }
-            } else {
-                try result.append(gpa, ':');
-                try result.print(gpa, "{d}", .{port});
-            }
-        }
-        return try result.toOwnedSlice(gpa);
-    }
-    fn hostStr(self: *const UrlData) ![]const u8 {
-        var result = std.ArrayList(u8).empty;
-        try result.appendSlice(gpa, self.host);
-        if (self.port) |port| {
-            if (defaultPortForScheme(self.scheme)) |dp| {
-                if (port != dp) {
-                    try result.append(gpa, ':');
-                    try result.print(gpa, "{d}", .{port});
-                }
-            } else {
-                try result.append(gpa, ':');
-                try result.print(gpa, "{d}", .{port});
-            }
-        }
-        return try result.toOwnedSlice(gpa);
-    }
+    block: *UrlBlock, // ownership handle — released by urlFinalizer, never freed here
+    pool: [*]u8,
+    port: ?u16 = null,
+    scheme: []const u8 = "", // all slices point into the block pool —
+    host: []const u8 = "", // existing readers (data.host, data.path, …)
+    path: []const u8 = "", // keep working unchanged
+    query: []const u8 = "",
+    fragment: []const u8 = "",
+    username: []const u8 = "",
+    password: []const u8 = "",
+    href: []const u8 = "", // precomputed at parse (replaces serialize())
+    origin: []const u8 = "", // replaces originStr()
+    host_str: []const u8 = "", // replaces hostStr()
+    search: []const u8 = "", // replaces searchStr()
+    hash: []const u8 = "", // replaces hashStr()
+    port_str: []const u8 = "", // replaces portStr()
+
     fn protocolStr(self: *const UrlData, buf: *[256]u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s}:", .{self.scheme}) catch self.scheme;
     }
-    fn portStr(self: *const UrlData) ![]const u8 {
-        if (self.port) |port| {
-            if (defaultPortForScheme(self.scheme)) |dp| {
-                if (port == dp) return try gpa.dupe(u8, "");
-            }
-            return try std.fmt.allocPrint(gpa, "{d}", .{port});
-        }
-        return try gpa.dupe(u8, "");
+    // deinit DELETED — UrlBlock.release owns everything
+};
+
+// One allocation per URL: refs + SP data + UrlData + string pool.
+const UrlBlock = struct {
+    mem_len: u32,
+    refs: u32, // urlFinalizer + spFinalizer each hold one ref
+    sp: URLSearchParamsData, // embedded; ArrayLists stay heap-backed for mutation growth
+    url: UrlData,
+
+    fn create(pool_len: usize) !*UrlBlock {
+        const hdr = std.mem.alignForward(usize, @sizeOf(UrlBlock), 8);
+        const total = hdr + pool_len;
+        const mem = try gpa.alignedAlloc(u8, .of(UrlBlock), total);
+        const block: *UrlBlock = @ptrCast(@alignCast(mem.ptr));
+        block.* = .{
+            .mem_len = @intCast(total),
+            .refs = 1, // the URL object's ref
+            .sp = URLSearchParamsData.init(),
+            .url = .{ .block = block, .pool = mem.ptr + hdr },
+        };
+        return block;
     }
-    fn searchStr(self: *const UrlData) ![]const u8 {
-        if (self.query.len > 0) {
-            return try std.fmt.allocPrint(gpa, "?{s}", .{self.query});
-        }
-        return try gpa.dupe(u8, "");
+    fn poolSlice(self: *UrlBlock) []u8 {
+        const hdr = std.mem.alignForward(usize, @sizeOf(UrlBlock), 8);
+        return (@as([*]u8, @ptrCast(self)) + hdr)[0 .. self.mem_len - hdr];
     }
-    fn hashStr(self: *const UrlData) ![]const u8 {
-        if (self.fragment.len > 0) {
-            return try std.fmt.allocPrint(gpa, "#{s}", .{self.fragment});
+    fn retain(self: *UrlBlock) void {
+        self.refs += 1;
+    }
+    fn release(self: *UrlBlock) void {
+        self.refs -= 1;
+        if (self.refs == 0) {
+            self.sp.deinit();
+            gpa.free(@as([*]u8, @ptrCast(self))[0..self.mem_len]);
         }
-        return try gpa.dupe(u8, "");
     }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(PoolSlice) == 8);
+}
+
+// ── Zero-alloc pool writer ──────────────────────────────────────────
+const PoolWriter = struct {
+    pool: []u8,
+    used: usize = 0,
+    fn rest(self: *PoolWriter) []u8 {
+        return self.pool[self.used..];
+    }
+    fn mark(self: *PoolWriter) usize {
+        return self.used;
+    }
+    fn sliceFrom(self: *PoolWriter, off: usize) []const u8 {
+        return self.pool[off..][0 .. self.used - off];
+    }
+    fn put(self: *PoolWriter, bytes: []const u8) []const u8 {
+        if (bytes.len == 0) return "";
+        const off = self.used;
+        @memcpy(self.pool[off..][0..bytes.len], bytes);
+        self.used += bytes.len;
+        return self.pool[off..][0..bytes.len];
+    }
+    fn putUint(self: *PoolWriter, v: u16) void {
+        var buf: [5]u8 = undefined;
+        var n: usize = 0;
+        var x = v;
+        if (x == 0) {
+            self.pool[self.used] = '0';
+            self.used += 1;
+            return;
+        }
+        while (x > 0) : (x /= 10) {
+            buf[n] = @intCast('0' + x % 10);
+            n += 1;
+        }
+        while (n > 0) {
+            n -= 1;
+            self.pool[self.used] = buf[n];
+            self.used += 1;
+        }
+    }
+    /// Decode-while-writing — same output as Component.toRawMaybeAlloc, no alloc.
+    fn putComponent(self: *PoolWriter, comp: std.Uri.Component) []const u8 {
+        switch (comp) {
+            .raw => |raw| return self.put(raw),
+            .percent_encoded => |pe| {
+                const off = self.used;
+                var i: usize = 0;
+                while (i < pe.len) {
+                    if (pe[i] == '%' and i + 2 < pe.len) {
+                        if (std.fmt.parseInt(u8, pe[i + 1 .. i + 3], 16)) |byte| {
+                            self.pool[self.used] = byte;
+                            self.used += 1;
+                            i += 3;
+                            continue;
+                        } else |_| {}
+                    }
+                    self.pool[self.used] = pe[i];
+                    self.used += 1;
+                    i += 1;
+                }
+                return self.pool[off..][0 .. self.used - off];
+            },
+        }
+    }
+};
+
+fn appendPort(url: *UrlData, w: *PoolWriter) void {
+    const p = url.port orelse return;
+    if (defaultPortForScheme(url.scheme)) |dp| {
+        if (p == dp) return;
+    }
+    _ = w.put(":");
+    w.putUint(p);
+}
+
+/// Precompute every derived string into the pool at parse time — the old
+/// serialize()/originStr()/hostStr()/searchStr()/hashStr()/portStr()
+/// transient allocations are gone.
+fn deriveStrings(url: *UrlData, w: *PoolWriter) void {
+    var m = w.mark();
+    _ = w.put("?");
+    _ = w.put(url.query);
+    url.search = w.sliceFrom(m);
+    m = w.mark();
+    _ = w.put("#");
+    _ = w.put(url.fragment);
+    url.hash = w.sliceFrom(m);
+    m = w.mark();
+    _ = w.put(url.host);
+    appendPort(url, w);
+    url.host_str = w.sliceFrom(m);
+    if (url.port != null and blk: {
+        const dp = defaultPortForScheme(url.scheme) orelse break :blk true;
+        break :blk url.port.? != dp;
+    }) {
+        m = w.mark();
+        w.putUint(url.port.?);
+        url.port_str = w.sliceFrom(m);
+    }
+    if (std.mem.eql(u8, url.scheme, "file") or !isSpecialScheme(url.scheme)) {
+        url.origin = w.put("null");
+    } else {
+        m = w.mark();
+        _ = w.put(url.scheme);
+        _ = w.put("://");
+        _ = w.put(url.host_str);
+        url.origin = w.sliceFrom(m);
+    }
+    m = w.mark();
+    _ = w.put(url.scheme);
+    _ = w.put("://");
+    if (url.username.len > 0 or url.password.len > 0) {
+        _ = w.put(url.username);
+        if (url.password.len > 0) {
+            _ = w.put(":");
+            _ = w.put(url.password);
+        }
+        _ = w.put("@");
+    }
+    _ = w.put(url.host_str);
+    _ = w.put(url.path);
+    _ = w.put(url.search);
+    _ = w.put(url.hash);
+    url.href = w.sliceFrom(m);
+}
 
 fn extractUrlData(ctx: ?*c.Context, this_val: c.Value) ?*UrlData {
     const ptr = c.getOpaque2(ctx, this_val, url_class_id) orelse return null;
     return @ptrCast(@alignCast(ptr));
 }
 
-
-fn parseUrlAbsolute(input: []const u8) !UrlData {
+fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     const uri = try std.Uri.parse(input);
-    const scheme = try gpa.dupe(u8, uri.scheme);
-    // toRawMaybeAlloc may return a VIEW into `input` (stack memory) when the
-    // component has no '%' escapes — UrlData must own heap copies.
-    const host = if (uri.host) |h| (try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-    const raw_path = try gpa.dupe(u8, try uri.path.toRawMaybeAlloc(gpa));
-    const path = if (raw_path.len == 0) blk: {
-        gpa.free(raw_path);
-        break :blk try gpa.dupe(u8, "/");
-    } else raw_path;
-    const query = if (uri.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-    const fragment = if (uri.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-    const username = if (uri.user) |u| (try gpa.dupe(u8, try u.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-    const password = if (uri.password) |p| (try gpa.dupe(u8, try p.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-    const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
-    sp.* = URLSearchParamsData.init();
-    sp.parseFromString(query);
-    return .{
-        .scheme = scheme,
-        .host = host,
-        .port = uri.port,
-        .path = path,
-        .query = query,
-        .fragment = fragment,
-        .username = username,
-        .password = password,
-        .search_params = sp,
+    const block = try UrlBlock.create(input.len + 256); // every decoded
+    errdefer block.release(); // component is a sub-slice of input
+    var w = PoolWriter{ .pool = block.poolSlice() };
+    const url = &block.url;
+    url.port = uri.port;
+    url.scheme = w.put(uri.scheme);
+    url.host = if (uri.host) |h| w.putComponent(h) else "";
+    url.path = blk: {
+        if (uri.path.isEmpty()) break :blk w.put("/");
+        const raw = w.putComponent(uri.path);
+        const off = w.used;
+        w.used += try removeDotSegmentsInto(w.rest(), raw);
+        break :blk w.pool[off..][0 .. w.used - off];
     };
+    url.query = if (uri.query) |q| w.putComponent(q) else "";
+    url.fragment = if (uri.fragment) |f| w.putComponent(f) else "";
+    url.username = if (uri.user) |u| w.putComponent(u) else "";
+    url.password = if (uri.password) |p| w.putComponent(p) else "";
+    block.sp.parseFromString(url.query);
+    deriveStrings(url, &w);
+    return block;
 }
 
-fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
+fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
     const base = try std.Uri.parse(base_url);
-    const base_port = base.port;
-    var result_scheme: []const u8 = undefined;
-    var result_host: []const u8 = undefined;
-    var result_port: ?u16 = undefined;
-    var result_user: []const u8 = "";
-    var result_pass: []const u8 = "";
-    var result_path: []const u8 = undefined;
-    var result_query: []const u8 = "";
-    var result_fragment: []const u8 = "";
+    const block = try UrlBlock.create(input.len + base_url.len + 256);
+    errdefer block.release();
+    var w = PoolWriter{ .pool = block.poolSlice() };
+    const url = &block.url;
     if (std.Uri.parse(input)) |rel| {
         if (rel.scheme.len > 0) {
-            result_scheme = try gpa.dupe(u8, rel.scheme);
-            result_host = if (rel.host) |h| (try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-            result_port = rel.port;
-            result_path = if (rel.path.isEmpty())
-                try gpa.dupe(u8, "/")
-            else
-                try removeDotSegments(try rel.path.toRawMaybeAlloc(gpa));
-            result_query = if (rel.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-            result_fragment = if (rel.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-            if (rel.user) |u| result_user = try gpa.dupe(u8, try u.toRawMaybeAlloc(gpa));
-            if (rel.password) |p| result_pass = try gpa.dupe(u8, try p.toRawMaybeAlloc(gpa));
-            const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
-            sp.* = URLSearchParamsData.init();
-            sp.parseFromString(result_query);
-            return .{
-                .scheme = result_scheme, .host = result_host, .port = result_port,
-                .path = result_path, .query = result_query, .fragment = result_fragment,
-                .username = result_user, .password = result_pass, .search_params = sp,
+            url.port = rel.port;
+            url.scheme = w.put(rel.scheme);
+            url.host = if (rel.host) |h| w.putComponent(h) else "";
+            url.path = if (rel.path.isEmpty()) w.put("/") else blk: {
+                const raw = w.putComponent(rel.path);
+                const off = w.used;
+                w.used += try removeDotSegmentsInto(w.rest(), raw);
+                break :blk w.pool[off..][0 .. w.used - off];
             };
+            url.query = if (rel.query) |q| w.putComponent(q) else "";
+            url.fragment = if (rel.fragment) |f| w.putComponent(f) else "";
+            url.username = if (rel.user) |u| w.putComponent(u) else "";
+            url.password = if (rel.password) |p| w.putComponent(p) else "";
+            block.sp.parseFromString(url.query);
+            deriveStrings(url, &w);
+            return block;
         }
         if (rel.host) |h| {
-            result_scheme = try gpa.dupe(u8, base.scheme);
-            result_host = try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa));
-            result_port = rel.port;
-            result_path = if (rel.path.isEmpty())
-                try gpa.dupe(u8, "/")
-            else
-                try removeDotSegments(try rel.path.toRawMaybeAlloc(gpa));
-            result_query = if (rel.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-            result_fragment = if (rel.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-            const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
-            sp.* = URLSearchParamsData.init();
-            sp.parseFromString(result_query);
-            return .{
-                .scheme = result_scheme, .host = result_host, .port = result_port,
-                .path = result_path, .query = result_query, .fragment = result_fragment,
-                .username = result_user, .password = result_pass, .search_params = sp,
+            url.port = rel.port;
+            url.scheme = w.put(base.scheme);
+            url.host = w.putComponent(h);
+            url.path = if (rel.path.isEmpty()) w.put("/") else blk: {
+                const raw = w.putComponent(rel.path);
+                const off = w.used;
+                w.used += try removeDotSegmentsInto(w.rest(), raw);
+                break :blk w.pool[off..][0 .. w.used - off];
             };
+            url.query = if (rel.query) |q| w.putComponent(q) else "";
+            url.fragment = if (rel.fragment) |f| w.putComponent(f) else "";
+            block.sp.parseFromString(url.query);
+            deriveStrings(url, &w);
+            return block;
         }
     } else |_| {}
-    const base_host_owned = try gpa.dupe(u8, if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else "");
-    defer gpa.free(base_host_owned);
-    const base_host = base_host_owned;
-    const base_path = try gpa.dupe(u8, try base.path.toRawMaybeAlloc(gpa));
-    defer gpa.free(base_path);
-    result_scheme = try gpa.dupe(u8, base.scheme);
-    result_host = try gpa.dupe(u8, base_host);
-    result_port = base_port;
+    // pure-relative: merge onto the base
+    url.port = base.port;
+    url.scheme = w.put(base.scheme);
+    url.host = if (base.host) |h| w.putComponent(h) else "";
+    url.username = if (base.user) |u| w.putComponent(u) else "";
+    url.password = if (base.password) |p| w.putComponent(p) else "";
+    const base_path = w.putComponent(base.path);
     const rel_path = input;
     if (rel_path.len == 0) {
-        result_path = try gpa.dupe(u8, base_path);
-        result_query = if (base.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+        url.path = w.put(base_path);
+        url.query = if (base.query) |q| w.putComponent(q) else "";
     } else if (rel_path[0] == '?') {
-        result_path = try gpa.dupe(u8, base_path);
-        result_query = try gpa.dupe(u8, rel_path[1..]);
+        url.path = w.put(base_path);
+        url.query = w.put(rel_path[1..]);
     } else if (rel_path[0] == '#') {
-        result_path = try gpa.dupe(u8, base_path);
-        result_query = if (base.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
-        result_fragment = try gpa.dupe(u8, rel_path[1..]);
+        url.path = w.put(base_path);
+        url.query = if (base.query) |q| w.putComponent(q) else "";
+        url.fragment = w.put(rel_path[1..]);
     } else if (rel_path[0] == '/') {
-        result_path = try removeDotSegments(rel_path);
-        result_query = "";
+        const off = w.used;
+        w.used += try removeDotSegmentsInto(w.rest(), rel_path);
+        url.path = w.pool[off..][0 .. w.used - off];
+        url.query = "";
     } else {
-        result_path = try removeDotSegments(try mergePaths(base_path, rel_path));
-        result_query = "";
+        var tmp: [4096]u8 = undefined;
+        const n = mergePathsInto(&tmp, base_path, rel_path);
+        const off = w.used;
+        w.used += try removeDotSegmentsInto(w.rest(), tmp[0..n]);
+        url.path = w.pool[off..][0 .. w.used - off];
+        url.query = "";
     }
-    const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
-    sp.* = URLSearchParamsData.init();
-    sp.parseFromString(result_query);
-    return .{
-        .scheme = result_scheme, .host = result_host, .port = result_port,
-        .path = result_path, .query = result_query, .fragment = result_fragment,
-        .username = result_user, .password = result_pass, .search_params = sp,
-    };
+    block.sp.parseFromString(url.query);
+    deriveStrings(url, &w);
+    return block;
 }
 
-fn mergePaths(base_path: []const u8, rel_path: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
-    try result.appendSlice(gpa, base_path);
-    if (std.mem.lastIndexOfScalar(u8, result.items, '/')) |idx| {
-        result.items.len = idx + 1;
-    } else {
-        result.items.len = 0;
-    }
-    try result.appendSlice(gpa, rel_path);
-    return try result.toOwnedSlice(gpa);
-}
-
-fn removeDotSegments(input: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).empty;
+fn removeDotSegmentsInto(out: []u8, input: []const u8) !usize {
+    var n: usize = 0;
     var rest = input;
     while (rest.len > 0) {
         if (std.mem.startsWith(u8, rest, "../")) {
@@ -677,46 +716,66 @@ fn removeDotSegments(input: []const u8) ![]const u8 {
             rest = rest[2..];
         } else if (std.mem.startsWith(u8, rest, "/../")) {
             rest = rest[4..];
-            while (result.items.len > 0) {
-                _ = result.orderedRemove(result.items.len - 1);
-                if (result.items.len > 0 and result.items[result.items.len - 1] == '/') {
-                    _ = result.orderedRemove(result.items.len - 1);
+            while (n > 0) {
+                n -= 1;
+                if (n > 0 and out[n - 1] == '/') {
+                    n -= 1; // CHANGED: original also strips the trailing '/'
                     break;
                 }
-                if (result.items.len == 0) break;
+                if (n == 0) break;
             }
-            try result.append(gpa, '/');
+            out[n] = '/';
+            n += 1;
         } else if (std.mem.eql(u8, rest, "/..")) {
             rest = "";
-            while (result.items.len > 0) {
-                _ = result.orderedRemove(result.items.len - 1);
-                if (result.items.len > 0 and result.items[result.items.len - 1] == '/') {
-                    _ = result.orderedRemove(result.items.len - 1);
+            while (n > 0) {
+                n -= 1;
+                if (n > 0 and out[n - 1] == '/') {
+                    n -= 1; // CHANGED
                     break;
                 }
-                if (result.items.len == 0) break;
+                if (n == 0) break;
             }
-            try result.append(gpa, '/');
+            out[n] = '/';
+            n += 1;
         } else if (std.mem.startsWith(u8, rest, "/./")) {
             rest = rest[2..];
         } else if (std.mem.eql(u8, rest, "..")) {
             rest = "";
-            try result.append(gpa, '/');
+            out[n] = '/';
+            n += 1;
         } else if (std.mem.eql(u8, rest, ".")) {
             rest = "";
         } else if (rest[0] == '/') {
-            try result.append(gpa, '/');
+            out[n] = '/';
+            n += 1;
             rest = rest[1..];
         } else {
             const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-            try result.appendSlice(gpa, rest[0..slash]);
+            @memcpy(out[n..][0..slash], rest[0..slash]);
+            n += slash;
             rest = if (slash < rest.len) rest[slash..] else "";
         }
     }
-    if (result.items.len == 0) {
-        try result.append(gpa, '/');
+    if (n == 0) {
+        out[n] = '/';
+        n += 1;
     }
-    return try result.toOwnedSlice(gpa);
+    return n;
+}
+
+fn mergePathsInto(out: []u8, base_path: []const u8, rel_path: []const u8) usize {
+    var n: usize = 0;
+    @memcpy(out[n..][0..base_path.len], base_path);
+    n += base_path.len;
+    if (std.mem.lastIndexOfScalar(u8, out[0..n], '/')) |idx| {
+        n = idx + 1;
+    } else {
+        n = 0;
+    }
+    @memcpy(out[n..][0..rel_path.len], rel_path);
+    n += rel_path.len;
+    return n;
 }
 
 // ============================================================
@@ -731,38 +790,24 @@ fn createSPJsObject(ctx: ?*c.Context, data: *URLSearchParamsData) c.Value {
 // ============================================================
 // Build URL JS object
 // ============================================================
-fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value {
+fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value { // CHANGED
     const obj = c.newObjectClass(ctx, @intCast(url_class_id));
     c.setOpaque(obj, data);
-
-    const href_val = data.serialize() catch "";
-    defer if (href_val.len > 0) gpa.free(href_val);
-    const origin_val = data.originStr() catch "";
-    defer if (origin_val.len > 0) gpa.free(origin_val);
-    const host_val = data.hostStr() catch "";
-    defer if (host_val.len > 0) gpa.free(host_val);
     var protocol_buf: [256]u8 = undefined;
-    const protocol_val = data.protocolStr(&protocol_buf);
-    const port_val = data.portStr() catch "";
-    defer if (port_val.len > 0) gpa.free(port_val);
-    const search_val = data.searchStr() catch "";
-    defer if (search_val.len > 0) gpa.free(search_val);
-    const hash_val = data.hashStr() catch "";
-    defer if (hash_val.len > 0) gpa.free(hash_val);
-
-    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, data.href), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, data.origin), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, data.host_str), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "hostname", zigStringToJS(ctx, data.host), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, data.port_str), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "pathname", zigStringToJS(ctx, data.path), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, data.search), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, data.hash), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "username", zigStringToJS(ctx, data.username), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "password", zigStringToJS(ctx, data.password), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
-    data.search_params.owned = false;
-    const sp_obj = createSPJsObject(ctx, data.search_params);
+    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, data.protocolStr(&protocol_buf)), c.PROP_C_W_E);
+    data.block.sp.block = data.block;
+    data.block.retain(); // the searchParams JS object holds its own ref
+    const sp_obj = createSPJsObject(ctx, &data.block.sp);
     _ = c.definePropertyValueStr(ctx, obj, "searchParams", sp_obj, c.PROP_C_W_E);
     return obj;
 }
@@ -770,30 +815,25 @@ fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value {
 // ============================================================
 // URL callbacks
 // ============================================================
-fn urlToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+fn urlToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value { // CHANGED
     const data = extractUrlData(ctx, this_val) orelse return zigStringToJS(ctx, "");
-    const str = data.serialize() catch return zigStringToJS(ctx, "");
-    defer if (str.len > 0) gpa.free(str);
-    return zigStringToJS(ctx, str);
+    return zigStringToJS(ctx, data.href); // zero alloc
 }
 
 fn urlToJSON(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     return urlToString(ctx, this_val, argc, argv);
 }
 
-fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
+fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void { // CHANGED
     _ = rt;
     if (c.getOpaque(val, url_class_id)) |ptr| {
         const data: *UrlData = @ptrCast(@alignCast(ptr));
-        if (data.owned) {
-            data.deinit();
-            gpa.destroy(data);
-        }
+        data.block.release();
     }
 }
 
-fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _=this_val;
+fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
+    _ = this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "URL constructor requires at least 1 argument");
         return c.JS_EXCEPTION;
@@ -807,55 +847,20 @@ fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
         base = extractStringAuto(ctx, argv[1], &base_buf);
     }
     defer if (base) |b| b.deinit();
-    const data_ptr = gpa.create(UrlData) catch return c.throwOutOfMemory(ctx);
-    data_ptr.* = if (base) |b|
+    const block = if (base) |b|
         parseUrlRelative(input.slice, b.slice) catch {
-            gpa.destroy(data_ptr);
             _ = c.throwTypeError(ctx, "Invalid URL");
             return c.JS_EXCEPTION;
         }
     else
         parseUrlAbsolute(input.slice) catch {
-            gpa.destroy(data_ptr);
             _ = c.throwTypeError(ctx, "Invalid URL");
             return c.JS_EXCEPTION;
         };
-    const obj = c.newObjectClass(ctx, @intCast(url_class_id)); // CHANGED
-    c.setOpaque(obj, data_ptr);                                // CHANGED
-    data_ptr.search_params.owned = false;
-    const sp_obj = createSPJsObject(ctx, data_ptr.search_params);
-
-    const href_val = data_ptr.serialize() catch "";
-    defer if (href_val.len > 0) gpa.free(href_val);
-    const origin_val = data_ptr.originStr() catch "";
-    defer if (origin_val.len > 0) gpa.free(origin_val);
-    const host_val = data_ptr.hostStr() catch "";
-    defer if (host_val.len > 0) gpa.free(host_val);
-    var protocol_buf: [256]u8 = undefined;
-    const protocol_val = data_ptr.protocolStr(&protocol_buf);
-    const port_val = data_ptr.portStr() catch "";
-    defer if (port_val.len > 0) gpa.free(port_val);
-    const search_val = data_ptr.searchStr() catch "";
-    defer if (search_val.len > 0) gpa.free(search_val);
-    const hash_val = data_ptr.hashStr() catch "";
-    defer if (hash_val.len > 0) gpa.free(hash_val);
-
-    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "hostname", zigStringToJS(ctx, data_ptr.host), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "pathname", zigStringToJS(ctx, data_ptr.path), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "username", zigStringToJS(ctx, data_ptr.username), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "password", zigStringToJS(ctx, data_ptr.password), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "searchParams", sp_obj, c.PROP_C_W_E);
-    return obj; // CHANGED
+    return createUrlJsObject(ctx, &block.url);
 }
 
-fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
     if (argc < 1) return c.JS_NULL;
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
@@ -866,21 +871,14 @@ fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) 
         base = extractStringAuto(ctx, argv[1], &base_buf);
     }
     defer if (base) |b| b.deinit();
-    const data_ptr = gpa.create(UrlData) catch return c.JS_NULL;
-    data_ptr.* = if (base) |b|
-        parseUrlRelative(input.slice, b.slice) catch {
-            gpa.destroy(data_ptr);
-            return c.JS_NULL;
-        }
+    const block = if (base) |b|
+        parseUrlRelative(input.slice, b.slice) catch return c.JS_NULL
     else
-        parseUrlAbsolute(input.slice) catch {
-            gpa.destroy(data_ptr);
-            return c.JS_NULL;
-        };
-    return createUrlJsObject(ctx, data_ptr);
+        parseUrlAbsolute(input.slice) catch return c.JS_NULL;
+    return createUrlJsObject(ctx, &block.url);
 }
 
-fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
     if (argc < 1) return c.JS_FALSE;
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
@@ -896,8 +894,7 @@ fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Valu
     else
         parseUrlAbsolute(input.slice) catch null;
     if (valid) |v| {
-        var data = v;
-        data.deinit();
+        v.release();
         return c.JS_TRUE;
     }
     return c.JS_FALSE;

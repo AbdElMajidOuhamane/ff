@@ -652,11 +652,8 @@ fn claimParkedSlot(magic: c_int) ?usize {
 }
 
 fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) c.Value {
-        const id = claimParkedSlot(magic) orelse {
-        std.debug.print("[http] completeParked: claim FAILED (stale)\n", .{}); // TEMP
-        return c.JS_UNDEFINED;
-    };
-    std.debug.print("[http] completeParked id={d} rejected={}\n", .{ id, rejected }); // TEMP
+    const id = claimParkedSlot(magic) orelse return c.JS_UNDEFINED;
+    
     cflags[id].handler_parked = false;
     parked_since_ms[id] = 0;
 
@@ -771,7 +768,7 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         c.getClassID(result) == promise_class_id)
     {
         const ps = c.promiseState(ctx, result);
-        std.debug.print("[http] promise branch ps={d}\n", .{ps}); // TEMP   <-- ADD
+        
         if (ps == 0) {
             // Pending: park the connection; the promise's `then` reactions
             // resume staging + writing from the event loop (or watchdog).

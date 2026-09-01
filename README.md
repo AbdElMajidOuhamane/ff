@@ -18,6 +18,7 @@ and a small readable codebase.
    - [Hello world](#hello-world)
    - [Timers and the event loop](#timers-and-the-event-loop)
    - [HTTP server](#http-server)
+   - [Async handlers](#async-handlers)
    - [Fetch client](#fetch-client)
    - [WebSocket server](#websocket-server)
    - [WebSocket client](#websocket-client)
@@ -153,8 +154,10 @@ handler returns a `Response` object.
 
 ```js
 // server.js
+// Handler signature: handler(url, method, body) — url is the raw
+// request-target ("/path?query"), so pass a base to the URL constructor.
 http.serve({ port: 3000 }, (req) => {
-    const url = new URL(req.url);
+    const url = new URL(req, "http://localhost");
     if (url.pathname === "/") {
         return new Response("hello from fairyfly", {
             status: 200,
@@ -171,6 +174,11 @@ http.serve({ port: 3000 }, (req) => {
 The handler runs on the event loop. Multiple concurrent connections are
 handled cooperatively — no thread per request.
 
+**Response headers** set on the returned `Response` are sent verbatim —
+`content-type`, `set-cookie`, custom headers — except `Content-Length`,
+`Transfer-Encoding`, and `Connection`, which the server computes. A hung
+handler is failed with `504` after 30 s.
+
 **Benchmarking this exact pattern:**
 
 ```sh
@@ -184,6 +192,24 @@ Running 10s test @ http://127.0.0.1:3000/
 Requests/sec: 138187.47
 Transfer/sec:    964.39KB
 ```
+
+### Async handlers
+
+Handlers can be `async` — the runtime parks the connection and resumes it
+when the promise settles. Awaiting timers, `fetch`, or any promise works
+inside a handler; no thread is blocked:
+
+```js
+// async_server.js
+http.serve({ port: 3000 }, async (req) => {
+    const res = await fetch("https://example.com/api");
+    const data = await res.json();
+    return Response.json(data);
+});
+```
+
+Rejected promises and thrown errors become `500` responses. Headers on the
+returned `Response` are honored as described above.
 
 ### Fetch client
 
@@ -201,7 +227,7 @@ via `.text()`, `.json()`, `.arrayBuffer()`, or `.blob()`.
 
 - HTTPS uses the system trust store
 - HTTP/2 not supported (HTTP/1.1 only)
-- Redirects are followed automatically by default
+- Redirects are not followed yet — 3xx responses are returned as-is
 
 ### WebSocket server
 
@@ -385,20 +411,23 @@ Module paths:
 
 | Name | Description |
 |---|---|
-| `console` | `log`, `error`, `warn`, `info`, `debug`, `time`/`timeEnd` |
+| `console` | `log`, `error`, `warn`, `info`, `debug` |
 | `setTimeout`, `clearTimeout` | Timer scheduling |
 | `setInterval`, `clearInterval` | Repeating timers |
-| `queueMicrotask` | Schedule a microtask |
-| `URL` | WHATWG URL parser |
-| `TextEncoder`, `TextDecoder` | UTF-8 encoding |
-| `fetch` | HTTP client |
+| `URL` | WHATWG URL parser (`URL.parse`, `URL.canParse`) |
+| `URLSearchParams` | Query-string parsing |
+| `Headers` | Fetch-style header collection |
+| `fetch` | HTTP client (16 concurrent max, gzip/deflate/zstd decoded) |
 | `WebSocket` | WebSocket client |
+| `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (sync) |
 | `process` | Env vars, argv, exit, cwd |
 | `Headers`, `Request`, `Response` | WHATWG Fetch primitives |
+| `crypto` | `crypto.randomUUID`, `crypto.getRandomValues` |
 
 ### Namespaces
 
-- `http.serve(options, handler)` — start an HTTP server; pass
+- `http.serve(options, handler)` — start an HTTP server; async handlers are
+  supported (the connection parks until the handler's promise settles); pass
   `tls: { cert, key }` to enable HTTPS/WSS (cert/key: file path or PEM)
 - `Response.json(value, init?)` — JSON response shortcut
 - `Response.redirect(url, status?)` — redirect response shortcut
@@ -412,6 +441,9 @@ Module paths:
 - No `process.nextTick` (use `queueMicrotask`)
 - HTTP/1.1 only
 - No browser DOM
+- Handlers receive `(url, method, body)` strings — no `Request` object yet
+- No `queueMicrotask`, `TextEncoder`, or `TextDecoder` yet
+- Response bodies buffered (64 KB cap per response); request bodies ≤ ~4 KB
 
 ---
 
@@ -465,6 +497,7 @@ The wrk script in this repo reproduces this: `./wrk.sh`.
 - SoA layout for connection slots (512× parallel arrays, packed 1-byte flags)
 - Static buffers reused across connections
 - HeadersData uses refcounting + lazy cold-struct split for hot/cold separation
+- URL objects: one refcounted allocation per URL (components pooled, zero-copy property reads)
 - Module interning: import/export strings interned into single arena
 - Boot arena owns runtime/event-loop/cache, no syscall-per-alloc at startup
 
@@ -522,47 +555,9 @@ Environment variables:
 - `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
 
 ---
-
-## Examples index
-
-The `examples/` directory has working scripts for every API:
-
-| File | Demonstrates |
-|---|---|
-| `hello.js` | `console.log` |
-| `timer.js` | `setTimeout`, `setInterval` |
-| `server.js` | `http.serve` with routing |
-| `fetch.js` | `fetch` + `Response.json` |
-| `ws_server.js` | Server-side WebSocket |
-| `ws_client.js` | Client-side WebSocket |
-| `url.js` | `URL` parsing & mutation |
-| `console.js` | `console.log/error/warn/time` |
-| `process.js` | `process.env`, `process.argv`, `process.exit` |
-| `parallel.js` | Concurrent `fetch` with `Promise.all` |
-| `complex.js` | A more complete HTTP server |
-| `express-test/` | Express-style routing patterns |
-| `fetch_pool_test.js` | Connection pool stress test |
-
-TLS tests live in `tests/tls/`:
-
-| File | Demonstrates |
-|---|---|
-| `server.js` | HTTPS + WSS server (TLS from JS or CLI) |
-| `wss-client.js` | WSS client round-trip test (`ff wss-client.js --ca cert.pem`) |
-| `node-client.mjs` | Independent Node cross-check (`NODE_EXTRA_CA_CERTS=cert.pem node node-client.mjs`) |
-
-Run any of them:
-
-```sh
-./zig-out/bin/ff examples/server.js
-```
-
----
-
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
+MPL-2.0 (Mozilla Public License Version 2.0). See [LICENSE](LICENSE).
 ---
 
 ## Acknowledgments
