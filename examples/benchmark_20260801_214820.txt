@@ -1,0 +1,99 @@
+=== HYPRLAND MEMORY BENCHMARK ===
+Date: Sat Aug  1 21:48:20 +01 2026
+
+[System Memory - Before]
+
+--- Running node ---
+[Hyprland]
+[Process Memory]
+[Memory Timeline]
+21:48:23 | RSS: 0 kB
+21:48:24 | RSS: 0 kB
+21:48:25 | RSS: 0 kB
+21:48:26 | RSS: 0 kB
+21:48:27 | RSS: 0 kB
+21:48:29 | RSS: 0 kB
+21:48:30 | RSS: 0 kB
+21:48:31 | RSS: 0 kB
+21:48:32 | RSS: 0 kB
+21:48:33 | RSS: 0 kB
+21:48:34 | RSS: 0 kB
+21:48:35 | RSS: 0 kB
+21:48:36 | RSS: 0 kB
+21:48:37 | RSS: 0 kB
+21:48:38 | RSS: 0 kB
+21:48:39 | RSS: 0 kB
+21:48:40 | RSS: 0 kB
+21:48:41 | RSS: 0 kB
+21:48:42 | RSS: 0 kB
+21:48:43 | RSS: 0 kB
+21:48:44 | RSS: 0 kB
+21:48:45 | RSS: 0 kB
+21:48:46 | RSS: 0 kB
+21:48:47 | RSS: 0 kB
+21:48:48 | RSS: 0 kB
+21:48:49 | RSS: 0 kB
+21:48:50 | RSS: 0 kB
+21:48:51 | RSS: 0 kB
+
+--- Running bun ---
+[Hyprland]
+[Process Memory]
+[Memory Timeline]
+21:48:55 | RSS: 0 kB
+21:48:56 | RSS: 0 kB
+21:48:57 | RSS: 0 kB
+21:48:58 | RSS: 0 kB
+21:48:59 | RSS: 0 kB
+21:49:00 | RSS: 0 kB
+21:49:01 | RSS: 0 kB
+21:49:03 | RSS: 0 kB
+21:49:04 | RSS: 0 kB
+21:49:05 | RSS: 0 kB
+21:49:06 | RSS: 0 kB
+21:49:07 | RSS: 0 kB
+21:49:08 | RSS: 0 kB
+21:49:09 | RSS: 0 kB
+21:49:10 | RSS: 0 kB
+21:49:11 | RSS: 0 kB
+21:49:12 | RSS: 0 kB
+21:49:13 | RSS: 0 kB
+21:49:14 | RSS: 0 kB
+21:49:15 | RSS: 0 kB
+21:49:16 | RSS: 0 kB
+21:49:17 | RSS: 0 kB
+21:49:18 | RSS: 0 kB
+21:49:19 | RSS: 0 kB
+21:49:20 | RSS: 0 kB
+21:49:21 | RSS: 0 kB
+21:49:22 | RSS: 0 kB
+
+--- Running ff ---
+[Hyprland]
+[Process Memory]
+[Memory Timeline]
+21:49:26 | RSS: 0 kB
+21:49:27 | RSS: 0 kB
+21:49:28 | RSS: 0 kB
+21:49:29 | RSS: 0 kB
+21:49:30 | RSS: 0 kB
+21:49:31 | RSS: 0 kB
+21:49:32 | RSS: 0 kB
+21:49:33 | RSS: 0 kB
+21:49:34 | RSS: 0 kB
+21:49:35 | RSS: 0 kB
+21:49:36 | RSS: 0 kB
+21:49:37 | RSS: 0 kB
+21:49:39 | RSS: 0 kB
+21:49:40 | RSS: 0 kB
+21:49:41 | RSS: 0 kB
+21:49:42 | RSS: 0 kB
+21:49:43 | RSS: 0 kB
+21:49:44 | RSS: 0 kB
+21:49:45 | RSS: 0 kB
+21:49:46 | RSS: 0 kB
+21:49:47 | RSS: 0 kB
+21:49:48 | RSS: 0 kB
+21:49:49 | RSS: 0 kB
+21:49:50 | RSS: 0 kB
+21:49:51 | RSS: 0 kB

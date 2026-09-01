@@ -4,19 +4,21 @@ const bssl = @import("../bearssl.zig").bssl;
 
 pub const available: bool = ffcfg.bearssl;
 
-pub const Ctx = bssl.br_ssl_server_context;
-pub const IOBUF_LEN = bssl.BR_SSL_BUFSIZE_BIDI;
+// Lazy-safe decls: these compile even with -Dbearssl=false because the
+// bssl.* references below are only analyzed when `available` is true.
+pub const Ctx = if (available) bssl.br_ssl_server_context else struct { _pad: u8 = 0 };
+pub const IOBUF_LEN: usize = if (available) bssl.BR_SSL_BUFSIZE_BIDI else 1;
 
 comptime {
     if (available) std.debug.assert(IOBUF_LEN >= 32000);
 }
 
-// Engine state bits (bearssl_ssl.h)
-pub const ST_CLOSED: c_uint = bssl.BR_SSL_CLOSED;
-pub const ST_SENDREC: c_uint = bssl.BR_SSL_SENDREC;
-pub const ST_RECVREC: c_uint = bssl.BR_SSL_RECVREC;
-pub const ST_SENDAPP: c_uint = bssl.BR_SSL_SENDAPP;
-pub const ST_RECVAPP: c_uint = bssl.BR_SSL_RECVAPP;
+// Engine state bits (bearssl_ssl.h) — mutually exclusive "current state" values.
+pub const ST_CLOSED: c_uint = if (available) bssl.BR_SSL_CLOSED else 0;
+pub const ST_SENDREC: c_uint = if (available) bssl.BR_SSL_SENDREC else 1;
+pub const ST_RECVREC: c_uint = if (available) bssl.BR_SSL_RECVREC else 2;
+pub const ST_SENDAPP: c_uint = if (available) bssl.BR_SSL_SENDAPP else 3;
+pub const ST_RECVAPP: c_uint = if (available) bssl.BR_SSL_RECVAPP else 4;
 
 pub const MAX_CERTS: usize = 4;
 
@@ -77,7 +79,29 @@ fn base64Der(body: []const u8, out: []u8) ?[]u8 {
             gi = 0;
         }
     }
-    if (gi != 0) return null;
+    // Padded final group: "xx==" carries 1 byte, "xxx=" carries 2.
+    // Decode with zero-bit filler chars ('A') and keep only the real bytes.
+    if (gi != 0) {
+        if (gi == 1) return null; // invalid base64
+        var full: [4]u8 = .{ group[0], group[1], 0, 0 };
+        var dec: [3]u8 = undefined;
+        if (gi == 2) {
+            full[2] = 'A';
+            full[3] = 'A';
+            std.base64.standard.Decoder.decode(&dec, &full) catch return null;
+            if (o + 1 > out.len) return null;
+            out[o] = dec[0];
+            o += 1;
+        } else { // gi == 3
+            full[2] = group[2];
+            full[3] = 'A';
+            std.base64.standard.Decoder.decode(&dec, &full) catch return null;
+            if (o + 2 > out.len) return null;
+            out[o] = dec[0];
+            out[o + 1] = dec[1];
+            o += 2;
+        }
+    }
     return out[0..o];
 }
 
@@ -130,6 +154,11 @@ pub fn initServer(cert_pem: []const u8, key_pem: []const u8) InitError!void {
     }
 
     g_ready = true;
+}
+
+/// True once initServer() parsed a cert chain + key successfully.
+pub fn ready() bool {
+    return g_ready;
 }
 
 /// One-time-per-accepted-connection setup. Cheap, allocation-free.

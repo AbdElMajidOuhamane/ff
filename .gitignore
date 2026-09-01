@@ -5,5 +5,4 @@ zig-pkg
 .DS_Store
 vendor/quickjs/
 bench
-examples
-vendor/bearssl
+vendor/bearssl 

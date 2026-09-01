@@ -109,7 +109,8 @@ pub fn setup(ctx: ?*c.Context) void {
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
 
-    const ctor = c.newCFunction(ctx, &wsConstructor, "WebSocket", 2);
+    //const ctor = c.newCFunction(ctx, &wsConstructor, "WebSocket", 2);
+    const ctor = c.newCFunction2(ctx, &wsConstructor, "WebSocket", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "WebSocket", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     // Static constants
     _ = c.definePropertyValueStr(ctx, ctor, "CONNECTING", c.newInt32(ctx, 0), c.PROP_WRITABLE | c.PROP_CONFIGURABLE);

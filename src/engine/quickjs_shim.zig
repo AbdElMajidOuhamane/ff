@@ -237,6 +237,7 @@ pub const newCFunctionMagic = qjs_c.JS_NewCFunctionMagic;
 pub const newCFunctionData = qjs_c.JS_NewCFunctionData;
 pub const setConstructor = qjs_c.JS_SetConstructor;
 pub const setConstructorBit = qjs_c.JS_SetConstructorBit;
+pub const JS_CFUNC_constructor = qjs_c.JS_CFUNC_constructor;
 
 // ─── Function call ──────────────────────────────────────────────
 pub const call = qjs_c.JS_Call;
@@ -265,6 +266,7 @@ pub const detachArrayBuffer = qjs_c.JS_DetachArrayBuffer;
 
 // ─── TypedArray ────────────────────────────────────────────────
 pub const newTypedArray = qjs_c.JS_NewTypedArray;
+pub const JS_TYPED_ARRAY_UINT8 = qjs_c.JS_TYPED_ARRAY_UINT8;
 pub const getTypedArrayBuffer = qjs_c.JS_GetTypedArrayBuffer;
 
 // ─── Promise ────────────────────────────────────────────────────

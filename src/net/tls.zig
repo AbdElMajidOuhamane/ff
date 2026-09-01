@@ -12,6 +12,7 @@ const http = std.http;
 // (types/headers.zig: lowerAsciiSimd, net/http_native.zig: findHeaderEnd);
 // this module previously carried unused copies that have been removed.
 // ============================================================
+const Io =std.Io;
 pub const MAX_CONN = 64;
 
 /// Hard bound on any single socket read/write on pooled connections: a
@@ -56,9 +57,14 @@ fn releaseSlot(s: usize) void {
 // ============================================================
 // TLS-capable HTTP client (std-backed, shared singleton)
 // ============================================================
-var io_backend: std.Io.Threaded = undefined;
+var io_backend: Io.Threaded = undefined;
 var http_client: http.Client = undefined;
 var client_initialized = false;
+
+/// Optional client CA file (PEM) loaded into the shared HTTP client's CA
+/// bundle at init(). Set by start.zig (--cert) or via FF_CA_FILE/FF_CERT env.
+pub var ca_file: ?[]const u8 = null;
+
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
@@ -74,6 +80,30 @@ pub fn init() void {
         .allocator = std.heap.page_allocator,
         .io = io_backend.io(),
     };
+    // Pin `now` up front: request() only rescans system roots (and swaps out
+    // ca_bundle) when now == null. With now set, our loaded CA persists.
+    http_client.now = Io.Clock.real.now(http_client.io);
+    const io = http_client.io;
+    const ca_env: ?[]const u8 = ca_file orelse blk: {
+        const p = std.c.getenv("FF_CA_FILE") orelse std.c.getenv("FF_CERT") orelse break :blk null;
+        break :blk std.mem.span(p);
+    };
+    if (ca_env) |path| {
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
+            std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
+            return;
+        };
+        defer file.close(io);
+        var file_reader = file.reader(io, &.{});
+        // now_sec=0 skips pre-filtering; the handshake enforces real validity.
+        http_client.ca_bundle.addCertsFromFile(
+            std.heap.page_allocator,
+            &file_reader,
+            0,
+        ) catch |e| {
+            std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
+        };
+    }
     client_initialized = true;
 }
 pub fn deinit() void {

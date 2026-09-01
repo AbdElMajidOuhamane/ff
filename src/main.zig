@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("engine/engine.zig");
+const tls = @import("net/tls.zig");
 const init_cmd = @import("commands/init.zig");
 const start_cmd = @import("commands/start.zig");
 const bench_cmd = @import("commands/bench.zig");
@@ -29,6 +30,20 @@ fn shutdownRuntime(runtime: *engine.Runtime) void {
     runtime.event_loop.deinit();
     runtime.deinit();
 }
+/// Scan the full arg list for `--ca <path>` and stage it for tls.init().
+/// (tls.ca_file is consumed inside engine.Runtime.init -> tls.init().)
+fn parseCaFlag(init: std.process.Init) void {
+    var it = init.minimal.args.iterate();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--ca")) {
+            tls.ca_file = it.next() orelse {
+                std.debug.print("Error: --ca requires a path\n", .{});
+                std.process.exit(1);
+            };
+            return;
+        }
+    }
+}
 pub fn main(init: std.process.Init) !void {
     var args_iter = init.minimal.args.iterate();
     _ = args_iter.next();
@@ -46,12 +61,14 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Error: -e requires an argument", .{});
                 std.process.exit(1);
             };
+            parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
             _ = runtime.eval(code, "<eval>");
             runtime.event_loop.runWithMicrotasks(runtime.ctx);
         },
         .file => {
+            parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
             const file = c.fopen(first_arg.ptr, "rb") orelse {
@@ -75,8 +92,8 @@ pub fn main(init: std.process.Init) !void {
 fn printUsage() void {
     std.debug.print("Usage:", .{});
     std.debug.print("  ff init              Initialize a new project", .{});
-    std.debug.print("  ff start             Run the project's main file", .{});
+    std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project (https/wss with cert+key)", .{});
     std.debug.print("  ff bench             Run benchmarks", .{});
-    std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
-    std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
+    std.debug.print("  ff -e <code> [--ca ca.pem]   Run inline JavaScript", .{});
+    std.debug.print("  ff <file.js> [--ca ca.pem]   Run a JavaScript file", .{});
 }

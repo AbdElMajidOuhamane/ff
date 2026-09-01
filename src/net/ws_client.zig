@@ -220,7 +220,7 @@ pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
     _ = std.c.write(pipe_fds[s][1], &[_]u8{1}, 1);
 }
 
-// ---- Worker (unchanged except no v8 references) ----
+// ---- Worker ----
 
 fn workerMain(slot_id: u16) void {
     const s: usize = slot_id;
@@ -308,7 +308,10 @@ fn workerMain(slot_id: u16) void {
         const rc = std.posix.poll(&pfd, if (tls_ready) 0 else 50) catch 0;
         if (tls_ready or (rc != 0 and pfd[0].revents != 0)) {
             if (rd_len[s] >= RDBUF) break;
-            const n = readWs(s, cn, rd_buf[s][rd_len[s]..]) catch break;
+            const n = readWs(s, cn, rd_buf[s][rd_len[s]..]) catch |e| {
+                std.debug.print("[wss] read error: {s}\n", .{@errorName(e)});
+                break;
+            };
             if (n == 0) {
                 if (!tls_active[s]) break;
             } else {
@@ -415,7 +418,19 @@ fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {
     if (!tls_active[s]) {
         return std.posix.read(sock_fds[s], buf);
     }
-    return cn.reader().readSliceShort(buf);
+    // TLS: never hand readSliceShort a large destination — it loops fill()
+    // until the destination is FULL (short return only on EndOfStream), so
+    // after decrypting one record it blocks reading the NEXT record header
+    // until RCVTIMEO. Fill once, then copy exactly what is buffered.
+    // (Verified against std/Io/Reader.zig readSliceShort.)
+    const r = cn.reader();
+    if (r.bufferedLen() == 0) {
+        try r.fill(1); // one fill: decrypts one pending record (or EOF/error)
+    }
+    const n = @min(buf.len, r.bufferedLen());
+    if (n == 0) return 0; // record consumed but no app data (alert/ticket)
+    try r.readSliceAll(buf[0..n]); // fully satisfied from the buffer — no blocking
+    return n;
 }
 fn verifyUpgrade(s: usize, cn: *http.Client.Connection) bool {
     _ = cn;
@@ -681,13 +696,29 @@ fn makeOpenEvent(ctx: ?*c.Context) c.Value {
     return newEventObj(ctx, "open");
 }
 
+fn u8ArrayFromBytes(ctx: ?*c.Context, bytes: []const u8) c.Value {
+    const ab = c.newArrayBufferCopy(ctx, bytes.ptr, bytes.len);
+    if (c.getTag(ab) == c.TAG_EXCEPTION) return ab;
+    defer c.freeValue(ctx, ab);
+    // JS_NewTypedArray implements the 3-arg constructor form: with an
+    // ArrayBuffer as argv[0] it unconditionally reads argv[1] (offset) and
+    // argv[2] (length) — passing argc=1 reads out of bounds and yields a
+    // zero-length view. Pass all three args explicitly.
+    var argv = [_]c.Value{
+        ab,
+        c.newInt32(ctx, 0),
+        c.newInt32(ctx, @intCast(bytes.len)),
+    };
+    return c.newTypedArray(ctx, 3, &argv, c.JS_TYPED_ARRAY_UINT8);
+}
+
 fn makeMessageEvent(ctx: ?*c.Context, s: usize) c.Value {
     const obj = newEventObj(ctx, "message");
     const n = @min(rx_len[s], WS_MSG_SIZE);
     const data_val = if (rx_binary[s])
-    c.newArrayBufferCopy(ctx, &rx_msg[s], n)
-else
-    c.newStringLen(ctx, &rx_msg[s], n);
+        u8ArrayFromBytes(ctx, rx_msg[s][0..n])
+    else
+        c.newStringLen(ctx, &rx_msg[s], n);
     _ = c.definePropertyValueStr(ctx, obj, "data", data_val, c.PROP_C_W_E);
     return obj;
 }

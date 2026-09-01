@@ -6,3 +6,4 @@ tests
 bench
 *.md
 vendor/quickjs
+vendor/bearssl

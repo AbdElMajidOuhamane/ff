@@ -6,6 +6,8 @@ const microtasks = @import("../event/microtasks.zig");
 const ws = @import("ws_native.zig");
 const api_ws = @import("../api/websocket.zig");
 const builtin = @import("builtin");
+const tls_mod = @import("tls_server.zig");
+const tls_on = tls_mod.available;
 
 var req_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -21,17 +23,19 @@ const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
 
 const ConnState = enum(u8) { idle, reading, writing, closing };
-const ConnFlags = packed struct(u8) {
+const ConnFlags = packed struct(u16) {
     keep_alive: bool = false,
     ws_open: bool = false,
     ws_writing: bool = false,
     ws_close_after_write: bool = false,
     ws_read_armed: bool = false,
     ws_pending_open: bool = false,
-    _pad: u2 = 0,
+    tls: bool = false,
+    tls_close_after_write: bool = false,
+    _pad: u8 = 0,
 };
 comptime {
-    assert(@sizeOf(ConnFlags) == 1);
+    assert(@sizeOf(ConnFlags) == 2);
     assert(@sizeOf(Method) == 1);
     assert(@sizeOf(ParsedRequest) <= 64);
     assert(@sizeOf(ConnState) == 1);
@@ -62,10 +66,17 @@ var ws_partial: [MAX_CONN][ws.WS_MSG_SIZE]u8 = undefined;
 // DOD-FIX 3: chunked-write state for large response bodies.
 var body_remaining: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var body_source_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
-// body_bufs holds up to one staged large body per slot, used when the body
-// doesn't fit in write_bufs. Static allocation: MAX_CONN × WRITE_BUF_SIZE.
-var body_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
+// body_bufs holds one fully-staged large response body per slot. Static
+// allocation: MAX_CONN × BODY_BUF_SIZE. Bodies larger than BODY_BUF_SIZE
+// get a 500 (JS body pointers are freed when callHandler returns, so the
+// whole body must be staged before the write pipeline starts).
+const BODY_BUF_SIZE = 64 * 1024;
+var body_bufs: [MAX_CONN][BODY_BUF_SIZE]u8 = undefined;
 var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+// ── TLS (https/wss): per-slot BearSSL engine + bidirectional iobuf ──
+var tls_ctxs: [MAX_CONN]tls_mod.Ctx = undefined;
+var tls_iobufs: [MAX_CONN][tls_mod.IOBUF_LEN]u8 = undefined;
+var tls_active: bool = false; // runtime switch (cert/key given), set before accept starts
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = 0;
 var slot_ids: [MAX_CONN]u16 = undefined;
@@ -319,6 +330,120 @@ fn buildResponse(id: usize, status: u16, body: []const u8) void {
     }
     write_lens[id] = pos;
 }
+
+// ── TLS (https/wss) helpers ─────────────────────────────────────────
+// Plain path: kernel reads/writes hit read_bufs/write_bufs directly.
+// TLS path:   kernel <-> BearSSL engine; plaintext flows via read_bufs/write_bufs.
+
+pub fn enableTls() void {
+    if (tls_on) tls_active = tls_mod.ready();
+}
+
+fn armRead(id: usize, l: *xev.Loop) void {
+    if (tls_on and cflags[id].tls) {
+        // Kernel may write ciphertext straight into the engine's landing buffer.
+        const sp = tls_mod.recvRecSpace(&tls_ctxs[id]);
+        if (sp.len == 0) return;
+        states[id] = .reading;
+        fds[id].read(l, &read_comps[id], .{ .slice = sp }, u16, &slot_ids[id], readCb);
+        return;
+    }
+    states[id] = .reading;
+    fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
+}
+
+fn armWrite(id: usize, l: *xev.Loop) void {
+    if (tls_on and cflags[id].tls) {
+        // Feed staged plaintext into the engine, then write ciphertext.
+        var fed: usize = 0;
+        while (write_lens[id] > fed) {
+            const got = tls_mod.sendAppFeed(&tls_ctxs[id], write_bufs[id][fed..write_lens[id]]);
+            if (got == 0) break;
+            fed += got;
+        }
+        if (fed < write_lens[id]) {
+            const rem = write_lens[id] - fed;
+            @memmove(write_bufs[id][0..rem], write_bufs[id][fed..write_lens[id]]);
+            write_lens[id] = rem;
+        } else {
+            write_lens[id] = 0;
+        }
+        write_offsets[id] = 0;
+        tls_mod.flush(&tls_ctxs[id]);
+        const out = tls_mod.sendRecReady(&tls_ctxs[id]);
+        
+        if (out.len == 0) return;
+        states[id] = .writing;
+        fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+        return;
+    }
+    states[id] = .writing;
+    fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+}
+
+/// Drive the BearSSL engine. br_ssl_engine_current_state() returns a BITMASK
+/// (flags combine; verified in bearssl_ssl.h), so check every applicable flag
+/// each pass, in BearSSL's documented priority: SENDREC > RECVAPP > SENDAPP > RECVREC.
+/// Called from readCb (after recvRecAck) and from writeCb (after ciphertext drained).
+fn tlsPump(id: usize, l: *xev.Loop) void {
+    var spins: u8 = 0;
+    while (spins < 32) : (spins += 1) {
+        const st = tls_mod.curState(&tls_ctxs[id]);
+        if (st & tls_mod.ST_CLOSED != 0) {
+            closeConn(id);
+            return;
+        }
+        // 1) Ciphertext ready for the kernel: write it (writeCb acks + re-pumps).
+        if (st & tls_mod.ST_SENDREC != 0) {
+            const out = tls_mod.sendRecReady(&tls_ctxs[id]);
+            if (out.len > 0) {
+                states[id] = .writing;
+                fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+                return;
+            }
+        }
+        // 2) Decrypted app data: stage into read_bufs, keep looping.
+        if (st & tls_mod.ST_RECVAPP != 0) {
+            const app = tls_mod.recvAppReady(&tls_ctxs[id]);
+            if (app.len > 0) {
+                if (buf_lens[id] + app.len > READ_BUF_SIZE) {
+                    closeConn(id);
+                    return;
+                }
+                @memcpy(read_bufs[id][buf_lens[id]..][0..app.len], app);
+                buf_lens[id] += app.len;
+                tls_mod.recvAppAck(&tls_ctxs[id], app.len);
+                continue;
+            }
+        }
+        // 3) Engine accepts plaintext: feed staged response data.
+        if (st & tls_mod.ST_SENDAPP != 0 and write_lens[id] > 0) {
+            armWrite(id, l);
+            return;
+        }
+        // 4) Engine wants ciphertext: process buffered plaintext first, else read.
+        if (st & tls_mod.ST_RECVREC != 0 and tls_mod.recvRecSpace(&tls_ctxs[id]).len > 0) {
+            if (buf_lens[id] > 0) {
+                processPlaintext(id, l);
+                return;
+            }
+            if (cflags[id].ws_open) armReadId(id, l) else armRead(id, l);
+            return;
+        }
+        return; // nothing actionable — wait for a kernel op to complete
+    }
+}
+
+fn hardClose(id: usize) void {
+    states[id] = .closing;
+    const loop = g_loop orelse {
+        states[id] = .idle;
+        freePush(id);
+        return;
+    };
+    fds[id].close(loop, &close_comps[id], u16, &slot_ids[id], closeCb);
+}
+
 fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
@@ -326,50 +451,22 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     return @intCast(out);
 }
 
-// DOD-FIX 3: chunked large-body write helper. Stages up to one body per slot
-// in body_bufs[id]; writeCb drains it across multiple tcp.write calls.
+// DOD-FIX 3: chunked large-body write helper. Stages the whole body per slot
+// in body_bufs[id]; writeCb drains it in WRITE_BUF_SIZE chunks.
 fn stageLargeResponse(id: usize, status: u16, body_ptr: [*]const u8, blen: usize, keep_alive: bool) void {
-    // Copy body into the static body_bufs (chunked) and remember total length.
-    var copied: usize = 0;
-    const dst = &body_bufs[id];
-    while (copied < blen) {
-        const chunk_len = @min(WRITE_BUF_SIZE, blen - copied);
-        @memcpy(dst[0..chunk_len], body_ptr[copied..][0..chunk_len]);
-        copied += chunk_len;
-        // Format a header for each chunk we stage into write_bufs as we go.
-        // For the simple case where body fits in a single chunk, we still
-        // need Content-Length so writeCb knows to terminate.
-        break;
+    if (blen > BODY_BUF_SIZE) {
+        buildResponse(id, 500, "response body too large");
+        return;
     }
-    // If the body fits entirely in one chunk:
-    if (blen <= WRITE_BUF_SIZE) {
-        var hdr: [256]u8 = undefined;
-        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
-        const w = &write_bufs[id];
-        @memcpy(w[0..hlen], hdr[0..hlen]);
-        @memcpy(w[hlen..][0..blen], body_ptr[0..blen]);
-        write_lens[id] = hlen + blen;
-        write_offsets[id] = 0;
-        body_remaining[id] = 0;
-        body_source_off[id] = 0;
-    } else {
-        // Multi-chunk path: emit Content-Length, send header first, then
-        // stream body in WRITE_BUF_SIZE chunks through body_bufs.
-        var hdr: [256]u8 = undefined;
-        const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
-        const w = &write_bufs[id];
-        @memcpy(w[0..hlen], hdr[0..hlen]);
-        write_lens[id] = hlen;
-        write_offsets[id] = 0;
-        body_remaining[id] = blen;
-        body_source_off[id] = 0;
-        body_lens[id] = blen;
-        // Stage the first body chunk into body_bufs so writeCb can pick it up.
-        const n = @min(WRITE_BUF_SIZE, blen);
-        @memcpy(body_bufs[id][0..n], body_ptr[0..n]);
-        body_source_off[id] = n;
-        body_remaining[id] = blen - n;
-    }
+    var hdr: [256]u8 = undefined;
+    const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
+    @memcpy(write_bufs[id][0..hlen], hdr[0..hlen]);
+    write_lens[id] = hlen;
+    write_offsets[id] = 0;
+    @memcpy(body_bufs[id][0..blen], body_ptr[0..blen]);
+    body_lens[id] = blen; // total staged body size
+    body_remaining[id] = blen; // bytes not yet copied into write_bufs
+    body_source_off[id] = 0; // read cursor into body_bufs
 }
 
 fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
@@ -523,13 +620,31 @@ fn wsNotify(id: usize, which: ?c.Value, argc: u32) void {
     }
 }
 
+/// Copy `bytes` into a fresh JS Uint8Array view (binary WS messages arrive
+/// as Uint8Array — matches every example in examples/ and Node's ws).
+fn u8ArrayFromBytes(ctx: ?*c.Context, bytes: []const u8) c.Value {
+    const ab = c.newArrayBufferCopy(ctx, bytes.ptr, bytes.len);
+    if (c.getTag(ab) == c.TAG_EXCEPTION) return ab;
+    defer c.freeValue(ctx, ab);
+    // JS_NewTypedArray implements the 3-arg constructor form: with an
+    // ArrayBuffer as argv[0] it unconditionally reads argv[1] (offset) and
+    // argv[2] (length) — passing argc=1 reads out of bounds and yields a
+    // zero-length view. Pass all three args explicitly.
+    var argv = [_]c.Value{
+        ab,
+        c.newInt32(ctx, 0),
+        c.newInt32(ctx, @intCast(bytes.len)),
+    };
+    return c.newTypedArray(ctx, 3, &argv, c.JS_TYPED_ARRAY_UINT8);
+}
+
 fn wsNotifyMessage(id: usize, msg: []const u8, binary: bool) void {
     const ctx = handler_ctx orelse return;
     const cb = ws_on_message orelse return;
     if (c.isFunction(ctx, cb) == 0) return;
     const sock = wsSocket(id, ctx) orelse return;
     const data_val = if (binary)
-        c.newArrayBufferCopy(ctx, msg.ptr, msg.len)
+        u8ArrayFromBytes(ctx, msg)
     else
         c.newStringLen(ctx, msg.ptr, @intCast(msg.len));
     defer c.freeValue(ctx, data_val);
@@ -683,6 +798,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 }
 
 fn wsConsume(id: usize, l: *xev.Loop) void {
+    
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
         const hdr = ws.parseHeader(leftover) orelse break;
@@ -745,7 +861,7 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
     if (end == start) {
         buildResponse(id, 400, "Bad Request");
         states[id] = .writing;
-        fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+        armWrite(id, l);
         return;
     }
     const key = read_bufs[id][start..end];
@@ -775,7 +891,7 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
     states[id] = .writing;
     write_offsets[id] = 0;
     ws_batch[id] = write_lens[id];
-    fds[id].write(l, &write_comps[id], .{ .slice = w[0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+    armWrite(id, l);
 }
 
 fn closeConn(id: usize) void {
@@ -784,13 +900,22 @@ fn closeConn(id: usize) void {
     body_lens[id] = 0;
     wsShutdown(id);
     if (states[id] == .closing) return;
-    states[id] = .closing;
-    const loop = g_loop orelse {
-        states[id] = .idle;
-        freePush(id);
-        return;
-    };
-    fds[id].close(loop, &close_comps[id], u16, &slot_ids[id], closeCb);
+    if (tls_on and cflags[id].tls) {
+        tls_mod.shutdown(&tls_ctxs[id]); // close_notify
+        tls_mod.flush(&tls_ctxs[id]);
+        const out = tls_mod.sendRecReady(&tls_ctxs[id]);
+        if (out.len > 0) {
+            states[id] = .closing;
+            cflags[id].tls_close_after_write = true;
+            const l = g_loop orelse {
+                hardClose(id);
+                return;
+            };
+            fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+            return;
+        }
+    }
+    hardClose(id);
 }
 
 fn closeCb(
@@ -830,11 +955,11 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
-    cflags[id] = .{ .keep_alive = true, .ws_read_armed = true };
+    cflags[id] = .{ .keep_alive = true, .ws_read_armed = true, .tls = tls_active };
     ws_partial_len[id] = 0;
     ws_partial_binary[id] = false;
-    ws_batch[id] = 0;
-    fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
+    if (tls_on and tls_active) tls_mod.slotInit(&tls_ctxs[id], &tls_iobufs[id]);
+    armRead(id, l);
     return true;
 }
 
@@ -879,10 +1004,23 @@ fn readCb(
         closeConn(id);
         return .disarm;
     }
+    if (tls_on and cflags[id].tls) {
+        // Ciphertext landed in the engine buffer; ack and drive the engine.
+        tls_mod.recvRecAck(&tls_ctxs[id], n);
+        tlsPump(id, l);
+        return .disarm;
+    }
     buf_lens[id] += n;
+    processPlaintext(id, l);
+    return .disarm;
+}
+
+/// HTTP/WS state machine over bytes in read_bufs[0..buf_lens]
+/// (plaintext for plain HTTP, decrypted app-data when TLS is active).
+fn processPlaintext(id: usize, l: *xev.Loop) void {
     if (cflags[id].ws_open) {
         wsConsume(id, l);
-        return .disarm;
+        return;
     }
     const scan_from = if (hdr_scan_off[id] > 3) hdr_scan_off[id] - 3 else 0;
     const he_found = findHeaderEnd(read_bufs[id][0..buf_lens[id]], scan_from);
@@ -890,10 +1028,10 @@ fn readCb(
         hdr_scan_off[id] = buf_lens[id];
         if (buf_lens[id] >= READ_BUF_SIZE) {
             closeConn(id);
-            return .disarm;
+            return;
         }
-        fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
-        return .disarm;
+        armRead(id, l);
+        return;
     }
     const headers_end = he_found.? + 4;
     hdr_scan_off[id] = 0;
@@ -902,25 +1040,25 @@ fn readCb(
     if (ws_enabled) {
         if (findTokenCI(read_bufs[id][0..buf_lens[id]], "sec-websocket-key:")) |kpos| {
             tryUpgrade(id, l, kpos, headers_end, &pr);
-            return .disarm;
+            return;
         }
     }
     if (pr.method.len == 0) {
         buildResponse(id, 400, "Bad Request");
         states[id] = .writing;
-        fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
-        return .disarm;
+        armWrite(id, l);
+        return;
     }
     const expect = headers_end + pr.content_length;
     if (expect > READ_BUF_SIZE) {
         buildResponse(id, 413, "Payload Too Large");
         states[id] = .writing;
-        fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
-        return .disarm;
+        armWrite(id, l);
+        return;
     }
     if (buf_lens[id] < expect) {
-        fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
-        return .disarm;
+        armRead(id, l);
+        return;
     }
     cflags[id].keep_alive = pr.keep_alive;
     if (native_echo) {
@@ -930,8 +1068,7 @@ fn readCb(
         callHandler(id, &pr, body);
     }
     states[id] = .writing;
-    fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
-    return .disarm;
+    armWrite(id, l);
 }
 
 fn writeCb(
@@ -948,6 +1085,82 @@ fn writeCb(
         closeConn(id);
         return .disarm;
     };
+
+    if (tls_on and cflags[id].tls) {
+        tls_mod.sendRecAck(&tls_ctxs[id], written);
+        const out = tls_mod.sendRecReady(&tls_ctxs[id]);
+        if (out.len > 0) {
+            tcp.write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+            return .disarm;
+        }
+        // All ciphertext drained — the staged plaintext "write" is complete.
+        write_lens[id] = 0;
+        write_offsets[id] = 0;
+        if (cflags[id].tls_close_after_write) {
+            hardClose(id);
+            return .disarm;
+        }
+        if (cflags[id].ws_open) {
+            ws_batch[id] = 0;
+            cflags[id].ws_writing = false;
+            if (cflags[id].ws_pending_open) {
+                cflags[id].ws_pending_open = false;
+                wsNotifyOpen(id);
+            }
+            if (cflags[id].ws_close_after_write) {
+                wsShutdown(id);
+                hardClose(id);
+                return .disarm;
+            }
+        } else if (body_lens[id] > 0) {
+            // Large-body chunked write: load the next chunk from body_bufs.
+            if (write_lens[id] == 0) {
+                const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
+                if (n > 0) {
+                    @memcpy(write_bufs[id][0..n], body_bufs[id][body_source_off[id]..][0..n]);
+                    write_lens[id] = n;
+                    write_offsets[id] = 0;
+                    body_source_off[id] += n;
+                    body_remaining[id] -= n;
+                } else {
+                    body_lens[id] = 0;
+                    body_remaining[id] = 0;
+                    body_source_off[id] = 0;
+                }
+            }
+            if (write_lens[id] > 0) {
+                armWrite(id, l);
+                return .disarm;
+            }
+            if (cflags[id].keep_alive) {
+                states[id] = .reading;
+                buf_lens[id] = 0;
+                hdr_scan_off[id] = 0;
+                tlsPump(id, l);
+            } else {
+                closeConn(id);
+            }
+            return .disarm;
+        }
+        // Frames staged while ciphertext was in flight.
+        if (write_lens[id] > 0) {
+            armWrite(id, l);
+            return .disarm;
+        }
+        if (cflags[id].ws_open) {
+            if (!cflags[id].ws_read_armed) tlsPump(id, l);
+            return .disarm;
+        }
+        if (cflags[id].keep_alive) {
+            states[id] = .reading;
+            buf_lens[id] = 0;
+            hdr_scan_off[id] = 0;
+            tlsPump(id, l); // re-enter pump: arms read / feeds staged data
+        } else {
+            closeConn(id);
+        }
+        return .disarm;
+    }
 
     if (cflags[id].ws_open) {
         write_offsets[id] += written;
@@ -986,16 +1199,16 @@ fn writeCb(
 
     write_offsets[id] += written;
 
-    // DOD-FIX 3: drain any remaining large-body chunks via body_bufs/body_remaining.
-    if (body_remaining[id] > 0 or body_lens[id] > 0) {
-        if (write_lens[id] == 0 and body_lens[id] > 0) {
-            // Header was already written; load the next body chunk.
+    // DOD-FIX 3: drain large-body chunks via body_bufs with proper offsets.
+    if (body_lens[id] > 0) {
+        if (write_offsets[id] >= write_lens[id]) {
+            // Current span (header or chunk) fully written; load the next chunk.
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
-                // All chunks drained.
                 body_lens[id] = 0;
                 body_remaining[id] = 0;
                 body_source_off[id] = 0;
+                write_lens[id] = 0;
                 write_offsets[id] = 0;
                 if (cflags[id].keep_alive) {
                     states[id] = .reading;
@@ -1007,15 +1220,10 @@ fn writeCb(
                 }
                 return .disarm;
             }
-            // body_bufs holds the next chunk at offset 0 (already staged by setup).
-            // Advance our pointer through body_bufs as we write.
-            const staged_offset = body_lens[id] - body_remaining[id];
-            const remaining_in_buf = body_bufs[id].len - @as(usize, 0);
-            _ = staged_offset;
-            _ = remaining_in_buf;
-            @memcpy(write_bufs[id][0..n], body_bufs[id][0..n]);
+            @memcpy(write_bufs[id][0..n], body_bufs[id][body_source_off[id]..][0..n]);
             write_lens[id] = n;
             write_offsets[id] = 0;
+            body_source_off[id] += n;
             body_remaining[id] -= n;
         }
         if (write_offsets[id] < write_lens[id]) {
@@ -1027,21 +1235,6 @@ fn writeCb(
                 &slot_ids[id],
                 writeCb,
             );
-            return .disarm;
-        }
-        if (body_remaining[id] == 0 and body_lens[id] > 0) {
-            body_lens[id] = 0;
-            body_remaining[id] = 0;
-            write_offsets[id] = 0;
-            write_lens[id] = 0;
-            if (cflags[id].keep_alive) {
-                states[id] = .reading;
-                buf_lens[id] = 0;
-                hdr_scan_off[id] = 0;
-                fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
-            } else {
-                closeConn(id);
-            }
             return .disarm;
         }
         return .disarm;
@@ -1071,12 +1264,12 @@ fn wsKick(id: usize) void {
     cflags[id].ws_writing = true;
     write_offsets[id] = 0;
     ws_batch[id] = write_lens[id];
-    fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][0..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+    armWrite(id, l);
 }
 
 fn armReadId(id: usize, l: *xev.Loop) void {
     cflags[id].ws_read_armed = true;
-    fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
+    armRead(id, l);
 }
 
 pub fn init(loop: *xev.Loop, port: u16) !void {
@@ -1095,6 +1288,7 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
     listener_tcp.accept(loop, &accept_comp, void, null, acceptCb);
     initialized = true;
     std.debug.print("[http] listening on 0.0.0.0:{d}\n", .{port});
+    if (tls_active) std.debug.print("[http] TLS mode: https/wss active\n", .{});
 }
 
 pub fn deinit() void {

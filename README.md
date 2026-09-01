@@ -21,6 +21,7 @@ and a small readable codebase.
    - [Fetch client](#fetch-client)
    - [WebSocket server](#websocket-server)
    - [WebSocket client](#websocket-client)
+   - [TLS: HTTPS and WSS servers](#tls-https-and-wss-servers)
    - [URL parsing](#url-parsing)
    - [Working with modules](#working-with-modules)
 5. [Built-in API reference](#built-in-api-reference)
@@ -80,7 +81,7 @@ timers, I/O completions, and microtasks.
 ```
 ┌─ JS code runs ─┐    ┌─ pending timer fires ─┐
 │                 │ →  │                         │
-└─────────────────┘    └─ microtask pump ────────�
+└─────────────────┘    └─ microtask pump ────────┘
                                 ↓
                     ┌─ I/O completion (kqueue/epoll) ─┐
                     └─ back to JS code ───────────────┘
@@ -243,6 +244,95 @@ ws.onclose = () => console.log("closed");
 
 Static constants: `WebSocket.CONNECTING`, `.OPEN`, `.CLOSING`, `.CLOSED`.
 
+### TLS: HTTPS and WSS servers
+
+Fairyfly ships with a built-in TLS stack ([BearSSL](https://www.bearssl.org)) —
+no OpenSSL dependency, no system libraries. The same `http.serve` code serves
+plain HTTP and HTTPS; TLS is enabled per server, and WebSocket (`wss://`)
+rides on it for free.
+
+**Enable TLS from JavaScript** (cert/key accept file paths *or* inline PEM
+content — anything starting with `-----BEGIN` is treated as PEM):
+
+```js
+// tls_server.js
+http.serve({
+    port: 8443,
+    tls: {
+        cert: "cert.pem",   // path, or PEM string
+        key:  "key.pem",
+    },
+    websocket: {
+        message: (sock, msg) => sock.send(`echo: ${msg}`),
+    },
+}, (req) => new Response("hello over tls"));
+```
+
+**Or enable it from the CLI** (applies to whatever `ff start` runs):
+
+```sh
+ff start --cert cert.pem --key key.pem
+# env fallback: FF_CERT / FF_KEY
+```
+
+If both are given, the JS-level `tls` config wins (it is applied when the
+listener starts). A failed TLS config throws a `TypeError` — the server
+never starts half-configured.
+
+**WebSocket over TLS (wss):** nothing extra — connect with `wss://` on the
+same port:
+
+```js
+const ws = new WebSocket("wss://localhost:8443/ws");
+ws.onopen = () => ws.send("hello over tls");
+```
+
+Binary frames arrive as `Uint8Array` (send them the same way):
+
+```js
+ws.onmessage = (e) => {
+    if (e.data instanceof Uint8Array) { /* binary */ }
+    else { /* string */ }
+};
+```
+
+**Trusting the server:**
+
+- The runtime's own clients (`fetch`, `WebSocket`) trust the served cert
+  automatically when it was given as a file path (`tls.cert` or `--cert`) —
+  so `fetch("https://localhost:8443")` works against your own server.
+- To trust it from a separate script, pass the cert as a CA:
+
+```sh
+ff client.js --ca cert.pem      # or env: FF_CA_FILE=cert.pem
+```
+
+- External tools: `curl -k`, or `NODE_EXTRA_CA_CERTS=cert.pem node client.mjs`.
+
+**Generating a dev certificate** (SANs matter — the runtime verifies the
+hostname; use `localhost`, not `127.0.0.1`, unless the SAN includes the IP):
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+**Notes & limitations:**
+
+- TLS 1.2 (BearSSL does not implement TLS 1.3) — compatible with curl,
+  browsers, Node, and Zig's std TLS client
+- RSA or EC keys; RSA is recommended — the runtime's own client negotiates
+  ECDHE_RSA suites
+- One listener is TLS-or-plain (no dual-port, no client certificates, no
+  session resumption yet)
+- Zero allocations on the TLS hot path; ~17 MB static buffers for 512
+  concurrent connections (lazily paged)
+- Docker: the image fetches BearSSL at build time (pinned + sha256-verified);
+  serving certs are mounted at runtime:
+  `docker run -v ./certs:/app/certs ff start --cert /app/certs/cert.pem --key /app/certs/key.pem`
+- Builds can opt out entirely: `zig build -Dbearssl=false`
+
 ### URL parsing
 
 ```js
@@ -308,7 +398,8 @@ Module paths:
 
 ### Namespaces
 
-- `http.serve(options, handler)` — start an HTTP server
+- `http.serve(options, handler)` — start an HTTP server; pass
+  `tls: { cert, key }` to enable HTTPS/WSS (cert/key: file path or PEM)
 - `Response.json(value, init?)` — JSON response shortcut
 - `Response.redirect(url, status?)` — redirect response shortcut
 - `Response.error()` — empty 500 response shortcut
@@ -362,7 +453,7 @@ The wrk script in this repo reproduces this: `./wrk.sh`.
 │   • net/    — http_native (SoA 512-slot server)   │
 │   • event/  — loop, timers, microtasks            │
 │   • types/  — HeadersData, RequestData, etc.      │
-└──────────────────┬───────────────────────────────�
+└──────────────────┬───────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────┐
 │ libxev event loop (epoll on Linux, kqueue on mac) │
@@ -385,6 +476,9 @@ Requirements:
 - Zig 0.16 (uses 0.16.0 std APIs)
 - C compiler (clang on macOS, gcc on Linux) — QuickJS vendored as C source
 - A POSIX system (macOS or Linux)
+
+TLS is built in by default (BearSSL, fetched into `vendor/bearssl/` — same
+untracked-vendor pattern as QuickJS). Disable with: `zig build -Dbearssl=false`
 
 ```sh
 git clone <repo>
@@ -417,12 +511,15 @@ make build
 ff <file.js>             Run a JavaScript file
 ff -e <code>             Run inline JavaScript code
 ff init [<dir>]          Write ff.json in <dir> (default: cwd)
-ff start                 Run the file named in ff.json's "main"
+ff start [--cert cert.pem --key key.pem]
+                         Run ff.json's "main" (TLS enabled with cert+key)
 ff bench                 Run JS microbenchmarks
 ```
 
 Environment variables:
 - `FF_ECHO=1` — run the server in echo mode (returns canned response)
+- `FF_CERT` / `FF_KEY` — TLS cert/key paths (same as `--cert/--key`)
+- `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
 
 ---
 
@@ -446,6 +543,14 @@ The `examples/` directory has working scripts for every API:
 | `express-test/` | Express-style routing patterns |
 | `fetch_pool_test.js` | Connection pool stress test |
 
+TLS tests live in `tests/tls/`:
+
+| File | Demonstrates |
+|---|---|
+| `server.js` | HTTPS + WSS server (TLS from JS or CLI) |
+| `wss-client.js` | WSS client round-trip test (`ff wss-client.js --ca cert.pem`) |
+| `node-client.mjs` | Independent Node cross-check (`NODE_EXTRA_CA_CERTS=cert.pem node node-client.mjs`) |
+
 Run any of them:
 
 ```sh
@@ -463,6 +568,7 @@ MIT. See [LICENSE](LICENSE).
 ## Acknowledgments
 
 - QuickJS — Fabrice Bellard
+- [BearSSL](https://www.bearssl.org) — Thomas Pornin
 - libxev — [mitchellh](https://github.com/mitchellh/libxev)
 - Inspired by Node.js, Bun, and Deno — none of their code is included; this is
   a from-scratch implementation in Zig

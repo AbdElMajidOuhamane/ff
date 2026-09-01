@@ -1,0 +1,1 @@
+console.detail("Hello");

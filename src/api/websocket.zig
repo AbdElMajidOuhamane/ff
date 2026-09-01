@@ -42,17 +42,20 @@ fn socketSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Valu
 }
 
 fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
-    if (c.isObject(arg) == 0) return null;
+    // Raw ArrayBuffer
     var size: usize = 0;
     const p = c.getArrayBuffer(ctx, &size, arg);
     if (p != null and size > 0) return p[0..size];
-    const buf_val = c.getPropertyStr(ctx, arg, "buffer");
-    if (c.isObject(buf_val) != 0) {
-        var size2: usize = 0;
-        const p2 = c.getArrayBuffer(ctx, &size2, buf_val);
-        if (p2 != null and size2 > 0) return p2[0..size2];
-    }
-    return null;
+    // Typed array view (Uint8Array etc.): JS_GetTypedArrayBuffer works
+    // directly on views and reports offset/length — no JS property round-trip.
+    var byte_offset: usize = 0;
+    var byte_length: usize = 0;
+    var bytes_per_element: usize = 0;
+    const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bytes_per_element);
+    if (c.getTag(buf_val) == c.TAG_EXCEPTION) return null;
+    const p2 = c.getArrayBuffer(ctx, &size, buf_val) orelse return null;
+    if (byte_offset + byte_length > size) return null;
+    return p2[byte_offset..][0..byte_length];
 }
 
 fn socketSendBinary(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
