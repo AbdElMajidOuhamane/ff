@@ -238,6 +238,7 @@ pub const newCFunctionData = qjs_c.JS_NewCFunctionData;
 pub const setConstructor = qjs_c.JS_SetConstructor;
 pub const setConstructorBit = qjs_c.JS_SetConstructorBit;
 pub const JS_CFUNC_constructor = qjs_c.JS_CFUNC_constructor;
+pub const JS_CFUNC_generic_magic = qjs_c.JS_CFUNC_generic_magic;
 
 // ─── Function call ──────────────────────────────────────────────
 pub const call = qjs_c.JS_Call;

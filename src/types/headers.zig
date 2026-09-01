@@ -539,7 +539,7 @@ pub fn setup(ctx: ?*c.Context) void {
 
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
-    const ctor = c.newCFunction(ctx, &headersConstructor, "Headers", -1);
+    const ctor = c.newCFunction2(ctx, &headersConstructor, "Headers", -1, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "Headers", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }
 pub fn createJSObject(ctx: ?*c.Context, data: *HeadersData) c.Value {

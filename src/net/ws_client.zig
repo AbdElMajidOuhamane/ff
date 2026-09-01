@@ -4,6 +4,7 @@ const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
+const microtasks = @import("../event/microtasks.zig"); // CHANGED
 const gpa = std.heap.smp_allocator;
 const http = std.http;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
@@ -86,19 +87,24 @@ const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
 var async_armed = false;
+var g_ctx: ?*c.Context = null; // CHANGED
+var g_loop: ?*xev.Loop = null; // CHANGED
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 var socks: [MAX_WS]?c.Value = [_]?c.Value{null} ** MAX_WS;
 
 fn poolLock() void {
     while (!pool_lock.tryLock()) std.atomic.spinLoopHint();
 }
+
 fn poolUnlock() void {
     pool_lock.unlock();
 }
+
 fn poolInit() void {
     for (0..MAX_WS) |i| free_list[i] = @intCast(MAX_WS - 1 - i);
     free_count = MAX_WS;
 }
+
 fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
@@ -106,6 +112,7 @@ fn acquireSlot() ?usize {
     states[s].store(JOB_BUSY, .release);
     return s;
 }
+
 fn releaseSlot(s: usize) void {
     if (socks[s]) |v| {
         c.freeValue(undefined, v);
@@ -122,11 +129,14 @@ fn releaseSlot(s: usize) void {
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
-pub fn init() void {
+
+pub fn init(ctx: ?*c.Context) void { // CHANGED: takes ctx
+    g_ctx = ctx;
     poolInit();
     async_h = AsyncT.init() catch unreachable;
     async_armed = false;
 }
+
 pub fn submit(
     ctx: ?*c.Context,
     obj: c.Value,
@@ -180,8 +190,10 @@ pub fn submit(
         return error.SpawnFailed;
     };
     th.detach();
+    ensureArmed(); // CHANGED: cover the disarm→submit sequence in server mode
     return s;
 }
+
 fn makePipe(s: usize) !void {
     var fds: [2]std.posix.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeCreateFailed;
@@ -191,6 +203,7 @@ fn makePipe(s: usize) !void {
     _ = std.c.fcntl(fds[0], std.posix.F.SETFL, @as(c_int, @bitCast(@as(u32, @bitCast(flags)))));
     pipe_fds[s] = fds;
 }
+
 fn closePipe(s: usize) void {
     for (pipe_fds[s]) |fd| {
         if (fd == -1) continue;
@@ -198,6 +211,7 @@ fn closePipe(s: usize) void {
     }
     pipe_fds[s] = .{ -1, -1 };
 }
+
 pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
     if (states[s].load(.acquire) == JOB_FREE) return;
     if (!ws_open[s]) return;
@@ -209,6 +223,7 @@ pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
     tx_pending[s].store(true, .release);
     _ = std.c.write(pipe_fds[s][1], &[_]u8{1}, 1);
 }
+
 pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
     if (states[s].load(.acquire) == JOB_FREE) return;
     const rlen = @min(reason.len, @as(usize, CLOSE_REASON_MAX));
@@ -326,6 +341,7 @@ fn workerMain(slot_id: u16) void {
     }
     closeExit(s, cn, &req);
 }
+
 fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) void {
     if (rx_event[s] != EV_CLOSE) {
         rx_event[s] = EV_CLOSE;
@@ -336,6 +352,7 @@ fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) 
     signalEvent(s);
     finishSlot(s);
 }
+
 fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8, r: *?http.Client.Request) void {
     const mlen = @min(msg.len, rx_err[s].len);
     @memcpy(rx_err[s][0..mlen], msg[0..mlen]);
@@ -347,6 +364,7 @@ fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8,
     signalEvent(s);
     finishSlot(s);
 }
+
 fn cleanupConn(s: usize, conn: ?*http.Client.Connection, r: *?http.Client.Request) void {
     closePipe(s);
     const fd = sock_fds[s];
@@ -361,14 +379,17 @@ fn cleanupConn(s: usize, conn: ?*http.Client.Connection, r: *?http.Client.Reques
         _ = std.c.close(fd);
     }
 }
+
 fn finishSlot(s: usize) void {
     states[s].store(JOB_DONE, .release);
     async_h.notify() catch {};
 }
+
 fn signalEvent(s: usize) void {
     states[s].store(JOB_DONE, .release);
     async_h.notify() catch {};
 }
+
 fn waitState(s: usize, target: u8) void {
     while (states[s].load(.acquire) != target) std.atomic.spinLoopHint();
 }
@@ -386,11 +407,13 @@ fn buildUpgradeRequest(s: usize, buf: []u8) ![]const u8 {
         .{ paths[s], hosts[s], ports[s], keys[s][0..24] },
     );
 }
+
 fn writeWs(s: usize, cn: *http.Client.Connection, bytes: []const u8) !void {
     _ = s;
     try cn.writer().writeAll(bytes);
     try cn.flush();
 }
+
 fn findHeaderValueCI(haystack: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, haystack, '\n');
     while (it.next()) |line_raw| {
@@ -402,6 +425,7 @@ fn findHeaderValueCI(haystack: []const u8, name: []const u8) ?[]const u8 {
     }
     return null;
 }
+
 fn sockReadable(s: usize, timeout_ms: i32) bool {
     if (sock_fds[s] < 0) return false;
     var pfd = [_]std.posix.pollfd{
@@ -410,10 +434,12 @@ fn sockReadable(s: usize, timeout_ms: i32) bool {
     const rc = std.posix.poll(&pfd, timeout_ms) catch return false;
     return rc != 0 and pfd[0].revents != 0;
 }
+
 fn tlsReadReady(s: usize, cn: *http.Client.Connection) bool {
     if (cn.reader().bufferedLen() > 0) return true;
     return sockReadable(s, 0);
 }
+
 fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {
     if (!tls_active[s]) {
         return std.posix.read(sock_fds[s], buf);
@@ -432,6 +458,7 @@ fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {
     try r.readSliceAll(buf[0..n]); // fully satisfied from the buffer — no blocking
     return n;
 }
+
 fn verifyUpgrade(s: usize, cn: *http.Client.Connection) bool {
     _ = cn;
     var head_buf: [2048]u8 = undefined;
@@ -473,12 +500,14 @@ fn verifyUpgrade(s: usize, cn: *http.Client.Connection) bool {
     }
     return true;
 }
+
 fn doUpgrade(s: usize, cn: *http.Client.Connection) bool {
     var req_buf: [768]u8 = undefined;
     const nreq = buildUpgradeRequest(s, &req_buf) catch return false;
     writeWs(s, cn, nreq) catch return false;
     return verifyUpgrade(s, cn);
 }
+
 fn sendFrame(s: usize, cn: *http.Client.Connection, opcode: u8, payload: []const u8) bool {
     if (payload.len > WS_MSG_SIZE) return false;
     var mask: [4]u8 = undefined;
@@ -491,6 +520,7 @@ fn sendFrame(s: usize, cn: *http.Client.Connection, opcode: u8, payload: []const
     writeWs(s, cn, wb[s][0 .. hdr_len + 4 + payload.len]) catch return false;
     return true;
 }
+
 fn writeCloseFrame(s: usize, cn: *http.Client.Connection, code: u16, reason: []const u8) bool {
     var payload: [2 + CLOSE_REASON_MAX]u8 = undefined;
     payload[0] = @intCast(code >> 8);
@@ -499,6 +529,7 @@ fn writeCloseFrame(s: usize, cn: *http.Client.Connection, code: u16, reason: []c
     @memcpy(payload[2..][0..rl], reason[0..rl]);
     return sendFrame(s, cn, ws.OP_CLOSE, payload[0 .. 2 + rl]);
 }
+
 fn initiateClose(s: usize, cn: *http.Client.Connection, code: u16, reason: []const u8) bool {
     if (ws_sent_close[s]) return true;
     ws_sent_close[s] = true;
@@ -513,6 +544,7 @@ fn initiateClose(s: usize, cn: *http.Client.Connection, code: u16, reason: []con
     }
     return writeCloseFrame(s, cn, code, reason);
 }
+
 fn recordClose(s: usize, payload: []const u8) void {
     if (payload.len >= 2) {
         rx_code[s] = (@as(u16, payload[0]) << 8) | @as(u16, payload[1]);
@@ -521,6 +553,7 @@ fn recordClose(s: usize, payload: []const u8) void {
     if (rl > 0) @memcpy(rx_reason[s][0..rl], payload[2..][0..rl]);
     rx_reason_len[s] = @intCast(rl);
 }
+
 fn emitMessage(s: usize, msg: []const u8, binary: bool) void {
     const n = @min(msg.len, WS_MSG_SIZE);
     @memcpy(rx_msg[s][0..n], msg[0..n]);
@@ -530,6 +563,7 @@ fn emitMessage(s: usize, msg: []const u8, binary: bool) void {
     signalEvent(s);
     waitState(s, JOB_BUSY);
 }
+
 fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: []const u8) bool {
     const op = hdr.opcode;
     if (op == ws.OP_CONT and partial_len[s] == 0) {
@@ -558,6 +592,7 @@ fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: 
     emitMessage(s, payload, op == ws.OP_BINARY);
     return true;
 }
+
 fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: []const u8) bool {
     if (ws.isControl(hdr.opcode)) {
         switch (hdr.opcode) {
@@ -576,6 +611,7 @@ fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload:
     }
     return handleData(s, cn, hdr, payload);
 }
+
 fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
     var off: usize = 0;
     const buf = rd_buf[s][0..rd_len[s]];
@@ -593,6 +629,7 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
     rd_len[s] = left;
     return true;
 }
+
 fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
     var wake: [64]u8 = undefined;
     while (true) {
@@ -622,12 +659,23 @@ fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
 
 // ---- Main-thread pump (QuickJS) ----
 
-pub fn arm(l: *xev.Loop) void {
+pub fn arm(l: *xev.Loop) void { // CHANGED: remembers the loop
     if (async_armed) return;
     async_armed = true;
+    g_loop = l;
     async_h.wait(l, &async_comp, void, null, asyncCb);
 }
-fn asyncCb(
+
+/// CHANGED: re-arm after a disarm→submit sequence (single main thread: no race).
+pub fn ensureArmed() void {
+    if (async_armed) return;
+    if (g_loop) |l| arm(l);
+}
+
+pub fn setLoop(l: *xev.Loop) void {
+    g_loop = l;
+}
+fn asyncCb( // CHANGED: drains events and pumps microtasks
     ud: ?*void,
     l: *xev.Loop,
     comp: *xev.Completion,
@@ -636,14 +684,19 @@ fn asyncCb(
     _ = ud;
     _ = comp;
     _ = r catch return .disarm;
+    if (g_ctx) |ctx| {
+        drainCompleted(ctx);
+        microtasks.pumpMicrotasks(ctx);
+    }
     if (pending.load(.acquire) > 0) {
         async_armed = true;
         async_h.wait(l, &async_comp, void, null, asyncCb);
-        return .disarm;
+    } else {
+        async_armed = false;
     }
-    async_armed = false;
     return .disarm;
 }
+
 fn doneMask() u64 {
     var raw: [MAX_WS]u8 = undefined;
     for (0..MAX_WS) |i| raw[i] = states[i].raw;
@@ -651,6 +704,7 @@ fn doneMask() u64 {
     const eq = v == @as(@Vector(MAX_WS, u8), @splat(JOB_DONE));
     return @bitCast(eq);
 }
+
 fn claimSlot(s: usize) bool {
     return states[s].cmpxchgStrong(JOB_DONE, JOB_CLAIMED, .acq_rel, .acquire) == null;
 }

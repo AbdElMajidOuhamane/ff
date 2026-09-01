@@ -389,6 +389,7 @@ fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 }
 
 fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
     const data = gpa.create(URLSearchParamsData) catch return c.throwOutOfMemory(ctx);
     data.* = URLSearchParamsData.init();
     if (argc > 0) {
@@ -400,8 +401,9 @@ fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
             }
         }
     }
-    c.setOpaque(this_val, data);
-    return this_val;
+    const obj = c.newObjectClass(ctx, @intCast(sp_class_id));
+    c.setOpaque(obj, data);
+    return obj;
 }
 
 // ============================================================
@@ -418,7 +420,7 @@ const UrlData = struct {
     password: []const u8,
     search_params: *URLSearchParamsData,
     owned: bool = true,
-    fn deinit(self: *UrlData) void {
+        fn deinit(self: *UrlData) void {
         gpa.free(self.scheme);
         gpa.free(self.host);
         gpa.free(self.path);
@@ -426,8 +428,8 @@ const UrlData = struct {
         gpa.free(self.fragment);
         gpa.free(self.username);
         gpa.free(self.password);
-        self.search_params.deinit();
-        gpa.destroy(self.search_params);
+        // search_params is owned by its URLSearchParams JS object
+        // (spFinalizer frees it — do NOT free it here).
     }
     fn serialize(self: *const UrlData) ![]const u8 {
         var result = std.ArrayList(u8).empty;
@@ -532,22 +534,22 @@ fn extractUrlData(ctx: ?*c.Context, this_val: c.Value) ?*UrlData {
     return @ptrCast(@alignCast(ptr));
 }
 
-// ============================================================
-// URL parsing (unchanged)
-// ============================================================
+
 fn parseUrlAbsolute(input: []const u8) !UrlData {
     const uri = try std.Uri.parse(input);
     const scheme = try gpa.dupe(u8, uri.scheme);
-    const host = if (uri.host) |h| (try h.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-    const raw_path = try uri.path.toRawMaybeAlloc(gpa);
+    // toRawMaybeAlloc may return a VIEW into `input` (stack memory) when the
+    // component has no '%' escapes — UrlData must own heap copies.
+    const host = if (uri.host) |h| (try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+    const raw_path = try gpa.dupe(u8, try uri.path.toRawMaybeAlloc(gpa));
     const path = if (raw_path.len == 0) blk: {
         gpa.free(raw_path);
         break :blk try gpa.dupe(u8, "/");
     } else raw_path;
-    const query = if (uri.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-    const fragment = if (uri.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-    const username = if (uri.user) |u| (try u.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-    const password = if (uri.password) |p| (try p.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
+    const query = if (uri.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+    const fragment = if (uri.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+    const username = if (uri.user) |u| (try gpa.dupe(u8, try u.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+    const password = if (uri.password) |p| (try gpa.dupe(u8, try p.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
     const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
     sp.* = URLSearchParamsData.init();
     sp.parseFromString(query);
@@ -578,16 +580,16 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     if (std.Uri.parse(input)) |rel| {
         if (rel.scheme.len > 0) {
             result_scheme = try gpa.dupe(u8, rel.scheme);
-            result_host = if (rel.host) |h| (try h.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
+            result_host = if (rel.host) |h| (try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
             result_port = rel.port;
             result_path = if (rel.path.isEmpty())
                 try gpa.dupe(u8, "/")
             else
                 try removeDotSegments(try rel.path.toRawMaybeAlloc(gpa));
-            result_query = if (rel.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-            result_fragment = if (rel.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-            if (rel.user) |u| result_user = try u.toRawMaybeAlloc(gpa);
-            if (rel.password) |p| result_pass = try p.toRawMaybeAlloc(gpa);
+            result_query = if (rel.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+            result_fragment = if (rel.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+            if (rel.user) |u| result_user = try gpa.dupe(u8, try u.toRawMaybeAlloc(gpa));
+            if (rel.password) |p| result_pass = try gpa.dupe(u8, try p.toRawMaybeAlloc(gpa));
             const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
@@ -599,14 +601,14 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
         }
         if (rel.host) |h| {
             result_scheme = try gpa.dupe(u8, base.scheme);
-            result_host = try h.toRawMaybeAlloc(gpa);
+            result_host = try gpa.dupe(u8, try h.toRawMaybeAlloc(gpa));
             result_port = rel.port;
             result_path = if (rel.path.isEmpty())
                 try gpa.dupe(u8, "/")
             else
                 try removeDotSegments(try rel.path.toRawMaybeAlloc(gpa));
-            result_query = if (rel.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
-            result_fragment = if (rel.fragment) |f| (try f.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
+            result_query = if (rel.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
+            result_fragment = if (rel.fragment) |f| (try gpa.dupe(u8, try f.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
             const sp = gpa.create(URLSearchParamsData) catch return error.OutOfMemory;
             sp.* = URLSearchParamsData.init();
             sp.parseFromString(result_query);
@@ -617,10 +619,10 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
             };
         }
     } else |_| {}
-    const base_host_owned = if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else null;
-    defer if (base_host_owned) |bh| gpa.free(bh);
-    const base_host = base_host_owned orelse "";
-    const base_path = try base.path.toRawMaybeAlloc(gpa);
+    const base_host_owned = try gpa.dupe(u8, if (base.host) |h| (try h.toRawMaybeAlloc(gpa)) else "");
+    defer gpa.free(base_host_owned);
+    const base_host = base_host_owned;
+    const base_path = try gpa.dupe(u8, try base.path.toRawMaybeAlloc(gpa));
     defer gpa.free(base_path);
     result_scheme = try gpa.dupe(u8, base.scheme);
     result_host = try gpa.dupe(u8, base_host);
@@ -628,13 +630,13 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !UrlData {
     const rel_path = input;
     if (rel_path.len == 0) {
         result_path = try gpa.dupe(u8, base_path);
-        result_query = if (base.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
+        result_query = if (base.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
     } else if (rel_path[0] == '?') {
         result_path = try gpa.dupe(u8, base_path);
         result_query = try gpa.dupe(u8, rel_path[1..]);
     } else if (rel_path[0] == '#') {
         result_path = try gpa.dupe(u8, base_path);
-        result_query = if (base.query) |q| (try q.toRawMaybeAlloc(gpa)) else try gpa.dupe(u8, "");
+        result_query = if (base.query) |q| (try gpa.dupe(u8, try q.toRawMaybeAlloc(gpa))) else try gpa.dupe(u8, "");
         result_fragment = try gpa.dupe(u8, rel_path[1..]);
     } else if (rel_path[0] == '/') {
         result_path = try removeDotSegments(rel_path);
@@ -791,6 +793,7 @@ fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 }
 
 fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _=this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "URL constructor requires at least 1 argument");
         return c.JS_EXCEPTION;
@@ -817,7 +820,8 @@ fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
             _ = c.throwTypeError(ctx, "Invalid URL");
             return c.JS_EXCEPTION;
         };
-    c.setOpaque(this_val, data_ptr);
+    const obj = c.newObjectClass(ctx, @intCast(url_class_id)); // CHANGED
+    c.setOpaque(obj, data_ptr);                                // CHANGED
     data_ptr.search_params.owned = false;
     const sp_obj = createSPJsObject(ctx, data_ptr.search_params);
 
@@ -836,19 +840,19 @@ fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     const hash_val = data_ptr.hashStr() catch "";
     defer if (hash_val.len > 0) gpa.free(hash_val);
 
-    _ = c.definePropertyValueStr(ctx, this_val, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "hostname", zigStringToJS(ctx, data_ptr.host), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "pathname", zigStringToJS(ctx, data_ptr.path), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "username", zigStringToJS(ctx, data_ptr.username), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "password", zigStringToJS(ctx, data_ptr.password), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, this_val, "searchParams", sp_obj, c.PROP_C_W_E);
-    return this_val;
+    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, href_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, origin_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, host_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "hostname", zigStringToJS(ctx, data_ptr.host), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, port_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "pathname", zigStringToJS(ctx, data_ptr.path), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, search_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, hash_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "username", zigStringToJS(ctx, data_ptr.username), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "password", zigStringToJS(ctx, data_ptr.password), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, protocol_val), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, obj, "searchParams", sp_obj, c.PROP_C_W_E);
+    return obj; // CHANGED
 }
 
 fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -955,10 +959,10 @@ pub fn setup(ctx: ?*c.Context) void {
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
 
-    const sp_ctor = c.newCFunction(ctx, &spConstructor, "URLSearchParams", 1);
+    const sp_ctor = c.newCFunction2(ctx, &spConstructor, "URLSearchParams", 1, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "URLSearchParams", sp_ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 
-    const url_ctor = c.newCFunction(ctx, &urlConstructor, "URL", 2);
+    const url_ctor = c.newCFunction2(ctx, &urlConstructor, "URL", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "URL", url_ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 
     const parse_fn = c.newCFunction(ctx, &urlParseStatic, "parse", 2);

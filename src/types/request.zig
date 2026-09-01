@@ -523,6 +523,7 @@ fn requestFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 }
 
 fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "Request requires a URL string as first argument");
         return c.JS_EXCEPTION;
@@ -623,9 +624,10 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
         if (c.toBool(ctx, keep_val) != 0) data.keepalive = true;
     }
 
-    c.setOpaque(this_val, data);
-    setRequestProps(ctx, this_val, data);
-    return this_val;
+    const obj = c.newObjectClass(ctx, @intCast(request_class_id)); // CHANGED
+    c.setOpaque(obj, data);                                        // CHANGED
+    setRequestProps(ctx, obj, data);                               // CHANGED
+    return obj;                                                    // CHANGED
 }
 
 pub fn buildRequestJSObject(ctx: ?*c.Context, data: *RequestData) c.Value {
@@ -663,6 +665,6 @@ pub fn setup(ctx: ?*c.Context) void {
 
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
-    const ctor = c.newCFunction(ctx, &requestConstructor, "Request", 2);
+    const ctor = c.newCFunction2(ctx, &requestConstructor, "Request", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "Request", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

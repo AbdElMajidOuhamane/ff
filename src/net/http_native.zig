@@ -8,6 +8,8 @@ const api_ws = @import("../api/websocket.zig");
 const builtin = @import("builtin");
 const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
+const response_mod = @import("../types/response.zig"); // NEW
+const headers_mod = @import("../types/headers.zig"); // NEW
 
 var req_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -32,7 +34,8 @@ const ConnFlags = packed struct(u16) {
     ws_pending_open: bool = false,
     tls: bool = false,
     tls_close_after_write: bool = false,
-    _pad: u8 = 0,
+    handler_parked: bool = false,   // NEW
+    _pad: u7 = 0,                   // u8 -> u7
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
@@ -80,6 +83,20 @@ var tls_active: bool = false; // runtime switch (cert/key given), set before acc
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = 0;
 var slot_ids: [MAX_CONN]u16 = undefined;
+
+// ── Parked async handlers (one flat column per slot) ── // NEW
+// Generation counter guards late promise reactions against slot reuse.
+var slot_gen: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
+var parked_since_ms: [MAX_CONN]u64 = [_]u64{0} ** MAX_CONN;
+var promise_class_id: c.ClassID = 0;
+
+const HDR_MAX = 2048;
+const HANDLER_TIMEOUT_MS: u64 = 30_000;
+const WATCHDOG_INTERVAL_MS: u64 = 1000;
+var watchdog_timer: xev.Timer = undefined;
+var watchdog_comp: xev.Completion = .{};
+var watchdog_started = false;
+
 pub var handler_fn: ?c.Value = null;
 pub var handler_ctx: ?*c.Context = null;
 pub var ws_enabled: bool = false;
@@ -213,7 +230,7 @@ fn classifyMethod(s: []const u8) Method {
     } else if (s.len == 5) {
         if (s[0] == 'P' and s[1] == 'A' and s[2] == 'T' and s[3] == 'C' and s[4] == 'H') return .patch;
     } else if (s.len == 6) {
-        if (s[0] == 'D' and s[1] == 'E' and s[2] == 'L' and s[3] == 'E' and s[4] == 'T' and s[5] == 'E') return .delete;
+        if (s[0] == 'D' and s[1] == 'E' and s[2] == 'L' and s[3] == 'E' and s[4] == 'T' and s[5] == 'E' and s[6] == 'E') return .delete;
     } else if (s.len == 7) {
         if (s[0] == 'O' and s[1] == 'P' and s[2] == 'T' and s[3] == 'I' and s[4] == 'O' and s[5] == 'N' and s[6] == 'S') return .options;
     }
@@ -451,17 +468,52 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     return @intCast(out);
 }
 
-// DOD-FIX 3: chunked large-body write helper. Stages the whole body per slot
-// in body_bufs[id]; writeCb drains it in WRITE_BUF_SIZE chunks.
-fn stageLargeResponse(id: usize, status: u16, body_ptr: [*]const u8, blen: usize, keep_alive: bool) void {
-    if (blen > BODY_BUF_SIZE) {
-        buildResponse(id, 500, "response body too large");
-        return;
-    }
-    var hdr: [256]u8 = undefined;
-    const hlen = formatResponseHeader(hdr[0..], status, blen, keep_alive);
-    @memcpy(write_bufs[id][0..hlen], hdr[0..hlen]);
-    write_lens[id] = hlen;
+
+
+
+
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @intCast(@as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms));
+}
+
+fn isManagedHeader(name: []const u8) bool {
+    // Length/hop-by-hop framing is computed by the server, never taken from JS.
+    return std.ascii.eqlIgnoreCase(name, "content-length") or
+        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(name, "connection");
+}
+
+fn printException(ctx: ?*c.Context, exc: c.Value) void {
+    if (ctx == null) return;
+    const msg = c.toCString(ctx, exc) orelse return;
+    defer c.freeCString(ctx, msg);
+    std.debug.print("[http] handler error: {s}\n", .{msg});
+}
+
+fn logAllocs(id: usize) void {
+    if (builtin.mode != .Debug) return;
+    std.debug.print(
+        "[allocs] req id={d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
+        .{
+            id,
+            req_counter.alloc_count,
+            req_counter.free_count,
+            req_counter.bytes_allocated,
+            req_counter.bytes_freed,
+            req_counter.balanced(),
+        },
+    );
+    std.debug.assert(req_counter.balanced());
+}
+
+// DOD-FIX 3: chunked large-body write helper. The caller has already
+// formatted the header block into write_bufs[id] (write_lens[id] = header
+// length); writeCb drains WRITE_BUF_SIZE chunks from body_bufs afterwards.
+fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen: usize) void { // CHANGED signature
+    write_lens[id] = header_len;
     write_offsets[id] = 0;
     @memcpy(body_bufs[id][0..blen], body_ptr[0..blen]);
     body_lens[id] = blen; // total staged body size
@@ -469,6 +521,216 @@ fn stageLargeResponse(id: usize, status: u16, body_ptr: [*]const u8, blen: usize
     body_source_off[id] = 0; // read cursor into body_bufs
 }
 
+// NEW: shared response staging — used by the sync path and the parked
+// continuation. Reads Response objects natively (opaque pointer, no JS
+// property lookups), plain objects via properties (back-compat). User
+// headers serialize straight into write_bufs — zero dynamic allocations.
+fn stageHandlerResponse(id: usize, result: c.Value) void {
+    const ctx = handler_ctx orelse {
+        buildResponse(id, 500, "Internal Server Error");
+        return;
+    };
+
+    var status: u16 = 200;
+    var status_text: []const u8 = "";
+    var body_bytes: []const u8 = "";
+    var has_body = false;
+    var hdrs: ?*headers_mod.HeadersData = null;
+
+    if (c.isObject(result) != 0) {
+        if (response_mod.dataFromJS(ctx, result)) |rd| {
+            status = rd.status;
+            status_text = rd.statusText();
+            if (rd.body()) |b| {
+                body_bytes = b;
+                has_body = true;
+            }
+            hdrs = &rd.headers;
+        } else {
+            // Plain JS object fallback: { status, body }.
+            const status_val = c.getPropertyStr(ctx, result, "status");
+            defer c.freeValue(ctx, status_val);
+            status = extractInt(ctx, status_val, 200);
+            const body_out_val = c.getPropertyStr(ctx, result, "body");
+            defer c.freeValue(ctx, body_out_val);
+            if (c.isString(body_out_val) != 0) {
+                if (c.toCString(ctx, body_out_val)) |cstr| {
+                    defer c.freeCString(ctx, cstr);
+                    const n = std.mem.len(cstr);
+                    if (n > 0) {
+                        body_bytes = cstr[0..n];
+                        has_body = true;
+                    }
+                }
+            } else if (c.isObject(body_out_val) != 0) {
+                var size: usize = 0;
+                const p = c.getArrayBuffer(ctx, &size, body_out_val);
+                if (p != null and size > 0) {
+                    body_bytes = p[0..size];   // was: p.?[0..size]
+                    has_body = true;
+                }
+            }        }
+    }
+
+    const suppress = !wantsBodyBytes(id, status);
+    if (has_body and !suppress and body_bytes.len > BODY_BUF_SIZE) {
+        buildResponse(id, 500, "response body too large");
+        return;
+    }
+
+    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
+    var pos: usize = 0;
+
+    // Status line.
+    pushStr(w, &pos, "HTTP/1.1 ");
+    appendUInt(w, &pos, status);
+    pushStr(w, &pos, " ");
+    if (status_text.len > 0 and std.mem.indexOfAny(u8, status_text, "\r\n") == null) {
+        pushStr(w, &pos, status_text);
+    } else {
+        pushStr(w, &pos, statusReason(status));
+    }
+    pushStr(w, &pos, "\r\n");
+
+    // User headers from the Response's HeadersData (already lowercased).
+    // Drop CR/LF-bearing pairs (header-injection guard).
+    var seen_ct = false;
+    if (hdrs) |h| {
+        for (0..h.len()) |i| {
+            const p = h.getPair(i);
+            if (isManagedHeader(p.name)) continue;
+            if (std.mem.indexOfAny(u8, p.name, "\r\n") != null or
+                std.mem.indexOfAny(u8, p.value, "\r\n") != null) continue;
+            if (std.ascii.eqlIgnoreCase(p.name, "content-type")) seen_ct = true;
+            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break; // budget: drop the rest
+            pushStr(w, &pos, p.name);
+            pushStr(w, &pos, ": ");
+            pushStr(w, &pos, p.value);
+            pushStr(w, &pos, "\r\n");
+        }
+    }
+    // Back-compat default content type only when JS gave none.
+    if (!seen_ct and has_body and !suppress) {
+        pushStr(w, &pos, "Content-Type: text/plain\r\n");
+    }
+    if (status != 204 and status != 304) {
+        pushStr(w, &pos, "Content-Length: ");
+        appendUInt(w, &pos, body_bytes.len);
+        pushStr(w, &pos, "\r\n");
+    }
+    if (cflags[id].keep_alive) pushStr(w, &pos, "Connection: keep-alive\r\n");
+    pushStr(w, &pos, "\r\n");
+
+    write_lens[id] = pos;
+    write_offsets[id] = 0;
+    body_lens[id] = 0;
+    body_remaining[id] = 0;
+    body_source_off[id] = 0;
+
+    if (suppress or !has_body or body_bytes.len == 0) return;
+
+    if (pos + body_bytes.len <= WRITE_BUF_SIZE) {
+        @memcpy(w[pos..][0..body_bytes.len], body_bytes);
+        write_lens[id] = pos + body_bytes.len;
+    } else {
+        stageLargeResponse(id, pos, body_bytes.ptr, body_bytes.len);
+    }
+}
+
+// NEW: park-and-resume machinery ─────────────────────────────────────
+
+/// Claim a parked slot from a reaction's packed magic. Returns null when the
+/// connection was closed or the slot was reused (generation mismatch).
+fn claimParkedSlot(magic: c_int) ?usize {
+    const m: u32 = @bitCast(magic);
+    const id: usize = @intCast(m & 0x1FF);
+    const gen: u16 = @intCast((m >> 9) & 0x3F);
+    if (id >= MAX_CONN) return null;
+    if (slot_gen[id] & 0x3F != gen) return null;
+    if (!cflags[id].handler_parked) return null;
+    return id;
+}
+
+fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) c.Value {
+        const id = claimParkedSlot(magic) orelse {
+        std.debug.print("[http] completeParked: claim FAILED (stale)\n", .{}); // TEMP
+        return c.JS_UNDEFINED;
+    };
+    std.debug.print("[http] completeParked id={d} rejected={}\n", .{ id, rejected }); // TEMP
+    cflags[id].handler_parked = false;
+    parked_since_ms[id] = 0;
+
+    const val: c.Value = if (argc > 0) argv[0] else c.JS_UNDEFINED;
+    if (rejected) {
+        printException(handler_ctx, val);
+        buildResponse(id, 500, "Internal Server Error");
+    } else {
+        stageHandlerResponse(id, val);
+    }
+    if (g_loop) |l| {
+        states[id] = .writing;
+        armWrite(id, l);
+    } else {
+        closeConn(id);
+    }
+    return c.JS_UNDEFINED;
+}
+
+fn handlerFulfilledCb(
+    _: ?*c.Context,
+    _: c.Value,
+    argc: c_int,
+    argv: [*c]c.Value,
+    magic: c_int,
+) callconv(.c) c.Value {
+    return completeParked(magic, argc, argv, false);
+}
+
+fn handlerRejectedCb(
+    _: ?*c.Context,
+    _: c.Value,
+    argc: c_int,
+    argv: [*c]c.Value,
+    magic: c_int,
+) callconv(.c) c.Value {
+    return completeParked(magic, argc, argv, true);
+}
+
+/// Attach onFulfilled/onRejected to a pending handler promise. Zero
+/// allocations on the Zig side: the slot id + generation travel in the
+/// C-function magic (i32), continuations live in the slot columns.
+fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
+    // QuickJS stores C-function magic in int16_t — keep the packed value
+    // within 15 bits: slot (9 bits, MAX_CONN=512) | generation (6 bits).
+    const magic: i32 = @bitCast(@as(u32, @intCast(id & 0x1FF)) |
+        (@as(u32, slot_gen[id] & 0x3F) << 9));
+    const ok_fn = c.newCFunctionMagic(ctx, &handlerFulfilledCb, "", 1, c.JS_CFUNC_generic_magic, magic);
+    const err_fn = c.newCFunctionMagic(ctx, &handlerRejectedCb, "", 1, c.JS_CFUNC_generic_magic, magic);
+    defer c.freeValue(ctx, ok_fn);
+    defer c.freeValue(ctx, err_fn);
+    if (c.isException(ok_fn) != 0 or c.isException(err_fn) != 0) {
+        const exc = c.getException(ctx);
+        printException(ctx, exc);
+        c.freeValue(ctx, exc);
+        return false;
+    }
+    const then_atom = c.newAtomLen(ctx, "then", 4);
+    defer c.freeAtom(ctx, then_atom);
+    var then_argv = [_]c.Value{ ok_fn, err_fn };
+    const then_result = c.invoke(ctx, promise, then_atom, 2, &then_argv);
+    defer c.freeValue(ctx, then_result);
+    if (c.isException(then_result) != 0) {
+        const exc = c.getException(ctx);
+        printException(ctx, exc);
+        c.freeValue(ctx, exc);
+        return false;
+    }
+    cflags[id].handler_parked = true;
+    parked_since_ms[id] = nowMs();
+    return true;
+}
+// CHANGED: callHandler — removes the dead tag==7 spin; detects promises via
+// the one-time class-id probe; parks pending promises; unwraps settled ones.
 fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     if (builtin.mode == .Debug) req_counter.reset();
     const ctx = handler_ctx orelse {
@@ -496,105 +758,51 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     var result = c.call(ctx, handler, global, 3, &argv);
     defer c.freeValue(ctx, result);
 
-    if (c.isObject(result) != 0) {
-        const tag = c.getTag(result);
-        if (tag == 7) {
-            var pi: u32 = 0;
-            while (pi < 1000) : (pi += 1) {
-                if (c.promiseState(ctx, result) != 0) break;
-                var ctx_mut = ctx;
-                _ = c.executePendingJob(c.getRuntime(ctx), @ptrCast(&ctx_mut));
-            }
-            if (c.promiseState(ctx, result) == 1) {
-                const pr = c.promiseResult(ctx, result);
-                c.freeValue(ctx, result);
-                result = pr;
-            } else {
-                buildResponse(id, 500, "");
-                return;
-            }
-        }
-    }
-
-    if (c.isObject(result) == 0) {
-        buildResponse(id, 500, "");
+    if (c.isException(result) != 0) {
+        const exc = c.getException(ctx);
+        printException(ctx, exc);
+        c.freeValue(ctx, exc);
+        buildResponse(id, 500, "Internal Server Error");
+        logAllocs(id);
         return;
     }
 
-    const status_val = c.getPropertyStr(ctx, result, "status");
-    defer c.freeValue(ctx, status_val);
-    const status = extractInt(ctx, status_val, 200);
-    const body_out_val = c.getPropertyStr(ctx, result, "body");
-    defer c.freeValue(ctx, body_out_val);
-
-    const suppress = !wantsBodyBytes(id, status);
-    const keep_alive = cflags[id].keep_alive;
-    var done = false;
-    body_pipeline: {
-        if (c.isUndefined(body_out_val) != 0 or c.isNull(body_out_val) == 0) {} else break :body_pipeline;
-
-        var blen: usize = 0;
-        var body_ptr: [*]const u8 = undefined;
-
-        if (c.isString(body_out_val) != 0) {
-            const cstr = c.toCString(ctx, body_out_val) orelse break :body_pipeline;
-            defer c.freeCString(ctx, cstr);
-            blen = std.mem.len(cstr);
-            if (blen == 0) break :body_pipeline;
-            body_ptr = cstr;
-        } else if (c.isObject(body_out_val) != 0) {
-            var size: usize = 0;
-            const p = c.getArrayBuffer(ctx, &size, body_out_val);
-            if (p != null and size > 0) {
-                blen = size;
-                body_ptr = p.?;
-            } else break :body_pipeline;
-        } else break :body_pipeline;
-
-        if (blen == 0) break :body_pipeline;
-
-        if (suppress) {
-            const cl: ?usize = if (status == 204 or status == 304) null else blen;
-            write_lens[id] = formatResponseHeader(write_bufs[id][0..], status, cl, keep_alive);
-            done = true;
-            break :body_pipeline;
+    if (promise_class_id != 0 and c.isObject(result) != 0 and
+        c.getClassID(result) == promise_class_id)
+    {
+        const ps = c.promiseState(ctx, result);
+        std.debug.print("[http] promise branch ps={d}\n", .{ps}); // TEMP   <-- ADD
+        if (ps == 0) {
+            // Pending: park the connection; the promise's `then` reactions
+            // resume staging + writing from the event loop (or watchdog).
+            if (parkHandler(id, ctx, result)) {
+                if (builtin.mode == .Debug)
+                    std.debug.print("[allocs] req id={d}: parked\n", .{id});
+                return;
+            }
+            buildResponse(id, 500, "Internal Server Error");
+            logAllocs(id);
+            return;
         }
-
-        if (blen <= WRITE_BUF_SIZE - 1024) {
-            const hlen = formatResponseHeader(write_bufs[id][0..], status, blen, keep_alive);
-            @memcpy(write_bufs[id][hlen..][0..blen], body_ptr[0..blen]);
-            write_lens[id] = hlen + blen;
-            done = true;
-            break :body_pipeline;
+        if (ps == 2) {
+            // Rejected.
+            const pr = c.promiseResult(ctx, result);
+            c.freeValue(ctx, result);
+            result = pr;
+            printException(ctx, pr);
+            buildResponse(id, 500, "Internal Server Error");
+            logAllocs(id);
+            return;
         }
+        // Fulfilled synchronously: unwrap and stage without an event-loop
+        // roundtrip (keeps the hot path allocation-free and fast).
+        const pr = c.promiseResult(ctx, result);
+        c.freeValue(ctx, result);
+        result = pr;
+    }
 
-        // DOD-FIX 3: large body uses static staging + chunked write.
-        stageLargeResponse(id, status, body_ptr, blen, keep_alive);
-        done = true;
-        break :body_pipeline;
-    }
-    if (!done) {
-        write_lens[id] = formatResponseHeader(
-            write_bufs[id][0..],
-            status,
-            0,
-            cflags[id].keep_alive,
-        );
-    }
-    if (builtin.mode == .Debug) {
-        std.debug.print(
-            "[allocs] req id={d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
-            .{
-                id,
-                req_counter.alloc_count,
-                req_counter.free_count,
-                req_counter.bytes_allocated,
-                req_counter.bytes_freed,
-                req_counter.balanced(),
-            },
-        );
-        std.debug.assert(req_counter.balanced());
-    }
+    stageHandlerResponse(id, result);
+    logAllocs(id);
 }
 
 pub const ws_class_id_val: c.ClassID = 0;
@@ -894,10 +1102,13 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
     armWrite(id, l);
 }
 
+// CHANGED: clears parked state so a late continuation no-ops.
 fn closeConn(id: usize) void {
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
+    cflags[id].handler_parked = false; // NEW
+    parked_since_ms[id] = 0; // NEW
     wsShutdown(id);
     if (states[id] == .closing) return;
     if (tls_on and cflags[id].tls) {
@@ -933,12 +1144,39 @@ fn closeCb(
     return .disarm;
 }
 
+// NEW: watchdog — one repeating timer (not from the 128-slot JS timer
+// pool): scans parked slots and fails hung handlers with 504.
+fn watchdogCb(
+    _: ?*void,
+    l: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch return .disarm;
+    const now = nowMs();
+    for (0..MAX_CONN) |id| {
+        if (!cflags[id].handler_parked) continue;
+        if (now -% parked_since_ms[id] < HANDLER_TIMEOUT_MS) continue;
+        cflags[id].handler_parked = false;
+        parked_since_ms[id] = 0;
+        buildResponse(id, 504, "Gateway Timeout");
+        states[id] = .writing;
+        armWrite(id, l);
+    }
+    watchdog_timer.run(l, &watchdog_comp, WATCHDOG_INTERVAL_MS, void, null, watchdogCb);
+    return .disarm;
+}
+
+// CHANGED: bumps generation, resets parked state (cflags reset below also
+// clears handler_parked).
 fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     const id = freePop() orelse {
         _ = std.c.close(tcp.fd);
         return false;
     };
     fds[id] = tcp;
+    slot_gen[id] +%= 1; // NEW
+    parked_since_ms[id] = 0; // NEW
     const nodelay: c_int = 1;
     std.posix.setsockopt(
         tcp.fd,
@@ -1018,6 +1256,13 @@ fn readCb(
 /// HTTP/WS state machine over bytes in read_bufs[0..buf_lens]
 /// (plaintext for plain HTTP, decrypted app-data when TLS is active).
 fn processPlaintext(id: usize, l: *xev.Loop) void {
+    if (cflags[id].handler_parked) {
+        // Parked: no pipelining, and leave the read DISARMED — re-arming
+        // here while the continuation later writes would double-arm the
+        // completion. A vanished client is caught on write or by the
+        // watchdog.
+        return;
+    }
     if (cflags[id].ws_open) {
         wsConsume(id, l);
         return;
@@ -1067,8 +1312,14 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
         callHandler(id, &pr, body);
     }
-    states[id] = .writing;
-    armWrite(id, l);
+    if (!cflags[id].handler_parked) {
+        states[id] = .writing;
+        armWrite(id, l);
+    } else {
+        // Parked: read stays disarmed; writeCb re-arms it after the
+        // continuation's write completes.
+        states[id] = .reading;
+    }
 }
 
 fn writeCb(
@@ -1286,6 +1537,11 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
     try listener_tcp.bind(addr);
     try listener_tcp.listen(128);
     listener_tcp.accept(loop, &accept_comp, void, null, acceptCb);
+    if (!watchdog_started) { // NEW
+        watchdog_timer = xev.Timer.init() catch unreachable;
+        watchdog_timer.run(loop, &watchdog_comp, WATCHDOG_INTERVAL_MS, void, null, watchdogCb);
+        watchdog_started = true;
+    }
     initialized = true;
     std.debug.print("[http] listening on 0.0.0.0:{d}\n", .{port});
     if (tls_active) std.debug.print("[http] TLS mode: https/wss active\n", .{});
@@ -1294,6 +1550,7 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
 pub fn deinit() void {
     if (!initialized) return;
     initialized = false;
+    watchdog_started = false; // NEW
     for (&states, 0..) |*s, i| {
         if (s.* != .idle) {
             closeConn(i);
@@ -1324,4 +1581,14 @@ pub fn deinit() void {
     g_loop = null;
 }
 
-pub fn setupStrings(_: ?*c.Context) void {}
+// CHANGED: one-time probe capturing QuickJS's internal Promise class id so
+// callHandler detects promises with a single JS_GetClassID call.
+pub fn setupStrings(ctx: ?*c.Context) void {
+    if (promise_class_id != 0) return;
+    var cap: [2]c.Value = undefined;
+    const p = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, p);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+    if (c.isObject(p) != 0) promise_class_id = c.getClassID(p);
+}

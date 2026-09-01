@@ -5,6 +5,7 @@ const tls = @import("./tls.zig");
 const response_mod = @import("../types/response.zig");
 const headers_mod = @import("../types/headers.zig");
 const builtin = @import("builtin");
+const microtasks = @import("../event/microtasks.zig"); // CHANGED
 
 var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -55,6 +56,8 @@ const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
 var async_armed = false;
+var g_ctx: ?*c.Context = null; // CHANGED
+var g_loop: ?*xev.Loop = null; // CHANGED
 
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 
@@ -124,7 +127,8 @@ fn wakeAllWorkers() void {
     _ = std.c.write(job_pipe[1], &b, b.len);
 }
 
-pub fn init() void {
+pub fn init(ctx: ?*c.Context) void { // CHANGED: takes ctx
+    g_ctx = ctx;
     poolInit();
     async_h = AsyncT.init() catch unreachable;
     async_armed = false;
@@ -246,6 +250,7 @@ pub fn submit(
     ring_tail +%= 1;
     ringUnlock();
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
+    ensureArmed(); // CHANGED: cover the disarm→submit sequence in server mode
 }
 
 fn runJob(slot_id: u16) void {
@@ -492,13 +497,24 @@ fn finishSlot(s: usize) void {
     async_h.notify() catch {};
 }
 
-pub fn arm(loop: *xev.Loop) void {
+pub fn arm(loop: *xev.Loop) void { // CHANGED: remembers the loop
     if (async_armed) return;
     async_armed = true;
+    g_loop = loop;
     async_h.wait(loop, &async_comp, void, null, asyncCb);
 }
 
-fn asyncCb(
+/// CHANGED: re-arm after a disarm→submit sequence (single main thread: no race).
+pub fn ensureArmed() void {
+    if (async_armed) return;
+    if (g_loop) |l| arm(l);
+}
+
+pub fn setLoop(l: *xev.Loop) void {
+    g_loop = l;
+}
+
+fn asyncCb( // CHANGED: drains completions and pumps promise reactions
     ud: ?*void,
     l: *xev.Loop,
     comp: *xev.Completion,
@@ -507,12 +523,18 @@ fn asyncCb(
     _ = ud;
     _ = comp;
     _ = r catch return .disarm;
+    if (g_ctx) |ctx| {
+        drainCompleted(ctx);
+        // Run reaction jobs: resolves user promises (and resumes parked
+        // HTTP handler continuations) on the main thread.
+        microtasks.pumpMicrotasks(ctx);
+    }
     if (pending.load(.acquire) > 0) {
         async_armed = true;
         async_h.wait(l, &async_comp, void, null, asyncCb);
-        return .disarm;
+    } else {
+        async_armed = false;
     }
-    async_armed = false;
     return .disarm;
 }
 

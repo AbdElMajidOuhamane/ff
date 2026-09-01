@@ -54,6 +54,14 @@ fn extractResponseData(ctx: ?*c.Context, this_val: c.Value) ?*ResponseData {
     return @ptrCast(@alignCast(ptr));
 }
 
+// NEW: native accessor for the HTTP server — read status/body/headers from
+// a JS Response object without JS property lookups.
+pub fn dataFromJS(ctx: ?*c.Context, val: c.Value) ?*ResponseData {
+    if (c.isObject(val) == 0) return null;
+    const ptr = c.getOpaque2(ctx, val, response_class_id) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
 pub const ResponseType = enum(u8) {
     basic, cors, default, err, opaque_type, opaqueredirect, other,
     pub fn fromSlice(s: []const u8) ResponseType {
@@ -402,9 +410,11 @@ fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         data.status = extractIntFromVal(ctx, status_val, 200);
         const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
         defer c.freeValue(ctx, status_text_val);
-        if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
-            defer st.deinit();
-            data.setStatusText(st.slice);
+        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) { // NEW
+            if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
+                defer st.deinit();
+                data.setStatusText(st.slice);
+            }
         }
         parseHeadersInitFromObj(ctx, init_val, &data.headers);
     }
@@ -452,6 +462,7 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 }
 
 fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
     const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
@@ -470,16 +481,19 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
         data.status = extractIntFromVal(ctx, status_val, 200);
         const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
         defer c.freeValue(ctx, status_text_val);
-        if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
-            defer st.deinit();
-            data.setStatusText(st.slice);
+        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) { // NEW
+            if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
+                defer st.deinit();
+                data.setStatusText(st.slice);
+            }
         }
         parseHeadersInitFromObj(ctx, init_val, &data.headers);
     }
 
-    c.setOpaque(this_val, data);
-    setResponseProps(ctx, this_val, data);
-    return this_val;
+    const obj = c.newObjectClass(ctx, @intCast(response_class_id));
+    c.setOpaque(obj, data);
+    setResponseProps(ctx, obj, data);
+    return obj;
 }
 
 pub fn buildResponseJSObject(ctx: ?*c.Context, data: *ResponseData) c.Value {
@@ -515,7 +529,7 @@ pub fn setup(ctx: ?*c.Context) void {
 
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
-    const ctor = c.newCFunction(ctx, &responseConstructor, "Response", 2);
+    const ctor = c.newCFunction2(ctx, &responseConstructor, "Response", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "Response", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 
     const static_json = c.newCFunction(ctx, &responseStaticJson, "json", 2);

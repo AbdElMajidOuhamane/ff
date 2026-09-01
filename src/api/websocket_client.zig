@@ -1,5 +1,6 @@
 
 
+
 const std = @import("std");
 const c = @import("../c.zig").c;
 const ws_client = @import("../net/ws_client.zig");
@@ -86,7 +87,7 @@ fn slotFromArg(ctx: ?*c.Context, arg: c.Value) ?usize {
 }
 
 pub fn setup(ctx: ?*c.Context) void {
-    ws_client.init();
+    ws_client.init(ctx); // CHANGED: pass ctx so the pump can dispatch events
 
     var def = c.ClassDef{
         .class_name = "WebSocket",

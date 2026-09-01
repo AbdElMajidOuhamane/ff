@@ -16,6 +16,9 @@ const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
 const websocket_client = @import("../api/websocket_client.zig");
 const http_native = @import("../net/http_native.zig");
+// CHANGED: pump modules armed at init so server mode drains completions
+const async_fetch = @import("../net/async_fetch.zig");
+const ws_client = @import("../net/ws_client.zig");
 
 const DepEntry = struct {
     key: [:0]const u8,
@@ -84,6 +87,11 @@ pub const Runtime = struct {
 
         const loop_ptr = try boot.create(EventLoop);
         EventLoop.initInto(loop_ptr);
+        // CHANGED: arm completion pumps before any user code runs so
+        // `ff start` (.until_done mode, no polling) drains fetch/ws results.
+        // Idempotent; runWithMicrotasks re-arms as needed in file mode.
+        async_fetch.setLoop(&loop_ptr.loop);
+        ws_client.setLoop(&loop_ptr.loop);
         const cache_ptr = try boot.create(mod.ModuleCache);
         cache_ptr.* = mod.ModuleCache.init(boot);
 

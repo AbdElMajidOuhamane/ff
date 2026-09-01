@@ -221,7 +221,7 @@ pub fn deinitClient() void {
 
 pub fn setup(ctx: ?*c.Context) void {
     tls.init();
-    async_fetch.init();
+    async_fetch.init(ctx); // CHANGED: pass ctx so the pump can resolve promises
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const fetch_func = c.newCFunction(ctx, &fetchCallback, "fetch", 2);
