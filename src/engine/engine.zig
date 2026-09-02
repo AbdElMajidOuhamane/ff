@@ -16,17 +16,16 @@ const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
 const websocket_client = @import("../api/websocket_client.zig");
 const http_native = @import("../net/http_native.zig");
-// CHANGED: pump modules armed at init so server mode drains completions
 const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
+const text_encoding = @import("../api/text_encoding.zig");
 
-const DepEntry = struct {
-    key: [:0]const u8,
-    module: *mod.Module,
-};
 
-// DOD-FIX 9: single boot arena; runtime struct + EventLoop + module cache
-// live inside it instead of being individually page_allocator-allocated.
+
+
+const gpa = std.heap.smp_allocator;
+// DOD-FIX 9: single boot arena; runtime struct + EventLoop live inside it
+// instead of being individually page_allocator-allocated.
 var boot_arena: std.heap.ArenaAllocator = undefined;
 var boot_inited: bool = false;
 
@@ -40,10 +39,64 @@ pub fn deinitNetwork() void {
 
 var g_runtime: ?*Runtime = null;
 
+// ── ESM module loading (NEW) ────────────────────────────────────
+// Mirrors quickjs-libc's js_module_loader: eval with
+// EVAL_TYPE_MODULE | COMPILE_ONLY, harvest the JSModuleDef from the
+// JSValue pointer, free the JSValue wrapper (module already referenced).
+fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = opaque_;
+    const base = std.mem.span(base_name);
+    const spec = std.mem.span(name);
+    const dir = std.fs.path.dirname(base) orelse ".";
+    const resolved = mod.resolveSpec(gpa, dir, spec) catch return null;
+    defer gpa.free(resolved);
+    // no extension → append .js (sentinel-terminated for js_strdup)
+    const has_ext = std.mem.lastIndexOfScalar(u8, std.fs.path.basename(resolved), '.') != null;
+    var path_z: [:0]u8 = undefined;
+    if (has_ext) {
+        path_z = gpa.allocSentinel(u8, resolved.len, 0) catch return null;
+        @memcpy(path_z[0..resolved.len], resolved);
+    } else {
+        path_z = gpa.allocSentinel(u8, resolved.len + 3, 0) catch return null;
+        @memcpy(path_z[0..resolved.len], resolved);
+        @memcpy(path_z[resolved.len..][0..3], ".js");
+    }
+    defer gpa.free(path_z);
+    return qjs.js_strdup(ctx, path_z.ptr);
+}
+
+fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) ?*qjs.ModuleDef {
+    _ = opaque_;
+    const name = std.mem.span(module_name);
+    const src = mod.readFile(gpa, name) catch {
+        _ = qjs.throwReferenceError(ctx, "could not load module filename '%s'", name.ptr);
+        return null;
+    };
+    defer gpa.free(src);
+    const func_val = qjs.eval(ctx, src.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
+    if (qjs.isException(func_val) != 0) return null;
+    const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
+    // import.meta.url (minimal js_module_set_import_meta equivalent)
+    const meta = qjs.getImportMeta(ctx, m);
+    if (qjs.isException(meta) == 0 and qjs.isNull(meta) == 0 and qjs.isUndefined(meta) == 0) {
+        if (std.mem.indexOfScalar(u8, name, ':') == null) {
+            // "file://" (7 bytes) + name + NUL — no allocPrintZ in Zig 0.16
+            const us = gpa.allocSentinel(u8, name.len + 7, 0) catch null;
+            if (us) |uz| {
+                defer gpa.free(uz);
+                @memcpy(uz[0..7], "file://");
+                @memcpy(uz[7..][0..name.len], name);
+                _ = qjs.definePropertyValueStr(ctx, meta, "url", qjs.newStringLen(ctx, uz.ptr, name.len + 7), qjs.PROP_C_W_E);
+            }
+        }
+    }
+    qjs.freeValue(ctx, meta);
+    qjs.freeValue(ctx, func_val); // module already referenced, so free the wrapper
+    return m;
+}
+
 pub const Runtime = struct {
     ctx: *qjs.Context,
-    module_cache: *mod.ModuleCache,
-    modules_initialized: bool,
     event_loop: *EventLoop,
     timer_manager: TimerManager,
 
@@ -51,6 +104,8 @@ pub const Runtime = struct {
         const rt = qjs.newRuntime() orelse return error.InitFailed;
         qjs.setMaxStackSize(rt, 1024 * 1024);
         qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
+        // NEW: real ESM support — QuickJS resolves imports via these hooks
+        qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
 
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
 
@@ -65,7 +120,7 @@ pub const Runtime = struct {
         response.setup(ctx);
         http.setup(ctx);
         websocket_client.setup(ctx);
-
+        text_encoding.setup(ctx);
         const global = qjs.getGlobalObject(ctx);
         defer qjs.freeValue(ctx, global);
 
@@ -73,11 +128,13 @@ pub const Runtime = struct {
         const setInterval_func = qjs.newCFunction(ctx, setIntervalCallback, "setInterval", 2);
         const clearTimeout_func = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         const clearInterval_func = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
+        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1); // NEW
 
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", setTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", setInterval_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", clearTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "clearInterval", clearInterval_func, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "queueMicrotask", queue_microtask_func, qjs.PROP_C_W_E); // NEW
 
         if (!boot_inited) {
             boot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -87,19 +144,14 @@ pub const Runtime = struct {
 
         const loop_ptr = try boot.create(EventLoop);
         EventLoop.initInto(loop_ptr);
-        // CHANGED: arm completion pumps before any user code runs so
-        // `ff start` (.until_done mode, no polling) drains fetch/ws results.
-        // Idempotent; runWithMicrotasks re-arms as needed in file mode.
+        // Store the loop for lazy arming; do NOT arm here — an always-armed
+        // pump keeps hasWork() true and prevents script-mode exit.
         async_fetch.setLoop(&loop_ptr.loop);
         ws_client.setLoop(&loop_ptr.loop);
-        const cache_ptr = try boot.create(mod.ModuleCache);
-        cache_ptr.* = mod.ModuleCache.init(boot);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{
             .ctx = ctx,
-            .module_cache = cache_ptr,
-            .modules_initialized = false,
             .event_loop = loop_ptr,
             .timer_manager = TimerManager.init(&loop_ptr.loop),
         };
@@ -154,15 +206,42 @@ pub const Runtime = struct {
         if (id >= 0) rt.timer_manager.clear(@intCast(id));
     }
 
+    // ── queueMicrotask (NEW) — zero alloc: JS_EnqueueJob dups argv ──
+    fn microtaskJob(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        const ret = qjs.call(ctx, argv[0], qjs.JS_UNDEFINED, 0, null);
+        if (qjs.isException(ret) != 0) {
+            // swallow: keep the shared job queue clean, report to stderr
+            const exc = qjs.getException(ctx);
+            defer qjs.freeValue(ctx, exc);
+            const msg = qjs.toCString(ctx, exc);
+            if (msg) |m| {
+                defer qjs.freeCString(ctx, m);
+                std.debug.print("queueMicrotask error: {s}\n", .{m});
+            }
+            return qjs.JS_UNDEFINED;
+        }
+        return ret;
+    }
+
+    fn queueMicrotaskCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        if (argc < 1 or qjs.isFunction(ctx, argv[0]) == 0) {
+            _ = qjs.throwTypeError(ctx, "queueMicrotask requires a function argument");
+            return qjs.JS_EXCEPTION;
+        }
+        if (qjs.enqueueJob(ctx, microtaskJob, 1, argv) != 0) return qjs.JS_EXCEPTION;
+        return qjs.JS_UNDEFINED;
+    }
+
     pub fn deinit(self: *Runtime) void {
         fetch_api.deinitClient();
-        self.module_cache.deinit();
         self.timer_manager.cancelAll();
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
         qjs.freeRuntime(rt);
-        // Boot arena is the sole owner of `self`, the EventLoop, and the
-        // ModuleCache. Free it LAST so all references stay valid above.
+        // Boot arena is the sole owner of `self` and the EventLoop.
+        // Free it LAST so all references stay valid above.
         if (boot_inited) {
             boot_arena.deinit();
             boot_inited = false;
@@ -193,90 +272,30 @@ pub const Runtime = struct {
     }
 
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
-        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const scratch = arena_state.allocator();
-        defer arena_state.deinit();
-        var sources = std.ArrayList(DepEntry).empty;
-        sources.ensureTotalCapacity(scratch, 16) catch return false;
-        self.collectDeps(scratch, source, filename, &sources) catch return false;
-        self.setupModuleRegistry() catch return false;
-        std.mem.reverse(DepEntry, sources.items);
-        for (sources.items) |s| {
-              const wrapped = self.wrapModule(scratch, s.module.source, s.key, s.module) catch continue;
-            _ = self.eval(wrapped, s.key);
+        // CHANGED: real module eval — imports resolve via moduleLoader
+        const flags: c_int = if (qjs.detectModule(source.ptr, source.len) != 0)
+            qjs.EVAL_TYPE_MODULE
+        else
+            qjs.EVAL_TYPE_GLOBAL;
+        const result = qjs.eval(
+            self.ctx,
+            source.ptr,
+            source.len,
+            filename.ptr,
+            flags,
+        );
+        defer qjs.freeValue(self.ctx, result);
+        if (qjs.isException(result) != 0) {
+            const exc = qjs.getException(self.ctx);
+            defer qjs.freeValue(self.ctx, exc);
+            const msg = qjs.toCString(self.ctx, exc);
+            if (msg) |m| {
+                defer qjs.freeCString(self.ctx, m);
+                std.debug.print("Error: {s}\n", .{m});
+            }
+            return false;
         }
-        var m = mod.Module.init(scratch, source, filename, std.fs.path.dirname(filename) orelse ".");
-        defer m.deinit();
-        m.parseImports() catch return false;
-        m.parseExports() catch return false;
-        const wrapped = self.wrapModule(scratch, source, filename, &m) catch return false;
-        const result = self.eval(wrapped, filename);
         microtasks.pumpMicrotasks(self.ctx);
-        return result;
-    }
-
-    fn collectDeps(
-        self: *Runtime,
-        scratch: std.mem.Allocator,
-        source: []const u8,
-        filename: [:0]const u8,
-        out: *std.ArrayList(DepEntry),
-    ) !void {
-        const dir = std.fs.path.dirname(filename) orelse ".";
-        try out.ensureTotalCapacity(scratch, 16);
-        var m = mod.Module.init(scratch, source, filename, dir);
-        defer m.deinit();
-        m.parseImports() catch return;
-        for (m.imports.items) |imp| {
-            const resolved = mod.resolveSpec(scratch, dir, m.sliceAt(imp.specifier)) catch continue;
-            defer scratch.free(resolved);
-            // Cache is StringHashMap keyed by resolved path (DOD-FIX 8 reverted).
-            if (self.module_cache.get(resolved) != null) continue;
-            const dep_source = mod.readFile(scratch, resolved) catch continue;
-            const path_z = scratch.dupeZ(u8, resolved) catch {
-                continue;
-            };
-            const dep_dir = std.fs.path.dirname(path_z) orelse ".";
-            var dep = mod.Module.init(scratch, dep_source, path_z, dep_dir);
-            dep.parseImports() catch {
-                continue;
-            };
-            dep.parseExports() catch {
-                continue;
-            };
-            const dep_ptr = scratch.create(mod.Module) catch {
-                continue;
-            };
-            dep_ptr.* = dep;
-            self.module_cache.put(path_z, dep_ptr) catch {
-                dep_ptr.deinit();
-                continue;
-            };
-            const key_z = scratch.dupeZ(u8, dep_ptr.path) catch continue;
-            out.append(scratch, .{ .key = key_z, .module = dep_ptr }) catch continue;
-            self.collectDeps(scratch, dep_source, path_z, out) catch {};
-        }
-    }
-
-    fn setupModuleRegistry(self: *Runtime) !void {
-        if (self.modules_initialized) return;
-        self.modules_initialized = true;
-        const global = qjs.getGlobalObject(self.ctx);
-        defer qjs.freeValue(self.ctx, global);
-        const registry = qjs.newObject(self.ctx);
-        _ = qjs.definePropertyValueStr(self.ctx, global, "__modules", registry, qjs.PROP_C_W_E);
-    }
-
-    fn wrapModule(
-        self: *Runtime,
-        scratch: std.mem.Allocator,
-        source: []const u8,
-        filename: [:0]const u8,
-        m: *mod.Module,
-    ) ![:0]const u8 {
-        _ = self;
-        _ = filename;
-        _ = m;
-        return scratch.dupeZ(u8, source) catch return error.OutOfMemory;
+        return true;
     }
 };

@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
-const PoolSlice = @import("../types/pool_slice.zig").PoolSlice; // CHANGED
+const PoolSlice = @import("../types/pool_slice.zig").PoolSlice;
 
 var url_class_id: c.ClassID = 0;
 var sp_class_id: c.ClassID = 0;
@@ -68,7 +68,7 @@ const URLSearchParamsData = struct {
     merge_buf: std.ArrayList(u8),
     view_buf: std.ArrayList([]const u8),
     ser_buf: std.ArrayList(u8),
-    block: ?*UrlBlock = null, // CHANGED: null = standalone; set when embedded in a URL block
+    block: ?*UrlBlock = null,
     fn init() URLSearchParamsData {
         return .{
             .names = std.ArrayList(u8).empty,
@@ -375,7 +375,7 @@ fn spForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value
     return c.JS_UNDEFINED;
 }
 
-fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void { // CHANGED
+fn spFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, sp_class_id)) |ptr| {
         const data: *URLSearchParamsData = @ptrCast(@alignCast(ptr));
@@ -407,37 +407,35 @@ fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 }
 
 // ============================================================
-// UrlData + UrlBlock — single allocation per URL (CHANGED)
+// UrlData + UrlBlock — single allocation per URL
 // ============================================================
 const UrlData = struct {
     block: *UrlBlock, // ownership handle — released by urlFinalizer, never freed here
     pool: [*]u8,
     port: ?u16 = null,
-    scheme: []const u8 = "", // all slices point into the block pool —
-    host: []const u8 = "", // existing readers (data.host, data.path, …)
-    path: []const u8 = "", // keep working unchanged
+    scheme: []const u8 = "",
+    host: []const u8 = "",
+    path: []const u8 = "",
     query: []const u8 = "",
     fragment: []const u8 = "",
     username: []const u8 = "",
     password: []const u8 = "",
-    href: []const u8 = "", // precomputed at parse (replaces serialize())
-    origin: []const u8 = "", // replaces originStr()
-    host_str: []const u8 = "", // replaces hostStr()
-    search: []const u8 = "", // replaces searchStr()
-    hash: []const u8 = "", // replaces hashStr()
-    port_str: []const u8 = "", // replaces portStr()
+    href: []const u8 = "",
+    origin: []const u8 = "",
+    host_str: []const u8 = "",
+    search: []const u8 = "",
+    hash: []const u8 = "",
+    port_str: []const u8 = "",
 
     fn protocolStr(self: *const UrlData, buf: *[256]u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s}:", .{self.scheme}) catch self.scheme;
     }
-    // deinit DELETED — UrlBlock.release owns everything
 };
 
-// One allocation per URL: refs + SP data + UrlData + string pool.
 const UrlBlock = struct {
     mem_len: u32,
-    refs: u32, // urlFinalizer + spFinalizer each hold one ref
-    sp: URLSearchParamsData, // embedded; ArrayLists stay heap-backed for mutation growth
+    refs: u32,
+    sp: URLSearchParamsData,
     url: UrlData,
 
     fn create(pool_len: usize) !*UrlBlock {
@@ -447,7 +445,7 @@ const UrlBlock = struct {
         const block: *UrlBlock = @ptrCast(@alignCast(mem.ptr));
         block.* = .{
             .mem_len = @intCast(total),
-            .refs = 1, // the URL object's ref
+            .refs = 1,
             .sp = URLSearchParamsData.init(),
             .url = .{ .block = block, .pool = mem.ptr + hdr },
         };
@@ -473,7 +471,6 @@ comptime {
     std.debug.assert(@sizeOf(PoolSlice) == 8);
 }
 
-// ── Zero-alloc pool writer ──────────────────────────────────────────
 const PoolWriter = struct {
     pool: []u8,
     used: usize = 0,
@@ -512,7 +509,6 @@ const PoolWriter = struct {
             self.used += 1;
         }
     }
-    /// Decode-while-writing — same output as Component.toRawMaybeAlloc, no alloc.
     fn putComponent(self: *PoolWriter, comp: std.Uri.Component) []const u8 {
         switch (comp) {
             .raw => |raw| return self.put(raw),
@@ -547,18 +543,23 @@ fn appendPort(url: *UrlData, w: *PoolWriter) void {
     w.putUint(p);
 }
 
-/// Precompute every derived string into the pool at parse time — the old
-/// serialize()/originStr()/hostStr()/searchStr()/hashStr()/portStr()
-/// transient allocations are gone.
 fn deriveStrings(url: *UrlData, w: *PoolWriter) void {
     var m = w.mark();
-    _ = w.put("?");
-    _ = w.put(url.query);
-    url.search = w.sliceFrom(m);
+    if (url.query.len > 0) {
+        _ = w.put("?");
+        _ = w.put(url.query);
+        url.search = w.sliceFrom(m);
+    } else {
+        url.search = "";
+    }
     m = w.mark();
-    _ = w.put("#");
-    _ = w.put(url.fragment);
-    url.hash = w.sliceFrom(m);
+    if (url.fragment.len > 0) {
+        _ = w.put("#");
+        _ = w.put(url.fragment);
+        url.hash = w.sliceFrom(m);
+    } else {
+        url.hash = "";
+    }
     m = w.mark();
     _ = w.put(url.host);
     appendPort(url, w);
@@ -603,10 +604,327 @@ fn extractUrlData(ctx: ?*c.Context, this_val: c.Value) ?*UrlData {
     return @ptrCast(@alignCast(ptr));
 }
 
+// ── URL property accessors (CHANGED: proto get/set pairs, block swap) ──
+// Every setter: recompose the full URL → reparse into a NEW single-alloc
+// block → repoint the searchParams object → release the old block.
+const UrlField = enum { href, protocol, host, hostname, port, pathname, search, hash, username, password };
+
+fn setUrlField(ctx: ?*c.Context, this_val: c.Value, field: UrlField, raw: []const u8) void {
+    const old = extractUrlData(ctx, this_val) orelse return;
+    var buf: [8192]u8 = undefined;
+    var n: usize = 0;
+    switch (field) {
+        .href => {
+            if (raw.len > buf.len) return;
+            @memcpy(buf[0..raw.len], raw);
+            n = raw.len;
+        },
+        .protocol => {
+            const s = if (std.mem.endsWith(u8, raw, ":")) raw[0 .. raw.len - 1] else raw;
+            const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
+            const rest = old.href[sep + 3 ..];
+            if (s.len + 3 + rest.len > buf.len) return;
+            @memcpy(buf[0..s.len], s);
+            n = s.len;
+            @memcpy(buf[n..][0..3], "://");
+            n += 3;
+            @memcpy(buf[n..][0..rest.len], rest);
+            n += rest.len;
+        },
+        .host, .hostname => {
+            var host_part: []const u8 = raw;
+            var port_part: []const u8 = if (field == .hostname) old.port_str else "";
+            if (field == .host) {
+                if (std.mem.lastIndexOfScalar(u8, raw, ':')) |ci| {
+                    host_part = raw[0..ci];
+                    port_part = raw[ci + 1 ..];
+                }
+            }
+            const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
+            const after_scheme = old.href[sep + 3 ..];
+            const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+            const rest = after_scheme[auth_end..];
+            if (sep + 3 + host_part.len + 1 + port_part.len + rest.len > buf.len) return;
+            @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
+            n = sep + 3;
+            if (old.username.len > 0 or old.password.len > 0) {
+                _ = std.fmt.bufPrint(buf[n..], "{s}:{s}@", .{ old.username, old.password }) catch return;
+                n += old.username.len + 1 + old.password.len + 1;
+            }
+            @memcpy(buf[n..][0..host_part.len], host_part);
+            n += host_part.len;
+            if (port_part.len > 0) {
+                buf[n] = ':';
+                n += 1;
+                @memcpy(buf[n..][0..port_part.len], port_part);
+                n += port_part.len;
+            }
+            @memcpy(buf[n..][0..rest.len], rest);
+            n += rest.len;
+        },
+        .port => {
+            var new_port_str: []const u8 = raw;
+            if (raw.len > 0) {
+                const p = std.fmt.parseInt(u16, raw, 10) catch return;
+                if (defaultPortForScheme(old.scheme)) |dp| {
+                    if (p == dp) new_port_str = "";
+                }
+            }
+            const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
+            const after_scheme = old.href[sep + 3 ..];
+            const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+            const authority = after_scheme[0..auth_end];
+            const rest = after_scheme[auth_end..];
+            var host_part: []const u8 = authority;
+            if (std.mem.lastIndexOfScalar(u8, authority, ':')) |ci| {
+                if (std.mem.indexOfScalar(u8, authority[ci..], ']') == null) {
+                    host_part = authority[0..ci];
+                }
+            }
+            var userinfo: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, host_part, '@')) |at| {
+                userinfo = host_part[0 .. at + 1];
+                host_part = host_part[at + 1 ..];
+            }
+            if (sep + 3 + userinfo.len + host_part.len + 1 + new_port_str.len + rest.len > buf.len) return;
+            @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
+            n = sep + 3;
+            @memcpy(buf[n..][0..userinfo.len], userinfo);
+            n += userinfo.len;
+            @memcpy(buf[n..][0..host_part.len], host_part);
+            n += host_part.len;
+            if (new_port_str.len > 0) {
+                buf[n] = ':';
+                n += 1;
+                @memcpy(buf[n..][0..new_port_str.len], new_port_str);
+                n += new_port_str.len;
+            }
+            @memcpy(buf[n..][0..rest.len], rest);
+            n += rest.len;
+        },
+        .pathname => {
+            var p: []const u8 = raw;
+            if (p.len == 0 or p[0] != '/') {
+                if (p.len + 1 > buf.len) return;
+                buf[0] = '/';
+                @memcpy(buf[1..][0..p.len], p);
+                p = buf[0 .. p.len + 1];
+            }
+            const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
+            const after_scheme = old.href[sep + 3 ..];
+            const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+            const keep = after_scheme[0..auth_end];
+            if (sep + 3 + keep.len + p.len + old.search.len + old.hash.len > buf.len) return;
+            @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
+            n = sep + 3;
+            @memcpy(buf[n..][0..keep.len], keep);
+            n += keep.len;
+            @memcpy(buf[n..][0..p.len], p);
+            n += p.len;
+            @memcpy(buf[n..][0..old.search.len], old.search);
+            n += old.search.len;
+            @memcpy(buf[n..][0..old.hash.len], old.hash);
+            n += old.hash.len;
+        },
+        .search, .hash => {
+            var v: []const u8 = raw;
+            const lead: u8 = if (field == .search) '?' else '#';
+            if (v.len > 0 and v[0] == lead) v = v[1..];
+            const cut = if (field == .search)
+                (std.mem.indexOfScalar(u8, old.href, '?') orelse (std.mem.indexOfScalar(u8, old.href, '#') orelse old.href.len))
+            else
+                (std.mem.indexOfScalar(u8, old.href, '#') orelse old.href.len);
+            if (cut + 1 + v.len > buf.len) return;
+            @memcpy(buf[0..cut], old.href[0..cut]);
+            n = cut;
+            if (v.len > 0) {
+                buf[n] = lead;
+                n += 1;
+                @memcpy(buf[n..][0..v.len], v);
+                n += v.len;
+            }
+        },
+        .username, .password => {
+            const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
+            const after_scheme = old.href[sep + 3 ..];
+            const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+            const authority = after_scheme[0..auth_end];
+            const rest = after_scheme[auth_end..];
+            var userinfo: []const u8 = "";
+            var hostport: []const u8 = authority;
+            if (std.mem.indexOfScalar(u8, authority, '@')) |at| {
+                userinfo = authority[0..at];
+                hostport = authority[at + 1 ..];
+            }
+            var user_part: []const u8 = "";
+            var pass_part: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, userinfo, ':')) |ci| {
+                user_part = userinfo[0..ci];
+                pass_part = userinfo[ci + 1 ..];
+            } else if (userinfo.len > 0) {
+                user_part = userinfo;
+            }
+            const new_user = if (field == .username) raw else user_part;
+            const new_pass = if (field == .password) raw else pass_part;
+            if (sep + 3 + new_user.len + 1 + new_pass.len + 1 + hostport.len + rest.len > buf.len) return;
+            @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
+            n = sep + 3;
+            if (new_user.len > 0 or new_pass.len > 0) {
+                @memcpy(buf[n..][0..new_user.len], new_user);
+                n += new_user.len;
+                if (new_pass.len > 0) {
+                    buf[n] = ':';
+                    n += 1;
+                    @memcpy(buf[n..][0..new_pass.len], new_pass);
+                    n += new_pass.len;
+                }
+                buf[n] = '@';
+                n += 1;
+            }
+            @memcpy(buf[n..][0..hostport.len], hostport);
+            n += hostport.len;
+            @memcpy(buf[n..][0..rest.len], rest);
+            n += rest.len;
+        },
+    }
+    const new_full = buf[0..n];
+    const block = parseUrlAbsolute(new_full) catch return;
+    // repoint the existing searchParams JS object to the new block 
+    const sp_obj = c.getPropertyStr(ctx, this_val, "searchParams");
+    defer c.freeValue(ctx, sp_obj);
+    if (c.getOpaque2(ctx, sp_obj, sp_class_id) != null) {
+        block.sp.block = block;
+        block.retain(); // sp object's ref on the new block
+        c.setOpaque(sp_obj, &block.sp);
+        old.block.release(); // old url ref (transferred)
+        old.block.release(); // old sp ref (transferred)
+    } else {
+        old.block.release();
+    }
+    c.setOpaque(this_val, &block.url);
+}
+
+fn getHref(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.href);
+}
+fn getOrigin(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.origin);
+}
+fn getProtocol(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    var buf: [256]u8 = undefined;
+    return zigStringToJS(ctx, data.protocolStr(&buf));
+}
+fn getHost(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.host_str);
+}
+fn getHostname(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.host);
+}
+fn getPort(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.port_str);
+}
+fn getPathname(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.path);
+}
+fn getSearch(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.search);
+}
+fn getHash(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.hash);
+}
+fn getUsername(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.username);
+}
+fn getPassword(ctx: ?*c.Context, this_val: c.Value) callconv(.c) c.Value {
+    const data = extractUrlData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    return zigStringToJS(ctx, data.password);
+}
+
+fn setHref(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .href, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setProtocol(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .protocol, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setHost(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .host, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setHostname(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .hostname, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setPort(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .port, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setPathname(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .pathname, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setSearch(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .search, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setHash(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .hash, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setUsername(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .username, v.slice);
+    return c.JS_UNDEFINED;
+}
+fn setPassword(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c.Value {
+    var buf: [512]u8 = undefined;
+    const v = extractStringAuto(ctx, val, &buf) orelse return c.JS_EXCEPTION;
+    defer v.deinit();
+    setUrlField(ctx, this_val, .password, v.slice);
+    return c.JS_UNDEFINED;
+}
+
 fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     const uri = try std.Uri.parse(input);
-    const block = try UrlBlock.create(input.len + 256); // every decoded
-    errdefer block.release(); // component is a sub-slice of input
+    const block = try UrlBlock.create(input.len + 256);
+    errdefer block.release();
     var w = PoolWriter{ .pool = block.poolSlice() };
     const url = &block.url;
     url.port = uri.port;
@@ -670,7 +988,6 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
             return block;
         }
     } else |_| {}
-    // pure-relative: merge onto the base
     url.port = base.port;
     url.scheme = w.put(base.scheme);
     url.host = if (base.host) |h| w.putComponent(h) else "";
@@ -719,7 +1036,7 @@ fn removeDotSegmentsInto(out: []u8, input: []const u8) !usize {
             while (n > 0) {
                 n -= 1;
                 if (n > 0 and out[n - 1] == '/') {
-                    n -= 1; // CHANGED: original also strips the trailing '/'
+                    n -= 1;
                     break;
                 }
                 if (n == 0) break;
@@ -731,7 +1048,7 @@ fn removeDotSegmentsInto(out: []u8, input: []const u8) !usize {
             while (n > 0) {
                 n -= 1;
                 if (n > 0 and out[n - 1] == '/') {
-                    n -= 1; // CHANGED
+                    n -= 1;
                     break;
                 }
                 if (n == 0) break;
@@ -793,20 +1110,8 @@ fn createSPJsObject(ctx: ?*c.Context, data: *URLSearchParamsData) c.Value {
 fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value { // CHANGED
     const obj = c.newObjectClass(ctx, @intCast(url_class_id));
     c.setOpaque(obj, data);
-    var protocol_buf: [256]u8 = undefined;
-    _ = c.definePropertyValueStr(ctx, obj, "href", zigStringToJS(ctx, data.href), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "origin", zigStringToJS(ctx, data.origin), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "host", zigStringToJS(ctx, data.host_str), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "hostname", zigStringToJS(ctx, data.host), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "port", zigStringToJS(ctx, data.port_str), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "pathname", zigStringToJS(ctx, data.path), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "search", zigStringToJS(ctx, data.search), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "hash", zigStringToJS(ctx, data.hash), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "username", zigStringToJS(ctx, data.username), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "password", zigStringToJS(ctx, data.password), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "protocol", zigStringToJS(ctx, data.protocolStr(&protocol_buf)), c.PROP_C_W_E);
     data.block.sp.block = data.block;
-    data.block.retain(); // the searchParams JS object holds its own ref
+    data.block.retain();
     const sp_obj = createSPJsObject(ctx, &data.block.sp);
     _ = c.definePropertyValueStr(ctx, obj, "searchParams", sp_obj, c.PROP_C_W_E);
     return obj;
@@ -815,16 +1120,16 @@ fn createUrlJsObject(ctx: ?*c.Context, data: *UrlData) c.Value { // CHANGED
 // ============================================================
 // URL callbacks
 // ============================================================
-fn urlToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value { // CHANGED
+fn urlToString(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
     const data = extractUrlData(ctx, this_val) orelse return zigStringToJS(ctx, "");
-    return zigStringToJS(ctx, data.href); // zero alloc
+    return zigStringToJS(ctx, data.href);
 }
 
 fn urlToJSON(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     return urlToString(ctx, this_val, argc, argv);
 }
 
-fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void { // CHANGED
+fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, url_class_id)) |ptr| {
         const data: *UrlData = @ptrCast(@alignCast(ptr));
@@ -832,7 +1137,7 @@ fn urlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void { // CHANGED
     }
 }
 
-fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
+fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "URL constructor requires at least 1 argument");
@@ -860,7 +1165,7 @@ fn urlConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     return createUrlJsObject(ctx, &block.url);
 }
 
-fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
+fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) return c.JS_NULL;
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
@@ -878,7 +1183,7 @@ fn urlParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) 
     return createUrlJsObject(ctx, &block.url);
 }
 
-fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value { // CHANGED
+fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) return c.JS_FALSE;
     var input_buf: [512]u8 = undefined;
     var base_buf: [512]u8 = undefined;
@@ -903,7 +1208,7 @@ fn urlCanParseStatic(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Valu
 // ============================================================
 // Setup
 // ============================================================
-pub fn setup(ctx: ?*c.Context) void {
+pub fn setup(ctx: *c.Context) void {
     {
         var sp_def = c.ClassDef{
             .class_name = "URLSearchParams",
@@ -951,6 +1256,34 @@ pub fn setup(ctx: ?*c.Context) void {
             _ = c.definePropertyValueStr(ctx, url_proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
         }
         c.setClassProto(ctx, url_class_id, url_proto);
+        // CHANGED: property get/set pairs (all reads are live-field accessors)
+        const GetSet = struct {
+            name: [*:0]const u8,
+            get: *const fn (?*c.Context, c.Value) callconv(.c) c.Value,
+            set: ?*const fn (?*c.Context, c.Value, c.Value) callconv(.c) c.Value,
+        };
+        const url_getsets = [_]GetSet{
+            .{ .name = "href", .get = &getHref, .set = &setHref },
+            .{ .name = "origin", .get = &getOrigin, .set = null },
+            .{ .name = "protocol", .get = &getProtocol, .set = &setProtocol },
+            .{ .name = "host", .get = &getHost, .set = &setHost },
+            .{ .name = "hostname", .get = &getHostname, .set = &setHostname },
+            .{ .name = "port", .get = &getPort, .set = &setPort },
+            .{ .name = "pathname", .get = &getPathname, .set = &setPathname },
+            .{ .name = "search", .get = &getSearch, .set = &setSearch },
+            .{ .name = "hash", .get = &getHash, .set = &setHash },
+            .{ .name = "username", .get = &getUsername, .set = &setUsername },
+            .{ .name = "password", .get = &getPassword, .set = &setPassword },
+        };
+        for (url_getsets) |gs| {
+            const get_val = c.newCFunction2(ctx, @ptrCast(gs.get), gs.name, 0, c.JS_CFUNC_getter, 0);
+            const set_val = if (gs.set) |sf|
+                c.newCFunction2(ctx, @ptrCast(sf), gs.name, 1, c.JS_CFUNC_setter, 0)
+            else
+                c.JS_UNDEFINED;
+            _ = c.definePropertyGetSet(ctx, url_proto, c.newAtomLen(ctx, gs.name, std.mem.len(gs.name)), get_val, set_val, c.PROP_CONFIGURABLE | c.PROP_WRITABLE);
+           
+        }
     }
 
     const global = c.getGlobalObject(ctx);

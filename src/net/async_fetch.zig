@@ -23,20 +23,21 @@ const JOB_BUSY: u8 = 1;
 const JOB_DONE: u8 = 2;
 const JOB_CLAIMED: u8 = 3;
 
-var states:    [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
+var states: [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
 var resolve_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
-var reject_funcs:  [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
-var results:   [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
-var errs:      [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
-var url_bufs:  [MAX_FETCH][:0]const u8 = undefined;
-var uris:      [MAX_FETCH]std.Uri = undefined;
-var methods:   [MAX_FETCH]http.Method = undefined;
+var reject_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
+var results: [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
+var errs: [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
+var url_bufs: [MAX_FETCH][:0]const u8 = undefined;
+var uris: [MAX_FETCH]std.Uri = undefined;
+var methods: [MAX_FETCH]http.Method = undefined;
 // DOD-FIX 5: in-flight headers now stored in the shared dense HeadersData.
 // We keep a pointer per slot and transfer ownership to the ResponseData on
 // success (the worker drops its reference). The pool slot is reset to
 // undefined on release; the pointer is owned by ResponseData after okSlot.
-var headers:   [MAX_FETCH]?*headers_mod.HeadersData = [_]?*headers_mod.HeadersData{null} ** MAX_FETCH;
-var bodies:    [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
+var headers: [MAX_FETCH]?*headers_mod.HeadersData = [_]?*headers_mod.HeadersData{null} ** MAX_FETCH;
+var bodies: [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
+var redirect_url_bufs: [MAX_FETCH][2048]u8 = undefined; // CHANGED: redirect hop targets
 
 var free_list: [MAX_FETCH]u16 = undefined;
 var free_count: usize = MAX_FETCH;
@@ -253,6 +254,42 @@ pub fn submit(
     ensureArmed(); // CHANGED: cover the disarm→submit sequence in server mode
 }
 
+/// Resolve a Location header against the current URL. Returns a slice of `out`.
+fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]const u8 {
+    const scheme_sep = std.mem.indexOf(u8, current_url, "://") orelse return null;
+    const auth_start = scheme_sep + 3;
+    const auth_end = std.mem.indexOfScalarPos(u8, current_url, auth_start, '/') orelse current_url.len;
+    if (std.mem.startsWith(u8, loc, "http://") or std.mem.startsWith(u8, loc, "https://")) {
+        if (loc.len > out.len) return null;
+        @memcpy(out[0..loc.len], loc);
+        return out[0..loc.len];
+    }
+    if (std.mem.startsWith(u8, loc, "//")) { // scheme-relative: scheme: + loc
+        const n = scheme_sep + 1;
+        if (n + loc.len > out.len) return null;
+        @memcpy(out[n..][0..loc.len], loc);
+        return out[0 .. n + loc.len];
+    }
+    if (loc.len > 0 and loc[0] == '/') { // origin-relative
+        if (auth_end + loc.len > out.len) return null;
+        @memcpy(out[0..auth_end], current_url[0..auth_end]);
+        @memcpy(out[auth_end..][0..loc.len], loc);
+        return out[0 .. auth_end + loc.len];
+    }
+    // path-relative: current dir + loc
+    const path = current_url[auth_end..];
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+    const dir_end = std.mem.lastIndexOfScalar(u8, path[0..q], '/') orelse 0;
+    if (auth_end + dir_end + 1 + loc.len > out.len) return null;
+    var n: usize = 0;
+    @memcpy(out[0..auth_end], current_url[0..auth_end]);
+    n = auth_end;
+    @memcpy(out[n..][0 .. dir_end + 1], path[0 .. dir_end + 1]);
+    n += dir_end + 1;
+    @memcpy(out[n..][0..loc.len], loc);
+    return out[0..n];
+}
+
 fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
     if (builtin.mode == .Debug) job_counter.reset();
@@ -284,199 +321,262 @@ fn runJob(slot_id: u16) void {
         http_hdrs = hdr_view.items;
     }
 
-    var req = tls.client().request(methods[s], uris[s], .{
-        .extra_headers = http_hdrs,
-    }) catch {
-        failSlot(s, "Network error");
-        return;
-    };
-    defer req.deinit();
-
-    var slot: ?usize = null;
-    if (req.connection) |cn| slot = tls.attach(cn);
-    defer if (slot) |sl| tls.detach(sl);
-
-    if (bodies[s]) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var body_writer = req.sendBodyUnflushed(&.{}) catch {
-            failSlot(s, "Failed to send request body");
-            return;
-        };
-        body_writer.writer.writeAll(payload) catch {
-            failSlot(s, "Failed to write request body");
-            return;
-        };
-        body_writer.end() catch {};
-        req.connection.?.flush() catch {};
-    } else {
-        req.sendBodiless() catch {
-            failSlot(s, "Failed to send request");
-            return;
-        };
-    }
-
-    var redirect_buf: [8000]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch {
-        failSlot(s, "Failed to receive response");
-        return;
-    };
-
+    // CHANGED: redirect hop loop — one request per hop, same slot state reused,
+    // zero allocations per hop beyond the required response body.
+    var current_method = methods[s];
+    var current_url: []const u8 = url_bufs[s];
+    var current_body: ?[:0]const u8 = bodies[s];
+    var redirect_count: u32 = 0;
+    var redirected = false;
+    var loc_buf: [4096]u8 = undefined;
     var owned_body: ?[]u8 = null;
     defer if (owned_body) |b| gpa.free(b);
 
-    const status_code = @intFromEnum(response.head.status);
-    const status_class = status_code / 100;
-    const has_body = switch (status_class) {
-        1 => false,
-        2 => response.head.status != .no_content and response.head.status != .not_modified,
-        3 => false,
-        else => true,
-    };
+    hop: while (true) {
+        const current_uri = std.Uri.parse(current_url) catch {
+            failSlot(s, "Invalid URL");
+            return;
+        };
+        var req = tls.client().request(current_method, current_uri, .{
+            .extra_headers = http_hdrs,
+        }) catch {
+            failSlot(s, "Network error");
+            return;
+        };
+    req.redirect_behavior = .unhandled;
+                                              // (so `redirected`/final `url` are ours to set)
+        defer req.deinit();
+        var slot: ?usize = null;
+        if (req.connection) |cn| slot = tls.attach(cn);
+        defer if (slot) |sl| tls.detach(sl);
 
-    if (!has_body) {
-        req.connection.?.closing = true;
-    }
-
-    // DOD-FIX 5: build ResponseData on the shared headers so the JS object
-    // returned to user code reuses the dense pool (one HeadersData alloc per
-    // request, not three).
-    const resp_data = gpa.create(response_mod.ResponseData) catch {
-        failSlot(s, "Out of memory");
-        return;
-    };
-    resp_data.* = response_mod.ResponseData.init();
-    // Transfer ownership of headers[s] to ResponseData; replace with the
-    // freshly-init'd HeadersData so the slot is sane on error paths.
-    const owned_headers = headers[s].?;
-    headers[s] = &resp_data.headers;
-    resp_data.headers = owned_headers.*;
-
-    resp_data.status = status_code;
-    resp_data.setStatusText(response.head.status.phrase() orelse "OK");
-
-    var header_it = response.head.iterateHeaders();
-    while (header_it.next()) |h| {
-        resp_data.headers.appendEntry(h.name, h.value);
-    }
-
-    if (has_body) {
-        var transfer_buf: [8192]u8 = undefined;
-        const content_encoding = response.head.content_encoding;
-        const compressed = content_encoding != .identity;
-        var decompress_buf: ?[]u8 = null;
-        defer if (decompress_buf) |d| gpa.free(d);
-        var decompress: std.http.Decompress = undefined;
-
-        const reader = if (!compressed)
-            response.reader(&transfer_buf)
-        else dec: {
-            const window_len: usize = switch (content_encoding) {
-                .gzip, .deflate => std.compress.flate.max_window_len,
-                .zstd => std.compress.zstd.default_window_len,
-                else => 0,
+        if (current_body) |payload| {
+            req.transfer_encoding = .{ .content_length = payload.len };
+            var body_writer = req.sendBodyUnflushed(&.{}) catch {
+                failSlot(s, "Failed to send request body");
+                return;
             };
-            if (window_len == 0) {
-                std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
-                break :dec response.reader(&transfer_buf);
-            }
-            const d = gpa.alloc(u8, window_len) catch break :dec response.reader(&transfer_buf);
-            decompress_buf = d;
-            break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
+            body_writer.writer.writeAll(payload) catch {
+                failSlot(s, "Failed to write request body");
+                return;
+            };
+            body_writer.end() catch {};
+            req.connection.?.flush() catch {};
+        } else {
+            req.sendBodiless() catch {
+                failSlot(s, "Failed to send request");
+                return;
+            };
+        }
+
+        var redirect_buf: [8000]u8 = undefined;
+        var response = req.receiveHead(&redirect_buf) catch {
+            failSlot(s, "Failed to receive response");
+            return;
         };
 
-        var body_incomplete = false;
-        const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
-
-        if (wire_cl) |cl| {
-            if (cl > 0) {
-                const len: usize = @intCast(cl);
-                const buf = gpa.alloc(u8, len) catch |err| alloc_b: {
-                    std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
-                    break :alloc_b null;
-                };
-                if (buf) |b| {
-                    const n = reader.readSliceShort(b) catch |err| read_b: {
-                        std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
-                        break :read_b 0;
-                    };
-                    if (n == 0) {
-                        gpa.free(b);
-                        body_incomplete = true;
-                    } else if (n == len) {
-                        owned_body = b;
-                    } else {
-                        owned_body = gpa.realloc(b, n) catch null;
-                        if (owned_body == null) gpa.free(b);
-                        body_incomplete = true;
-                    }
+        const status_code = @intFromEnum(response.head.status);
+        var location: ?[]const u8 = null;
+        if (status_code / 100 == 3) {
+            var header_it = response.head.iterateHeaders();
+            while (header_it.next()) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "location")) {
+                    location = h.value;
+                    break;
                 }
             }
-        } else {
-            // DOD-FIX 6: single-capacity ArrayList to avoid reallocation thrash.
-            var acc: std.ArrayList(u8) = .empty;
-            defer acc.deinit(gpa);
-            acc.ensureTotalCapacity(gpa, 64 * 1024) catch {};
-            var chunk: [16 * 1024]u8 = undefined;
-            var total: usize = 0;
-            while (true) {
-                const n = reader.readSliceShort(chunk[0..]) catch |err| acc_b: {
-                    std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
-                    break :acc_b 0;
-                };
-                if (n == 0) break;
-                acc.appendSlice(gpa, chunk[0..n]) catch |err| {
-                    std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
-                    break;
-                };
-                total += n;
-            }
-            if (total > 0) {
-                owned_body = acc.toOwnedSlice(gpa) catch |err| fin_b: {
-                    std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
-                    break :fin_b null;
-                };
-            }
         }
 
-        if (compressed) {
-            var plain_reader = response.reader(&transfer_buf);
-            var drain: [2048]u8 = undefined;
-            while (true) {
-                const n = plain_reader.readSliceShort(drain[0..]) catch break;
-                if (n == 0) break;
+        if (status_code / 100 == 3 and location != null) {
+            if (redirect_count >= 5) {
+                failSlot(s, "Too many redirects");
+                return;
             }
+            redirect_count += 1;
+            redirected = true;
+            const loc = location.?;
+            if (loc.len == 0 or loc.len > loc_buf.len) {
+                failSlot(s, "Invalid redirect location");
+                return;
+            }
+            const new_url = resolveRedirectInto(&loc_buf, current_url, loc) orelse {
+                failSlot(s, "Invalid redirect location");
+                return;
+            };
+            if (new_url.len > redirect_url_bufs[s].len) {
+                failSlot(s, "Invalid redirect location");
+                return;
+            }
+            // persist across hops (loc_buf is reused)
+            @memcpy(redirect_url_bufs[s][0..new_url.len], new_url);
+            current_url = redirect_url_bufs[s][0..new_url.len];
+            // 303 → GET; 301/302 with POST → GET; only 307/308 keep the body
+            const code = status_code;
+            if (code == 303 or ((code == 301 or code == 302) and current_method == .POST)) {
+                current_method = .GET;
+                current_body = null;
+            } else if (code != 307 and code != 308) {
+                current_body = null;
+            }
+            continue :hop;
         }
 
-        if (body_incomplete) {
+        const status_class = status_code / 100;
+        const has_body = switch (status_class) {
+            1 => false,
+            2 => response.head.status != .no_content and response.head.status != .not_modified,
+            3 => false,
+            else => true,
+        };
+
+        if (!has_body) {
             req.connection.?.closing = true;
         }
-    }
 
-    if (owned_body) |b| {
-        resp_data.setBodyOwned(b);
-        owned_body = null;
-    } else if (response.head.content_length != null and has_body) {
-        resp_data.setBody("");
-    }
+        // DOD-FIX 5: build ResponseData on the shared headers so the JS object
+        // returned to user code reuses the dense pool (one HeadersData alloc per
+        // request, not three).
+        const resp_data = gpa.create(response_mod.ResponseData) catch {
+            failSlot(s, "Out of memory");
+            return;
+        };
+        resp_data.* = response_mod.ResponseData.init();
+        // Transfer ownership of headers[s] to ResponseData; replace with the
+        // freshly-init'd HeadersData so the slot is sane on error paths.
+        const owned_headers = headers[s].?;
+        headers[s] = &resp_data.headers;
+        resp_data.headers = owned_headers.*;
 
-    if (builtin.mode == .Debug) {
-        std.debug.print(
-            "[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
-            .{
-                slot_id,
-                job_counter.alloc_count,
-                job_counter.free_count,
-                job_counter.bytes_allocated,
-                job_counter.bytes_freed,
-                job_counter.balanced(),
-            },
-        );
-        std.debug.assert(job_counter.balanced());
-    }
+        resp_data.status = status_code;
+        resp_data.setStatusText(response.head.status.phrase() orelse "OK");
+        resp_data.redirected = redirected; // CHANGED
+        resp_data.setUrl(current_url); // CHANGED
 
-    // okSlot stores resp_data; releaseSlot will skip headers since headers[s]==null
-    // after the transfer above.
-    okSlot(s, resp_data);
+        var header_it = response.head.iterateHeaders();
+        while (header_it.next()) |h| {
+            resp_data.headers.appendEntry(h.name, h.value);
+        }
+
+        if (has_body) {
+            var transfer_buf: [8192]u8 = undefined;
+            const content_encoding = response.head.content_encoding;
+            const compressed = content_encoding != .identity;
+            var decompress_buf: ?[]u8 = null;
+            defer if (decompress_buf) |d| gpa.free(d);
+            var decompress: std.http.Decompress = undefined;
+
+            const reader = if (!compressed)
+                response.reader(&transfer_buf)
+            else dec: {
+                const window_len: usize = switch (content_encoding) {
+                    .gzip, .deflate => std.compress.flate.max_window_len,
+                    .zstd => std.compress.zstd.default_window_len,
+                    else => 0,
+                };
+                if (window_len == 0) {
+                    std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
+                    break :dec response.reader(&transfer_buf);
+                }
+                const d = gpa.alloc(u8, window_len) catch break :dec response.reader(&transfer_buf);
+                decompress_buf = d;
+                break :dec response.readerDecompressing(&transfer_buf, &decompress, d);
+            };
+
+            var body_incomplete = false;
+            const wire_cl = if (content_encoding == .identity) response.head.content_length else null;
+
+            if (wire_cl) |cl| {
+                if (cl > 0) {
+                    const len: usize = @intCast(cl);
+                    const buf = gpa.alloc(u8, len) catch |err| alloc_b: {
+                        std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
+                        break :alloc_b null;
+                    };
+                    if (buf) |b| {
+                        const n = reader.readSliceShort(b) catch |err| read_b: {
+                            std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
+                            break :read_b 0;
+                        };
+                        if (n == 0) {
+                            gpa.free(b);
+                            body_incomplete = true;
+                        } else if (n == len) {
+                            owned_body = b;
+                        } else {
+                            owned_body = gpa.realloc(b, n) catch null;
+                            if (owned_body == null) gpa.free(b);
+                            body_incomplete = true;
+                        }
+                    }
+                }
+            } else {
+                // DOD-FIX 6: single-capacity ArrayList to avoid reallocation thrash.
+                var acc: std.ArrayList(u8) = .empty;
+                defer acc.deinit(gpa);
+                acc.ensureTotalCapacity(gpa, 64 * 1024) catch {};
+                var chunk: [16 * 1024]u8 = undefined;
+                var total: usize = 0;
+                while (true) {
+                    const n = reader.readSliceShort(chunk[0..]) catch |err| acc_b: {
+                        std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
+                        break :acc_b 0;
+                    };
+                    if (n == 0) break;
+                    acc.appendSlice(gpa, chunk[0..n]) catch |err| {
+                        std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
+                        break;
+                    };
+                    total += n;
+                }
+                if (total > 0) {
+                    owned_body = acc.toOwnedSlice(gpa) catch |err| fin_b: {
+                        std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
+                        break :fin_b null;
+                    };
+                }
+            }
+
+            if (compressed) {
+                var plain_reader = response.reader(&transfer_buf);
+                var drain: [2048]u8 = undefined;
+                while (true) {
+                    const n = plain_reader.readSliceShort(drain[0..]) catch break;
+                    if (n == 0) break;
+                }
+            }
+
+            if (body_incomplete) {
+                req.connection.?.closing = true;
+            }
+        }
+
+        if (owned_body) |b| {
+            resp_data.setBodyOwned(b);
+            owned_body = null;
+        } else if (response.head.content_length != null and has_body) {
+            resp_data.setBody("");
+        }
+
+        if (builtin.mode == .Debug) {
+            std.debug.print(
+                "[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
+                .{
+                    slot_id,
+                    job_counter.alloc_count,
+                    job_counter.free_count,
+                    job_counter.bytes_allocated,
+                    job_counter.bytes_freed,
+                    job_counter.balanced(),
+                },
+            );
+            std.debug.assert(job_counter.balanced());
+        }
+
+        // okSlot stores resp_data; releaseSlot will skip headers since headers[s]==null
+        // after the transfer above.
+        okSlot(s, resp_data);
+        break :hop;
+    }
 }
 
 fn failSlot(s: usize, comptime msg: []const u8) void {
@@ -510,6 +610,8 @@ pub fn ensureArmed() void {
     if (g_loop) |l| arm(l);
 }
 
+/// CHANGED: called once at startup with the loop; arming happens lazily on
+/// first submit so an idle script exits cleanly.
 pub fn setLoop(l: *xev.Loop) void {
     g_loop = l;
 }

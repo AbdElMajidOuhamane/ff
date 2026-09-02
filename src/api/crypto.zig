@@ -23,12 +23,74 @@ fn getRandomBytes(buf: []u8) void {
     }
 }
 
+const ExtractedStr = struct {
+    slice: []const u8,
+    heap: ?[]u8 = null,
+    fn deinit(self: ExtractedStr) void {
+        if (self.heap) |h| gpa.free(h);
+    }
+};
+
+fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
+    var len: usize = 0;
+    const cstr = c.toCStringLen(ctx, &len, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    if (len == 0) return .{ .slice = "" };
+    if (len <= stack_buf.len) {
+        @memcpy(stack_buf[0..len], cstr[0..len]);
+        return .{ .slice = stack_buf[0..len] };
+    }
+    const heap_buf = gpa.alloc(u8, len) catch return null;
+    @memcpy(heap_buf[0..len], cstr[0..len]);
+    return .{ .slice = heap_buf, .heap = heap_buf };
+}
+
+/// Raw bytes of an ArrayBuffer or TypedArray view.
+fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
+    var size: usize = 0;
+    if (c.getArrayBuffer(ctx, &size, arg)) |p| {
+        if (size > 0) return p[0..size];
+        return "";
+    }
+    var byte_offset: usize = 0;
+    var byte_length: usize = 0;
+    var bpe: usize = 0;
+    const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bpe);
+    if (c.getTag(buf_val) == c.TAG_EXCEPTION) return null;
+    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse return null;
+    if (byte_offset + byte_length > size) return null;
+    return p[byte_offset..][0..byte_length];
+}
+
 fn getRandomValuesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
-        return c.JS_UNDEFINED;
+        return c.JS_EXCEPTION;
     }
+    const arg = argv[0];
+    var byte_offset: usize = 0;
+    var byte_length: usize = 0;
+    var bpe: usize = 0;
+    const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bpe);
+    if (c.getTag(buf_val) == c.TAG_EXCEPTION) {
+        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
+        return c.JS_EXCEPTION;
+    }
+    var size: usize = 0;
+    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse {
+        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
+        return c.JS_EXCEPTION;
+    };
+    if (byte_offset + byte_length > size) {
+        _ = c.throwTypeError(ctx, "getRandomValues: view out of bounds");
+        return c.JS_EXCEPTION;
+    }
+    if (byte_length > 65536) { // WHATWG cap
+        _ = c.throwTypeError(ctx, "getRandomValues: max 65536 bytes");
+        return c.JS_EXCEPTION;
+    }
+    getRandomBytes(p[byte_offset..][0..byte_length]); // CHANGED: actually fills!
     return argv[0];
 }
 
@@ -62,12 +124,80 @@ fn randomUUIDCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
 fn subtleDigestCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 2) {
-        c.throwTypeError(ctx, "subtle.digest requires algorithm and data");
-        return c.JS_UNDEFINED;
+        _ = c.throwTypeError(ctx, "subtle.digest requires algorithm and data");
+        return c.JS_EXCEPTION;
     }
-    _ = argv;
-    // TODO: Phase 3 — full QuickJS implementation
-    return c.JS_UNDEFINED;
+    var algo_buf: [64]u8 = undefined;
+    const algo_ex = extractStringAuto(ctx, argv[0], &algo_buf) orelse {
+        _ = c.throwTypeError(ctx, "subtle.digest: invalid algorithm");
+        return c.JS_EXCEPTION;
+    };
+    defer algo_ex.deinit();
+    const bytes = backingBytes(ctx, argv[1]) orelse {
+        _ = c.throwTypeError(ctx, "subtle.digest: data must be ArrayBuffer or TypedArray");
+        return c.JS_EXCEPTION;
+    };
+
+    var digest_buf: [64]u8 = undefined; // fixed-size stack buffer (skill)
+    var digest_len: usize = 0;
+    if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-1")) {
+        std.crypto.hash.Sha1.hash(bytes, digest_buf[0..20], .{});
+        digest_len = 20;
+    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-256")) {
+        std.crypto.hash.sha2.Sha256.hash(bytes, digest_buf[0..32], .{});
+        digest_len = 32;
+    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-384")) {
+        std.crypto.hash.sha2.Sha384.hash(bytes, digest_buf[0..48], .{});
+        digest_len = 48;
+    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-512")) {
+        std.crypto.hash.sha2.Sha512.hash(bytes, digest_buf[0..64], .{});
+        digest_len = 64;
+    } else {
+        _ = c.throwTypeError(ctx, "subtle.digest: unsupported algorithm (SHA-1/SHA-256/SHA-384/SHA-512)");
+        return c.JS_EXCEPTION;
+    }
+
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    const ab = c.newArrayBufferCopy(ctx, &digest_buf, digest_len);
+    var args = [_]c.Value{ab};
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+    c.freeValue(ctx, ab);
+    c.freeValue(ctx, cap[0]);
+    c.freeValue(ctx, cap[1]);
+    return promise;
+}
+
+fn btoaCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var buf: [512]u8 = undefined;
+    const input = extractStringAuto(ctx, if (argc > 0) argv[0] else c.JS_UNDEFINED, &buf) orelse return c.JS_EXCEPTION;
+    defer input.deinit();
+    const enc = std.base64.standard.Encoder;
+    const out_len = enc.calcSize(input.slice.len); // exact-size single alloc (skill)
+    const out = gpa.alloc(u8, out_len) catch return c.throwOutOfMemory(ctx);
+    defer gpa.free(out);
+    _ = enc.encode(out, input.slice);
+    return c.newStringLen(ctx, out.ptr, out_len);
+}
+
+fn atobCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var buf: [512]u8 = undefined;
+    const input = extractStringAuto(ctx, if (argc > 0) argv[0] else c.JS_UNDEFINED, &buf) orelse return c.JS_EXCEPTION;
+    defer input.deinit();
+    const dec = std.base64.standard.Decoder;
+    const out_len = dec.calcSizeForSlice(input.slice) catch {
+        _ = c.throwTypeError(ctx, "atob: invalid base64 input");
+        return c.JS_EXCEPTION;
+    };
+    const out = gpa.alloc(u8, out_len) catch return c.throwOutOfMemory(ctx);
+    defer gpa.free(out);
+    dec.decode(out, input.slice) catch {
+        _ = c.throwTypeError(ctx, "atob: invalid base64 input");
+        return c.JS_EXCEPTION;
+    };
+    return c.newStringLen(ctx, out.ptr, out_len);
 }
 
 pub fn setup(ctx: *c.Context) void {
@@ -82,7 +212,15 @@ pub fn setup(ctx: *c.Context) void {
     _ = c.definePropertyValueStr(ctx, crypto_obj, "randomUUID", randomUUID_fn, c.PROP_C_W_E);
 
     const subtle_obj = c.newObject(ctx);
+    const digest_fn = c.newCFunction(ctx, subtleDigestCallback, "digest", 2); // CHANGED
+    _ = c.definePropertyValueStr(ctx, subtle_obj, "digest", digest_fn, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, crypto_obj, "subtle", subtle_obj, c.PROP_C_W_E);
+
+    const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1); // CHANGED
+    _ = c.definePropertyValueStr(ctx, global, "btoa", btoa_fn, c.PROP_C_W_E);
+
+    const atob_fn = c.newCFunction(ctx, atobCallback, "atob", 1); // CHANGED
+    _ = c.definePropertyValueStr(ctx, global, "atob", atob_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "crypto", crypto_obj, c.PROP_C_W_E);
 }

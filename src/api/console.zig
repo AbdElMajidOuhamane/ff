@@ -21,9 +21,16 @@ fn flush(buf: []u8, len: *usize) void {
 }
 
 fn stageString(ctx: ?*c.Context, val: c.Value, buf: []u8, len: *usize) void {
-    if (c.isString(val) == 0) return;
+    var sval: ?c.Value = null;
+    defer if (sval) |s| c.freeValue(ctx, s);
+    if (c.isString(val) == 0) {
+        // numbers/bools/etc → string via JS_ToString (no more empty lines)
+        const s = c.toString(ctx, val);
+        if (c.getTag(s) == c.TAG_EXCEPTION) return;
+        sval = s;
+    }
     var str_len: usize = 0;
-    const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return;
+    const str_ptr = c.toCStringLen(ctx, &str_len, sval orelse val) orelse return;
     defer c.freeCString(ctx, str_ptr);
     var written: usize = 0;
     while (written < str_len) {
@@ -70,6 +77,63 @@ fn consoleDetailCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv:
     return c.JS_UNDEFINED;
 }
 
+// ── console.time / timeLog / timeEnd (CHANGED) ──
+// One map entry per label — developer-cold path (skill anti-pattern #7:
+// deliberately not denser than this).
+const TimerMap = std.StringHashMap(i64);
+var timers: TimerMap = TimerMap.init(std.heap.smp_allocator);
+
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
+}
+
+/// Borrowed label slice — valid until freeCString (callers copy when storing).
+fn labelArg(ctx: ?*c.Context, argc: c_int, argv: [*c]c.Value) ?[]const u8 {
+    if (argc < 1) return "default";
+    const cstr = c.toCString(ctx, argv[0]) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    return std.mem.span(cstr);
+}
+
+fn consoleTimeCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    const label = labelArg(ctx, argc, argv) orelse return c.JS_EXCEPTION;
+    const gop = timers.getOrPut(label) catch return c.JS_EXCEPTION;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = std.heap.smp_allocator.dupe(u8, label) catch {
+            _ = timers.remove(label);
+            return c.JS_EXCEPTION;
+        };
+    }
+    gop.value_ptr.* = nowMs();
+    return c.JS_UNDEFINED;
+}
+
+fn consoleTimeLogCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    const label = labelArg(ctx, argc, argv) orelse return c.JS_EXCEPTION;
+    const start = timers.get(label) orelse {
+        std.debug.print("warning: unknown timer '{s}'\n", .{label});
+        return c.JS_UNDEFINED;
+    };
+    std.debug.print("{s}: {d}ms\n", .{ label, nowMs() - start });
+    return c.JS_UNDEFINED;
+}
+
+fn consoleTimeEndCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    const label = labelArg(ctx, argc, argv) orelse return c.JS_EXCEPTION;
+    if (timers.fetchRemove(label)) |kv| {
+        defer std.heap.smp_allocator.free(kv.key);
+        std.debug.print("{s}: {d}ms\n", .{ label, nowMs() - kv.value });
+    } else {
+        std.debug.print("warning: unknown timer '{s}'\n", .{label});
+    }
+    return c.JS_UNDEFINED;
+}
+
 pub fn setup(ctx: *c.Context) void {
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
@@ -98,6 +162,15 @@ pub fn setup(ctx: *c.Context) void {
 
     const debug_fn = c.newCFunction(ctx, consoleLogCallback, "debug", 2);
     _ = c.definePropertyValueStr(ctx, console_obj, "debug", debug_fn, c.PROP_C_W_E);
+
+    const time_fn = c.newCFunction(ctx, consoleTimeCallback, "time", 1); // CHANGED
+    _ = c.definePropertyValueStr(ctx, console_obj, "time", time_fn, c.PROP_C_W_E);
+
+    const time_log_fn = c.newCFunction(ctx, consoleTimeLogCallback, "timeLog", 1); // CHANGED
+    _ = c.definePropertyValueStr(ctx, console_obj, "timeLog", time_log_fn, c.PROP_C_W_E);
+
+    const time_end_fn = c.newCFunction(ctx, consoleTimeEndCallback, "timeEnd", 1); // CHANGED
+    _ = c.definePropertyValueStr(ctx, console_obj, "timeEnd", time_end_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "console", console_obj, c.PROP_C_W_E);
 }
