@@ -1214,7 +1214,7 @@ pub fn setup(ctx: *c.Context) void {
             .class_name = "URLSearchParams",
             .finalizer = spFinalizer,
         };
-        _ = c.newClassID(&sp_class_id);
+        _ = c.newClassID(c.getRuntime(ctx), &sp_class_id);
         _ = c.newClass(c.getRuntime(ctx), sp_class_id, &sp_def);
         const sp_proto = c.newObject(ctx);
         const sp_methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
@@ -1244,7 +1244,7 @@ pub fn setup(ctx: *c.Context) void {
             .class_name = "URL",
             .finalizer = urlFinalizer,
         };
-        _ = c.newClassID(&url_class_id);
+        _ = c.newClassID(c.getRuntime(ctx), &url_class_id);
         _ = c.newClass(c.getRuntime(ctx), url_class_id, &url_def);
         const url_proto = c.newObject(ctx);
         const url_methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{

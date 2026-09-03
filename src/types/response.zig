@@ -54,8 +54,6 @@ fn extractResponseData(ctx: ?*c.Context, this_val: c.Value) ?*ResponseData {
     return @ptrCast(@alignCast(ptr));
 }
 
-// NEW: native accessor for the HTTP server — read status/body/headers from
-// a JS Response object without JS property lookups.
 pub fn dataFromJS(ctx: ?*c.Context, val: c.Value) ?*ResponseData {
     if (c.isObject(val) == 0) return null;
     const ptr = c.getOpaque2(ctx, val, response_class_id) orelse return null;
@@ -92,7 +90,7 @@ pub const ResponseData = struct {
     pool: std.ArrayList(u8),
     status: u16,
     status_text: PoolSlice,
-    headers: headers_mod.HeadersData,
+    headers: *headers_mod.HeadersData,
     _body: PoolSlice,
     owned_body: ?[]u8 = null,
     has_body: bool,
@@ -102,11 +100,13 @@ pub const ResponseData = struct {
     response_type: ResponseType,
     cold: ?*ResponseDataCold,
     pub fn init() ResponseData {
+        const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
+        h.* = headers_mod.HeadersData.init();
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
             .status = 200,
             .status_text = .{},
-            .headers = headers_mod.HeadersData.init(),
+            .headers = h,
             ._body = .{},
             .has_body = false,
             .body_used = false,
@@ -296,7 +296,7 @@ fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
     _ = c.definePropertyValueStr(ctx, obj, "statusText", zigStringToJS(ctx, data.statusText()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "type", zigStringToJS(ctx, data.responseType()), c.PROP_C_W_E);
-    const hdr_obj = createEmbeddedHeaders(ctx, &data.headers);
+    const hdr_obj = createEmbeddedHeaders(ctx, data.headers);
     _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
 }
 
@@ -410,13 +410,13 @@ fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         data.status = extractIntFromVal(ctx, status_val, 200);
         const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
         defer c.freeValue(ctx, status_text_val);
-        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) { // NEW
+        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) {
             if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
                 defer st.deinit();
                 data.setStatusText(st.slice);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, &data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers);
     }
     return buildResponseJSObject(ctx, data);
 }
@@ -481,13 +481,13 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
         data.status = extractIntFromVal(ctx, status_val, 200);
         const status_text_val = c.getPropertyStr(ctx, init_val, "statusText");
         defer c.freeValue(ctx, status_text_val);
-        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) { // NEW
+        if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) {
             if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
                 defer st.deinit();
                 data.setStatusText(st.slice);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, &data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers);
     }
 
     const obj = c.newObjectClass(ctx, @intCast(response_class_id));
@@ -508,7 +508,7 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "Response",
         .finalizer = responseFinalizer,
     };
-    _ = c.newClassID(&response_class_id);
+    _ = c.newClassID(c.getRuntime(ctx), &response_class_id);
     _ = c.newClass(c.getRuntime(ctx), response_class_id, &class_def);
 
     const proto = c.newObject(ctx);

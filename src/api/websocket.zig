@@ -71,7 +71,7 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "ServerWebSocket",
         .finalizer = wsFinalizer,
     };
-    _ = c.newClassID(&ws_class_id);
+    _ = c.newClassID(c.getRuntime(ctx), &ws_class_id);
     _ = c.newClass(c.getRuntime(ctx), ws_class_id, &def);
 
     const proto = c.newObject(ctx);

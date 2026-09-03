@@ -10,7 +10,6 @@ const ExtractedStr = struct {
     }
 };
 
-// Stack-first extraction (skill: heap fallback only for oversized inputs)
 fn extractStr(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
     var len: usize = 0;
     const cstr = c.toCStringLen(ctx, &len, val) orelse return null;
@@ -31,13 +30,32 @@ fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
         if (size > 0) return p[0..size];
         return "";
     }
+    if (c.hasException(ctx)) {
+        const exc = c.getException(ctx);
+        c.freeValue(ctx, exc);
+    }
     var byte_offset: usize = 0;
     var byte_length: usize = 0;
     var bpe: usize = 0;
     const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bpe);
-    if (c.getTag(buf_val) == c.TAG_EXCEPTION) return null;
-    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse return null;
+    if (c.getTag(buf_val) == c.TAG_EXCEPTION) {
+        if (c.hasException(ctx)) {
+            const exc = c.getException(ctx);
+            c.freeValue(ctx, exc);
+        }
+        return null;
+    }
+    defer c.freeValue(ctx, buf_val);
+    if (c.isNull(buf_val) != 0 or c.isUndefined(buf_val) != 0) return null;
+    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse {
+        if (c.hasException(ctx)) {
+            const exc = c.getException(ctx);
+            c.freeValue(ctx, exc);
+        }
+        return null;
+    };
     if (byte_offset + byte_length > size) return null;
+    if (byte_length == 0) return "";
     return p[byte_offset..][0..byte_length];
 }
 
@@ -58,11 +76,28 @@ fn encoderEncode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     var buf: [512]u8 = undefined;
     const input = extractStr(ctx, if (argc > 0) argv[0] else c.JS_UNDEFINED, &buf) orelse return c.JS_EXCEPTION;
     defer input.deinit();
+    if (input.slice.len == 0) {
+        const empty_ab = c.newArrayBufferCopy(ctx, "", 0);
+        if (c.isException(empty_ab) != 0) return empty_ab;
+        defer c.freeValue(ctx, empty_ab);
+        const off = c.newInt32(ctx, 0);
+        const len = c.newInt32(ctx, 0);
+        defer c.freeValue(ctx, off);
+        defer c.freeValue(ctx, len);
+        var eargv = [_]c.Value{ empty_ab, off, len };
+        return c.newTypedArray(ctx, 3, &eargv[0], c.JS_TYPED_ARRAY_UINT8);
+    }
     const ab = c.newArrayBufferCopy(ctx, input.slice.ptr, input.slice.len);
-    if (c.getTag(ab) == c.TAG_EXCEPTION) return ab;
+    if (c.isException(ab) != 0) return ab;
     defer c.freeValue(ctx, ab);
-    var view_argv = [_]c.Value{ ab, c.newInt32(ctx, 0), c.newInt32(ctx, @intCast(input.slice.len)) };
-    return c.newTypedArray(ctx, 3, &view_argv, c.JS_TYPED_ARRAY_UINT8);
+    const off = c.newInt32(ctx, 0);
+    const len = c.newInt32(ctx, @intCast(input.slice.len));
+    defer c.freeValue(ctx, off);
+    defer c.freeValue(ctx, len);
+    var view_argv = [_]c.Value{ ab, off, len };
+    const view = c.newTypedArray(ctx, 3, &view_argv[0], c.JS_TYPED_ARRAY_UINT8);
+    if (c.isException(view) != 0) return view;
+    return view;
 }
 
 fn textDecoderCtor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -84,10 +119,10 @@ fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
         _ = c.throwTypeError(ctx, "TextDecoder.decode requires ArrayBuffer or TypedArray input");
         return c.JS_EXCEPTION;
     };
+    if (bytes.len == 0) return c.newStringLen(ctx, "", 0);
     if (std.unicode.utf8ValidateSlice(bytes)) {
-        return c.newStringLen(ctx, bytes.ptr, bytes.len); // zero-copy fast path
+        return c.newStringLen(ctx, bytes.ptr, bytes.len);
     }
-    // lossy: each invalid byte → U+FFFD (3 bytes) — exact worst-case single alloc
     const out = gpa.alloc(u8, bytes.len * 3) catch return c.throwOutOfMemory(ctx);
     var n: usize = 0;
     var i: usize = 0;
@@ -95,7 +130,7 @@ fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
         const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
             out[n] = 0xef;
             out[n + 1] = 0xbf;
-            out[n + 2] = 0xbd; // U+FFFD
+            out[n + 2] = 0xbd;
             n += 3;
             i += 1;
             continue;

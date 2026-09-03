@@ -513,7 +513,7 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "Headers",
         .finalizer = headersFinalizer,
     };
-    _ = c.newClassID(&headers_class_id);
+_ = c.newClassID(c.getRuntime(ctx), &headers_class_id);
     _ = c.newClass(c.getRuntime(ctx), headers_class_id, &class_def);
 
     const proto = c.newObject(ctx);

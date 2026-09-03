@@ -545,7 +545,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                 body_bytes = b;
                 has_body = true;
             }
-            hdrs = &rd.headers;
+            hdrs = rd.headers;
         } else {
             // Plain JS object fallback: { status, body }.
             const status_val = c.getPropertyStr(ctx, result, "status");

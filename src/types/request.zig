@@ -642,7 +642,7 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "Request",
         .finalizer = requestFinalizer,
     };
-    _ = c.newClassID(&request_class_id);
+_ = c.newClassID(c.getRuntime(ctx), &request_class_id);
     _ = c.newClass(c.getRuntime(ctx), request_class_id, &class_def);
 
     const proto = c.newObject(ctx);

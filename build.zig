@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const ffcfg_mod = ffcfg_opts.createModule();
 
     // ── QuickJS C translation (auto-generates types + inline functions) ──
+    // CHANGED: vendored quickjs-ng v0.16.2 (no CONFIG_VERSION/BIGNUM/CHECK_OPTIONS)
     const translate = b.addTranslateC(.{
         .root_source_file = b.path("vendor/quickjs/quickjs.h"),
         .target = target,
@@ -98,19 +99,16 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Compile QuickJS C sources ──
+    // CHANGED: quickjs-ng v0.16.2 — no CONFIG_VERSION/BIGNUM/CHECK_OPTIONS
+    // defines; cutils is header-only; quickjs-libc is not used by the runtime.
     const qjs_flags: []const []const u8 = &.{
-        "-DCONFIG_VERSION=\"2024_01_13\"",
-        "-DCONFIG_BIGNUM",
-        "-DCONFIG_CHECK_OPTIONS",
         "-D_GNU_SOURCE",
     };
 
     exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs.c"), .flags = qjs_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/cutils.c"), .flags = qjs_flags });
     exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libregexp.c"), .flags = qjs_flags });
     exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libunicode.c"), .flags = qjs_flags });
     exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/dtoa.c"), .flags = qjs_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs-libc.c"), .flags = qjs_flags });
 
     exe.root_module.addIncludePath(b.path("vendor/quickjs"));
 

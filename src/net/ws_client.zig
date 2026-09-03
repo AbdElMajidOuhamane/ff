@@ -115,7 +115,7 @@ fn acquireSlot() ?usize {
 
 fn releaseSlot(s: usize) void {
     if (socks[s]) |v| {
-        c.freeValue(undefined, v);
+        if (g_ctx) |ctx| c.freeValue(ctx, v);
         socks[s] = null;
     }
     gpa.free(hosts[s]);
@@ -181,8 +181,10 @@ pub fn submit(
     const s16: u16 = @intCast(s);
     const th = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerMain, .{s16}) catch {
         _ = pending.fetchSub(1, .acq_rel);
-        c.freeValue(ctx, socks[s] orelse undefined);
-        socks[s] = null;
+        if (socks[s]) |v| {
+            if (g_ctx) |cctx| c.freeValue(cctx, v);
+            socks[s] = null;
+        }
         closePipe(s);
         gpa.free(hosts[s]);
         gpa.free(paths[s]);
@@ -190,7 +192,7 @@ pub fn submit(
         return error.SpawnFailed;
     };
     th.detach();
-    ensureArmed(); // CHANGED: cover the disarm→submit sequence in server mode
+    ensureArmed();
     return s;
 }
 

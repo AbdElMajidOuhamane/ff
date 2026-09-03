@@ -68,11 +68,6 @@ pub var ca_file: ?[]const u8 = null;
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
-    // async_fetch spawns up to 10 concurrent connect+handshake paths through
-    // this io instance. The std default limit is cpus-1 (7 here), which the
-    // connect wave saturates — excess Io.async tasks then run inline on the
-    // calling worker, ~1 RTT of scheduling contention per straggler. Raise it
-    // so every connect+DNS dispatch gets a dedicated pool thread.
     io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
         .async_limit = .limited(64),
     });
@@ -80,22 +75,19 @@ pub fn init() void {
         .allocator = std.heap.page_allocator,
         .io = io_backend.io(),
     };
-    // Pin `now` up front: request() only rescans system roots (and swaps out
-    // ca_bundle) when now == null. With now set, our loaded CA persists.
-    http_client.now = Io.Clock.real.now(http_client.io);
-    const io = http_client.io;
+    // DO NOT set http_client.now here — leave it null so request()
+    // auto-scans system root certificates on the first HTTPS call.
     const ca_env: ?[]const u8 = ca_file orelse blk: {
         const p = std.c.getenv("FF_CA_FILE") orelse std.c.getenv("FF_CERT") orelse break :blk null;
         break :blk std.mem.span(p);
     };
     if (ca_env) |path| {
-        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
+        var file = std.Io.Dir.cwd().openFile(http_client.io, path, .{}) catch {
             std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
             return;
         };
-        defer file.close(io);
-        var file_reader = file.reader(io, &.{});
-        // now_sec=0 skips pre-filtering; the handshake enforces real validity.
+        defer file.close(http_client.io);
+        var file_reader = file.reader(http_client.io, &.{});
         http_client.ca_bundle.addCertsFromFile(
             std.heap.page_allocator,
             &file_reader,

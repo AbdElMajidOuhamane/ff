@@ -46,52 +46,82 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 }
 
 /// Raw bytes of an ArrayBuffer or TypedArray view.
+/// JS_GetArrayBuffer throws InvalidClass on views, JS_GetUint8Array throws
+/// on non-Uint8 views — each failed probe must clear its exception.
 fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
     var size: usize = 0;
     if (c.getArrayBuffer(ctx, &size, arg)) |p| {
         if (size > 0) return p[0..size];
         return "";
     }
-    var byte_offset: usize = 0;
-    var byte_length: usize = 0;
-    var bpe: usize = 0;
-    const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bpe);
-    if (c.getTag(buf_val) == c.TAG_EXCEPTION) return null;
-    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse return null;
-    if (byte_offset + byte_length > size) return null;
-    return p[byte_offset..][0..byte_length];
-}
-
-fn getRandomValuesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = this_val;
-    if (argc < 1) {
-        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
-        return c.JS_EXCEPTION;
+    if (c.hasException(ctx)) {
+        const exc = c.getException(ctx);
+        c.freeValue(ctx, exc);
     }
-    const arg = argv[0];
+    var byte_size: usize = 0;
+    if (c.getUint8Array(ctx, &byte_size, arg)) |p| {
+        if (byte_size > 0) return p[0..byte_size];
+        return "";
+    }
+    if (c.hasException(ctx)) {
+        const exc = c.getException(ctx);
+        c.freeValue(ctx, exc);
+    }
     var byte_offset: usize = 0;
     var byte_length: usize = 0;
     var bpe: usize = 0;
     const buf_val = c.getTypedArrayBuffer(ctx, arg, &byte_offset, &byte_length, &bpe);
     if (c.getTag(buf_val) == c.TAG_EXCEPTION) {
-        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
-        return c.JS_EXCEPTION;
+        if (c.hasException(ctx)) {
+            const exc = c.getException(ctx);
+            c.freeValue(ctx, exc);
+        }
+        return null;
     }
-    var size: usize = 0;
-    const p = c.getArrayBuffer(ctx, &size, buf_val) orelse {
-        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
-        return c.JS_EXCEPTION;
+    defer c.freeValue(ctx, buf_val);
+    if (c.isNull(buf_val) != 0 or c.isUndefined(buf_val) != 0) return null;
+    const base = c.getArrayBuffer(ctx, &size, buf_val) orelse {
+        if (c.hasException(ctx)) {
+            const exc = c.getException(ctx);
+            c.freeValue(ctx, exc);
+        }
+        return null;
     };
-    if (byte_offset + byte_length > size) {
-        _ = c.throwTypeError(ctx, "getRandomValues: view out of bounds");
+    if (byte_offset + byte_length > size) return null;
+    if (byte_length == 0) return "";
+    return base[byte_offset..][0..byte_length];
+}
+
+fn getRandomValuesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 1 or c.isObject(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
         return c.JS_EXCEPTION;
     }
-    if (byte_length > 65536) { // WHATWG cap
+    const len_val = c.getPropertyStr(ctx, argv[0], "length");
+    if (c.isException(len_val) != 0) return len_val;
+    var size: i32 = 0;
+    if (c.toInt32(ctx, &size, len_val) != 0) {
+        c.freeValue(ctx, len_val);
+        return c.JS_EXCEPTION;
+    }
+    c.freeValue(ctx, len_val);
+    if (size <= 0 or size > 65536) {
         _ = c.throwTypeError(ctx, "getRandomValues: max 65536 bytes");
         return c.JS_EXCEPTION;
     }
-    getRandomBytes(p[byte_offset..][0..byte_length]); // CHANGED: actually fills!
-    return argv[0];
+    var buf: [65536]u8 = undefined;
+    getRandomBytes(buf[0..@intCast(size)]);
+    var i: i32 = 0;
+    while (i < size) : (i += 1) {
+        const elem = c.newInt32(ctx, @intCast(buf[@intCast(i)]));
+        if (c.setPropertyUint32(ctx, argv[0], @intCast(i), elem) < 0) {
+            c.freeValue(ctx, elem);
+            return c.JS_EXCEPTION;
+        }
+    }
+    // argv is borrowed — must Dup before returning as owned value.
+    return c.dupValue(ctx, argv[0]);
 }
 
 fn randomUUIDCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -138,7 +168,7 @@ fn subtleDigestCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: 
         return c.JS_EXCEPTION;
     };
 
-    var digest_buf: [64]u8 = undefined; // fixed-size stack buffer (skill)
+    var digest_buf: [64]u8 = undefined;
     var digest_len: usize = 0;
     if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-1")) {
         std.crypto.hash.Sha1.hash(bytes, digest_buf[0..20], .{});
@@ -159,9 +189,24 @@ fn subtleDigestCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: 
 
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
-    const ab = c.newArrayBufferCopy(ctx, &digest_buf, digest_len);
+    if (c.isException(promise) != 0) return promise;
+    const ab = c.newArrayBufferCopy(ctx, digest_buf[0..digest_len].ptr, digest_len);
+    if (c.isException(ab) != 0) {
+        c.freeValue(ctx, cap[0]);
+        c.freeValue(ctx, cap[1]);
+        c.freeValue(ctx, promise);
+        return ab;
+    }
     var args = [_]c.Value{ab};
-    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+    const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+    if (c.isException(ret) != 0) {
+        c.freeValue(ctx, ab);
+        c.freeValue(ctx, cap[0]);
+        c.freeValue(ctx, cap[1]);
+        c.freeValue(ctx, promise);
+        return ret;
+    }
+    c.freeValue(ctx, ret);
     c.freeValue(ctx, ab);
     c.freeValue(ctx, cap[0]);
     c.freeValue(ctx, cap[1]);
@@ -174,7 +219,7 @@ fn btoaCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const input = extractStringAuto(ctx, if (argc > 0) argv[0] else c.JS_UNDEFINED, &buf) orelse return c.JS_EXCEPTION;
     defer input.deinit();
     const enc = std.base64.standard.Encoder;
-    const out_len = enc.calcSize(input.slice.len); // exact-size single alloc (skill)
+    const out_len = enc.calcSize(input.slice.len);
     const out = gpa.alloc(u8, out_len) catch return c.throwOutOfMemory(ctx);
     defer gpa.free(out);
     _ = enc.encode(out, input.slice);
@@ -212,14 +257,14 @@ pub fn setup(ctx: *c.Context) void {
     _ = c.definePropertyValueStr(ctx, crypto_obj, "randomUUID", randomUUID_fn, c.PROP_C_W_E);
 
     const subtle_obj = c.newObject(ctx);
-    const digest_fn = c.newCFunction(ctx, subtleDigestCallback, "digest", 2); // CHANGED
+    const digest_fn = c.newCFunction(ctx, subtleDigestCallback, "digest", 2);
     _ = c.definePropertyValueStr(ctx, subtle_obj, "digest", digest_fn, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, crypto_obj, "subtle", subtle_obj, c.PROP_C_W_E);
 
-    const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1); // CHANGED
+    const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1);
     _ = c.definePropertyValueStr(ctx, global, "btoa", btoa_fn, c.PROP_C_W_E);
 
-    const atob_fn = c.newCFunction(ctx, atobCallback, "atob", 1); // CHANGED
+    const atob_fn = c.newCFunction(ctx, atobCallback, "atob", 1);
     _ = c.definePropertyValueStr(ctx, global, "atob", atob_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "crypto", crypto_obj, c.PROP_C_W_E);

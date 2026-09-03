@@ -20,12 +20,7 @@ const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
 const text_encoding = @import("../api/text_encoding.zig");
 
-
-
-
 const gpa = std.heap.smp_allocator;
-// DOD-FIX 9: single boot arena; runtime struct + EventLoop live inside it
-// instead of being individually page_allocator-allocated.
 var boot_arena: std.heap.ArenaAllocator = undefined;
 var boot_inited: bool = false;
 
@@ -39,10 +34,42 @@ pub fn deinitNetwork() void {
 
 var g_runtime: ?*Runtime = null;
 
-// ── ESM module loading (NEW) ────────────────────────────────────
-// Mirrors quickjs-libc's js_module_loader: eval with
-// EVAL_TYPE_MODULE | COMPILE_ONLY, harvest the JSModuleDef from the
-// JSValue pointer, free the JSValue wrapper (module already referenced).
+// CHANGED: source-based module detection (replaces buggy JS_DetectModule)
+fn sourceHasModuleSyntax(source: []const u8) bool {
+    var i: usize = 0;
+    while (i < source.len) {
+        const ch = source[i];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == ';' or ch == ',') {
+            i += 1;
+            continue;
+        }
+        if (ch == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') i += 1;
+            continue;
+        }
+        if (ch == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+            if (i + 1 < source.len) i += 2;
+            continue;
+        }
+        if (ch == '-' and i + 1 < source.len and source[i + 1] == '-') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "import ")) return true;
+        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "export ")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import{")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "export{")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import('")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import(\"")) return true;
+        return false;
+    }
+    return false;
+}
+
 fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) [*c]u8 {
     _ = opaque_;
     const base = std.mem.span(base_name);
@@ -50,7 +77,6 @@ fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const 
     const dir = std.fs.path.dirname(base) orelse ".";
     const resolved = mod.resolveSpec(gpa, dir, spec) catch return null;
     defer gpa.free(resolved);
-    // no extension → append .js (sentinel-terminated for js_strdup)
     const has_ext = std.mem.lastIndexOfScalar(u8, std.fs.path.basename(resolved), '.') != null;
     var path_z: [:0]u8 = undefined;
     if (has_ext) {
@@ -76,11 +102,9 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
     const func_val = qjs.eval(ctx, src.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     if (qjs.isException(func_val) != 0) return null;
     const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
-    // import.meta.url (minimal js_module_set_import_meta equivalent)
     const meta = qjs.getImportMeta(ctx, m);
     if (qjs.isException(meta) == 0 and qjs.isNull(meta) == 0 and qjs.isUndefined(meta) == 0) {
         if (std.mem.indexOfScalar(u8, name, ':') == null) {
-            // "file://" (7 bytes) + name + NUL — no allocPrintZ in Zig 0.16
             const us = gpa.allocSentinel(u8, name.len + 7, 0) catch null;
             if (us) |uz| {
                 defer gpa.free(uz);
@@ -91,7 +115,7 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
         }
     }
     qjs.freeValue(ctx, meta);
-    qjs.freeValue(ctx, func_val); // module already referenced, so free the wrapper
+    qjs.freeValue(ctx, func_val);
     return m;
 }
 
@@ -104,7 +128,6 @@ pub const Runtime = struct {
         const rt = qjs.newRuntime() orelse return error.InitFailed;
         qjs.setMaxStackSize(rt, 1024 * 1024);
         qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
-        // NEW: real ESM support — QuickJS resolves imports via these hooks
         qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
 
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
@@ -128,13 +151,13 @@ pub const Runtime = struct {
         const setInterval_func = qjs.newCFunction(ctx, setIntervalCallback, "setInterval", 2);
         const clearTimeout_func = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         const clearInterval_func = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
-        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1); // NEW
+        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1);
 
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", setTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", setInterval_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", clearTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "clearInterval", clearInterval_func, qjs.PROP_C_W_E);
-        _ = qjs.definePropertyValueStr(ctx, global, "queueMicrotask", queue_microtask_func, qjs.PROP_C_W_E); // NEW
+        _ = qjs.definePropertyValueStr(ctx, global, "queueMicrotask", queue_microtask_func, qjs.PROP_C_W_E);
 
         if (!boot_inited) {
             boot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -144,8 +167,6 @@ pub const Runtime = struct {
 
         const loop_ptr = try boot.create(EventLoop);
         EventLoop.initInto(loop_ptr);
-        // Store the loop for lazy arming; do NOT arm here — an always-armed
-        // pump keeps hasWork() true and prevents script-mode exit.
         async_fetch.setLoop(&loop_ptr.loop);
         ws_client.setLoop(&loop_ptr.loop);
 
@@ -206,12 +227,10 @@ pub const Runtime = struct {
         if (id >= 0) rt.timer_manager.clear(@intCast(id));
     }
 
-    // ── queueMicrotask (NEW) — zero alloc: JS_EnqueueJob dups argv ──
     fn microtaskJob(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
         _ = argc;
         const ret = qjs.call(ctx, argv[0], qjs.JS_UNDEFINED, 0, null);
         if (qjs.isException(ret) != 0) {
-            // swallow: keep the shared job queue clean, report to stderr
             const exc = qjs.getException(ctx);
             defer qjs.freeValue(ctx, exc);
             const msg = qjs.toCString(ctx, exc);
@@ -240,8 +259,6 @@ pub const Runtime = struct {
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
         qjs.freeRuntime(rt);
-        // Boot arena is the sole owner of `self` and the EventLoop.
-        // Free it LAST so all references stay valid above.
         if (boot_inited) {
             boot_arena.deinit();
             boot_inited = false;
@@ -271,9 +288,13 @@ pub const Runtime = struct {
         return true;
     }
 
+    // CHANGED: source-based module detection instead of buggy JS_DetectModule
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
-        // CHANGED: real module eval — imports resolve via moduleLoader
-        const flags: c_int = if (qjs.detectModule(source.ptr, source.len) != 0)
+        const is_module = blk: {
+            if (std.mem.endsWith(u8, filename, ".mjs")) break :blk true;
+            break :blk sourceHasModuleSyntax(source);
+        };
+        const flags: c_int = if (is_module)
             qjs.EVAL_TYPE_MODULE
         else
             qjs.EVAL_TYPE_GLOBAL;
