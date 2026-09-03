@@ -98,6 +98,25 @@ fn getRandomValuesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, arg
         _ = c.throwTypeError(ctx, "getRandomValues requires a TypedArray argument");
         return c.JS_EXCEPTION;
     }
+    // Fast batch path: Uint8Array — fill backing store in one call.
+    var direct_size: usize = 0;
+    if (c.getUint8Array(ctx, &direct_size, argv[0])) |dst| {
+        if (direct_size == 0 or direct_size > 65536) {
+            if (c.hasException(ctx)) {
+                const exc = c.getException(ctx);
+                c.freeValue(ctx, exc);
+            }
+            _ = c.throwTypeError(ctx, "getRandomValues: max 65536 bytes");
+            return c.JS_EXCEPTION;
+        }
+        getRandomBytes(dst[0..direct_size]);
+        return c.dupValue(ctx, argv[0]);
+    }
+    if (c.hasException(ctx)) {
+        const exc = c.getException(ctx);
+        c.freeValue(ctx, exc);
+    }
+    // Cold fallback: generic length-based fill (non-Uint8 views).
     const len_val = c.getPropertyStr(ctx, argv[0], "length");
     if (c.isException(len_val) != 0) return len_val;
     var size: i32 = 0;
@@ -110,17 +129,23 @@ fn getRandomValuesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, arg
         _ = c.throwTypeError(ctx, "getRandomValues: max 65536 bytes");
         return c.JS_EXCEPTION;
     }
-    var buf: [65536]u8 = undefined;
-    getRandomBytes(buf[0..@intCast(size)]);
-    var i: i32 = 0;
-    while (i < size) : (i += 1) {
-        const elem = c.newInt32(ctx, @intCast(buf[@intCast(i)]));
-        if (c.setPropertyUint32(ctx, argv[0], @intCast(i), elem) < 0) {
-            c.freeValue(ctx, elem);
-            return c.JS_EXCEPTION;
+    // Stack-first chunked fill: 512B window, batched SetProperty calls,
+    // no 64KB frame. Size cap keeps this loop off any hot path.
+    var chunk: [512]u8 = undefined;
+    var off: i32 = 0;
+    while (off < size) {
+        const n: usize = @min(chunk.len, @as(usize, @intCast(size - off)));
+        getRandomBytes(chunk[0..n]);
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const elem = c.newInt32(ctx, chunk[k]);
+            if (c.setPropertyUint32(ctx, argv[0], @intCast(off + @as(i32, @intCast(k))), elem) < 0) {
+                c.freeValue(ctx, elem);
+                return c.JS_EXCEPTION;
+            }
         }
+        off += @intCast(n);
     }
-    // argv is borrowed — must Dup before returning as owned value.
     return c.dupValue(ctx, argv[0]);
 }
 

@@ -5,9 +5,12 @@ const microtasks = @import("./microtasks.zig");
 const http_api = @import("../net/http.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
+
 var g_thread_pool: xev.ThreadPool = undefined;
+
 pub const EventLoop = struct {
     loop: xev.Loop,
+
     pub fn init() !EventLoop {
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
         return .{ .loop = try xev.Loop.init(.{ .thread_pool = &g_thread_pool }) };
@@ -28,17 +31,21 @@ pub const EventLoop = struct {
     pub fn run(self: *EventLoop) !void {
         try self.loop.run(.until_done);
     }
-    fn hasPendingCompletions(loop: *const xev.Loop) bool {
+
+    // ── hot inline predicates: single-bit / empty checks, predictable ──
+    inline fn hasPendingCompletions(loop: *const xev.Loop) bool {
         if (@hasField(@TypeOf(loop.*), "completions")) {
             return !loop.completions.empty();
         }
         return false;
     }
-    fn hasWork(loop: *const xev.Loop) bool {
+    inline fn hasWork(loop: *const xev.Loop) bool {
         return loop.active > 0 or
             !loop.submissions.empty() or
             hasPendingCompletions(loop);
     }
+
+    // Cold tuning knobs — kept out of the per-iteration working set.
     const GC_POLICE = (1 << 13);
     const GC_MIN_HEAP = 8 * 1024 * 1024;
     const IDLE_MIN_NS: u64 = 100_000;
@@ -55,6 +62,8 @@ pub const EventLoop = struct {
                 self.loop.run(.once) catch {};
                 did_work = true;
             }
+            // Batched completion drains: contiguous, reusable slot storage,
+            // zero allocations per drain. Order is fixed for predictability.
             if (async_fetch.pending.load(.acquire) > 0) {
                 async_fetch.arm(&self.loop);
             }

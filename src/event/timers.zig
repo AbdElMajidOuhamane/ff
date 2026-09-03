@@ -2,37 +2,53 @@ const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const microtasks = @import("./microtasks.zig");
+
 const MAX_TIMERS = 128;
 const MS_ONESHOT: u64 = 0;
+
+// Hot state (touched every set/clear/fire): active bits + repeat + completions.
+// Cold state (touched only on alloc/free/fire): ctx + callbacks + timers.
+// Split ordering keeps the hot working set in fewer cache lines.
 pub const TimerManager = struct {
     loop: *xev.Loop,
-    timers: [MAX_TIMERS]xev.Timer,
-    free_head: u8,
-    next_free: [MAX_TIMERS]u8,
-    active:     [MAX_TIMERS]bool,
-    repeat_ms:  [MAX_TIMERS]u64,
-    ctx:        [MAX_TIMERS]?*c.Context,
-    callbacks:  [MAX_TIMERS]?c.Value,
-    completion: [MAX_TIMERS]xev.Completion,
-    c_cancel:   [MAX_TIMERS]xev.Completion,
+    // ── hot ──
+    active_bits: [2]u64 = [_]u64{0} ** 2,
+    repeat_ms: [MAX_TIMERS]u64 = [_]u64{MS_ONESHOT} ** MAX_TIMERS,
+    completion: [MAX_TIMERS]xev.Completion = [_]xev.Completion{.{}} ** MAX_TIMERS,
+    c_cancel: [MAX_TIMERS]xev.Completion = [_]xev.Completion{.{}} ** MAX_TIMERS,
+    free_head: u8 = 0,
+    next_free: [MAX_TIMERS]u8 = undefined,
+    // ── cold ──
+    timers: [MAX_TIMERS]xev.Timer = undefined,
+    ctx: [MAX_TIMERS]?*c.Context = [_]?*c.Context{null} ** MAX_TIMERS,
+    callbacks: [MAX_TIMERS]?c.Value = [_]?c.Value{null} ** MAX_TIMERS,
+
+    comptime {
+        // 128 active flags must fit in 16 bytes, not 128.
+        std.debug.assert(@sizeOf([2]u64) == 16);
+        std.debug.assert(MAX_TIMERS == 128);
+    }
+
     pub fn init(loop: *xev.Loop) TimerManager {
         var tm: TimerManager = .{
             .loop = loop,
-            .timers = undefined,
-            .free_head = 0,
-            .next_free = undefined,
-            .active = [_]bool{false} ** MAX_TIMERS,
-            .repeat_ms = [_]u64{MS_ONESHOT} ** MAX_TIMERS,
-            .ctx = [_]?*c.Context{null} ** MAX_TIMERS,
-            .callbacks = [_]?c.Value{null} ** MAX_TIMERS,
-            .completion = [_]xev.Completion{.{}} ** MAX_TIMERS,
-            .c_cancel = [_]xev.Completion{.{}} ** MAX_TIMERS,
         };
         for (&tm.timers) |*t| t.* = xev.Timer.init() catch unreachable;
         for (0..MAX_TIMERS) |i| tm.next_free[i] = @intCast(i + 1);
         tm.next_free[MAX_TIMERS - 1] = MAX_TIMERS;
         return tm;
     }
+
+    inline fn isActive(self: *const TimerManager, idx: u8) bool {
+        return (self.active_bits[idx >> 6] >> @intCast(idx & 63)) & 1 == 1;
+    }
+    inline fn setActive(self: *TimerManager, idx: u8) void {
+        self.active_bits[idx >> 6] |= (@as(u64, 1) << @intCast(idx & 63));
+    }
+    inline fn clearActive(self: *TimerManager, idx: u8) void {
+        self.active_bits[idx >> 6] &= ~(@as(u64, 1) << @intCast(idx & 63));
+    }
+
     fn popFree(self: *TimerManager) ?u8 {
         const head = self.free_head;
         if (head == MAX_TIMERS) return null;
@@ -51,13 +67,13 @@ pub const TimerManager = struct {
     }
     fn allocSlot(self: *TimerManager, ctx: *c.Context, callback: c.Value) !u8 {
         const idx = self.popFree() orelse return error.NoSlotsAvailable;
-        self.active[idx] = true;
+        self.setActive(idx);
         self.ctx[idx] = ctx;
         self.callbacks[idx] = c.dupValue(ctx, callback);
         return idx;
     }
     fn freeSlot(self: *TimerManager, idx: u8) void {
-        self.active[idx] = false;
+        self.clearActive(idx);
         self.repeat_ms[idx] = MS_ONESHOT;
         if (self.callbacks[idx]) |v| {
             c.freeValue(self.ctx[idx].?, v);
@@ -91,8 +107,8 @@ pub const TimerManager = struct {
     pub fn clear(self: *TimerManager, id: usize) void {
         if (id >= MAX_TIMERS) return;
         const idx: u8 = @intCast(id);
-        if (!self.active[idx]) return;
-        self.active[idx] = false;
+        if (!self.isActive(idx)) return;
+        self.clearActive(idx);
         if (self.callbacks[idx]) |v| {
             c.freeValue(self.ctx[idx].?, v);
         }
@@ -102,8 +118,9 @@ pub const TimerManager = struct {
     }
     pub fn cancelAll(self: *TimerManager) void {
         for (0..MAX_TIMERS) |i| {
-            if (self.active[i]) {
-                self.active[i] = false;
+            const idx: u8 = @intCast(i);
+            if (self.isActive(idx)) {
+                self.clearActive(idx);
                 if (self.callbacks[i]) |v| {
                     c.freeValue(self.ctx[i].?, v);
                 }
@@ -113,6 +130,7 @@ pub const TimerManager = struct {
         }
     }
 };
+
 fn timerCallback(
     ud: ?*TimerManager,
     l: *xev.Loop,
@@ -122,10 +140,10 @@ fn timerCallback(
     const tm = ud orelse return .disarm;
     const idx: u8 = @intCast(tm.indexOfCompletion(cpl));
     _ = r catch |err| {
-        if (err != error.Canceled and tm.active[idx]) tm.freeSlot(idx);
+        if (err != error.Canceled and tm.isActive(idx)) tm.freeSlot(idx);
         return .disarm;
     };
-    if (!tm.active[idx]) return .disarm;
+    if (!tm.isActive(idx)) return .disarm;
     if (tm.ctx[idx]) |ctx| {
         if (tm.callbacks[idx]) |fn_val| {
             _ = c.call(ctx, fn_val, c.JS_UNDEFINED, 0, null);
@@ -133,7 +151,7 @@ fn timerCallback(
         microtasks.pumpMicrotasks(ctx);
     }
     if (tm.repeat_ms[idx] != MS_ONESHOT) {
-        if (tm.active[idx]) {
+        if (tm.isActive(idx)) {
             tm.timers[idx].run(l, &tm.completion[idx], tm.repeat_ms[idx], TimerManager, tm, timerCallback);
         } else {
             tm.freeSlot(idx);
@@ -143,6 +161,7 @@ fn timerCallback(
     tm.freeSlot(idx);
     return .disarm;
 }
+
 fn cancelCb(
     ud: ?*TimerManager,
     _: *xev.Loop,

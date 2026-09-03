@@ -5,6 +5,16 @@ const simd = std.simd;
 
 pub var headers_class_id: c.ClassID = 0;
 
+// ── DOD design note (skill: zig-data-oriented-design) ──
+// Manual SoA: `entries: ArrayList(Entry)` 16B stride scanned by every
+// get/has/forEach, plus dense byte pools `names`/`values`.
+// `std.MultiArrayList(Entry)` was considered and rejected: name/value
+// bytes are variable-length pools addressed by stable `off/len` indices,
+// so splitting Entry into separate field arrays buys nothing while
+// complicating stable indexing. Static SoA (like http_native 512-slot
+// columns) is wrong here — header count per request is small (4-16)
+// and lifetime is JS-GC bound, not a fixed slot array.
+
 fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
     _ = c.throwTypeError(ctx, "%.*s", @as(c_int, @intCast(msg.len)), msg.ptr);
 }
@@ -71,32 +81,42 @@ const Entry = struct {
 };
 comptime {
     std.debug.assert(@sizeOf(Entry) == 16);
+    std.debug.assert(@alignOf(Entry) == 4);
 }
 
-// DOD-FIX 1: refcounted HeadersData. Strict-compliance layout assertion.
+// Hot data: `entries` (16B stride, scanned by every get/has/forEach).
+// Cold data: `names`/`values` bytes, `merge_buf`/`view_buf` scratch.
+// Hot loops touch entries + the referenced name bytes only; merge/view
+// scratch never flows through the scan path.
 pub const HeadersData = struct {
+    entries: std.ArrayList(Entry),
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
-    entries: std.ArrayList(Entry),
     merge_buf: std.ArrayList(u8),
     view_buf: std.ArrayList([]const u8),
     refcount: std.atomic.Value(usize),
     pub const PairView = struct { name: []const u8, value: []const u8 };
 
+    comptime {
+        // 3 pointers+len (ArrayList = 16B on 64-bit) x5 + atomic = small GC object,
+        // not a hot array element — size guard documents cold-bridge intent.
+        std.debug.assert(@alignOf(HeadersData) >= @alignOf(usize));
+    }
+
     pub fn init() HeadersData {
         return .{
+            .entries = std.ArrayList(Entry).empty,
             .names = std.ArrayList(u8).empty,
             .values = std.ArrayList(u8).empty,
-            .entries = std.ArrayList(Entry).empty,
             .merge_buf = std.ArrayList(u8).empty,
             .view_buf = std.ArrayList([]const u8).empty,
             .refcount = .{ .raw = 1 },
         };
     }
     pub fn deinit(self: *HeadersData) void {
+        self.entries.deinit(gpa);
         self.names.deinit(gpa);
         self.values.deinit(gpa);
-        self.entries.deinit(gpa);
         self.merge_buf.deinit(gpa);
         self.view_buf.deinit(gpa);
     }
@@ -108,6 +128,29 @@ pub const HeadersData = struct {
             self.deinit();
             gpa.destroy(self);
         }
+    }
+    // Batch reserve: one growth per bulk load instead of per-header realloc.
+    // Call before any bulk append loop (fetch, async_fetch, constructor).
+    pub fn reserve(self: *HeadersData, n_entries: usize, name_bytes: usize, val_bytes: usize) void {
+        self.entries.ensureTotalCapacity(gpa, self.entries.items.len + n_entries) catch {};
+        self.names.ensureTotalCapacity(gpa, self.names.items.len + name_bytes) catch {};
+        self.values.ensureTotalCapacity(gpa, self.values.items.len + val_bytes) catch {};
+    }
+    pub const ensureCapacity = reserve;
+    // Hint when only entry count is known (avg 16B name / 32B value estimate).
+    pub fn reserveEntries(self: *HeadersData, n_entries: usize) void {
+        self.reserve(n_entries, n_entries * 16, n_entries * 32);
+    }
+    // Single-reserve batch append — preferred over appendEntry in a loop.
+    pub fn appendBatch(self: *HeadersData, pairs: []const Pair) void {
+        var nb: usize = 0;
+        var vb: usize = 0;
+        for (pairs) |p| {
+            nb += p.name.len;
+            vb += p.value.len;
+        }
+        self.reserve(pairs.len, nb, vb);
+        for (pairs) |p| self.appendEntry(p.name, p.value);
     }
     fn nameOf(self: *const HeadersData, e: Entry) []const u8 {
         return self.names.items[e.name_off .. e.name_off + e.name_len];
@@ -130,24 +173,22 @@ pub const HeadersData = struct {
         self.entries.items.len -= 1;
     }
     pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+        self.tryAppendEntry(name, value) catch return;
+    }
+    pub fn tryAppendEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
         const nbase = self.names.items.len;
-        self.names.appendSlice(gpa, name) catch return;
+        try self.names.appendSlice(gpa, name);
+        errdefer self.names.items.len = nbase;
         lowerAsciiSimd(self.names.items[nbase..]);
         const vbase = self.values.items.len;
-        self.values.appendSlice(gpa, value) catch {
-            self.names.items.len = nbase;
-            return;
-        };
-        self.entries.append(gpa, .{
+        try self.values.appendSlice(gpa, value);
+        errdefer self.values.items.len = vbase;
+        try self.entries.append(gpa, .{
             .name_off = @intCast(nbase),
             .name_len = @intCast(name.len),
             .val_off = @intCast(vbase),
             .val_len = @intCast(value.len),
-        }) catch {
-            self.names.items.len = nbase;
-            self.values.items.len = vbase;
-            return;
-        };
+        });
     }
     pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
         var first: ?usize = null;
@@ -228,6 +269,7 @@ pub const HeadersData = struct {
         }
         return false;
     }
+    // Cold JS-bridge helper: allocates per call, never used in I/O hot loop.
     pub fn getUniqueNames(self: *const HeadersData) [][]const u8 {
         var result = std.ArrayList([]const u8).empty;
         for (self.entries.items) |e| {
@@ -243,6 +285,7 @@ pub const HeadersData = struct {
         }
         return result.toOwnedSlice(gpa) catch &.{};
     }
+    // Cold JS-bridge helper: allocates per call, never used in I/O hot loop.
     pub fn serialize(self: *const HeadersData) ![]const u8 {
         var total: usize = 0;
         for (self.entries.items) |e| {
@@ -260,9 +303,10 @@ pub const HeadersData = struct {
         return try result.toOwnedSlice(gpa);
     }
     pub fn fromPairs(self: *HeadersData, pairs: []const Pair) void {
-        for (pairs) |pair| self.appendEntry(pair.name, pair.value);
+        self.appendBatch(pairs);
     }
     pub fn fromRawHeaderString(self: *HeadersData, raw: []const u8) void {
+        self.reserve(8, raw.len / 2, raw.len / 2);
         var lines = std.mem.splitSequence(u8, raw, "\r\n");
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -274,6 +318,7 @@ pub const HeadersData = struct {
         }
     }
 };
+
 fn extractHeadersData(ctx: ?*c.Context, this_val: c.Value) ?*HeadersData {
     const ptr = c.getOpaque2(ctx, this_val, headers_class_id) orelse return null;
     return @ptrCast(@alignCast(ptr));
@@ -438,43 +483,43 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
         } else if (c.isObject(init_val) != 0) {
             if (c.getOpaque2(ctx, init_val, headers_class_id)) |ptr| {
                 const src: *HeadersData = @ptrCast(@alignCast(ptr));
+                data.reserve(src.len(), src.names.items.len, src.values.items.len);
                 for (0..src.len()) |i| {
                     const p = src.getPair(i);
                     data.appendEntry(p.name, p.value);
                 }
             } else if (c.isArray(ctx, init_val) != 0) {
-                var pairs_buf = std.ArrayList(Pair).empty;
+                // DOD-FIX: append directly — old code stored n.slice/v.slice
+                // (pointing at stack nbuf/vbuf) into pairs_buf → use-after-free.
                 const len_val = c.getPropertyStr(ctx, init_val, "length");
                 defer c.freeValue(ctx, len_val);
                 var len: c_int = 0;
                 _ = c.toInt32(ctx, &len, len_val);
+                if (len > 0) data.reserveEntries(@intCast(len));
                 var i: c_uint = 0;
                 while (i < @as(c_uint, @intCast(len))) : (i += 1) {
                     const item = c.getPropertyUint32(ctx, init_val, i);
+                    defer c.freeValue(ctx, item);
                     if (c.isObject(item) == 0) continue;
                     const name_val = c.getPropertyUint32(ctx, item, 0);
+                    defer c.freeValue(ctx, name_val);
                     const val_val = c.getPropertyUint32(ctx, item, 1);
+                    defer c.freeValue(ctx, val_val);
                     var nbuf: [128]u8 = undefined;
                     var vbuf: [256]u8 = undefined;
-                    const name_z = extractStringAuto(ctx, name_val, &nbuf);
-                    const val_z = extractStringAuto(ctx, val_val, &vbuf);
-                    if (name_z) |n| {
-                        defer n.deinit();
-                        if (val_z) |v| {
-                            defer v.deinit();
-                            pairs_buf.append(gpa, .{ .name = n.slice, .value = v.slice }) catch {};
-                        }
-                    }
+                    const name_z = extractStringAuto(ctx, name_val, &nbuf) orelse continue;
+                    defer name_z.deinit();
+                    const val_z = extractStringAuto(ctx, val_val, &vbuf) orelse continue;
+                    defer val_z.deinit();
+                    data.appendEntry(name_z.slice, val_z.slice);
                 }
-                if (pairs_buf.items.len > 0) {
-                    data.fromPairs(pairs_buf.items);
-                }
-                pairs_buf.deinit(gpa);
             } else {
-                var pairs_buf = std.ArrayList(Pair).empty;
                 var p: [*c]c.PropertyEnum = null;
                 var count: c_uint = 0;
                 if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+                    defer c.freePropertyEnum(ctx, p, count);
+                    // DOD-FIX: same dangling-slice fix — append directly.
+                    data.reserveEntries(count);
                     for (0..count) |idx| {
                         const name_atom = p[idx].atom;
                         const name_val = c.atomToString(ctx, name_atom);
@@ -483,22 +528,13 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                         defer c.freeValue(ctx, val_val);
                         var nbuf: [128]u8 = undefined;
                         var vbuf: [256]u8 = undefined;
-                        const name_z = extractStringAuto(ctx, name_val, &nbuf);
-                        const val_z = extractStringAuto(ctx, val_val, &vbuf);
-                        if (name_z) |n| {
-                            defer n.deinit();
-                            if (val_z) |v| {
-                                defer v.deinit();
-                                pairs_buf.append(gpa, .{ .name = n.slice, .value = v.slice }) catch {};
-                            }
-                        }
+                        const name_z = extractStringAuto(ctx, name_val, &nbuf) orelse continue;
+                        defer name_z.deinit();
+                        const val_z = extractStringAuto(ctx, val_val, &vbuf) orelse continue;
+                        defer val_z.deinit();
+                        data.appendEntry(name_z.slice, val_z.slice);
                     }
-                    c.freePropertyEnum(ctx, p, count);
                 }
-                if (pairs_buf.items.len > 0) {
-                    data.fromPairs(pairs_buf.items);
-                }
-                pairs_buf.deinit(gpa);
             }
         }
     }
@@ -513,7 +549,7 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "Headers",
         .finalizer = headersFinalizer,
     };
-_ = c.newClassID(c.getRuntime(ctx), &headers_class_id);
+    _ = c.newClassID(c.getRuntime(ctx), &headers_class_id);
     _ = c.newClass(c.getRuntime(ctx), headers_class_id, &class_def);
 
     const proto = c.newObject(ctx);

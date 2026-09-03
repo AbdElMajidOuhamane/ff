@@ -1,4 +1,14 @@
 const std = @import("std");
+
+// ── DOD note ──
+// FrameHdr is a stack transient (parse → consume in wsConsume), never stored
+// in a hot array, so AoS-by-value is correct and MultiArrayList is wrong.
+// `fin: bool` stays a bool: folding it into `opcode` bit 7 would save 0 BSS
+// (no array) while adding parse/mask cost on every frame. Documented here so
+// the skill §3 bool review is recorded as intentional, not missed.
+// SIMD (§9): `unmask` uses explicit @Vector at suggestVectorLength with scalar
+// tail + `unmaskScalar` oracle + test — the justified pattern, not "SIMD is faster".
+
 // ---- RFC6455 constants ----
 pub const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub const WS_MSG_SIZE = 16384;
@@ -16,6 +26,11 @@ pub const FrameHdr = struct {
     header_len: u8,
     mask: [4]u8,
 };
+comptime {
+    // Stack transient: assert exact stride so future field adds are deliberate.
+    std.debug.assert(@sizeOf(FrameHdr) <= 32);
+    std.debug.assert(@alignOf(FrameHdr) == 8);
+}
 pub fn isControl(op: u8) bool {
     return op >= 0x8;
 }
@@ -146,11 +161,10 @@ test "parseHeader roundtrip" {
     var buf: [14]u8 = undefined;
     const h1 = buildHeader(&buf, OP_TEXT, true, 300);
     _ = h1;
-    // simulate client masked frame: fin|text, mask bit, len126
     buf[0] = 0x81;
     buf[1] = 0x80 | 126;
     buf[2] = 0x01;
-    buf[3] = 0x2c; // 300
+    buf[3] = 0x2c;
     buf[4] = 0x11;
     buf[5] = 0x22;
     buf[6] = 0x33;

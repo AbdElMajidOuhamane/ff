@@ -7,6 +7,16 @@ const tls = @import("../net/tls.zig");
 const gpa = std.heap.smp_allocator;
 const http = std.http;
 
+// ── DOD note ──
+// This file is cold submit path (once per fetch() call), NOT the hot drain
+// path (async_fetch.runJob / event-loop pump). Heap ownership here is
+// intentional: url/method/body/headers are transferred to the worker thread
+// via async_fetch.submit and freed in freeOwned. Do not micro-opt this into
+// stack-only lifetimes — the worker outlives this call frame.
+// Skill rules applied: batch reserve before header loops, single dense
+// HeadersData built in-place, no per-header reallocation, cached RequestData
+// lookup (no repeated getOpaque2 pointer chase).
+
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
@@ -33,11 +43,15 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
 
-// DOD-FIX 2 (corrected): heap case returns the [:0]u8 directly.
+// Cold-submit owned-string helper: heap copy is REQUIRED because the
+// result outlives this frame (transferred to async_fetch worker).
+// Empty string returns a static "" sentinel — no alloc.
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
     var stack_buf: [256]u8 = undefined;
     const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
-    if (ex.heap) |h| return h;
+    if (ex.heap) |h| return h; // heap case: return directly, no second copy
+    if (ex.slice.len == 0) return "";
     const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
     @memcpy(buf[0..ex.slice.len], ex.slice);
     buf[ex.slice.len] = 0;
@@ -80,6 +94,8 @@ fn collectHeadersFromJS(
     if (c.isObject(val) == 0) return;
     if (c.getOpaque2(ctx, val, headers_mod.headers_class_id)) |ptr| {
         const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
+        // Batch reserve: one growth instead of per-header realloc.
+        target.reserve(src.len(), src.names.items.len, src.values.items.len);
         for (0..src.len()) |i| {
             const p = src.getPair(i);
             target.appendEntry(p.name, p.value);
@@ -90,6 +106,8 @@ fn collectHeadersFromJS(
     var count: c_uint = 0;
     if (c.getOwnPropertyNames(ctx, &p, &count, val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
         defer c.freePropertyEnum(ctx, p, count);
+        // DOD-FIX: pre-reserve with count hint (avg 16B name / 32B value).
+        target.reserveEntries(count);
         for (0..count) |idx| {
             const name_atom = p[idx].atom;
             const name_val = c.atomToString(ctx, name_atom);
@@ -124,14 +142,22 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     var owned_method: ?[:0]const u8 = null;
     var body_payload: ?[:0]const u8 = null;
     defer {
-        if (url_str) |u| gpa.free(u);
-        if (owned_method) |m| gpa.free(m);
-        if (body_payload) |b| gpa.free(b);
+        if (url_str) |u| {
+            if (u.len > 0) gpa.free(u);
+        }
+        if (owned_method) |m| {
+            if (m.len > 0) gpa.free(m);
+        }
+        if (body_payload) |b| {
+            if (b.len > 0) gpa.free(b);
+        }
     }
+    // DOD-FIX: single getOpaque2 lookup, reused below (was looked up twice).
+    const req_data = extractRequestData(ctx, arg0);
     if (c.isString(arg0) != 0) {
         url_str = extractStringFromVal(ctx, arg0);
     } else if (c.isObject(arg0) != 0) {
-        if (extractRequestData(ctx, arg0)) |rd| {
+        if (req_data) |rd| {
             url_str = gpa.dupeZ(u8, rd.url()) catch null;
             method_override = rd.method();
             body_payload = if (rd.body()) |b| gpa.dupeZ(u8, b) catch null else null;
@@ -150,7 +176,9 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     errdefer in_flight_headers.deinit();
 
     // If arg0 is a Request, copy its headers into the in-flight pool.
-    if (extractRequestData(ctx, arg0)) |rd| {
+    // Batch reserve first: one growth, not per-header.
+    if (req_data) |rd| {
+        in_flight_headers.reserve(rd.headers.len(), rd.headers.names.items.len, rd.headers.values.items.len);
         for (0..rd.headers.len()) |i| {
             const pair = rd.headers.getPair(i);
             in_flight_headers.appendEntry(pair.name, pair.value);
@@ -161,9 +189,12 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         const init_val = argv[1];
         const method_val = c.getPropertyStr(ctx, init_val, "method");
         defer c.freeValue(ctx, method_val);
-        if (extractStringFromVal(ctx, method_val)) |m| {
-            method_override = m;
-            owned_method = m;
+        // Guard undefined/null before alloc (was unconditional alloc).
+        if (c.isUndefined(method_val) == 0 and c.isNull(method_val) == 0) {
+            if (extractStringFromVal(ctx, method_val)) |m| {
+                method_override = m;
+                owned_method = m;
+            }
         }
         const headers_val = c.getPropertyStr(ctx, init_val, "headers");
         defer c.freeValue(ctx, headers_val);

@@ -39,8 +39,11 @@ const ConnFlags = packed struct(u16) {
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
+    assert(@alignOf(ConnFlags) == 2);
     assert(@sizeOf(Method) == 1);
+    assert(@alignOf(Method) == 1);
     assert(@sizeOf(ParsedRequest) <= 64);
+    assert(@alignOf(ParsedRequest) <= 8);
     assert(@sizeOf(ConnState) == 1);
 }
 const assert = std.debug.assert;
@@ -59,7 +62,17 @@ var hdr_scan_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var fds: [MAX_CONN]xev.TCP = undefined;
 var buf_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var ws_partial_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
-var ws_partial_binary: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
+// DOD §3: 512B bool column → 64B bitset (8×u64). Set only on fragment start,
+// read only on fragment completion — never scanned linearly with buf_lens.
+var ws_partial_binary_bits: [MAX_CONN / 64]u64 = [_]u64{0} ** (MAX_CONN / 64);
+inline fn wsPartialBinary(id: usize) bool {
+    return (ws_partial_binary_bits[id >> 6] >> @intCast(id & 63)) & 1 == 1;
+}
+inline fn wsSetPartialBinary(id: usize, is_bin: bool) void {
+    const w = &ws_partial_binary_bits[id >> 6];
+    const bit: u64 = @as(u64, 1) << @intCast(id & 63);
+    if (is_bin) w.* |= bit else w.* &= ~bit;
+}
 var ws_sockets: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
 var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var read_bufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
@@ -980,7 +993,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
             wsSendClose(id, 1009);
             return false;
         }
-        ws_partial_binary[id] = hdr.opcode == ws.OP_BINARY;
+    wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
         @memcpy(ws_partial[id][0..payload.len], payload);
         ws_partial_len[id] = payload.len;
         return true;
@@ -996,7 +1009,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
     @memcpy(ws_partial[id][ws_partial_len[id]..][0..payload.len], payload);
     ws_partial_len[id] += payload.len;
     if (hdr.fin) {
-        wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]], ws_partial_binary[id]);
+        wsNotifyMessage(id, ws_partial[id][0..ws_partial_len[id]], wsPartialBinary(id));
         ws_partial_len[id] = 0;
     }
     return true;
@@ -1052,7 +1065,7 @@ fn wsShutdown(id: usize) void {
     }
     cflags[id].ws_open = false;
     ws_partial_len[id] = 0;
-    ws_partial_binary[id] = false;
+   wsSetPartialBinary(id, false);
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_writing = false;
 }
@@ -1092,7 +1105,7 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_pending_open = true;
     ws_partial_len[id] = 0;
-    ws_partial_binary[id] = false;
+    wsSetPartialBinary(id, false);
     states[id] = .writing;
     write_offsets[id] = 0;
     ws_batch[id] = write_lens[id];
@@ -1192,7 +1205,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     body_lens[id] = 0;
     cflags[id] = .{ .keep_alive = true, .ws_read_armed = true, .tls = tls_active };
     ws_partial_len[id] = 0;
-    ws_partial_binary[id] = false;
+    wsSetPartialBinary(id, false);
     if (tls_on and tls_active) tls_mod.slotInit(&tls_ctxs[id], &tls_iobufs[id]);
     armRead(id, l);
     return true;

@@ -88,17 +88,22 @@ pub const ResponseDataCold = struct {
 
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
-    status: u16,
-    status_text: PoolSlice,
     headers: *headers_mod.HeadersData,
-    _body: PoolSlice,
     owned_body: ?[]u8 = null,
+    cold: ?*ResponseDataCold,
+    status: u16,
+    response_type: ResponseType,
+    status_text: PoolSlice,
+    _body: PoolSlice,
+    _url: PoolSlice,
     has_body: bool,
     body_used: bool,
-    _url: PoolSlice,
     redirected: bool,
-    response_type: ResponseType,
-    cold: ?*ResponseDataCold,
+    comptime {
+        std.debug.assert(@sizeOf(PoolSlice) == 8);
+        std.debug.assert(@alignOf(ResponseData) >= 8);
+    }
+  
     pub fn init() ResponseData {
         const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
         h.* = headers_mod.HeadersData.init();
@@ -201,6 +206,8 @@ pub const ResponseData = struct {
         self._url = src._url;
         self.redirected = src.redirected;
         self.response_type = src.response_type;
+        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
+        self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
         self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
         if (src.cold) |sc| {
             if (self.ensureCold()) |dc| {

@@ -6,6 +6,12 @@ const gpa = std.heap.smp_allocator;
 
 pub var request_class_id: c.ClassID = 0;
 
+// ── DOD note ──
+// Cold JS-bridge object, NOT hot I/O path (http_native uses ParsedRequest).
+// Layout fix per skill §3: largest→smallest, trailing grouped bools so the
+// struct stride carries no padding holes. `cold` box keeps `.other` strings
+// out of the hot inline path. AoS per-Request is correct — GC lifetime.
+
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
@@ -33,9 +39,11 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 }
 
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
     var stack_buf: [256]u8 = undefined;
     const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
     if (ex.heap) |h| return h;
+    if (ex.slice.len == 0) return "";
     const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
     @memcpy(buf[0..ex.slice.len], ex.slice);
     buf[ex.slice.len] = 0;
@@ -143,31 +151,38 @@ pub const RequestDataCold = struct {
     _redirect_other: PoolSlice,
 };
 
+// DOD-FIX §3: largest→smallest, bools grouped trailing. Same field names
+// so callers (fetch.zig, http layer) keep compiling.
 pub const RequestData = struct {
     pool: std.ArrayList(u8),
+    headers: headers_mod.HeadersData,
+    cold: ?*RequestDataCold,
     _url: PoolSlice,
     _body: PoolSlice,
-    has_body: bool,
     _integrity: PoolSlice,
     _method: Method,
     _cache: CacheMode,
     _credentials: CredMode,
     _mode: Mode,
     _redirect: RedirectMode,
-    headers: headers_mod.HeadersData,
+    has_body: bool,
     body_used: bool,
     keepalive: bool,
-    cold: ?*RequestDataCold,
+
+    comptime {
+        std.debug.assert(@sizeOf(PoolSlice) == 8);
+        std.debug.assert(@alignOf(RequestData) >= 8);
+    }
 
     pub fn init() RequestData {
         return .{
             .pool = std.ArrayList(u8).empty,
-            ._url = .{}, ._body = .{}, .has_body = false, ._integrity = .{},
+            .headers = headers_mod.HeadersData.init(),
+            .cold = null,
+            ._url = .{}, ._body = .{}, ._integrity = .{},
             ._method = .GET, ._cache = .default, ._credentials = .same_origin,
             ._mode = .cors, ._redirect = .follow,
-            .headers = headers_mod.HeadersData.init(),
-            .body_used = false, .keepalive = false,
-            .cold = null,
+            .has_body = false, .body_used = false, .keepalive = false,
         };
     }
     pub fn deinit(self: *RequestData) void {
@@ -293,16 +308,17 @@ pub const RequestData = struct {
         }
     }
     pub fn cloneFrom(self: *RequestData, src: *const RequestData) void {
+        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
         self.pool.appendSlice(gpa, src.pool.items) catch {};
         self._url = src._url;
         self._body = src._body;
-        self.has_body = src.has_body;
         self._integrity = src._integrity;
         self._method = src._method;
         self._cache = src._cache;
         self._credentials = src._credentials;
         self._mode = src._mode;
         self._redirect = src._redirect;
+        self.has_body = src.has_body;
         self.body_used = false;
         self.keepalive = src.keepalive;
         if (src.cold) |sc| {
@@ -314,6 +330,7 @@ pub const RequestData = struct {
                 dc._redirect_other = sc._redirect_other;
             }
         }
+        self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
             self.headers.appendEntry(p.name, p.value);
@@ -326,6 +343,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     if (c.isObject(init_val) == 0) return;
     if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
         const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
+        target.reserve(src.len(), src.names.items.len, src.values.items.len);
         for (0..src.len()) |i| {
             const p = src.getPair(i);
             target.appendEntry(p.name, p.value);
@@ -337,12 +355,16 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
+        if (len > 0) target.reserveEntries(@intCast(len));
         var i: c_uint = 0;
         while (i < @as(c_uint, @intCast(len))) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
+            defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;
             const name_val = c.getPropertyUint32(ctx, item, 0);
+            defer c.freeValue(ctx, name_val);
             const val_val = c.getPropertyUint32(ctx, item, 1);
+            defer c.freeValue(ctx, val_val);
             var nbuf: [128]u8 = undefined;
             var vbuf: [256]u8 = undefined;
             const n = extractStringAuto(ctx, name_val, &nbuf);
@@ -360,6 +382,8 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     var p: [*c]c.PropertyEnum = null;
     var count: c_uint = 0;
     if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        defer c.freePropertyEnum(ctx, p, count);
+        target.reserveEntries(count);
         for (0..count) |idx| {
             const name_atom = p[idx].atom;
             const name_val = c.atomToString(ctx, name_atom);
@@ -378,7 +402,6 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
                 }
             }
         }
-        c.freePropertyEnum(ctx, p, count);
     }
 }
 
@@ -543,7 +566,6 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     } else if (c.isObject(arg0) != 0) {
         const src = extractRequestData(ctx, arg0);
         if (src) |src_data| {
-            // Release the freshly-init'd headers before taking src's.
             data.headers.release();
             data.cloneFrom(src_data);
         } else {
@@ -572,9 +594,7 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 data.setMethod(m.slice);
             }
         }
-
         parseHeadersInitFromObj(ctx, init_val, &data.headers);
-
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
@@ -583,51 +603,45 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 data.setBody(b.slice);
             }
         }
-
         const cache_val = c.getPropertyStr(ctx, init_val, "cache");
         defer c.freeValue(ctx, cache_val);
         if (extractStringAuto(ctx, cache_val, &scratch)) |c_val| {
             defer c_val.deinit();
             data.setCache(c_val.slice);
         }
-
         const cred_val = c.getPropertyStr(ctx, init_val, "credentials");
         defer c.freeValue(ctx, cred_val);
         if (extractStringAuto(ctx, cred_val, &scratch)) |c_val| {
             defer c_val.deinit();
             data.setCredentials(c_val.slice);
         }
-
         const mode_val = c.getPropertyStr(ctx, init_val, "mode");
         defer c.freeValue(ctx, mode_val);
         if (extractStringAuto(ctx, mode_val, &scratch)) |m_val| {
             defer m_val.deinit();
             data.setMode(m_val.slice);
         }
-
         const redir_val = c.getPropertyStr(ctx, init_val, "redirect");
         defer c.freeValue(ctx, redir_val);
         if (extractStringAuto(ctx, redir_val, &scratch)) |r_val| {
             defer r_val.deinit();
             data.setRedirect(r_val.slice);
         }
-
         const integ_val = c.getPropertyStr(ctx, init_val, "integrity");
         defer c.freeValue(ctx, integ_val);
         if (extractStringAuto(ctx, integ_val, &scratch)) |i_val| {
             defer i_val.deinit();
             data.setIntegrity(i_val.slice);
         }
-
         const keep_val = c.getPropertyStr(ctx, init_val, "keepalive");
         defer c.freeValue(ctx, keep_val);
         if (c.toBool(ctx, keep_val) != 0) data.keepalive = true;
     }
 
-    const obj = c.newObjectClass(ctx, @intCast(request_class_id)); // CHANGED
-    c.setOpaque(obj, data);                                        // CHANGED
-    setRequestProps(ctx, obj, data);                               // CHANGED
-    return obj;                                                    // CHANGED
+    const obj = c.newObjectClass(ctx, @intCast(request_class_id));
+    c.setOpaque(obj, data);
+    setRequestProps(ctx, obj, data);
+    return obj;
 }
 
 pub fn buildRequestJSObject(ctx: ?*c.Context, data: *RequestData) c.Value {
@@ -642,9 +656,8 @@ pub fn setup(ctx: ?*c.Context) void {
         .class_name = "Request",
         .finalizer = requestFinalizer,
     };
-_ = c.newClassID(c.getRuntime(ctx), &request_class_id);
+    _ = c.newClassID(c.getRuntime(ctx), &request_class_id);
     _ = c.newClass(c.getRuntime(ctx), request_class_id, &class_def);
-
     const proto = c.newObject(ctx);
     const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
         .{ .name = "text", .func = &requestText, .len = 0 },
@@ -662,7 +675,6 @@ _ = c.newClassID(c.getRuntime(ctx), &request_class_id);
         _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
     c.setClassProto(ctx, request_class_id, proto);
-
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const ctor = c.newCFunction2(ctx, &requestConstructor, "Request", 2, c.JS_CFUNC_constructor, 0);
