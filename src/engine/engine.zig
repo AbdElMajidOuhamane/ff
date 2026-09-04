@@ -83,9 +83,20 @@ fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const 
         path_z = gpa.allocSentinel(u8, resolved.len, 0) catch return null;
         @memcpy(path_z[0..resolved.len], resolved);
     } else {
-        path_z = gpa.allocSentinel(u8, resolved.len + 3, 0) catch return null;
-        @memcpy(path_z[0..resolved.len], resolved);
-        @memcpy(path_z[resolved.len..][0..3], ".js");
+        // Extensionless import: try P.js, then P/index.js (directory import).
+        // Fall back to P.js so the loader error names a concrete file.
+        const js_path = std.fmt.allocPrint(gpa, "{s}.js", .{resolved}) catch return null;
+        defer gpa.free(js_path);
+        const idx_path = std.fmt.allocPrint(gpa, "{s}/index.js", .{resolved}) catch return null;
+        defer gpa.free(idx_path);
+        const chosen: []const u8 = if (mod.pathExists(gpa, js_path))
+            js_path
+        else if (mod.pathExists(gpa, idx_path))
+            idx_path
+        else
+            js_path;
+        path_z = gpa.allocSentinel(u8, chosen.len, 0) catch return null;
+        @memcpy(path_z[0..chosen.len], chosen);
     }
     defer gpa.free(path_z);
     return qjs.js_strdup(ctx, path_z.ptr);

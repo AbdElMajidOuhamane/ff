@@ -16,7 +16,8 @@ pub fn run(io: Io) !void {
         \\{
         \\  "name": "my-app",
         \\  "version": "0.0.1",
-        \\  "main": "main.js"
+        \\  "main": "main.js",
+        \\   "dependencies": {}
         \\}
         \\
     ;
