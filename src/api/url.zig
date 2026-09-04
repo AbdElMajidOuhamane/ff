@@ -945,7 +945,6 @@ fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     deriveStrings(url, &w);
     return block;
 }
-
 fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
     const base = try std.Uri.parse(base_url);
     const block = try UrlBlock.create(input.len + base_url.len + 256);
@@ -1006,17 +1005,45 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
         url.query = if (base.query) |q| w.putComponent(q) else "";
         url.fragment = w.put(rel_path[1..]);
     } else if (rel_path[0] == '/') {
+        // FIX: split ?query / #fragment BEFORE dot-segment removal.
+        // Old code normalized "/notes?tag=work" as a path and blanked the
+        // query, so pathname carried "?tag=work" and searchParams was empty.
+        var path_part = rel_path;
+        var frag: []const u8 = "";
+        var query: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, path_part, '#')) |hi| {
+            frag = path_part[hi + 1 ..];
+            path_part = path_part[0..hi];
+        }
+        if (std.mem.indexOfScalar(u8, path_part, '?')) |qi| {
+            query = path_part[qi + 1 ..];
+            path_part = path_part[0..qi];
+        }
         const off = w.used;
-        w.used += try removeDotSegmentsInto(w.rest(), rel_path);
+        w.used += try removeDotSegmentsInto(w.rest(), path_part);
         url.path = w.pool[off..][0 .. w.used - off];
-        url.query = "";
+        url.query = if (query.len > 0) w.put(query) else "";
+        url.fragment = if (frag.len > 0) w.put(frag) else "";
     } else {
+        // FIX: same split for merged relative paths ("sub?q=1" form).
+        var path_part = rel_path;
+        var frag: []const u8 = "";
+        var query: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, path_part, '#')) |hi| {
+            frag = path_part[hi + 1 ..];
+            path_part = path_part[0..hi];
+        }
+        if (std.mem.indexOfScalar(u8, path_part, '?')) |qi| {
+            query = path_part[qi + 1 ..];
+            path_part = path_part[0..qi];
+        }
         var tmp: [4096]u8 = undefined;
-        const n = mergePathsInto(&tmp, base_path, rel_path);
+        const n = mergePathsInto(&tmp, base_path, path_part);
         const off = w.used;
         w.used += try removeDotSegmentsInto(w.rest(), tmp[0..n]);
         url.path = w.pool[off..][0 .. w.used - off];
-        url.query = "";
+        url.query = if (query.len > 0) w.put(query) else "";
+        url.fragment = if (frag.len > 0) w.put(frag) else "";
     }
     block.sp.parseFromString(url.query);
     deriveStrings(url, &w);
