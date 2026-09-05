@@ -6,6 +6,7 @@ const ffcfg = @import("ffcfg");
 const loop_mod = @import("event/loop.zig");
 const init_cmd = @import("commands/init.zig");
 const imprint_cmd = @import("commands/imprint.zig");
+const sever_cmd = @import("commands/sever.zig");
 const start_cmd = @import("commands/start.zig");
 const bench_cmd = @import("commands/bench.zig");
 const c = @cImport({
@@ -15,6 +16,7 @@ const c = @cImport({
 const Command = enum {
     init,
     imprint,
+    sever,
     start,
     bench,
     e_flag,
@@ -25,6 +27,7 @@ const Command = enum {
 fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "init")) return .init;
     if (std.mem.eql(u8, arg, "imprint")) return .imprint;
+    if (std.mem.eql(u8, arg, "sever")) return .sever;
     if (std.mem.eql(u8, arg, "start")) return .start;
     if (std.mem.eql(u8, arg, "bench")) return .bench;
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
@@ -70,6 +73,15 @@ pub fn main(init: std.process.Init) !void {
             defer rest.deinit(gpa);
             while (args_iter.next()) |a| try rest.append(gpa, a);
             try imprint_cmd.run(init.io, rest.items);
+        },
+        .sever => {
+            var gpa_state = std.heap.DebugAllocator(.{}).init;
+            defer _ = gpa_state.deinit();
+            const gpa = gpa_state.allocator();
+            var rest = std.ArrayList([]const u8).empty;
+            defer rest.deinit(gpa);
+            while (args_iter.next()) |a| try rest.append(gpa, a);
+            try sever_cmd.run(init.io, rest.items);
         },
         .start => try start_cmd.run(init.io, init),
         .bench => try bench_cmd.run(init.io, init),
@@ -117,6 +129,7 @@ fn printUsage() void {
     std.debug.print("Usage:", .{});
     std.debug.print("  ff init              Initialize a new project", .{});
     std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM", .{});
+    std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s), prune orphans; no args clears all (confirms)", .{});
     std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project (https/wss with cert+key)", .{});
     std.debug.print("  ff bench             Run benchmarks", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
