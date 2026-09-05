@@ -5,8 +5,17 @@ const microtasks = @import("./microtasks.zig");
 const http_api = @import("../net/http.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
+const timers_mod = @import("timers.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
+
+// Set once by Runtime.init (engine owns both ends). Null-safe: no timers yet.
+pub var timer_mgr: ?*timers_mod.TimerManager = null;
+
+fn timersAlive() bool {
+    const tm = timer_mgr orelse return false;
+    return tm.hasReferencedTimers();
+}
 
 pub const EventLoop = struct {
     loop: xev.Loop,
@@ -88,7 +97,8 @@ pub const EventLoop = struct {
             if (!http_api.server_running.load(.acquire) and
                 !work_left and
                 async_fetch.pending.load(.acquire) == 0 and
-                ws_client.pending.load(.acquire) == 0) break;
+                ws_client.pending.load(.acquire) == 0 and
+                !timersAlive()) break;
             if (!work_left and !did_work) {
                 const ts: std.c.timespec = .{
                     .sec = @intCast(idle_delay_ns / std.time.ns_per_s),
