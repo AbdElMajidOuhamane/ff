@@ -64,9 +64,12 @@ fn resolveBare(allocator: Allocator, importer_dir: []const u8, specifier: []cons
     const rest = if (pkg_end < specifier.len) specifier[pkg_end + 1 ..] else "";
     var dir = try allocator.dupe(u8, importer_dir);
     defer allocator.free(dir);
+    var first: ?[]u8 = null;
+    defer if (first) |f| allocator.free(f);
     while (true) {
         const cand = try std.fmt.allocPrint(allocator, "{s}/node_modules/{s}", .{ dir, pkg });
         defer allocator.free(cand);
+        if (first == null) first = try allocator.dupe(u8, cand);
         if (try resolvePackageDir(allocator, cand, rest)) |hit| return hit;
         if (std.mem.lastIndexOfScalar(u8, dir, '/')) |i| {
             const parent = try allocator.dupe(u8, dir[0..i]);
@@ -75,60 +78,124 @@ fn resolveBare(allocator: Allocator, importer_dir: []const u8, specifier: []cons
             if (dir.len == 0) break;
         } else break;
     }
-    return error.ModuleNotFound;
+    // Walk exhausted: return the first candidate literally so the loader
+    // prints its standard filename error (today's missing-module UX,
+    // preserved — no new silent failure mode introduced).
+    const base = first orelse return error.ModuleNotFound;
+    first = null;
+    defer allocator.free(base);
+    if (rest.len > 0) {
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, rest });
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/index.js", .{base});
+}
+
+// Import-condition target for an exports-map value, else null.
+// (Borrowed from the parsed doc; the caller dupes what it keeps.)
+fn importTarget(v: std.json.Value) ?[]const u8 {
+    if (v == .string) return v.string;
+    if (v != .object) return null;
+    if (v.object.get("import")) |imp| {
+        if (imp == .string) return imp.string;
+    }
+    if (v.object.get("default")) |d| {
+        if (d == .string) return d.string;
+    }
+    return null;
+}
+
+// Join + normalize + verify. A manifest-named file that is absent is a
+// broken install: single message, hard error — resolving a different
+// version higher up would mask it (npm errors here too).
+fn verifiedJoin(allocator: Allocator, pkgdir: []const u8, target: []const u8) ![]u8 {
+    const clean = if (std.mem.startsWith(u8, target, "./")) target[2..] else target;
+    const cand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, clean });
+    defer allocator.free(cand);
+    if (!pathExists(allocator, cand)) {
+        std.debug.print("could not load module filename '{s}'\n", .{cand});
+        return error.ModuleNotFound;
+    }
+    return try allocator.dupe(u8, cand);
 }
 
 fn resolvePackageDir(allocator: Allocator, pkgdir: []const u8, rest: []const u8) !?[]const u8 {
     const pj_path = try std.fmt.allocPrint(allocator, "{s}/package.json", .{pkgdir});
     defer allocator.free(pj_path);
-    const pj_src = readFile(allocator, pj_path) catch {
-        if (rest.len > 0) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, rest });
-        return try std.fmt.allocPrint(allocator, "{s}/index.js", .{pkgdir});
-    };
-    defer allocator.free(pj_src);
-    const pj = std.json.parseFromSlice(std.json.Value, allocator, pj_src, .{}) catch {
-        if (rest.len > 0) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, rest });
-        return try std.fmt.allocPrint(allocator, "{s}/index.js", .{pkgdir});
-    };
-    defer pj.deinit();
+    const pj_src = readFile(allocator, pj_path) catch null;
+    if (pj_src) |src| {
+        defer allocator.free(src);
+        if (std.json.parseFromSlice(std.json.Value, allocator, src, .{})) |pj| {
+            defer pj.deinit();
+            if (pj.value == .object) {
+                if (try manifestHit(allocator, pkgdir, rest, pj.value)) |hit| {
+                    return hit;
+                }
+                // Manifest present but silent on this specifier: fall through
+                // to the verified literal fallback (rest-passthrough for maps
+                // like nanoid's, index.js for bare roots).
+            }
+        } else |_| {}
+    }
     if (rest.len > 0) {
-        if (pj.value.object.get("exports")) |ex| {
-            if (ex == .object) {
-                const key = try std.fmt.allocPrint(allocator, "./{s}", .{rest});
-                defer allocator.free(key);
-                if (ex.object.get(key)) |target| {
-                    if (target == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, target.string });
-                    if (target == .object) {
-                        if (target.object.get("import")) |imp| {
-                            if (imp == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, imp.string });
-                        }
-                        if (target.object.get("default")) |d| {
-                            if (d == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, d.string });
-                        }
+        const cand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, rest });
+        defer allocator.free(cand);
+        if (!pathExists(allocator, cand)) return null; // keep walking
+        return try allocator.dupe(u8, cand);
+    }
+    const cand = try std.fmt.allocPrint(allocator, "{s}/index.js", .{pkgdir});
+    defer allocator.free(cand);
+    if (!pathExists(allocator, cand)) return null; // keep walking
+    return try allocator.dupe(u8, cand);
+}
+
+// Manifest lookup with verification. Returns owned hit, null when silent,
+// error only for named-but-missing (broken install, fail loud).
+fn manifestHit(allocator: Allocator, pkgdir: []const u8, rest: []const u8, doc: std.json.Value) !?[]const u8 {
+    if (rest.len > 0) {
+        const ex = doc.object.get("exports") orelse return null;
+        if (ex != .object) return null;
+        const key = try std.fmt.allocPrint(allocator, "./{s}", .{rest});
+        defer allocator.free(key);
+        const target = ex.object.get(key) orelse return null;
+        const rel = importTarget(target) orelse return null;
+        return try verifiedJoin(allocator, pkgdir, rel);
+    }
+    if (doc.object.get("exports")) |ex| {
+        if (ex == .string) {
+            return try verifiedJoin(allocator, pkgdir, ex.string);
+        }
+        if (ex == .object) {
+            if (importTarget(ex)) |rel| {
+                return try verifiedJoin(allocator, pkgdir, rel);
+            }
+            // FIX: subpath map (the standard modern shape) — the root entry
+            // lives under ".". Without this branch, packages like preact and
+            // preact-render-to-string fall through to the legacy `module`
+            // twin and silently load the wrong file (observed: the unparseable
+            // microbundle source dist/index.module.js instead of dist/index.mjs).
+            if (ex.object.get(".")) |dot| {
+                if (dot == .string) {
+                    return try verifiedJoin(allocator, pkgdir, dot.string);
+                }
+                if (dot == .object) {
+                    if (importTarget(dot)) |rel| {
+                        return try verifiedJoin(allocator, pkgdir, rel);
                     }
                 }
             }
         }
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, rest });
     }
-    if (pj.value.object.get("exports")) |ex| {
-        if (ex == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, ex.string });
-        if (ex == .object) {
-            if (ex.object.get("import")) |imp| {
-                if (imp == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, imp.string });
-            }
-            if (ex.object.get("default")) |d| {
-                if (d == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, d.string });
-            }
+    if (doc.object.get("module")) |m| {
+        if (m == .string) {
+            return try verifiedJoin(allocator, pkgdir, m.string);
         }
     }
-    if (pj.value.object.get("module")) |m| {
-        if (m == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, m.string });
+    if (doc.object.get("main")) |m| {
+        if (m == .string) {
+            return try verifiedJoin(allocator, pkgdir, m.string);
+        }
     }
-    if (pj.value.object.get("main")) |m| {
-        if (m == .string) return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, m.string });
-    }
-    return try std.fmt.allocPrint(allocator, "{s}/index.js", .{pkgdir});
+    return null;
 }
 
 pub fn readFile(allocator: Allocator, path: []const u8) ![]const u8 {

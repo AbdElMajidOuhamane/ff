@@ -139,6 +139,12 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
         return null;
     };
     defer gpa.free(src);
+    std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
+        name,
+        src.len,
+        if (src.len >= 16) src[0..16] else src,
+        if (src.len >= 16) src[src.len - 16 ..] else src,
+    });
     const func_val = qjs.eval(ctx, src.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     if (qjs.isException(func_val) != 0) return null;
     const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
@@ -458,6 +464,15 @@ pub const Runtime = struct {
                 defer qjs.freeCString(self.ctx, m);
                 std.debug.print("Error: {s}\n", .{m});
             }
+            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+            defer qjs.freeValue(self.ctx, stack_val);
+            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+                const smsg = qjs.toCString(self.ctx, stack_val);
+                if (smsg) |sm| {
+                    defer qjs.freeCString(self.ctx, sm);
+                    std.debug.print("{s}\n", .{sm});
+                }
+            }
             return false;
         }
         microtasks.pumpMicrotasks(self.ctx);
@@ -489,6 +504,15 @@ pub const Runtime = struct {
             if (msg) |m| {
                 defer qjs.freeCString(self.ctx, m);
                 std.debug.print("Error: {s}\n", .{m});
+            }
+            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+            defer qjs.freeValue(self.ctx, stack_val);
+            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+                const smsg = qjs.toCString(self.ctx, stack_val);
+                if (smsg) |sm| {
+                    defer qjs.freeCString(self.ctx, sm);
+                    std.debug.print("{s}\n", .{sm});
+                }
             }
             return false;
         }

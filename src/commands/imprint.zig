@@ -7,7 +7,13 @@ const semver = @import("semver.zig");
 // in node_modules/, exact snapshot in ff.lock v2.
 // ff imprint (no args) — v2 lock present: exact rebuild (ci-like, no range
 // queries). Otherwise: resolve from ff.json and write v2 lock.
-// Pure-JS ESM only: the gate runs on EVERY package in the tree.
+// Pure-JS ESM only: the gate runs on EVERY copied file, and copying follows
+// the ESM closure (route 1) so multi-format siblings (CJS/UMD twins) never
+// enter node_modules to false-positive the gate. Packages with no `import`
+// conditions anywhere fall back to the legacy whole-tree copy (route 2).
+// Gating granularity: the package ROOT must be pure (abort on failure);
+// each SUBPATH entry is gated independently — failure warns and skips that
+// subpath (with partial-file cleanup) instead of aborting the install.
 
 const Pin = struct { name: []const u8, spec: []const u8 }; // borrowed; owner frees
 const Dep = struct { name: []u8, spec: []u8, optional: bool }; // owned
@@ -140,7 +146,6 @@ fn installAll(io: Io) !void {
                 if (lv == .integer and lv.integer == 1) {
                     if (lock.value.object.get("packages")) |pkgs| {
                         if (pkgs == .object) {
-                            // FIX: pkgs is const — pass *const (signature below).
                             try installFromLock(io, gpa, &pkgs.object);
                             std.debug.print("Done (from ff.lock). Run: ff start\n", .{});
                             return;
@@ -176,7 +181,6 @@ fn installAll(io: Io) !void {
     std.debug.print("Done. Run: ff start\n", .{});
 }
 
-// FIX: *const — the lock value is borrowed const; body only reads.
 fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
     const prefix = "node_modules/";
     var it = pkgs.iterator();
@@ -198,8 +202,6 @@ fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
 
 fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarball: []const u8, integrity: []const u8) !void {
     std.debug.print("imprint {s}@{s} ...\n", .{ name, version });
-    // FIX: const — element mutation goes through |*ch|, binding never reassigns.
-    // (Also flattens scoped names: old code built /tmp paths with raw names.)
     const tmp_base = try gpa.dupe(u8, name);
     defer gpa.free(tmp_base);
     for (tmp_base) |*ch| {
@@ -223,7 +225,61 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
         .{ stage, dest, stage, dest, tmp, stage, stage, dest });
     defer gpa.free(sh);
     try runCmd(io, &.{ "sh", "-c", sh });
-    const n = try gateAndCopyTree(io, gpa, stage, dest);
+    // Route 1: root ESM closure (fail loud), then each subpath entry
+    // isolated (warn + skip + partial cleanup). Empty root set: legacy
+    // whole-tree copy (route 2, unchanged) — nanoid/valibot install
+    // bit-identically through it.
+    var entries = try collectImportEntries(io, gpa, stage);
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.path);
+            if (e.sub) |s| gpa.free(s);
+        }
+        entries.deinit(gpa);
+    }
+    var root_paths = std.ArrayList([]const u8).empty;
+    defer root_paths.deinit(gpa);
+    var sub_keys = std.ArrayList([]const u8).empty;
+    defer sub_keys.deinit(gpa);
+    for (entries.items) |e| {
+        if (e.sub) |k| {
+            if (!containsStr(sub_keys.items, k)) try sub_keys.append(gpa, k);
+        } else {
+            try root_paths.append(gpa, e.path);
+        }
+    }
+    var n: usize = 0;
+    if (root_paths.items.len > 0) {
+        std.debug.print("  esm entries: {d} root", .{root_paths.items.len});
+        if (sub_keys.items.len > 0) std.debug.print(" + {d} subpath", .{sub_keys.items.len});
+        std.debug.print("\n", .{});
+        n += try copyClosure(io, gpa, stage, dest, root_paths.items, null);
+    } else {
+        n = try gateAndCopyTree(io, gpa, stage, dest);
+    }
+    for (sub_keys.items) |key| {
+        var paths = std.ArrayList([]const u8).empty;
+        defer paths.deinit(gpa);
+        for (entries.items) |e| {
+            if (e.sub) |k| {
+                if (std.mem.eql(u8, k, key)) try paths.append(gpa, e.path);
+            }
+        }
+        var written = std.ArrayList([]u8).empty;
+        defer {
+            for (written.items) |w| gpa.free(w);
+            written.deinit(gpa);
+        }
+        const m = copyClosure(io, gpa, stage, dest, paths.items, &written) catch |err| {
+            if (err == error.NeedsNodeBuiltins or err == error.MissingImport) {
+                for (written.items) |w| dir.deleteFile(io, w) catch {};
+                std.debug.print("  warn: skip subpath {s} ({s})\n", .{ key, @errorName(err) });
+                continue;
+            }
+            return err;
+        };
+        n += m;
+    }
     if (n == 0) {
         std.debug.print("  EMPTY node_modules/{s}: no .js/.mjs after copy\n", .{name});
         return error.EmptyPackage;
@@ -292,6 +348,7 @@ const Tree = struct {
         c.deps.deinit(gpa);
     }
 
+    // Seed an exact pin. Directs are seeded first, so they always win.
     fn requireExact(self: *Tree, io: Io, name: []const u8, version: []const u8, parent: []const u8) !void {
         if (self.chosen.get(name) != null) return;
         const doc = try fetchVersionDoc(self.gpa, io, name, version);
@@ -299,6 +356,7 @@ const Tree = struct {
         try self.chooseOwned(name, version, parent, false, doc.value);
     }
 
+    // Extract + DUPE everything the tree keeps; the doc is freed by the caller.
     fn chooseOwned(self: *Tree, name: []const u8, version: []const u8, parent: []const u8, optional: bool, doc: std.json.Value) !void {
         const gpa = self.gpa;
         if (doc != .object) return error.BadManifest;
@@ -329,10 +387,11 @@ const Tree = struct {
         });
     }
 
+    // Breadth-first over chosen deps until the tree is closed.
+    // Queue + visiting hold OWNED dupes: map keys move on insert, so the
+    // walk never borrows map-owned memory across a mutation.
     fn walk(self: *Tree, io: Io) !void {
         const gpa = self.gpa;
-        // Owned queue: map keys move on insert, so the walk never borrows
-        // map-owned memory across a mutation.
         var queue = std.ArrayList([]u8).empty;
         defer {
             for (queue.items) |q| gpa.free(q);
@@ -590,6 +649,381 @@ fn gateAndCopyDir(io: Io, gpa: Alloc, base: Io.Dir, stage_rel: []const u8, dest_
             }
             try base.writeFile(io, .{ .sub_path = d_path, .data = src });
             total += 1;
+        }
+    }
+    return total;
+}
+
+// An ESM-closure entry: manifest target + the exports key it came from
+// (null = root entry: module field, root string/import). Both owned.
+const Entry = struct {
+    path: []u8,
+    sub: ?[]u8,
+};
+
+// ESM-closure entries: manifest `exports.*.import` targets plus the
+// top-level `module` field (ESM by convention). Only loadable-looking
+// targets (.js/.mjs/.cjs/extensionless — see isLoadableTarget) qualify:
+// data values like the "./package.json" self-reference must never route a
+// package into the closure path with nothing copyable (that produced
+// EmptyPackage for nanoid, which has zero import conditions and one
+// self-reference). Subpath `default`-only entries are deliberately NOT
+// collected.
+fn isLoadableTarget(target: []const u8) bool {
+    if (std.mem.endsWith(u8, target, ".js")) return true;
+    if (std.mem.endsWith(u8, target, ".mjs")) return true;
+    if (std.mem.endsWith(u8, target, ".cjs")) return true;
+    const base = std.fs.path.basename(target);
+    return std.mem.indexOfScalar(u8, base, '.') == null;
+}
+
+fn collectImportEntries(io: Io, gpa: Alloc, stage: []const u8) !std.ArrayList(Entry) {
+    var out = std.ArrayList(Entry).empty;
+    errdefer {
+        for (out.items) |e| {
+            gpa.free(e.path);
+            if (e.sub) |s| gpa.free(s);
+        }
+        out.deinit(gpa);
+    }
+    const dir = Io.Dir.cwd();
+    const pj_path = try std.fmt.allocPrint(gpa, "{s}/package.json", .{stage});
+    defer gpa.free(pj_path);
+    const pj_src = dir.readFileAlloc(io, pj_path, gpa, .limited(1024 * 1024)) catch return out;
+    defer gpa.free(pj_src);
+    const pj = std.json.parseFromSlice(std.json.Value, gpa, pj_src, .{}) catch return out;
+    defer pj.deinit();
+    if (pj.value != .object) return out;
+    if (pj.value.object.get("module")) |m| {
+        if (m == .string and isLoadableTarget(m.string)) {
+            try out.append(gpa, .{ .path = try gpa.dupe(u8, m.string), .sub = null });
+        }
+    }
+    const ex = pj.value.object.get("exports") orelse return out;
+    if (ex == .string) {
+        if (isLoadableTarget(ex.string)) try out.append(gpa, .{ .path = try gpa.dupe(u8, ex.string), .sub = null });
+        return out;
+    }
+    if (ex != .object) return out;
+    var it = ex.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "./package.json")) continue; // manifest self-reference, never code
+        if (std.mem.indexOfScalar(u8, kv.key_ptr.*, '*') != null) {
+            std.debug.print("  note: skip wildcard export {s} (v1)\n", .{kv.key_ptr.*});
+            continue;
+        }
+        const v = kv.value_ptr.*;
+        const is_root = std.mem.eql(u8, kv.key_ptr.*, ".");
+        if (v == .string) {
+            if (!isLoadableTarget(v.string)) continue;
+            try out.append(gpa, .{
+                .path = try gpa.dupe(u8, v.string),
+                .sub = if (is_root) null else try gpa.dupe(u8, kv.key_ptr.*),
+            });
+        } else if (v == .object) {
+            if (v.object.get("import")) |imp| {
+                if (imp == .string and isLoadableTarget(imp.string)) {
+                    try out.append(gpa, .{
+                        .path = try gpa.dupe(u8, imp.string),
+                        .sub = if (is_root) null else try gpa.dupe(u8, kv.key_ptr.*),
+                    });
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn containsStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, s)) return true;
+    }
+    return false;
+}
+
+// Lexically join a relative target onto a base file's directory.
+// ("dist/sub/a.mjs" + "../b" -> "dist/b"). Escape above root -> BadImport.
+fn joinRelPaths(gpa: Alloc, base_file: []const u8, target: []const u8) ![]u8 {
+    var parts = std.ArrayList([]const u8).empty;
+    defer parts.deinit(gpa);
+    if (std.fs.path.dirname(base_file)) |bd| {
+        var bit = std.mem.splitScalar(u8, bd, '/');
+        while (bit.next()) |p| {
+            if (p.len == 0 or std.mem.eql(u8, p, ".")) continue;
+            try parts.append(gpa, p);
+        }
+    }
+    var tit = std.mem.splitScalar(u8, target, '/');
+    while (tit.next()) |p| {
+        if (p.len == 0 or std.mem.eql(u8, p, ".")) continue;
+        if (std.mem.eql(u8, p, "..")) {
+            if (parts.items.len == 0) return error.BadImport;
+            _ = parts.pop();
+            continue;
+        }
+        try parts.append(gpa, p);
+    }
+    var total: usize = 0;
+    for (parts.items, 0..) |p, i| {
+        total += p.len;
+        if (i + 1 < parts.items.len) total += 1;
+    }
+    if (total == 0) return error.BadImport;
+    const out = try gpa.alloc(u8, total);
+    errdefer gpa.free(out);
+    var o: usize = 0;
+    for (parts.items, 0..) |p, i| {
+        @memcpy(out[o..][0..p.len], p);
+        o += p.len;
+        if (i + 1 < parts.items.len) {
+            out[o] = '/';
+            o += 1;
+        }
+    }
+    return out;
+}
+
+fn isRelativeSpec(spec: []const u8) bool {
+    return std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+}
+
+fn isIdChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '$';
+}
+
+fn matchWord(buf: []const u8, i: usize, w: []const u8) bool {
+    if (i + w.len > buf.len) return false;
+    if (!std.mem.eql(u8, buf[i..][0..w.len], w)) return false;
+    if (i > 0 and (isIdChar(buf[i - 1]) or buf[i - 1] == '.')) return false;
+    if (i + w.len < buf.len and isIdChar(buf[i + w.len])) return false;
+    return true;
+}
+
+fn skipWs(buf: []const u8, i: usize) usize {
+    var j = i;
+    while (j < buf.len and (buf[j] == ' ' or buf[j] == '\t' or buf[j] == '\n' or buf[j] == '\r')) : (j += 1) {}
+    return j;
+}
+
+fn readQuoted(src: []const u8, i: usize) ?struct { text: []const u8, end: usize } {
+    if (i >= src.len) return null;
+    const q = src[i];
+    if (q != '"' and q != '\'') return null;
+    var j = i + 1;
+    while (j < src.len) {
+        if (src[j] == '\\') {
+            j += 2;
+            continue;
+        }
+        if (src[j] == q) return .{ .text = src[i + 1 .. j], .end = j + 1 };
+        j += 1;
+    }
+    return null;
+}
+
+fn skipQuoted(src: []const u8, i: usize) usize {
+    if (readQuoted(src, i)) |r| return r.end;
+    return src.len;
+}
+
+fn skipTemplate(src: []const u8, i: usize) usize {
+    // src[i] == '`'. Tracks ${} depth + quotes inside expressions.
+    // Limitation: nested template literals confuse depth counting, and regex
+    // literals with quote-adjacent `from` text mis-scan. Either failure mode
+    // is loud (MissingImport naming the path, or a runtime load error for a
+    // missed dep) — never a silent hole. A `from` directly preceded by '.'
+    // (method call like obj.from("x")) is rejected by matchWord's guard.
+    var j = i + 1;
+    var depth: usize = 0;
+    var q: u8 = 0;
+    while (j < src.len) {
+        const ch = src[j];
+        if (q != 0) {
+            if (ch == '\\') {
+                j += 2;
+                continue;
+            }
+            if (ch == q) q = 0;
+            j += 1;
+            continue;
+        }
+        if (ch == '\\') {
+            j += 2;
+            continue;
+        }
+        if (ch == '`' and depth == 0) return j + 1;
+        if ((ch == '"' or ch == '\'') and depth > 0) {
+            q = ch;
+            j += 1;
+            continue;
+        }
+        if (ch == '$' and j + 1 < src.len and src[j + 1] == '{') {
+            depth += 1;
+            j += 2;
+            continue;
+        }
+        if (ch == '{' and depth > 0) {
+            depth += 1;
+            j += 1;
+            continue;
+        }
+        if (ch == '}' and depth > 0) {
+            depth -= 1;
+            j += 1;
+            continue;
+        }
+        j += 1;
+    }
+    return src.len;
+}
+
+// Single-pass import scanner: code state only (comments, strings and
+// template literals skipped). Recognizes `from "…"`, `import "…"`,
+// `import("…")` and `export … from "…"` (via the from-keyword).
+fn scanImports(gpa: Alloc, src: []const u8, out: *std.ArrayList([]u8)) !void {
+    var i: usize = 0;
+    const n = src.len;
+    while (i < n) {
+        const ch = src[i];
+        if (ch == '/' and i + 1 < n and src[i + 1] == '/') {
+            i += 2;
+            while (i < n and src[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        if (ch == '/' and i + 1 < n and src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n and !(src[i] == '*' and src[i + 1] == '/')) : (i += 1) {}
+            i = @min(i + 2, n);
+            continue;
+        }
+        if (ch == '\'' or ch == '"') {
+            i = skipQuoted(src, i);
+            continue;
+        }
+        if (ch == '`') {
+            i = skipTemplate(src, i);
+            continue;
+        }
+        const kw: ?[]const u8 = if (matchWord(src, i, "from"))
+            "from"
+        else if (matchWord(src, i, "import"))
+            "import"
+        else if (matchWord(src, i, "export"))
+            "export"
+        else
+            null;
+        if (kw) |k| {
+            const j = skipWs(src, i + k.len);
+            var advanced = false;
+            if (j < n and src[j] == '(') {
+                const k2 = skipWs(src, j + 1);
+                if (k2 < n and (src[k2] == '"' or src[k2] == '\'')) {
+                    if (readQuoted(src, k2)) |r| {
+                        try out.append(gpa, try gpa.dupe(u8, r.text));
+                        i = r.end;
+                        advanced = true;
+                    }
+                }
+            } else if (j < n and (src[j] == '"' or src[j] == '\'')) {
+                if (readQuoted(src, j)) |r| {
+                    try out.append(gpa, try gpa.dupe(u8, r.text));
+                    i = r.end;
+                    advanced = true;
+                }
+            }
+            if (!advanced) i += k.len;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// Copy exactly the ESM closure: entry files + transitively imported
+// relative files. Bare/absolute specifiers belong to other packages (or are
+// unsupported) and are ignored here — the runtime resolver owns them.
+// Unresolvable relative targets warn-and-skip (likely scanner edge);
+// files that resolve but are missing FAIL LOUD (concrete broken package).
+// `written`, when non-null, collects every dest path written (owned dupes)
+// so a failed subpath walk can clean up after itself.
+fn copyClosure(
+    io: Io,
+    gpa: Alloc,
+    stage: []const u8,
+    dest: []const u8,
+    entries: []const []const u8,
+    written: ?*std.ArrayList([]u8),
+) !usize {
+    const dir = Io.Dir.cwd();
+    var total: usize = 0;
+    var queue = std.ArrayList([]u8).empty;
+    defer {
+        for (queue.items) |q| gpa.free(q);
+        queue.deinit(gpa);
+    }
+    var seen = std.ArrayList([]u8).empty;
+    defer {
+        for (seen.items) |s| gpa.free(s);
+        seen.deinit(gpa);
+    }
+    for (entries) |e| try queue.append(gpa, try gpa.dupe(u8, e));
+    var head: usize = 0;
+    while (head < queue.items.len) {
+        const rel = queue.items[head];
+        head += 1;
+        if (containsStr(seen.items, rel)) continue;
+        try seen.append(gpa, try gpa.dupe(u8, rel));
+        const clean = if (std.mem.startsWith(u8, rel, "./")) rel[2..] else rel;
+        const suffixes = [_][]const u8{ "", ".js", ".mjs", "/index.js", "/index.mjs" };
+        const found: struct {
+            logical: []u8,
+            bytes: []u8,
+        } = blk: {
+            for (suffixes) |sfx| {
+                const cand = try std.fmt.allocPrint(gpa, "{s}{s}", .{ clean, sfx });
+                const sp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ stage, cand });
+                defer gpa.free(sp);
+                if (dir.readFileAlloc(io, sp, gpa, .limited(4 * 1024 * 1024))) |bytes| {
+                    break :blk .{ .logical = cand, .bytes = bytes };
+                } else |_| {
+                    gpa.free(cand);
+                }
+            }
+            std.debug.print("  missing file {s} (imported; failing loud)\n", .{clean});
+            return error.MissingImport;
+        };
+        defer gpa.free(found.logical);
+        defer gpa.free(found.bytes);
+        if (!isJsFile(found.logical)) {
+            // Data entries (e.g. a re-exported package.json): acknowledged,
+            // not copied. package.json itself is always copied by installDist.
+            std.debug.print("  note: skip non-JS entry {s}\n", .{found.logical});
+            continue;
+        }
+        const dp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dest, found.logical });
+        defer gpa.free(dp);
+        try gateSource(dp, found.bytes);
+        if (std.fs.path.dirname(dp)) |parent| {
+            dir.createDirPath(io, parent) catch {};
+        }
+        try dir.writeFile(io, .{ .sub_path = dp, .data = found.bytes });
+        if (written) |w| try w.append(gpa, try gpa.dupe(u8, dp));
+        total += 1;
+        var specs = std.ArrayList([]u8).empty;
+        defer {
+            for (specs.items) |s| gpa.free(s);
+            specs.deinit(gpa);
+        }
+        try scanImports(gpa, found.bytes, &specs);
+        const base_dir = std.fs.path.dirname(found.logical);
+        for (specs.items) |spec| {
+            if (!isRelativeSpec(spec)) continue;
+            const joined = joinRelPaths(gpa, base_dir orelse ".", spec) catch |err| {
+                std.debug.print("  warning: cannot resolve {s} from {s}: {s}\n", .{ spec, found.logical, @errorName(err) });
+                continue;
+            };
+            // Ownership to the queue; deduped at pop time via seen.
+            errdefer gpa.free(joined);
+            try queue.append(gpa, joined);
         }
     }
     return total;
