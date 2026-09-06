@@ -431,8 +431,11 @@ fn promptYesNo(gpa: Alloc, n_pkgs: usize, n_deps: usize) bool {
     _ = gpa;
     std.debug.print("Remove all {d} installed packages and clear {d} dependencies? [y/N] ", .{ n_pkgs, n_deps });
     var ans: [16]u8 = undefined;
-    // FIX: stdin is a function in translate-c, not a value.
-    const line = c.fgets(&ans, ans.len, c.stdin()) orelse return false;
+    // PORTABLE FIX: glibc/host translate-c exposes stdin as fn () -> FILE*,
+    // musl translate-c exposes it as a global FILE* variable.
+    // Branch on the translated type so both targets compile.
+    const stdin_stream = if (@typeInfo(@TypeOf(c.stdin)) == .@"fn") c.stdin() else c.stdin;
+    const line = c.fgets(@ptrCast(&ans), ans.len, stdin_stream) orelse return false;
     const len = std.mem.len(line);
     if (len == 0) return false;
     const ch = ans[0];
