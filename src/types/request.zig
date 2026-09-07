@@ -38,18 +38,6 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
 
-fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
-    var stack_buf: [256]u8 = undefined;
-    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
-    if (ex.heap) |h| return h;
-    if (ex.slice.len == 0) return "";
-    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
-    @memcpy(buf[0..ex.slice.len], ex.slice);
-    buf[ex.slice.len] = 0;
-    return buf;
-}
-
 fn extractRequestData(ctx: ?*c.Context, this_val: c.Value) ?*RequestData {
     const ptr = c.getOpaque2(ctx, this_val, request_class_id) orelse return null;
     return @ptrCast(@alignCast(ptr));

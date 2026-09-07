@@ -37,29 +37,32 @@ var g_runtime: ?*Runtime = null;
 
 var timeout_class_id: qjs.ClassID = 0;
 
-const TimeoutData = struct {
-    slot: u8,
-};
+// F2: no TimeoutData heap node. The timer slot (u8, max 128) is encoded
+// directly in the opaque pointer as (slot + 1); +1 keeps slot 0 distinct
+// from NULL. Type safety is preserved: getOpaque2 still NULL-guards on the
+// Timeout class id, so a forged integer can never be misread from a
+// non-Timeout object. Zero heap allocation per setTimeout/setInterval and
+// no pointer chase on ref/unref/refresh/hasRef/clear.
+fn slotFromOpaque(ptr: *anyopaque) ?u8 {
+    const v: usize = @intFromPtr(ptr);
+    if (v == 0 or v > 128) return null;
+    return @intCast(v - 1);
+}
 
 fn timeoutFinalizer(rt: ?*qjs.Runtime, val: qjs.Value) callconv(.c) void {
     _ = rt;
-    if (qjs.getOpaque(val, timeout_class_id)) |ptr| {
-        const data: *TimeoutData = @ptrCast(@alignCast(ptr));
-        std.heap.smp_allocator.destroy(data);
-    }
+    _ = val;
+    // No-op: the opaque is a tagged slot index, not a heap pointer.
 }
 
 fn timeoutSlotFromThis(ctx: ?*qjs.Context, this_val: qjs.Value) ?u8 {
     const data_ptr = qjs.getOpaque2(ctx, this_val, timeout_class_id) orelse return null;
-    const data: *TimeoutData = @ptrCast(@alignCast(data_ptr));
-    return data.slot;
+    return slotFromOpaque(data_ptr);
 }
 
 fn makeTimeout(ctx: ?*qjs.Context, id: usize) ?qjs.Value {
-    const data = std.heap.smp_allocator.create(TimeoutData) catch return null;
-    data.* = .{ .slot = @intCast(id) };
     const obj = qjs.newObjectClass(ctx, @intCast(timeout_class_id));
-    qjs.setOpaque(obj, data);
+    qjs.setOpaque(obj, @ptrFromInt(id + 1));
     return obj;
 }
 
@@ -215,7 +218,7 @@ pub const Runtime = struct {
         const setInterval_func = qjs.newCFunction(ctx, setIntervalCallback, "setInterval", 2);
         const clearTimeout_func = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         const clearInterval_func = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
-        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1);
+        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 2);
 
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", setTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", setInterval_func, qjs.PROP_C_W_E);
@@ -273,7 +276,7 @@ pub const Runtime = struct {
         defer qjs.freeValue(ctx, global);
         const st = qjs.newCFunction(ctx, wSetTimeoutCallback, "setTimeout", 2);
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", st, qjs.PROP_C_W_E);
-        const si = qjs.newCFunction(ctx, wSetIntervalCallback, "setInterval", 2);
+        const si = qjs.newCFunction(ctx, wSetIntervalCallback, "setInterval", 2, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", si, qjs.PROP_C_W_E);
         const ct = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", ct, qjs.PROP_C_W_E);
@@ -320,8 +323,8 @@ pub const Runtime = struct {
     fn extractTimeoutId(ctx: ?*qjs.Context, val: qjs.Value) ?usize {
         // Timeout object or bare numeric id (back-compat + worker numerics).
         if (qjs.getOpaque2(ctx, val, timeout_class_id)) |ptr| {
-            const data: *TimeoutData = @ptrCast(@alignCast(ptr));
-            return data.slot;
+            const slot = slotFromOpaque(ptr) orelse return null;
+            return @intCast(slot);
         }
         var id: i32 = 0;
         _ = qjs.toInt32(ctx, &id, val);

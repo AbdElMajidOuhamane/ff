@@ -333,9 +333,9 @@ fn runJob(slot_id: u16) void {
         // One heap wrapper per fetch (cold submit path) — transferred to
         // completeJob which builds the JS object. Not per-chunk.
         const resp_data = gpa.create(response_mod.ResponseData) catch { failSlot(s,"Out of memory"); return; };
-        resp_data.* = response_mod.ResponseData.init();
-        resp_data.headers.release();
-        resp_data.headers = headers[s].?;
+        // F1: take ownership of the slot's parsed headers directly — no
+        // create+release of a throwaway HeadersData per fetch.
+        resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
         headers[s]=null;
         resp_data.status=status_code;
         resp_data.setStatusText(response.head.status.phrase() orelse "OK");

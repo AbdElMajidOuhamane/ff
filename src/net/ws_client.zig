@@ -5,7 +5,6 @@ const tls = @import("./tls.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig"); // CHANGED
-const gpa = std.heap.smp_allocator;
 const http = std.http;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 fn getRandomBytes(buf: []u8) void {
@@ -48,15 +47,33 @@ const TX_BINARY: u8 = 2;
 const TX_CLOSE: u8 = 3;
 
 var states:       [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_WS;
-var tls_active:   [MAX_WS]bool = [_]bool{false} ** MAX_WS;
+// Gap-2 fix: single-thread-owned flags packed to 1 byte/slot (cf.
+// http_native ConnFlags). `want_connect`/`tx_pending` stay separate plain
+// columns: they are cross-thread hints written by main while the worker
+// reads/writes sibling flags — sharing a byte would tear on RMW.
+// Packing is safe here because for any slot, at most one thread writes
+// wflags at a time: main writes pre-publish (submit) or on CLAIMED slots
+// (completeEvent/releaseSlot, which the worker skips as non-BUSY), the
+// worker writes only on BUSY slots it owns. `tls_active` is written once
+// pre-publish, then read-only.
+const WsFlags = packed struct(u8) {
+    tls_active: bool = false,
+    ws_open: bool = false,
+    ws_sent_close: bool = false,
+    rx_binary: bool = false,
+    partial_binary: bool = false,
+    conn_live: bool = false,
+    _pad: u2 = 0,
+};
+comptime {
+    std.debug.assert(@sizeOf(WsFlags) == 1);
+}
+var wflags: [MAX_WS]WsFlags = [_]WsFlags{.{}} ** MAX_WS;
 var sock_fds:     [MAX_WS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** MAX_WS;
-var pipe_fds:     [MAX_WS][2]std.posix.fd_t = [_][2]std.posix.fd_t{.{ -1, -1 }} ** MAX_WS;
 var hosts:        [MAX_WS][:0]const u8 = [_][:0]const u8{""} ** MAX_WS;
 var paths:        [MAX_WS][]const u8 = [_][]const u8{""} ** MAX_WS;
 var ports:        [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
 var keys:         [MAX_WS][28]u8 = undefined;
-var ws_open:      [MAX_WS]bool = [_]bool{false} ** MAX_WS;
-var ws_sent_close:[MAX_WS]bool = [_]bool{false} ** MAX_WS;
 var close_deadline: [MAX_WS]i64 = [_]i64{0} ** MAX_WS;
 var tx_pending:   [MAX_WS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_WS;
 var tx_job:       [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
@@ -67,7 +84,6 @@ var tx_reason:    [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
 var tx_msg:       [MAX_WS][WS_MSG_SIZE]u8 = undefined;
 var rx_event:     [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
 var rx_len:       [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var rx_binary:    [MAX_WS]bool = [_]bool{false} ** MAX_WS;
 var rx_code:      [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
 var rx_reason_len:[MAX_WS]u8 = [_]u8{0} ** MAX_WS;
 var rx_reason:    [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
@@ -76,10 +92,23 @@ var rx_err:       [MAX_WS][64]u8 = undefined;
 var rx_msg:       [MAX_WS][WS_MSG_SIZE]u8 = undefined;
 var rd_len:       [MAX_WS]usize = [_]usize{0} ** MAX_WS;
 var partial_len:  [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var partial_binary:[MAX_WS]bool = [_]bool{false} ** MAX_WS;
 var wb:           [MAX_WS][WS_MSG_SIZE + ws.MAX_HDR]u8 = undefined;
 var rd_buf:       [MAX_WS][RDBUF]u8 = undefined;
 var partial:      [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+// F7-B: static per-slot URL storage — no per-connection dupe/free.
+// `hosts`/`paths` stay slice views so all downstream uses are untouched.
+var host_bufs:    [MAX_WS][256:0]u8 = undefined;
+var path_bufs:    [MAX_WS][2048]u8 = undefined;
+// F7-B: shared-worker coordination. The main thread is the sole producer of
+// want_connect/tx flags; `states` (atomic) is the guard and flags are
+// level-triggered hints re-verified against it. conn_live/w_conns/w_reqs are
+// worker-owned (releaseSlot only clears want_connect once the slot is DONE).
+var want_connect: [MAX_WS]bool = [_]bool{false} ** MAX_WS;
+var conn_live_alias_note: void = {}; // (no-op marker: conn_live now lives in wflags; see comment above)
+var w_conns:      [MAX_WS]?*http.Client.Connection = [_]?*http.Client.Connection{null} ** MAX_WS;
+var w_reqs:       [MAX_WS]?http.Client.Request = [_]?http.Client.Request{null} ** MAX_WS;
+var cmd_pipe:     [2]std.posix.fd_t = .{ -1, -1 };
+var worker_started: bool = false; // guarded by poolLock (submit path only)
 var free_list: [MAX_WS]u16 = undefined;
 var free_count: usize = MAX_WS;
 var pool_lock: std.atomic.Mutex = .unlocked;
@@ -118,11 +147,11 @@ fn releaseSlot(s: usize) void {
         if (g_ctx) |ctx| c.freeValue(ctx, v);
         socks[s] = null;
     }
-    gpa.free(hosts[s]);
-    gpa.free(paths[s]);
+    // F7-B: hosts/paths are views into static slot buffers — nothing to free.
     hosts[s] = "";
     paths[s] = "";
-    ws_open[s] = false;
+    want_connect[s] = false;
+    wflags[s].ws_open = false;
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
     states[s].store(JOB_FREE, .release);
@@ -135,6 +164,11 @@ pub fn init(ctx: ?*c.Context) void { // CHANGED: takes ctx
     poolInit();
     async_h = AsyncT.init() catch unreachable;
     async_armed = false;
+    // F7-B: one shared command pipe for the single worker thread.
+    makeCmdPipe() catch {
+        async_h.deinit();
+        return;
+    };
 }
 
 pub fn submit(
@@ -148,28 +182,23 @@ pub fn submit(
     poolLock();
     defer poolUnlock();
     const s = acquireSlot() orelse return error.NoConnectionAvailable;
-    hosts[s] = gpa.dupeZ(u8, host) catch {
+    // F7-B: bounded copy into static slot buffers — no per-connection dupes.
+    if (host.len == 0 or host.len > 255 or path.len > 2047) {
         releaseSlot(s);
-        return error.OutOfMemory;
-    };
-    paths[s] = gpa.dupe(u8, path) catch {
-        gpa.free(hosts[s]);
-        releaseSlot(s);
-        return error.OutOfMemory;
-    };
+        return error.UrlTooLong;
+    }
+    @memcpy(host_bufs[s][0..host.len], host);
+    host_bufs[s][host.len] = 0;
+    hosts[s] = host_bufs[s][0..host.len :0];
+    @memcpy(path_bufs[s][0..path.len], path);
+    paths[s] = path_bufs[s][0..path.len];
     ports[s] = port;
-    tls_active[s] = tls_flag;
+    wflags[s].tls_active = tls_flag;
     var key16: [16]u8 = undefined;
     getRandomBytes(&key16);
     _ = std.base64.standard.Encoder.encode(keys[s][0..24], &key16);
-    makePipe(s) catch {
-        gpa.free(hosts[s]);
-        gpa.free(paths[s]);
-        releaseSlot(s);
-        return error.PipeCreateFailed;
-    };
-    ws_open[s] = false;
-    ws_sent_close[s] = false;
+    wflags[s].ws_open = false;
+    wflags[s].ws_sent_close = false;
     rd_len[s] = 0;
     partial_len[s] = 0;
     tx_pending[s] = .{ .raw = false };
@@ -178,52 +207,57 @@ pub fn submit(
     close_deadline[s] = 0;
     socks[s] = c.dupValue(ctx, obj);
     _ = pending.fetchAdd(1, .acq_rel);
-    const s16: u16 = @intCast(s);
-    const th = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerMain, .{s16}) catch {
+    startWorkerOnce() catch {
         _ = pending.fetchSub(1, .acq_rel);
         if (socks[s]) |v| {
             if (g_ctx) |cctx| c.freeValue(cctx, v);
             socks[s] = null;
         }
-        closePipe(s);
-        gpa.free(hosts[s]);
-        gpa.free(paths[s]);
         releaseSlot(s);
         return error.SpawnFailed;
     };
-    th.detach();
+    want_connect[s] = true;
+    wakeWorker();
     ensureArmed();
     return s;
 }
 
-fn makePipe(s: usize) !void {
+fn makeCmdPipe() !void {
     var fds: [2]std.posix.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeCreateFailed;
     const cur: c_int = std.c.fcntl(fds[0], std.posix.F.GETFL);
     var flags: std.c.O = @bitCast(@as(u32, @intCast(cur)));
     flags.NONBLOCK = true;
     _ = std.c.fcntl(fds[0], std.posix.F.SETFL, @as(c_int, @bitCast(@as(u32, @bitCast(flags)))));
-    pipe_fds[s] = fds;
+    cmd_pipe = fds;
 }
 
-fn closePipe(s: usize) void {
-    for (pipe_fds[s]) |fd| {
-        if (fd == -1) continue;
-        _ = std.c.close(fd);
-    }
-    pipe_fds[s] = .{ -1, -1 };
+fn wakeWorker() void {
+    if (cmd_pipe[1] < 0) return;
+    _ = std.c.write(cmd_pipe[1], &[_]u8{1}, 1);
+}
+
+// F7-B: the single shared worker is started lazily on first submit, under
+// the already-held poolLock. One 1MiB-stack thread for all 64 slots.
+fn startWorkerOnce() !void {
+    if (worker_started) return;
+    const th = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, sharedWorkerMain, .{}) catch {
+        return error.SpawnFailed;
+    };
+    th.detach();
+    worker_started = true;
 }
 
 pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
     if (states[s].load(.acquire) == JOB_FREE) return;
-    if (!ws_open[s]) return;
+    if (!wflags[s].ws_open) return;
     if (bytes.len > WS_MSG_SIZE) return;
     if (tx_pending[s].load(.acquire)) return;
     @memcpy(tx_msg[s][0..bytes.len], bytes);
     tx_len[s] = bytes.len;
     tx_job[s] = if (binary) TX_BINARY else TX_TEXT;
     tx_pending[s].store(true, .release);
-    _ = std.c.write(pipe_fds[s][1], &[_]u8{1}, 1);
+    wakeWorker();
 }
 
 pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
@@ -234,18 +268,21 @@ pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
     tx_code[s] = code;
     tx_job[s] = TX_CLOSE;
     tx_pending[s].store(true, .release);
-    _ = std.c.write(pipe_fds[s][1], &[_]u8{1}, 1);
+    wakeWorker();
 }
 
 // ---- Worker ----
 
-fn workerMain(slot_id: u16) void {
-    const s: usize = slot_id;
-    defer _ = pending.fetchSub(1, .release);
+// F7-B: blocking connect + handshake for one slot. The slot's conn/req are
+// published to w_conns/w_reqs on success (locals are then nulled so the
+// defer below is a no-op). On failure, failClose runs and the defer deinits
+// the local req — exactly-once teardown either way, same as before.
+fn connectSlot(s: usize) void {
+    want_connect[s] = false;
     var conn: ?*http.Client.Connection = null;
     var req: ?http.Client.Request = null;
     defer if (req) |*r| r.deinit();
-    if (tls_active[s]) {
+    if (wflags[s].tls_active) {
         var uri_buf: [768]u8 = undefined;
         const uri_str = std.fmt.bufPrint(&uri_buf, "wss://{s}:{d}{s}", .{ hosts[s], ports[s], paths[s] }) catch {
             failClose(s, null, "invalid url", &req);
@@ -309,39 +346,102 @@ fn workerMain(slot_id: u16) void {
         }
     }
     const cn = conn.?;
+    w_conns[s] = conn;
+    w_reqs[s] = req;
+    conn = null;
+    req = null;
+    wflags[s].conn_live = true;
     rx_event[s] = EV_OPEN;
     signalEvent(s);
-    waitState(s, JOB_BUSY);
-    if (rd_len[s] > 0 and !consumeFrames(s, cn)) {
-        closeExit(s, cn, &req);
-        return;
-    }
+    _ = cn;
+}
+
+// F7-B: one thread drives all WS client connections (was: one 1MiB-stack
+// thread + one pipe per connection). Per-slot work is discovered by scanning
+// columns on every wake: the wake byte is level-triggered (coalescing is
+// harmless), `states` is the atomic guard, flags are re-verified hints.
+// Event ordering per slot is preserved: a slot with an undispatched event
+// (not JOB_BUSY) is skipped until drainCompleted flips it back.
+fn sharedWorkerMain() void {
+    var wake: [64]u8 = undefined;
     while (true) {
-        var pfd = [_]std.posix.pollfd{
-            .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 },
-            .{ .fd = pipe_fds[s][0], .events = std.posix.POLL.IN, .revents = 0 },
-        };
-        const tls_ready = tls_active[s] and tlsReadReady(s, cn);
-        const rc = std.posix.poll(&pfd, if (tls_ready) 0 else 50) catch 0;
-        if (tls_ready or (rc != 0 and pfd[0].revents != 0)) {
-            if (rd_len[s] >= RDBUF) break;
-            const n = readWs(s, cn, rd_buf[s][rd_len[s]..]) catch |e| {
-                std.debug.print("[wss] read error: {s}\n", .{@errorName(e)});
-                break;
-            };
-            if (n == 0) {
-                if (!tls_active[s]) break;
-            } else {
-                rd_len[s] += n;
-                if (!consumeFrames(s, cn)) break;
+        // Drain wake pipe (bytes coalesce; the columns hold the work).
+        while (true) {
+            const n = std.c.read(cmd_pipe[0], &wake, wake.len);
+            if (n <= 0) break;
+        }
+        // 1) New connections (blocking handshake, one slot at a time).
+        for (0..MAX_WS) |s| {
+            if (states[s].load(.acquire) == JOB_BUSY and want_connect[s] and !wflags[s].conn_live) {
+                connectSlot(s);
             }
         }
-        if (rc != 0 and pfd[1].revents != 0) {
-            if (!serviceTx(s, cn)) break;
+        // 2) Pending transmits (SEND/CLOSE columns).
+        for (0..MAX_WS) |s| {
+            if (wflags[s].conn_live and states[s].load(.acquire) == JOB_BUSY and tx_pending[s].load(.acquire)) {
+                if (w_conns[s]) |cn| {
+                    if (!serviceTx(s, cn)) closeExit(s, cn, &w_reqs[s]);
+                }
+            }
         }
-        if (ws_sent_close[s] and monoMillis() > close_deadline[s]) break;
+        // 3) Reads: poll cmd_pipe + all live BUSY sockets in one syscall.
+        var pfd: [1 + MAX_WS]std.posix.pollfd = undefined;
+        pfd[0] = .{ .fd = cmd_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+        var nfds: usize = 1;
+        var slots: [MAX_WS]u16 = undefined;
+        var nslots: usize = 0;
+        var tls_ready_any = false;
+        for (0..MAX_WS) |s| {
+            if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
+            if (w_conns[s]) |cn| {
+                if (wflags[s].tls_active and tlsReadReady(s, cn)) tls_ready_any = true;
+                pfd[nfds] = .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 };
+                slots[nslots] = @intCast(s);
+                nfds += 1;
+                nslots += 1;
+            }
+        }
+        // No live sockets: block in poll until the next submit/send/close.
+        const rc = std.posix.poll(pfd[0..nfds], if (nfds == 1) -1 else (if (tls_ready_any) 0 else 50)) catch 0;
+        _ = rc;
+        for (0..nslots) |k| {
+            const s: usize = slots[k];
+            if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
+            const cn = w_conns[s] orelse continue;
+            const readable = (wflags[s].tls_active and tlsReadReady(s, cn)) or pfd[1 + k].revents != 0;
+            if (readable) {
+                if (rd_len[s] >= RDBUF) {
+                    closeExit(s, cn, &w_reqs[s]);
+                    continue;
+                }
+                const n = readWs(s, cn, rd_buf[s][rd_len[s]..]) catch |e| {
+                    std.debug.print("[wss] read error: {s}\n", .{@errorName(e)});
+                    closeExit(s, cn, &w_reqs[s]);
+                    continue;
+                };
+                if (n == 0) {
+                    if (!wflags[s].tls_active) {
+                        closeExit(s, cn, &w_reqs[s]);
+                        continue;
+                    }
+                } else {
+                    rd_len[s] += n;
+                }
+            }
+            // Bytes left from verifyUpgrade or an earlier partial frame are
+            // consumed even when the socket had nothing new to report.
+            if (rd_len[s] > 0) {
+                if (!consumeFrames(s, cn)) {
+                    closeExit(s, cn, &w_reqs[s]);
+                    continue;
+                }
+            }
+            if (wflags[s].ws_sent_close and monoMillis() > close_deadline[s]) {
+                closeExit(s, cn, &w_reqs[s]);
+                continue;
+            }
+        }
     }
-    closeExit(s, cn, &req);
 }
 
 fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) void {
@@ -351,6 +451,11 @@ fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) 
         rx_reason_len[s] = 0;
     }
     cleanupConn(s, conn, r);
+    if (w_reqs[s]) |*rr| rr.deinit();
+    w_conns[s] = null;
+    w_reqs[s] = null;
+    wflags[s].conn_live = false;
+    _ = pending.fetchSub(1, .release);
     signalEvent(s);
     finishSlot(s);
 }
@@ -363,15 +468,16 @@ fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8,
     rx_reason_len[s] = 0;
     rx_event[s] = EV_CLOSE;
     if (conn) |cn| cleanupConn(s, cn, r);
+    wflags[s].conn_live = false;
+    _ = pending.fetchSub(1, .release);
     signalEvent(s);
     finishSlot(s);
 }
 
 fn cleanupConn(s: usize, conn: ?*http.Client.Connection, r: *?http.Client.Request) void {
-    closePipe(s);
     const fd = sock_fds[s];
     sock_fds[s] = -1;
-    if (tls_active[s]) {
+    if (wflags[s].tls_active) {
         if (r.*) |*rr| rr.connection = null;
         if (conn) |cn| {
             cn.closing = true;
@@ -390,10 +496,6 @@ fn finishSlot(s: usize) void {
 fn signalEvent(s: usize) void {
     states[s].store(JOB_DONE, .release);
     async_h.notify() catch {};
-}
-
-fn waitState(s: usize, target: u8) void {
-    while (states[s].load(.acquire) != target) std.atomic.spinLoopHint();
 }
 
 const UPGRADE_TIMEOUT_MS: i64 = 5000;
@@ -443,7 +545,7 @@ fn tlsReadReady(s: usize, cn: *http.Client.Connection) bool {
 }
 
 fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {
-    if (!tls_active[s]) {
+    if (!wflags[s].tls_active) {
         return std.posix.read(sock_fds[s], buf);
     }
     // TLS: never hand readSliceShort a large destination — it loops fill()
@@ -533,8 +635,8 @@ fn writeCloseFrame(s: usize, cn: *http.Client.Connection, code: u16, reason: []c
 }
 
 fn initiateClose(s: usize, cn: *http.Client.Connection, code: u16, reason: []const u8) bool {
-    if (ws_sent_close[s]) return true;
-    ws_sent_close[s] = true;
+    if (wflags[s].ws_sent_close) return true;
+    wflags[s].ws_sent_close = true;
     close_deadline[s] = monoMillis() + UPGRADE_TIMEOUT_MS;
     if (rx_event[s] != EV_CLOSE) {
         rx_event[s] = EV_CLOSE;
@@ -560,10 +662,12 @@ fn emitMessage(s: usize, msg: []const u8, binary: bool) void {
     const n = @min(msg.len, WS_MSG_SIZE);
     @memcpy(rx_msg[s][0..n], msg[0..n]);
     rx_len[s] = n;
-    rx_binary[s] = binary;
+    wflags[s].rx_binary = binary;
     rx_event[s] = EV_MESSAGE;
     signalEvent(s);
-    waitState(s, JOB_BUSY);
+    // F7-B: no waitState spin. The worker skips non-BUSY slots until
+    // drainCompleted dispatches this event; consumeFrames stops after the
+    // first undispatched event so rx_msg can't be overwritten meanwhile.
 }
 
 fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: []const u8) bool {
@@ -577,7 +681,7 @@ fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: 
         return false;
     }
     if (op != ws.OP_CONT and !hdr.fin) {
-        partial_binary[s] = op == ws.OP_BINARY;
+        wflags[s].partial_binary = op == ws.OP_BINARY;
     }
     if (!hdr.fin or op == ws.OP_CONT or partial_len[s] > 0) {
         if (payload.len > WS_MSG_SIZE - partial_len[s]) {
@@ -587,7 +691,7 @@ fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: 
         @memcpy(partial[s][partial_len[s]..][0..payload.len], payload);
         partial_len[s] += payload.len;
         if (!hdr.fin) return true;
-        emitMessage(s, partial[s][0..partial_len[s]], partial_binary[s]);
+        emitMessage(s, partial[s][0..partial_len[s]], wflags[s].partial_binary);
         partial_len[s] = 0;
         return true;
     }
@@ -625,6 +729,10 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
         ws.unmask(payload, hdr.mask);
         if (!handleFrame(s, cn, hdr, payload)) return false;
         off += total;
+        // F7-B: stop after the first undispatched event — the slot is now
+        // DONE and its rx columns belong to the main thread until dispatch.
+        // Leftover bytes stay buffered in rd_buf (accounted below).
+        if (states[s].load(.acquire) != JOB_BUSY) break;
     }
     const left = rd_len[s] - off;
     if (off > 0 and left > 0) @memmove(rd_buf[s][0..left], rd_buf[s][off..rd_len[s]]);
@@ -633,11 +741,9 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
 }
 
 fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
-    var wake: [64]u8 = undefined;
-    while (true) {
-        const n = std.c.read(pipe_fds[s][0], &wake, wake.len);
-        if (n <= 0) break;
-    }
+    // F7-B: the per-slot wake-pipe drain is gone (single cmd_pipe, drained in
+    // the shared worker loop). The tx_* columns are the level-triggered work
+    // description; the wake byte was only ever a notification.
     if (!tx_pending[s].load(.acquire)) return true;
     const job = tx_job[s];
     const code = tx_code[s];
@@ -713,6 +819,10 @@ fn claimSlot(s: usize) bool {
 
 pub fn drainCompleted(ctx: ?*c.Context) void {
     var mask = doneMask();
+    // F7-B: one wake per batch so the worker promptly resumes polling slots
+    // the dispatch just flipped back to BUSY (replaces the old per-message
+    // spin handshake).
+    if (mask != 0) wakeWorker();
     while (mask != 0) {
         const s: usize = @ctz(mask);
         mask &= mask - 1;
@@ -722,7 +832,7 @@ pub fn drainCompleted(ctx: ?*c.Context) void {
 
 fn setReadyState(ctx: ?*c.Context, obj: c.Value, v: i32) void {
     const val = c.newInt32(ctx, v);
-    _ = c.definePropertyValueStr(ctx, obj, "readyState", val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    _ = c.definePropertyValueStr(ctx, obj, "readyState", val, c.PROP_C_W_E);
 }
 
 fn dispatchEvent(
@@ -771,7 +881,7 @@ fn u8ArrayFromBytes(ctx: ?*c.Context, bytes: []const u8) c.Value {
 fn makeMessageEvent(ctx: ?*c.Context, s: usize) c.Value {
     const obj = newEventObj(ctx, "message");
     const n = @min(rx_len[s], WS_MSG_SIZE);
-    const data_val = if (rx_binary[s])
+    const data_val = if (wflags[s].rx_binary)
         u8ArrayFromBytes(ctx, rx_msg[s][0..n])
     else
         c.newStringLen(ctx, &rx_msg[s], n);
@@ -816,7 +926,7 @@ fn completeEvent(ctx: ?*c.Context, s: usize) void {
     };
     switch (ev) {
         EV_OPEN => {
-            ws_open[s] = true;
+            wflags[s].ws_open = true;
             setReadyState(ctx, sv, 1);
             dispatchEvent(ctx, sv, "onopen", makeOpenEvent(ctx));
             states[s].store(JOB_BUSY, .release);

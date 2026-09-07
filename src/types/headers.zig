@@ -23,11 +23,6 @@ fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
 
-fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    var stack_buf: [256]u8 = undefined;
-    return extractStringAuto(ctx, val, &stack_buf) orelse null;
-}
-
 const ExtractedStr = struct {
     slice: []const u8,
     heap: ?[:0]u8 = null,
@@ -70,6 +65,23 @@ fn lowerAsciiSimd(buf: []u8) void {
     while (i < buf.len) : (i += 1) {
         buf[i] = std.ascii.toLower(buf[i]);
     }
+}
+
+// Gap-6 fix: stored names are ALWAYS lowercase (tryAppendEntry lowercases
+// at insert), so per-scan `eqlIgnoreCase` re-cases both sides on every
+// element. Lower the query ONCE per call into caller stack storage, then
+// compare with plain `mem.eql`. Returns null when `name` exceeds `buf`
+// (pathological >128B header name) — the caller then falls back to
+// eqlIgnoreCase, preserving exact semantics in all cases.
+fn lowerQuery(name: []const u8, buf: []u8) ?[]u8 {
+    if (name.len > buf.len) return null;
+    for (name, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    return buf[0..name.len];
+}
+
+inline fn nameMatches(stored_lower: []const u8, query: []const u8, query_lower: ?[]const u8) bool {
+    if (query_lower) |q| return std.mem.eql(u8, stored_lower, q);
+    return std.ascii.eqlIgnoreCase(stored_lower, query);
 }
 
 pub const Pair = struct { name: []const u8, value: []const u8 };
@@ -191,10 +203,12 @@ pub const HeadersData = struct {
         });
     }
     pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+        var lower_buf: [128]u8 = undefined;
+        const q = lowerQuery(name, &lower_buf);
         var first: ?usize = null;
         var i: usize = 0;
         while (i < self.entries.items.len) {
-            if (std.ascii.eqlIgnoreCase(self.nameOf(self.entries.items[i]), name)) {
+            if (nameMatches(self.nameOf(self.entries.items[i]), name, q)) {
                 if (first == null) {
                     first = i;
                     const vbase = self.values.items.len;
@@ -212,10 +226,12 @@ pub const HeadersData = struct {
         if (first == null) self.appendEntry(name, value);
     }
     pub fn deleteEntry(self: *HeadersData, name: []const u8, value: ?[]const u8) void {
+        var lower_buf: [128]u8 = undefined;
+        const q = lowerQuery(name, &lower_buf);
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
-            if (std.ascii.eqlIgnoreCase(self.nameOf(e), name)) {
+            if (nameMatches(self.nameOf(e), name, q)) {
                 if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) {
                     self.removeSwap(i);
                     if (value != null) return;
@@ -226,11 +242,13 @@ pub const HeadersData = struct {
         }
     }
     pub fn getFirst(self: *HeadersData, name: []const u8) ?[]const u8 {
+        var lower_buf: [128]u8 = undefined;
+        const q = lowerQuery(name, &lower_buf);
         var first: ?usize = null;
         var count: usize = 0;
         var joined_len: usize = 0;
         for (self.entries.items, 0..) |e, i| {
-            if (std.ascii.eqlIgnoreCase(self.nameOf(e), name)) {
+            if (nameMatches(self.nameOf(e), name, q)) {
                 if (first == null) first = i;
                 joined_len += self.valueOf(e).len + 2;
                 count += 1;
@@ -242,7 +260,7 @@ pub const HeadersData = struct {
         self.merge_buf.ensureTotalCapacity(gpa, joined_len - 2) catch {};
         var skipped = false;
         for (self.entries.items) |e| {
-            if (!std.ascii.eqlIgnoreCase(self.nameOf(e), name)) continue;
+            if (!nameMatches(self.nameOf(e), name, q)) continue;
             if (!skipped) {
                 skipped = true;
             } else {
@@ -253,17 +271,21 @@ pub const HeadersData = struct {
         return self.merge_buf.items;
     }
     pub fn getAllValues(self: *HeadersData, name: []const u8) [][]const u8 {
+        var lower_buf: [128]u8 = undefined;
+        const q = lowerQuery(name, &lower_buf);
         self.view_buf.clearRetainingCapacity();
         for (self.entries.items) |e| {
-            if (std.ascii.eqlIgnoreCase(self.nameOf(e), name)) {
+            if (nameMatches(self.nameOf(e), name, q)) {
                 self.view_buf.append(gpa, self.valueOf(e)) catch break;
             }
         }
         return self.view_buf.items;
     }
     pub fn hasEntry(self: *const HeadersData, name: []const u8, value: ?[]const u8) bool {
+        var lower_buf: [128]u8 = undefined;
+        const q = lowerQuery(name, &lower_buf);
         for (self.entries.items) |e| {
-            if (std.ascii.eqlIgnoreCase(self.nameOf(e), name)) {
+            if (nameMatches(self.nameOf(e), name, q)) {
                 if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) return true;
             }
         }

@@ -11,13 +11,12 @@ const tls_on = tls_mod.available;
 const response_mod = @import("../types/response.zig"); // NEW
 const headers_mod = @import("../types/headers.zig"); // NEW
 
-var req_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
-const gpa = if (builtin.mode == .Debug)
-    req_counter.allocator()
-else
-    std.heap.smp_allocator;
-
-const counting = @import("../util/counting_allocator.zig");
+// F3: the Debug req_counter (CountingAllocator) that used to wrap this
+// file's allocator is deleted. Nothing in this file allocates through it
+// (zero `gpa.` call sites) and the real per-request heap traffic — QuickJS
+// values plus types/response.zig via raw smp_allocator — bypasses it, so
+// `balanced=true` was vacuous false assurance. The meaningful per-job
+// counter lives in net/async_fetch.zig.
 
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 4096;
@@ -61,6 +60,10 @@ var close_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
 var hdr_scan_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var fds: [MAX_CONN]xev.TCP = undefined;
 var buf_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+// F4: bytes of read_bufs[0..buf_lens] consumed by the current request
+// (headers_end + content_length). Keep-alive re-arms use it to preserve
+// pipelined bytes instead of discarding them.
+var req_consumed: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var ws_partial_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // DOD §3: 512B bool column → 64B bitset (8×u64). Set only on fragment start,
 // read only on fragment completion — never scanned linearly with buf_lens.
@@ -243,7 +246,9 @@ fn classifyMethod(s: []const u8) Method {
     } else if (s.len == 5) {
         if (s[0] == 'P' and s[1] == 'A' and s[2] == 'T' and s[3] == 'C' and s[4] == 'H') return .patch;
     } else if (s.len == 6) {
-        if (s[0] == 'D' and s[1] == 'E' and s[2] == 'L' and s[3] == 'E' and s[4] == 'T' and s[5] == 'E' and s[6] == 'E') return .delete;
+        // FIX: "DELETE" is exactly 6 bytes (indices 0..5) — the old code read
+        // s[6] here (OOB: panics in safe builds, silent `.none` in ReleaseFast).
+        if (s[0] == 'D' and s[1] == 'E' and s[2] == 'L' and s[3] == 'E' and s[4] == 'T' and s[5] == 'E') return .delete;
     } else if (s.len == 7) {
         if (s[0] == 'O' and s[1] == 'P' and s[2] == 'T' and s[3] == 'I' and s[4] == 'O' and s[5] == 'N' and s[6] == 'S') return .options;
     }
@@ -401,7 +406,7 @@ fn armWrite(id: usize, l: *xev.Loop) void {
         write_offsets[id] = 0;
         tls_mod.flush(&tls_ctxs[id]);
         const out = tls_mod.sendRecReady(&tls_ctxs[id]);
-        
+
         if (out.len == 0) return;
         states[id] = .writing;
         fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
@@ -484,8 +489,6 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
 
 
 
-
-
 fn nowMs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -504,22 +507,6 @@ fn printException(ctx: ?*c.Context, exc: c.Value) void {
     const msg = c.toCString(ctx, exc) orelse return;
     defer c.freeCString(ctx, msg);
     std.debug.print("[http] handler error: {s}\n", .{msg});
-}
-
-fn logAllocs(id: usize) void {
-    if (builtin.mode != .Debug) return;
-    std.debug.print(
-        "[allocs] req id={d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n",
-        .{
-            id,
-            req_counter.alloc_count,
-            req_counter.free_count,
-            req_counter.bytes_allocated,
-            req_counter.bytes_freed,
-            req_counter.balanced(),
-        },
-    );
-    std.debug.assert(req_counter.balanced());
 }
 
 // DOD-FIX 3: chunked large-body write helper. The caller has already
@@ -666,7 +653,7 @@ fn claimParkedSlot(magic: c_int) ?usize {
 
 fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) c.Value {
     const id = claimParkedSlot(magic) orelse return c.JS_UNDEFINED;
-    
+
     cflags[id].handler_parked = false;
     parked_since_ms[id] = 0;
 
@@ -742,7 +729,6 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
 // CHANGED: callHandler — removes the dead tag==7 spin; detects promises via
 // the one-time class-id probe; parks pending promises; unwraps settled ones.
 fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
-    if (builtin.mode == .Debug) req_counter.reset();
     const ctx = handler_ctx orelse {
         buildResponse(id, 500, "");
         return;
@@ -773,7 +759,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         printException(ctx, exc);
         c.freeValue(ctx, exc);
         buildResponse(id, 500, "Internal Server Error");
-        logAllocs(id);
         return;
     }
 
@@ -781,7 +766,7 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
         c.getClassID(result) == promise_class_id)
     {
         const ps = c.promiseState(ctx, result);
-        
+
         if (ps == 0) {
             // Pending: park the connection; the promise's `then` reactions
             // resume staging + writing from the event loop (or watchdog).
@@ -791,7 +776,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
                 return;
             }
             buildResponse(id, 500, "Internal Server Error");
-            logAllocs(id);
             return;
         }
         if (ps == 2) {
@@ -801,7 +785,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
             result = pr;
             printException(ctx, pr);
             buildResponse(id, 500, "Internal Server Error");
-            logAllocs(id);
             return;
         }
         // Fulfilled synchronously: unwrap and stage without an event-loop
@@ -812,7 +795,6 @@ fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     }
 
     stageHandlerResponse(id, result);
-    logAllocs(id);
 }
 
 pub const ws_class_id_val: c.ClassID = 0;
@@ -1016,7 +998,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 }
 
 fn wsConsume(id: usize, l: *xev.Loop) void {
-    
+
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
         const hdr = ws.parseHeader(leftover) orelse break;
@@ -1197,6 +1179,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     states[id] = .reading;
     methods[id] = Method.none;
     buf_lens[id] = 0;
+    req_consumed[id] = 0; // F4
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
@@ -1311,6 +1294,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         armWrite(id, l);
         return;
     }
+    req_consumed[id] = expect; // F4: remember the consumed span for keep-alive
     if (buf_lens[id] < expect) {
         armRead(id, l);
         return;
@@ -1330,6 +1314,38 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         // continuation's write completes.
         states[id] = .reading;
     }
+}
+
+// F4: keep-alive re-arm that preserves pipelined bytes. The finished request
+// consumed read_bufs[0..req_consumed]; bytes beyond it belong to the next
+// pipelined request and must survive (the old code zeroed buf_lens and
+// re-read from offset 0, silently discarding them). Mirrors the WS leftover
+// handling in wsConsume.
+fn keepAlivePreserve(id: usize) void {
+    const leftover = read_bufs[id][req_consumed[id]..buf_lens[id]];
+    @memmove(read_bufs[id][0..leftover.len], leftover);
+    buf_lens[id] = leftover.len;
+    req_consumed[id] = 0;
+    hdr_scan_off[id] = 0;
+}
+
+fn keepAliveRearm(id: usize, l: *xev.Loop) void {
+    keepAlivePreserve(id);
+    states[id] = .reading;
+    if (buf_lens[id] > 0) {
+        // A complete pipelined request may already be buffered: drive it now
+        // with NO read armed (processPlaintext arms its own write). Falling
+        // through to armRead here as well would double-arm the completion.
+        if (findHeaderEnd(read_bufs[id][0..buf_lens[id]], 0)) |he| {
+            const headers_end = he + 4;
+            const pr = parseRequest(read_bufs[id][0..buf_lens[id]], headers_end);
+            if (pr.method.len == 0 or buf_lens[id] >= headers_end + pr.content_length) {
+                processPlaintext(id, l);
+                return;
+            }
+        }
+    }
+    armRead(id, l);
 }
 
 fn writeCb(
@@ -1395,8 +1411,7 @@ fn writeCb(
             }
             if (cflags[id].keep_alive) {
                 states[id] = .reading;
-                buf_lens[id] = 0;
-                hdr_scan_off[id] = 0;
+                keepAlivePreserve(id); // F4 (TLS: tlsPump re-arms + scans)
                 tlsPump(id, l);
             } else {
                 closeConn(id);
@@ -1414,8 +1429,7 @@ fn writeCb(
         }
         if (cflags[id].keep_alive) {
             states[id] = .reading;
-            buf_lens[id] = 0;
-            hdr_scan_off[id] = 0;
+            keepAlivePreserve(id); // F4 (TLS: tlsPump re-arms + scans)
             tlsPump(id, l); // re-enter pump: arms read / feeds staged data
         } else {
             closeConn(id);
@@ -1472,10 +1486,7 @@ fn writeCb(
                 write_lens[id] = 0;
                 write_offsets[id] = 0;
                 if (cflags[id].keep_alive) {
-                    states[id] = .reading;
-                    buf_lens[id] = 0;
-                    hdr_scan_off[id] = 0;
-                    fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
+                    keepAliveRearm(id, l); // F4
                 } else {
                     closeConn(id);
                 }
@@ -1508,11 +1519,8 @@ fn writeCb(
 
     write_offsets[id] = 0;
     if (cflags[id].keep_alive) {
-        states[id] = .reading;
-        buf_lens[id] = 0;
-        hdr_scan_off[id] = 0;
         write_lens[id] = 0;
-        fds[id].read(l, &read_comps[id], .{ .slice = &read_bufs[id] }, u16, &slot_ids[id], readCb);
+        keepAliveRearm(id, l); // F4
     } else {
         closeConn(id);
     }
@@ -1601,4 +1609,27 @@ pub fn setupStrings(ctx: ?*c.Context) void {
     defer c.freeValue(ctx, cap[0]);
     defer c.freeValue(ctx, cap[1]);
     if (c.isObject(p) != 0) promise_class_id = c.getClassID(p);
+}
+
+// ── Regression test: classifyMethod must never read past the slice ──
+// "DELETE" is exactly 6 bytes; the old code read s[6] in the len==6 branch
+// (OOB: panics in Debug, silent misclassify as .none in ReleaseFast).
+// Exact-length slices make any regression a hard panic under `zig build test`.
+test "classifyMethod covers all methods with exact-length slices" {
+    const cases = .{
+        .{ "GET", Method.get },
+        .{ "PUT", Method.put },
+        .{ "POST", Method.post },
+        .{ "HEAD", Method.head },
+        .{ "PATCH", Method.patch },
+        .{ "DELETE", Method.delete },
+        .{ "OPTIONS", Method.options },
+        .{ "", Method.none },
+        .{ "TRACE", Method.none },
+        .{ "get", Method.none },
+    };
+    inline for (cases) |case| {
+        const s: []const u8 = case[0];
+        try std.testing.expectEqual(case[1], classifyMethod(s));
+    }
 }

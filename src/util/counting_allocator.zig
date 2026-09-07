@@ -19,7 +19,8 @@ pub const CountingAllocator = struct {
 
     /// Live-byte invariant: every alloc must be matched by a free.
     pub fn balanced(self: *const CountingAllocator) bool {
-        return self.bytes_allocated == self.bytes_freed;
+        return self.alloc_count == self.free_count and
+            self.bytes_allocated == self.bytes_freed;
     }
 
     pub fn allocator(self: *CountingAllocator) std.mem.Allocator {

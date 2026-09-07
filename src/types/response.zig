@@ -32,16 +32,6 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
 
-fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    var stack_buf: [256]u8 = undefined;
-    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
-    if (ex.heap) |h| return h;
-    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
-    @memcpy(buf[0..ex.slice.len], ex.slice);
-    buf[ex.slice.len] = 0;
-    return buf;
-}
-
 fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
@@ -103,7 +93,7 @@ pub const ResponseData = struct {
         std.debug.assert(@sizeOf(PoolSlice) == 8);
         std.debug.assert(@alignOf(ResponseData) >= 8);
     }
-  
+
     pub fn init() ResponseData {
         const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
         h.* = headers_mod.HeadersData.init();
@@ -122,6 +112,26 @@ pub const ResponseData = struct {
         };
         self.storeString("OK", &self.status_text);
         return self;
+    }
+    /// F1: take ownership of an already-built HeadersData (e.g. the fetch
+    /// slot's parsed headers) instead of creating + immediately releasing
+    /// one. Saves 1 create + 1 release + 1 pool append per fetch.
+    /// NOTE: no default "OK" status text is stored — every caller sets the
+    /// status text explicitly, so it would be dead pool bytes.
+    pub fn initWithHeaders(h: *headers_mod.HeadersData) ResponseData {
+        return ResponseData{
+            .pool = std.ArrayList(u8).empty,
+            .status = 200,
+            .status_text = .{},
+            .headers = h,
+            ._body = .{},
+            .has_body = false,
+            .body_used = false,
+            ._url = .{},
+            .redirected = false,
+            .response_type = .basic,
+            .cold = null,
+        };
     }
     pub fn deinit(self: *ResponseData) void {
         if (self.owned_body) |b| gpa.free(b);
@@ -226,6 +236,8 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     if (c.isObject(init_val) == 0) return;
     if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
         const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
+        // F5: single growth for the copy loop — no per-header growth.
+        target.reserveEntries(src.len());
         for (0..src.len()) |i| {
             const p = src.getPair(i);
             target.appendEntry(p.name, p.value);

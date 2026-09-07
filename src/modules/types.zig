@@ -25,4 +25,4 @@ pub const Export = struct {
     source: ?PoolSlice,
 };
 
-pub const PoolSlice = struct { off: u32 = 0, len: u32 = 0 };
+pub const PoolSlice = @import("../types/pool_slice.zig").PoolSlice;
