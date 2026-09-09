@@ -20,6 +20,8 @@ const http_native = @import("../net/http_native.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
 const text_encoding = @import("../api/text_encoding.zig");
+const formdata = @import("../types/formdata.zig");
+const blob = @import("../types/blob.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -188,6 +190,8 @@ pub const Runtime = struct {
         url_api.setup(ctx);
         fetch_api.setup(ctx);
         header.setup(ctx);
+        blob.setup(ctx);
+        formdata.setup(ctx);
         request.setup(ctx);
         response.setup(ctx);
         http.setup(ctx);

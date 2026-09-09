@@ -2,6 +2,8 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const headers_mod = @import("headers.zig");
 const pool_slice_mod = @import("pool_slice.zig");
+const blob_mod = @import("blob.zig");
+const formdata_mod = @import("formdata.zig");
 const gpa = std.heap.smp_allocator;
 
 var response_class_id: c.ClassID = 0;
@@ -367,20 +369,48 @@ fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
 }
 
 fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv; _ = this_val;
+    _ = argc; _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
+    data.body_used = true;
+    const body_bytes = data.body() orelse "";
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
-    var msg = zigStringToJS(ctx, "Blob not supported");
-    _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+    const blob = gpa.create(blob_mod.BlobData) catch {
+        var msg = zigStringToJS(ctx, "out of memory");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    };
+    blob.* = blob_mod.BlobData.init();
+    blob.setBytes(body_bytes);
+    if (data.headers.getFirst("content-type")) |ct| blob.setTypeNormalized(ct);
+    var obj = blob_mod.buildBlobJSObject(ctx, blob);
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
 
 fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv; _ = this_val;
+    _ = argc; _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
+    data.body_used = true;
+    const body_bytes = data.body() orelse "";
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
-    var msg = zigStringToJS(ctx, "FormData not supported");
-    _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+    const fd = gpa.create(formdata_mod.FormData) catch {
+        var msg = zigStringToJS(ctx, "out of memory");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    };
+    fd.* = formdata_mod.FormData.init();
+    const ct = data.headers.getFirst("content-type") orelse "";
+    if (!formdata_mod.parseBody(fd, ct, body_bytes)) {
+        fd.deinit();
+        gpa.destroy(fd);
+        var msg = zigStringToJS(ctx, "FormData unsupported content-type");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    }
+    var obj = formdata_mod.buildFormDataJSObject(ctx, fd);
+    _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
 
