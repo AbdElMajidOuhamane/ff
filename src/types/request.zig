@@ -143,7 +143,7 @@ pub const RequestDataCold = struct {
 // so callers (fetch.zig, http layer) keep compiling.
 pub const RequestData = struct {
     pool: std.ArrayList(u8),
-    headers: headers_mod.HeadersData,
+    headers: *headers_mod.HeadersData,
     cold: ?*RequestDataCold,
     _url: PoolSlice,
     _body: PoolSlice,
@@ -163,9 +163,14 @@ pub const RequestData = struct {
     }
 
     pub fn init() RequestData {
+        // Gap-5 fix: headers live in a heap refcounted HeadersData like
+        // ResponseData (see response.zig), so createEmbeddedHeaders' retain
+        // and deinit's release always pair on a real heap object.
+        const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
+        h.* = headers_mod.HeadersData.init();
         return .{
             .pool = std.ArrayList(u8).empty,
-            .headers = headers_mod.HeadersData.init(),
+            .headers = h,
             .cold = null,
             ._url = .{}, ._body = .{}, ._integrity = .{},
             ._method = .GET, ._cache = .default, ._credentials = .same_origin,
@@ -409,7 +414,7 @@ fn createEmbeddedHeaders(ctx: ?*c.Context, src: *headers_mod.HeadersData) c.Valu
 fn setRequestProps(ctx: ?*c.Context, obj: c.Value, data: *RequestData) void {
     _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "method", zigStringToJS(ctx, data.method()), c.PROP_C_W_E);
-    const hdr_obj = createEmbeddedHeaders(ctx, &data.headers);
+    const hdr_obj = createEmbeddedHeaders(ctx, data.headers);
     _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "bodyUsed", if (data.body_used) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "cache", zigStringToJS(ctx, data.cache()), c.PROP_C_W_E);
@@ -554,7 +559,9 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     } else if (c.isObject(arg0) != 0) {
         const src = extractRequestData(ctx, arg0);
         if (src) |src_data| {
-            data.headers.release();
+            // Fresh headers from init() are empty: clone straight into them.
+            // Releasing here would destroy the live container and leave
+            // cloneFrom writing through a dangling pointer.
             data.cloneFrom(src_data);
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
@@ -567,6 +574,7 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
             }
         }
     } else {
+        data.deinit();
         gpa.destroy(data);
         _ = c.throwTypeError(ctx, "Request requires a URL string or Request object as first argument");
         return c.JS_EXCEPTION;
@@ -582,7 +590,7 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 data.setMethod(m.slice);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, &data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers);
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
@@ -646,6 +654,7 @@ pub fn setup(ctx: ?*c.Context) void {
     };
     _ = c.newClassID(c.getRuntime(ctx), &request_class_id);
     _ = c.newClass(c.getRuntime(ctx), request_class_id, &class_def);
+
     const proto = c.newObject(ctx);
     const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
         .{ .name = "text", .func = &requestText, .len = 0 },

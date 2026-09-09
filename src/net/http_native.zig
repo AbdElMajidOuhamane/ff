@@ -125,11 +125,14 @@ var accept_comp: xev.Completion = .{};
 var g_loop: ?*xev.Loop = null;
 var initialized: bool = false;
 
+// Gap-7 fix: largest→smallest field order (56B → 48B, still ≤64 assert).
+// The single construction site (parseRequest) uses named fields, so the
+// reorder is safe. Stack transient only — never stored in a large array.
 pub const ParsedRequest = struct {
     method: []const u8,
-    method_tag: Method,
     url: []const u8,
     content_length: usize,
+    method_tag: Method,
     keep_alive: bool,
 };
 
@@ -653,7 +656,6 @@ fn claimParkedSlot(magic: c_int) ?usize {
 
 fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) c.Value {
     const id = claimParkedSlot(magic) orelse return c.JS_UNDEFINED;
-
     cflags[id].handler_parked = false;
     parked_since_ms[id] = 0;
 

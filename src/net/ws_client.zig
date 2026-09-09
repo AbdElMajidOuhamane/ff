@@ -104,7 +104,6 @@ var path_bufs:    [MAX_WS][2048]u8 = undefined;
 // level-triggered hints re-verified against it. conn_live/w_conns/w_reqs are
 // worker-owned (releaseSlot only clears want_connect once the slot is DONE).
 var want_connect: [MAX_WS]bool = [_]bool{false} ** MAX_WS;
-var conn_live_alias_note: void = {}; // (no-op marker: conn_live now lives in wflags; see comment above)
 var w_conns:      [MAX_WS]?*http.Client.Connection = [_]?*http.Client.Connection{null} ** MAX_WS;
 var w_reqs:       [MAX_WS]?http.Client.Request = [_]?http.Client.Request{null} ** MAX_WS;
 var cmd_pipe:     [2]std.posix.fd_t = .{ -1, -1 };

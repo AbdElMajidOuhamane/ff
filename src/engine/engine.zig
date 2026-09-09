@@ -218,7 +218,7 @@ pub const Runtime = struct {
         const setInterval_func = qjs.newCFunction(ctx, setIntervalCallback, "setInterval", 2);
         const clearTimeout_func = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         const clearInterval_func = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
-        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 2);
+        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1);
 
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", setTimeout_func, qjs.PROP_C_W_E);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", setInterval_func, qjs.PROP_C_W_E);
@@ -276,7 +276,7 @@ pub const Runtime = struct {
         defer qjs.freeValue(ctx, global);
         const st = qjs.newCFunction(ctx, wSetTimeoutCallback, "setTimeout", 2);
         _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", st, qjs.PROP_C_W_E);
-        const si = qjs.newCFunction(ctx, wSetIntervalCallback, "setInterval", 2, qjs.PROP_C_W_E);
+        const si = qjs.newCFunction(ctx, wSetIntervalCallback, "setInterval", 2);
         _ = qjs.definePropertyValueStr(ctx, global, "setInterval", si, qjs.PROP_C_W_E);
         const ct = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
         _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", ct, qjs.PROP_C_W_E);
