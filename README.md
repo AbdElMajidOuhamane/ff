@@ -889,7 +889,7 @@ Fairyfly is:
 - **-90% memory** vs Deno (~10x lower RSS)
 - **-24% p50 latency** vs Deno
 
-The wrk script in this repo reproduces this: `./wrk.sh`.
+
 
 ---
 
@@ -945,8 +945,8 @@ with: `zig build -Dbearssl=false`
 ```sh
 git clone <repo>
 cd fairyfly
-make build         # ReleaseFast build
-./zig-out/bin/ff examples/hello.js
+make install         # ReleaseFast build
+ff examples/hello.js
 ```
 
 Debug build (with allocation balance assertions):
@@ -961,7 +961,6 @@ zig build
 
 ```sh
 docker build -t fairyfly .
-docker run --rm -p 3000:3000 fairyfly ff examples/hello.js
 ```
 
 Run the benchmark suite:
@@ -986,7 +985,6 @@ ff imprint [pkg[@ver] ...]
                          Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
-ff bench                 Run JS microbenchmarks
 ff --version             Print runtime version
 ```
 
