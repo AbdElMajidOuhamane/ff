@@ -1,4 +1,4 @@
-![Fairyfly logo](assets/ff.png)
+<img src="assets/ff.png" alt="Fairyfly logo" width="120" />
 
 # Fairyfly Runtime
 
