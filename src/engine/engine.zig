@@ -22,6 +22,7 @@ const ws_client = @import("../net/ws_client.zig");
 const text_encoding = @import("../api/text_encoding.zig");
 const formdata = @import("../types/formdata.zig");
 const blob = @import("../types/blob.zig");
+const sqlite_api = @import("../api/sqlite.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -197,6 +198,7 @@ pub const Runtime = struct {
         http.setup(ctx);
         websocket_client.setup(ctx);
         text_encoding.setup(ctx);
+        sqlite_api.setup(ctx);
         {
             var timeout_def = qjs.ClassDef{
                 .class_name = "Timeout",

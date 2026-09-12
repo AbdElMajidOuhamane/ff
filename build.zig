@@ -13,7 +13,6 @@ pub fn build(b: *std.Build) void {
     const ffcfg_mod = ffcfg_opts.createModule();
 
     // ── QuickJS C translation (auto-generates types + inline functions) ──
-    // CHANGED: vendored quickjs-ng v0.16.2 (no CONFIG_VERSION/BIGNUM/CHECK_OPTIONS)
     const translate = b.addTranslateC(.{
         .root_source_file = b.path("vendor/quickjs/quickjs.h"),
         .target = target,
@@ -34,7 +33,6 @@ pub fn build(b: *std.Build) void {
         btranslate.addIncludePath(b.path("vendor/bearssl/inc"));
         bssl_mod = btranslate.createModule();
 
-        // Collect every BearSSL .c file under vendor/bearssl/src (deterministic order).
         const io = b.graph.io;
         var files: std.ArrayList([]const u8) = .empty;
         var src_dir = std.Io.Dir.cwd().openDir(io, "vendor/bearssl/src", .{ .iterate = true }) catch {
@@ -64,12 +62,55 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             }),
         });
-        // In Zig 0.16 include paths and C sources live on Module, not Compile.
         lib.root_module.addIncludePath(b.path("vendor/bearssl/inc"));
         lib.root_module.addIncludePath(b.path("vendor/bearssl/src"));
         lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/bearssl/src"), .files = files.items });
         bssl_lib = lib;
     }
+
+    // ── SQLite: translated declarations module + compiled static library ──
+    const sqltranslate = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/sqlite/zig_bridge.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sqltranslate.addIncludePath(b.path("vendor/sqlite"));
+    const sql_mod = sqltranslate.createModule();
+
+    const mod_sqlite = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod_sqlite.addIncludePath(b.path("vendor/sqlite"));
+    mod_sqlite.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-std=c99",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+            "-DSQLITE_USE_ALLOCA=1",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_TEMP_STORE=3",
+            "-DSQLITE_ENABLE_API_ARMOR=1",
+            "-DSQLITE_ENABLE_UNLOCK_NOTIFY",
+            "-DSQLITE_DEFAULT_FILE_PERMISSIONS=0600",
+            "-DSQLITE_OMIT_DECLTYPE=1",
+            "-DSQLITE_OMIT_DEPRECATED=1",
+            "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+            "-DSQLITE_OMIT_PROGRESS_CALLBACK=1",
+            "-DSQLITE_OMIT_SHARED_CACHE",
+            "-DSQLITE_OMIT_TRACE=1",
+            "-DSQLITE_OMIT_UTF16=1",
+        },
+    });
+
+    const sqlite_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "sqlite3",
+        .root_module = mod_sqlite,
+    });
+    sqlite_lib.installHeadersDirectory(b.path("vendor/sqlite"), "", .{});
 
     // ── Executable ──
     const exe = b.addExecutable(.{
@@ -87,6 +128,7 @@ pub fn build(b: *std.Build) void {
                     } },
                 }) },
                 .{ .name = "quickjs_c", .module = c_mod },
+                .{ .name = "sqlite_c", .module = sql_mod },
             },
         }),
     });
@@ -98,9 +140,10 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkLibrary(bssl_lib.?);
     }
 
+    // Link SQLite static library
+    exe.root_module.linkLibrary(sqlite_lib);
+
     // ── Compile QuickJS C sources ──
-    // CHANGED: quickjs-ng v0.16.2 — no CONFIG_VERSION/BIGNUM/CHECK_OPTIONS
-    // defines; cutils is header-only; quickjs-libc is not used by the runtime.
     const qjs_flags: []const []const u8 = &.{
         "-D_GNU_SOURCE",
     };

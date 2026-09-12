@@ -16,6 +16,7 @@ and a small readable codebase.
 3. [Core concepts](#core-concepts)
 4. [Tutorials](#tutorials)
    - [Hello world](#hello-world)
+   - [Console](#console)
    - [Timers and the event loop](#timers-and-the-event-loop)
    - [HTTP server](#http-server)
    - [Async handlers](#async-handlers)
@@ -24,12 +25,20 @@ and a small readable codebase.
    - [WebSocket client](#websocket-client)
    - [TLS: HTTPS and WSS servers](#tls-https-and-wss-servers)
    - [URL parsing](#url-parsing)
+   - [Headers](#headers)
+   - [File system](#file-system)
+   - [SQLite database](#sqlite-database)
+   - [Crypto](#crypto)
+   - [Text encoding](#text-encoding)
+   - [Performance timing](#performance-timing)
    - [Working with modules](#working-with-modules)
 5. [Built-in API reference](#built-in-api-reference)
 6. [Performance](#performance)
 7. [Architecture](#architecture)
 8. [Building from source](#building-from-source)
 9. [CLI reference](#cli-reference)
+10. [Limitations](#limitations-vs-node--browser)
+11. [License](#license)
 
 ---
 
@@ -123,6 +132,34 @@ $ ./zig-out/bin/ff hello.js
 hello, world!
 ```
 
+### Console
+
+Fairyfly provides a full `console` object with colored output and timers:
+
+```js
+// Basic output methods
+console.log("standard output");         // plain text
+console.info("informational");          // same as log
+console.debug("debug details");         // same as log
+console.warn("warning message");        // yellow text
+console.error("error occurred");        // red text
+
+// Custom colored output
+console.detail("success message");      // green text
+console.slops("another warning");       // alias for warn (yellow)
+console.redbal("another error");        // alias for error (red)
+
+// Performance timers
+console.time("db-query");
+// ... some operation ...
+console.timeLog("db-query");            // "db-query: 12.345ms"
+// ... more work ...
+console.timeEnd("db-query");            // "db-query: 45.678ms" (timer removed)
+
+// All methods accept any number of arguments, any type
+console.log("count:", 42, "items:", ["a", "b"]);
+```
+
 ### Timers and the event loop
 
 `setTimeout` schedules a callback to run after a minimum delay. The event
@@ -143,9 +180,54 @@ setTimeout(() => {
 console.log("end (synchronous)");
 ```
 
-To run the event loop after the script body executes, the runtime
-auto-runs `event_loop.runWithMicrotasks` for you. For most use cases
-no additional setup is needed.
+Output:
+
+```
+start
+end (synchronous)
+after 50ms
+after 100ms
+```
+
+**Repeating timers** with `setInterval`:
+
+```js
+let count = 0;
+const id = setInterval(() => {
+    count++;
+    console.log(`tick ${count}`);
+    if (count >= 5) clearInterval(id);
+}, 1000);
+```
+
+**Queuing microtasks** (runs before the next timer or I/O callback):
+
+```js
+queueMicrotask(() => {
+    console.log("microtask 1");
+});
+queueMicrotask(() => {
+    console.log("microtask 2");
+});
+console.log("main code");
+
+// Output:
+// main code
+// microtask 1
+// microtask 2
+```
+
+**Timer control** — each timer returns an object with `ref()`, `unref()`,
+`refresh()`, and `hasRef()` methods:
+
+```js
+const timer = setTimeout(() => console.log("done"), 5000);
+timer.unref();        // process can exit even if timer is still pending
+timer.refresh();      // reset the countdown
+timer.hasRef();       // check if timer keeps process alive
+```
+
+**Max timers**: 128 concurrent timers. After that, new timers queue and wait.
 
 ### HTTP server
 
@@ -154,22 +236,29 @@ handler returns a `Response` object.
 
 ```js
 // server.js
-// Handler signature: handler(url, method, body) — url is the raw
-// request-target ("/path?query"), so pass a base to the URL constructor.
-http.serve({ port: 3000 }, (req) => {
-    const url = new URL(req, "http://localhost");
-    if (url.pathname === "/") {
+http.serve({ port: 3000 }, (url, method, body) => {
+    const u = new URL(url, "http://localhost");
+
+    if (u.pathname === "/") {
         return new Response("hello from fairyfly", {
             status: 200,
             headers: { "content-type": "text/plain" },
         });
     }
-    if (url.pathname === "/json") {
+
+    if (u.pathname === "/json") {
         return Response.json({ ok: true, runtime: "fairyfly" });
     }
+
     return new Response("not found", { status: 404 });
 });
 ```
+
+The handler signature is `(url, method, body)`:
+
+- `url` — the raw request target, e.g. `"/api/todos?page=1"`
+- `method` — HTTP method string: `"GET"`, `"POST"`, etc.
+- `body` — request body as a string (empty string if no body)
 
 The handler runs on the event loop. Multiple concurrent connections are
 handled cooperatively — no thread per request.
@@ -178,6 +267,19 @@ handled cooperatively — no thread per request.
 `content-type`, `set-cookie`, custom headers — except `Content-Length`,
 `Transfer-Encoding`, and `Connection`, which the server computes. A hung
 handler is failed with `504` after 30 s.
+
+**Response.json** is a shortcut for JSON responses:
+
+```js
+// Sets content-type: application/json automatically
+return Response.json({ users: [{ name: "Alice" }] }, { status: 200 });
+
+// With custom headers
+return Response.json({ data: items }, {
+    status: 200,
+    headers: { "X-Total-Count": String(items.length) },
+});
+```
 
 **Benchmarking this exact pattern:**
 
@@ -201,27 +303,59 @@ inside a handler; no thread is blocked:
 
 ```js
 // async_server.js
-http.serve({ port: 3000 }, async (req) => {
-    const res = await fetch("https://example.com/api");
+http.serve({ port: 3000 }, async (url, method, body) => {
+    const res = await fetch("https://httpbin.org/json");
     const data = await res.json();
-    return Response.json(data);
+    return Response.json({ proxy: data });
 });
 ```
 
-Rejected promises and thrown errors become `500` responses. Headers on the
-returned `Response` are honored as described above.
+You can also receive a `Request` object if you prefer:
+
+```js
+http.serve({ port: 3000 }, async (request) => {
+    const body = await request.text();
+    return Response.json({ echo: body });
+});
+```
+
+Rejected promises and thrown errors become `500` responses.
 
 ### Fetch client
 
+`fetch` makes HTTP requests and returns a `Promise<Response>`:
+
 ```js
-// fetch.js
+// GET request
 const res = await fetch("https://httpbin.org/json");
 const data = await res.json();
 console.log(data);
+
+// POST request with JSON body
+const res2 = await fetch("https://httpbin.org/post", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Alice", age: 30 }),
+});
+const result = await res2.json();
+console.log(result);
+
+// Check status
+const res3 = await fetch("https://httpbin.org/status/404");
+console.log(res3.status);   // 404
+console.log(res3.ok);       // false
+
+// Read as text
+const html = await fetch("https://example.com").then(r => r.text());
 ```
 
-`fetch` returns a Promise that resolves to a `Response`. The body is consumed
-via `.text()`, `.json()`, `.arrayBuffer()`, or `.blob()`.
+**Body consumption methods** (each can only be called once):
+
+- `res.text()` — returns `Promise<string>`
+- `res.json()` — returns `Promise<object>`
+- `res.arrayBuffer()` — returns `Promise<ArrayBuffer>`
+- `res.blob()` — returns `Promise<Blob>`
+- `res.formData()` — returns `Promise<FormData>`
 
 **Caveats:**
 
@@ -247,16 +381,30 @@ http.serve({
             console.log("received:", msg);
             sock.send(`echo: ${msg}`);
         },
-        close: (sock) => console.log("client disconnected"),
+        close: (sock, code, reason) => {
+            console.log("client disconnected:", code, reason);
+        },
     },
-}, (req) => new Response("ws endpoint", { status: 200 }));
+}, (url, method, body) => new Response("ws endpoint", { status: 200 }));
 ```
 
 The `sock` object exposes:
 
 - `sock.send(text)` — send a UTF-8 text frame
-- `sock.sendBinary(buffer)` — send a binary frame
+- `sock.sendBinary(buffer)` — send a binary frame (`ArrayBuffer` or `Uint8Array`)
 - `sock.readyState` — `CONNECTING` / `OPEN` / `CLOSING` / `CLOSED`
+
+**Binary frames:**
+
+```js
+ws.onmessage = (e) => {
+    if (e.data instanceof Uint8Array) {
+        console.log("binary:", e.data.length, "bytes");
+    } else {
+        console.log("text:", e.data);
+    }
+};
+```
 
 ### WebSocket client
 
@@ -265,7 +413,8 @@ The `sock` object exposes:
 const ws = new WebSocket("ws://127.0.0.1:8080");
 ws.onopen = () => ws.send("hello server");
 ws.onmessage = (e) => console.log("got:", e.data);
-ws.onclose = () => console.log("closed");
+ws.onclose = (e) => console.log("closed:", e.code, e.reason);
+ws.onerror = (e) => console.error("error:", e);
 ```
 
 Static constants: `WebSocket.CONNECTING`, `.OPEN`, `.CLOSING`, `.CLOSED`.
@@ -291,7 +440,7 @@ http.serve({
     websocket: {
         message: (sock, msg) => sock.send(`echo: ${msg}`),
     },
-}, (req) => new Response("hello over tls"));
+}, (url, method, body) => new Response("hello over tls"));
 ```
 
 **Or enable it from the CLI** (applies to whatever `ff start` runs):
@@ -313,15 +462,6 @@ const ws = new WebSocket("wss://localhost:8443/ws");
 ws.onopen = () => ws.send("hello over tls");
 ```
 
-Binary frames arrive as `Uint8Array` (send them the same way):
-
-```js
-ws.onmessage = (e) => {
-    if (e.data instanceof Uint8Array) { /* binary */ }
-    else { /* string */ }
-};
-```
-
 **Trusting the server:**
 
 - The runtime's own clients (`fetch`, `WebSocket`) trust the served cert
@@ -332,8 +472,6 @@ ws.onmessage = (e) => {
 ```sh
 ff client.js --ca cert.pem      # or env: FF_CA_FILE=cert.pem
 ```
-
-- External tools: `curl -k`, or `NODE_EXTRA_CA_CERTS=cert.pem node client.mjs`.
 
 **Generating a dev certificate** (SANs matter — the runtime verifies the
 hostname; use `localhost`, not `127.0.0.1`, unless the SAN includes the IP):
@@ -346,17 +484,9 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 
 **Notes & limitations:**
 
-- TLS 1.2 (BearSSL does not implement TLS 1.3) — compatible with curl,
-  browsers, Node, and Zig's std TLS client
-- RSA or EC keys; RSA is recommended — the runtime's own client negotiates
-  ECDHE_RSA suites
-- One listener is TLS-or-plain (no dual-port, no client certificates, no
-  session resumption yet)
-- Zero allocations on the TLS hot path; ~17 MB static buffers for 512
-  concurrent connections (lazily paged)
-- Docker: the image fetches BearSSL at build time (pinned + sha256-verified);
-  serving certs are mounted at runtime:
-  `docker run -v ./certs:/app/certs ff start --cert /app/certs/cert.pem --key /app/certs/key.pem`
+- TLS 1.2 (BearSSL does not implement TLS 1.3)
+- RSA or EC keys; RSA is recommended
+- Zero allocations on the TLS hot path
 - Builds can opt out entirely: `zig build -Dbearssl=false`
 
 ### URL parsing
@@ -382,26 +512,312 @@ u.pathname = "/api/v3";
 console.log(u.toString());   // "https://example.com/api/v3"
 ```
 
+**URLSearchParams** for working with query strings:
+
+```js
+const params = new URLSearchParams("page=1&limit=10&tag=zig&tag=fairyfly");
+console.log(params.get("page"));      // "1"
+console.log(params.getAll("tag"));    // ["zig", "fairyfly"]
+console.log(params.has("limit"));     // true
+
+params.append("sort", "desc");
+console.log(params.toString());       // "page=1&limit=10&tag=zig&tag=fairyfly&sort=desc"
+
+params.delete("page");
+console.log([...params.entries()]);   // [["limit","10"],["tag","zig"],["tag","fairyfly"],["sort","desc"]]
+```
+
+**Non-throwing parse** with `URL.parse`:
+
+```js
+const valid = URL.parse("https://example.com");
+console.log(valid);   // URL { ... }
+
+const invalid = URL.parse("not a url");
+console.log(invalid); // null
+
+console.log(URL.canParse("https://example.com")); // true
+console.log(URL.canParse("not a url"));            // false
+```
+
+### Headers
+
+`Headers` is a case-insensitive collection of HTTP headers:
+
+```js
+const h = new Headers({
+    "Content-Type": "application/json",
+    "X-Custom": "hello",
+});
+
+h.append("X-Custom", "world");
+console.log(h.get("x-custom"));       // "hello, world" (case-insensitive)
+console.log(h.has("content-type"));   // true
+console.log(h.size());                // 2
+
+h.delete("x-custom");
+console.log([...h.keys()]);           // ["content-type"]
+```
+
+**Iterate with forEach:**
+
+```js
+const h = new Headers({ "Accept": "text/html", "Authorization": "Bearer token" });
+h.forEach((value, name) => {
+    console.log(`${name}: ${value}`);
+});
+```
+
+**Create from array of pairs:**
+
+```js
+const h = new Headers([
+    ["Accept", "application/json"],
+    ["X-Request-Id", "123"],
+]);
+```
+
+### File system
+
+All `fs` methods are **synchronous** (blocking):
+
+```js
+// Write a file
+fs.writeFile("./data.json", JSON.stringify({ hello: "world" }));
+
+// Read a file
+const content = fs.readFile("./data.json");
+console.log(content);  // '{"hello":"world"}'
+
+// Check if a path exists
+console.log(fs.exists("./data.json"));   // true
+console.log(fs.exists("./missing.txt")); // false
+
+// Create a directory
+fs.mkdir("./logs/2026", true);  // recursive = true
+
+// List a directory
+const files = fs.readdir("./src");
+console.log(files);  // ["main.js", "utils.js", ...]
+
+// Remove a file
+fs.rm("./temp.txt");
+
+// Remove a directory and everything inside it
+fs.rm("./logs", true);  // recursive = true
+```
+
+**Error handling** — all methods throw on failure:
+
+```js
+try {
+    const data = fs.readFile("./nonexistent.txt");
+} catch (e) {
+    console.error("Failed:", e.message);  // "FileNotFound"
+}
+```
+
+### SQLite database
+
+Fairyfly includes a built-in SQLite database. No external packages needed.
+
+**Opening a database:**
+
+```js
+// In-memory database (lost when process exits)
+const db = Database.open(":memory:");
+
+// File-based database (persists across restarts)
+const db = Database.open("./data.sqlite");
+
+// WAL mode and 5s busy timeout are enabled automatically
+```
+
+**Creating tables and inserting data:**
+
+```js
+const db = Database.open("./app.db");
+
+// execNoArgs for multi-statement SQL
+db.execNoArgs(`
+    CREATE TABLE IF NOT EXISTS users (
+        id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        name  TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL
+    )
+`);
+
+// exec for single statements with parameter binding
+// ? placeholders prevent SQL injection
+db.exec("INSERT INTO users (name, email) VALUES (?, ?)", ["Alice", "alice@example.com"]);
+db.exec("INSERT INTO users (name, email) VALUES (?, ?)", ["Bob", "bob@example.com"]);
+
+// lastInsertRowId() returns the auto-generated ID
+const id = db.lastInsertRowId();
+console.log("Created user:", id);
+```
+
+**Querying data:**
+
+```js
+// row() — single row as an object, or null if no results
+const user = db.row("SELECT * FROM users WHERE id = ?", [1]);
+console.log(user.name);   // "Alice"
+console.log(user.email);  // "alice@example.com"
+
+// rows() — all matching rows as an array
+const all = db.rows("SELECT * FROM users ORDER BY name ASC");
+for (const u of all) {
+    console.log(`${u.name} <${u.email}>`);
+}
+
+// count rows affected by INSERT/UPDATE/DELETE
+db.exec("UPDATE users SET name = ? WHERE id = ?", ["Alicia", 1]);
+console.log(db.changes());  // 1
+```
+
+**Partial updates:**
+
+```js
+function updateUser(id, patch) {
+    const sets = [];
+    const params = [];
+    if (typeof patch.name === "string")  { sets.push("name = ?");  params.push(patch.name); }
+    if (typeof patch.email === "string") { sets.push("email = ?"); params.push(patch.email); }
+    if (sets.length === 0) return db.row("SELECT * FROM users WHERE id = ?", [id]);
+    params.push(id);
+    db.exec("UPDATE users SET " + sets.join(", ") + " WHERE id = ?", params);
+    return db.row("SELECT * FROM users WHERE id = ?", [id]);
+}
+```
+
+**Transactions:**
+
+```js
+db.transaction(() => {
+    db.exec("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+    db.exec("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+});
+// If anything throws, the transaction rolls back automatically
+```
+
+**Supported parameter types:**
+
+| JS Type | SQLite Type |
+|---------|-------------|
+| `number` (integer) | `INTEGER` |
+| `number` (float) | `REAL` |
+| `string` | `TEXT` |
+| `null` | `NULL` |
+| `boolean` | `INTEGER` (1 or 0) |
+| `ArrayBuffer` / `Uint8Array` | `BLOB` |
+
+**Closing the database:**
+
+```js
+db.close();
+```
+
+### Crypto
+
+Fairyfly includes the `crypto` global for random values, UUIDs, and
+cryptographic hashing:
+
+```js
+// Generate a random UUID (v4)
+const id = crypto.randomUUID();
+console.log(id);  // "550e8400-e29b-41d4-a716-446655440000"
+
+// Fill a typed array with random bytes
+const bytes = new Uint8Array(16);
+crypto.getRandomValues(bytes);
+console.log(Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(""));
+
+// SHA-256 hash (returns a Promise)
+const data = new TextEncoder().encode("hello world");
+const hash = await crypto.subtle.digest("SHA-256", data);
+console.log(new Uint8Array(hash));  // Uint8Array of 32 bytes
+
+// SHA-512 hash
+const bigHash = await crypto.subtle.digest("SHA-512", data);
+
+// Other algorithms: "SHA-1", "SHA-384"
+```
+
+**Base64 encoding/decoding:**
+
+```js
+const encoded = btoa("hello world");
+console.log(encoded);  // "aGVsbG8gd29ybGQ="
+
+const decoded = atob("aGVsbG8gd29ybGQ=");
+console.log(decoded);  // "hello world"
+```
+
+### Text encoding
+
+`TextEncoder` and `TextDecoder` convert between strings and byte arrays:
+
+```js
+// Encode a string to bytes
+const encoder = new TextEncoder();
+const bytes = encoder.encode("hello world");
+console.log(bytes);           // Uint8Array [104, 101, 108, 108, 111, ...]
+console.log(bytes.length);    // 11
+
+// Decode bytes to a string
+const decoder = new TextDecoder();
+const text = decoder.decode(bytes);
+console.log(text);            // "hello world"
+
+// Both always use UTF-8
+console.log(encoder.encoding); // "utf-8"
+console.log(decoder.encoding); // "utf-8"
+```
+
+### Performance timing
+
+`performance.now()` returns a high-resolution timestamp in milliseconds:
+
+```js
+const start = performance.now();
+// ... do some work ...
+const elapsed = performance.now() - start;
+console.log(`Work took ${elapsed.toFixed(2)}ms`);
+```
+
+This uses `CLOCK_MONOTONIC` — it's not affected by system clock changes and
+is ideal for benchmarking code sections.
+
 ### Working with modules
 
 ```js
 // math.js
 export function add(a, b) { return a + b; }
-export const pi = 3.14159;
+export function multiply(a, b) { return a * b; }
+export const PI = 3.14159;
 ```
 
 ```js
 // main.js
-import { add, pi } from "./math.js";
+import { add, multiply, PI } from "./math.js";
 console.log(add(2, 3));         // 5
-console.log(pi);               // 3.14159
+console.log(multiply(4, 5));    // 20
+console.log(PI);                // 3.14159
 ```
 
 Module paths:
+
 - Relative: `./foo.js`, `../bar.js`
 - Absolute: `/abs/path/to/file.js`
 - Bare specifiers (`foo`) are *not* resolved through `node_modules` —
   Fairyfly has no package manager integration
+
+The `import.meta.url` property contains the `file://` URL of the current module:
+
+```js
+console.log(import.meta.url);  // "file:///path/to/module.js"
+```
 
 ---
 
@@ -411,39 +827,47 @@ Module paths:
 
 | Name | Description |
 |---|---|
-| `console` | `log`, `error`, `warn`, `info`, `debug` |
-| `setTimeout`, `clearTimeout` | Timer scheduling |
-| `setInterval`, `clearInterval` | Repeating timers |
-| `URL` | WHATWG URL parser (`URL.parse`, `URL.canParse`) |
-| `URLSearchParams` | Query-string parsing |
-| `Headers` | Fetch-style header collection |
-| `fetch` | HTTP client (16 concurrent max, gzip/deflate/zstd decoded) |
+| `console` | `log`, `info`, `debug`, `warn`, `error`, `detail`, `slops`, `redbal`, `time`, `timeLog`, `timeEnd` |
+| `setTimeout`, `clearTimeout` | One-shot timer scheduling (max 128 concurrent) |
+| `setInterval`, `clearInterval` | Repeating timer scheduling |
+| `queueMicrotask` | Queue a microtask (runs before next I/O/timer) |
+| `performance` | `performance.now()` — high-resolution monotonic timestamp |
+| `URL`, `URLSearchParams` | WHATWG URL parser and query string manipulation |
+| `Headers`, `Request`, `Response` | Fetch API primitives |
+| `Blob` | Binary data container |
+| `FormData` | Multipart/form-data container |
+| `TextEncoder`, `TextDecoder` | UTF-8 string and byte array conversion |
+| `fetch` | HTTP client (Promise-based) |
 | `WebSocket` | WebSocket client |
-| `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (sync) |
-| `process` | Env vars, argv, exit, cwd |
-| `Headers`, `Request`, `Response` | WHATWG Fetch primitives |
-| `crypto` | `crypto.randomUUID`, `crypto.getRandomValues` |
+| `Database` | SQLite database (via `Database.open(path)`) |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` |
+| `btoa`, `atob` | Base64 encode/decode |
+| `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (all sync) |
+| `process` | `exit`, `cwd`, `chdir`, `pid`, `platform`, `arch`, `env`, `argv` |
+| `http` | `http.serve(options, handler)` — start an HTTP/HTTPS server |
 
-### Namespaces
+### Response static methods
 
-- `http.serve(options, handler)` — start an HTTP server; async handlers are
-  supported (the connection parks until the handler's promise settles); pass
-  `tls: { cert, key }` to enable HTTPS/WSS (cert/key: file path or PEM)
-- `Response.json(value, init?)` — JSON response shortcut
-- `Response.redirect(url, status?)` — redirect response shortcut
-- `Response.error()` — empty 500 response shortcut
+| Method | Signature | Description |
+|---|---|---|
+| `Response.json(value, init?)` | `(any, { status?, headers? }) -> Response` | JSON response shortcut |
+| `Response.redirect(url, status?)` | `(string, number?) -> Response` | Redirect response (default 302) |
+| `Response.error()` | `() -> Response` | Error response (status 0) |
 
-### Limitations vs Node / browser
+### Database methods
 
-- No `require()`, no CommonJS
-- No `node_modules` resolution
-- No `Buffer` (use `ArrayBuffer` / `Uint8Array`)
-- No `process.nextTick` (use `queueMicrotask`)
-- HTTP/1.1 only
-- No browser DOM
-- Handlers receive `(url, method, body)` strings — no `Request` object yet
-- No `queueMicrotask`, `TextEncoder`, or `TextDecoder` yet
-- Response bodies buffered (64 KB cap per response); request bodies ≤ ~4 KB
+| Method | Signature | Description |
+|---|---|---|
+| `Database.open(path)` | `(string) -> Database` | Open or create a SQLite database |
+| `db.exec(sql, params?)` | `(string, Array?) -> undefined` | Execute SQL with optional parameters |
+| `db.execNoArgs(sql)` | `(string) -> undefined` | Execute multi-statement SQL without parameters |
+| `db.row(sql, params?)` | `(string, Array?) -> object or null` | Fetch one row or null |
+| `db.rows(sql, params?)` | `(string, Array?) -> object[]` | Fetch all matching rows |
+| `db.changes()` | `() -> number` | Rows affected by last exec |
+| `db.lastInsertRowId()` | `() -> number` | ID of last inserted row |
+| `db.transaction(fn)` | `(Function) -> any` | Execute in a transaction (auto-rollback on error) |
+| `db.close()` | `() -> undefined` | Close the database |
+| `db.busyTimeout(ms)` | `(number) -> undefined` | Set busy timeout |
 
 ---
 
@@ -460,9 +884,10 @@ handler:
 | Node 23       | 69k       | 1.36 ms | 1.69 ms | 82 MB    |
 
 Fairyfly is:
+
 - **+25% throughput** vs the next-fastest runtime
-- **−90% memory** vs Deno (~10× lower RSS)
-- **−24% p50 latency** vs Deno
+- **-90% memory** vs Deno (~10x lower RSS)
+- **-24% p50 latency** vs Deno
 
 The wrk script in this repo reproduces this: `./wrk.sh`.
 
@@ -478,13 +903,15 @@ The wrk script in this repo reproduces this: `./wrk.sh`.
 ┌──────────────────▼───────────────────────────────┐
 │ QuickJS bytecode + JS runtime (gc, value stack)  │
 └──────────────────┬───────────────────────────────┘
-                   │ C ABI (src/c.zig → quickjs_shim.zig)
+                   │ C ABI (src/c.zig -> quickjs_shim.zig)
 ┌──────────────────▼───────────────────────────────┐
 │ Zig API layer                                     │
-│   • api/    — Request, Response, fetch, ws, fs, … │
-│   • net/    — http_native (SoA 512-slot server)   │
-│   • event/  — loop, timers, microtasks            │
-│   • types/  — HeadersData, RequestData, etc.      │
+│   api/  - console, fs, process, crypto, url,      │
+│           fetch, websocket_client, sqlite          │
+│   net/  - http_native (SoA 512-slot server)       │
+│   event/- loop, timers, microtasks                │
+│   types/- Headers, Request, Response, Blob,       │
+│           FormData, PoolSlice                      │
 └──────────────────┬───────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────┐
@@ -493,8 +920,9 @@ The wrk script in this repo reproduces this: `./wrk.sh`.
 ```
 
 **Hot-path design:**
+
 - Zero allocations per request (CountingAllocator asserts `balanced=true`)
-- SoA layout for connection slots (512× parallel arrays, packed 1-byte flags)
+- SoA layout for connection slots (512x parallel arrays, packed 1-byte flags)
 - Static buffers reused across connections
 - HeadersData uses refcounting + lazy cold-struct split for hot/cold separation
 - URL objects: one refcounted allocation per URL (components pooled, zero-copy property reads)
@@ -506,12 +934,13 @@ The wrk script in this repo reproduces this: `./wrk.sh`.
 ## Building from source
 
 Requirements:
+
 - Zig 0.16 (uses 0.16.0 std APIs)
 - C compiler (clang on macOS, gcc on Linux) — QuickJS vendored as C source
 - A POSIX system (macOS or Linux)
 
-TLS is built in by default (BearSSL, fetched into `vendor/bearssl/` — same
-untracked-vendor pattern as QuickJS). Disable with: `zig build -Dbearssl=false`
+TLS is built in by default (BearSSL, fetched into `vendor/bearssl/`). Disable
+with: `zig build -Dbearssl=false`
 
 ```sh
 git clone <repo>
@@ -528,12 +957,19 @@ zig build
 # Look for: "[allocs] req id=N: balanced=true" after each request
 ```
 
+**Docker:**
+
+```sh
+docker build -t fairyfly .
+docker run --rm -p 3000:3000 fairyfly ff examples/hello.js
+```
+
 Run the benchmark suite:
 
 ```sh
 make build
 ./wrk.sh                 # HTTP server comparison (node/bun/deno/fairyfly)
-./bench/run-bench.sh     # JS microbenchmarks (fib, sort, json, …)
+./bench/run-bench.sh     # JS microbenchmarks (fib, sort, json, ...)
 ```
 
 ---
@@ -546,18 +982,41 @@ ff -e <code>             Run inline JavaScript code
 ff init [<dir>]          Write ff.json in <dir> (default: cwd)
 ff start [--cert cert.pem --key key.pem]
                          Run ff.json's "main" (TLS enabled with cert+key)
+ff imprint [pkg[@ver] ...]
+                         Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
+ff sever [pkg ...] [--force]
+                         Remove dep(s), prune orphans
 ff bench                 Run JS microbenchmarks
+ff --version             Print runtime version
 ```
 
 Environment variables:
+
 - `FF_ECHO=1` — run the server in echo mode (returns canned response)
 - `FF_CERT` / `FF_KEY` — TLS cert/key paths (same as `--cert/--key`)
 - `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
 
 ---
+
+## Limitations vs Node / browser
+
+- No `require()`, no CommonJS
+- No `node_modules` resolution
+- No `Buffer` (use `ArrayBuffer` / `Uint8Array`)
+- HTTP/1.1 only
+- No browser DOM
+- TLS 1.2 only (BearSSL does not implement TLS 1.3)
+- Response bodies buffered (64 KB cap per response); request bodies <= ~4 KB
+- Max 128 concurrent timers
+- Max 512 concurrent HTTP connections
+- Max 64 concurrent outbound TLS connections
+
+---
+
 ## License
 
 MPL-2.0 (Mozilla Public License Version 2.0). See [LICENSE](LICENSE).
+
 ---
 
 ## Acknowledgments
