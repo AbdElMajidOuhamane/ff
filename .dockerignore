@@ -7,3 +7,4 @@ bench
 *.md
 vendor/quickjs
 vendor/bearssl
+vendor/sqlite

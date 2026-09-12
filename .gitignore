@@ -8,3 +8,4 @@ bench
 examples
 vendor/bearssl 
 tests
+vendor/sqlite
