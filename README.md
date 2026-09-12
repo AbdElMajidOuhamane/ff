@@ -1,4 +1,7 @@
+![Fairyfly logo](assets/ff.png)
+
 # Fairyfly Runtime
+
 
 A lightweight, backend-focused JavaScript runtime built with Zig and powered by
 [QuickJS](https://bellard.org/quickjs/). Designed for fast startup, low memory,
@@ -65,17 +68,15 @@ runtime that's small, fast, and auditable, Fairyfly fits.
 
 ```sh
 # Build (one-time)
-make build
+make install
 
-# Run a JavaScript file
-./zig-out/bin/ff examples/hello.js
 
 # Run inline code
-./zig-out/bin/ff -e 'console.log("hello from fairyfly")'
+ff -e 'console.log("hello from fairyfly")'
 
 # Initialize a project (writes ff.json)
-./zig-out/bin/ff init myapp
-cd myapp && ../zig-out/bin/ff start
+f init
+ff start
 ```
 
 ---
@@ -128,7 +129,7 @@ console.log("hello, world!");
 Run:
 
 ```sh
-$ ./zig-out/bin/ff hello.js
+$ ff hello.js
 hello, world!
 ```
 
@@ -945,31 +946,27 @@ with: `zig build -Dbearssl=false`
 ```sh
 git clone <repo>
 cd fairyfly
+<<<<<<< HEAD
 make install         # ReleaseFast build
 ff examples/hello.js
+=======
+make install         # ReleaseFast build and install
+
+>>>>>>> 746ad0e (update README content)
 ```
 
-Debug build (with allocation balance assertions):
 
-```sh
-zig build
-./zig-out/bin/ff examples/hello.js
-# Look for: "[allocs] req id=N: balanced=true" after each request
-```
 
 **Docker:**
 
 ```sh
 docker build -t fairyfly .
+<<<<<<< HEAD
+=======
+
+>>>>>>> 746ad0e (update README content)
 ```
 
-Run the benchmark suite:
-
-```sh
-make build
-./wrk.sh                 # HTTP server comparison (node/bun/deno/fairyfly)
-./bench/run-bench.sh     # JS microbenchmarks (fib, sort, json, ...)
-```
 
 ---
 
@@ -985,6 +982,10 @@ ff imprint [pkg[@ver] ...]
                          Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
+<<<<<<< HEAD
+=======
+
+>>>>>>> 746ad0e (update README content)
 ff --version             Print runtime version
 ```
 
