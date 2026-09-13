@@ -52,6 +52,20 @@ fn readFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
     };
     defer gpa.free(content);
 
+    // COMPAT: default string (restores server), opt-in binary for images.
+    // fs.readFile(path) / fs.readFile(path, "utf8") -> string (old behavior)
+    // fs.readFile(path, "buffer" | "binary") -> ArrayBuffer (PNG fix)
+    if (argc >= 2 and c.isString(argv[1]) != 0) {
+        var mode_len: usize = 0;
+        const mode_ptr = c.toCStringLen(ctx, &mode_len, argv[1]) orelse return c.JS_UNDEFINED;
+        defer c.freeCString(ctx, mode_ptr);
+        const mode = mode_ptr[0..mode_len];
+        if (std.mem.eql(u8, mode, "buffer") or std.mem.eql(u8, mode, "binary")) {
+            if (content.len == 0) return c.newArrayBufferCopy(ctx, "", 0);
+            return c.newArrayBufferCopy(ctx, content.ptr, content.len);
+        }
+    }
+    if (content.len == 0) return c.newStringLen(ctx, "", 0);
     return c.newStringLen(ctx, content.ptr, content.len);
 }
 

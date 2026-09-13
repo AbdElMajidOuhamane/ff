@@ -115,11 +115,6 @@ pub const ResponseData = struct {
         self.storeString("OK", &self.status_text);
         return self;
     }
-    /// F1: take ownership of an already-built HeadersData (e.g. the fetch
-    /// slot's parsed headers) instead of creating + immediately releasing
-    /// one. Saves 1 create + 1 release + 1 pool append per fetch.
-    /// NOTE: no default "OK" status text is stored — every caller sets the
-    /// status text explicitly, so it would be dead pool bytes.
     pub fn initWithHeaders(h: *headers_mod.HeadersData) ResponseData {
         return ResponseData{
             .pool = std.ArrayList(u8).empty,
@@ -238,7 +233,6 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     if (c.isObject(init_val) == 0) return;
     if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
         const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
-        // F5: single growth for the copy loop — no per-header growth.
         target.reserveEntries(src.len());
         for (0..src.len()) |i| {
             const p = src.getPair(i);
@@ -510,6 +504,7 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
+// ===== THIS IS THE ONLY FUNCTION THAT CHANGED =====
 fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var body_buf: [512]u8 = undefined;
@@ -518,9 +513,33 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     data.* = ResponseData.init();
 
     if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {
-        if (extractStringAuto(ctx, argv[0], &body_buf)) |owned| {
-            defer owned.deinit();
-            data.setBody(owned.slice);
+        const body_val = argv[0];
+        if (c.isObject(body_val) != 0) {
+            var ab_size: usize = 0;
+            if (c.getArrayBuffer(ctx, &ab_size, body_val)) |ab_ptr| {
+                const bytes: []const u8 = if (ab_size == 0) "" else ab_ptr[0..ab_size];
+                const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
+                data.setBodyOwned(owned);
+            } else {
+                if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                var u8_size: usize = 0;
+                if (c.getUint8Array(ctx, &u8_size, body_val)) |u8_ptr| {
+                    const bytes: []const u8 = if (u8_size == 0) "" else u8_ptr[0..u8_size];
+                    const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
+                    data.setBodyOwned(owned);
+                } else {
+                    if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                    if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
+                        defer owned.deinit();
+                        data.setBody(owned.slice);
+                    }
+                }
+            }
+        } else {
+            if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
+                defer owned.deinit();
+                data.setBody(owned.slice);
+            }
         }
     }
     if (argc > 1 and c.isObject(argv[1]) != 0) {
