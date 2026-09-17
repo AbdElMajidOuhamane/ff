@@ -145,13 +145,21 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
         return null;
     };
     defer gpa.free(src);
+    // QuickJS requires input[input_len] == '\0' (quickjs.h:1034).
+    // readFile returns a non-sentinel buffer, so dupeZ it — same
+    // pattern as start.zig uses for the entry file.
+    const src_z = gpa.dupeZ(u8, src) catch {
+        _ = qjs.throwReferenceError(ctx, "out of memory loading module '%s'", name.ptr);
+        return null;
+    };
+    defer gpa.free(src_z);
     std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
         name,
         src.len,
         if (src.len >= 16) src[0..16] else src,
         if (src.len >= 16) src[src.len - 16 ..] else src,
     });
-    const func_val = qjs.eval(ctx, src.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
+    const func_val = qjs.eval(ctx, src_z.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     if (qjs.isException(func_val) != 0) return null;
     const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
     const meta = qjs.getImportMeta(ctx, m);

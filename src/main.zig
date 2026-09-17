@@ -64,7 +64,15 @@ pub fn main(init: std.process.Init) !void {
     };
     const cmd = parseCommand(first_arg);
     switch (cmd) {
-        .init => try init_cmd.run(init.io),
+        .init => {
+            var gpa_state = std.heap.DebugAllocator(.{}).init;
+            defer _ = gpa_state.deinit();
+            const gpa = gpa_state.allocator();
+            var rest = std.ArrayList([]const u8).empty;
+            defer rest.deinit(gpa);
+            while (args_iter.next()) |a| try rest.append(gpa, a);
+            try init_cmd.run(init.io, rest.items);
+        },
         .imprint => {
             var gpa_state = std.heap.DebugAllocator(.{}).init;
             defer _ = gpa_state.deinit();
@@ -127,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
 }
 fn printUsage() void {
     std.debug.print("Usage:", .{});
-    std.debug.print("  ff init              Initialize a new project", .{});
+    std.debug.print("  ff init [-y|--yes] [<dir>]  Initialize a new project", .{});
     std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM", .{});
     std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s), prune orphans; no args clears all (confirms)", .{});
     std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project (https/wss with cert+key)", .{});
