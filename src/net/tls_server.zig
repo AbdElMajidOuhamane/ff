@@ -29,6 +29,9 @@ var g_nchains: usize = 0;
 var g_skey: bssl.br_skey_decoder_context = undefined; // outlives get_ec/get_rsa pointers
 var g_is_ec: bool = false;
 var g_ready = false;
+// ALPN protocol list: static lifetime required — BearSSL stores the pointer,
+// not a copy, and reads it during the handshake long after slotInit returns.
+var g_alpn_ptrs: [2]?[*:0]const u8 = .{ "h2", "http/1.1" };
 
 // ── PEM plumbing (pure Zig) ─────────────────────────────────────────
 
@@ -181,6 +184,8 @@ pub fn slotInit(ctx: *Ctx, iobuf: []u8) void {
         );
     }
     bssl.br_ssl_engine_set_buffer(&ctx.eng, @ptrCast(iobuf.ptr), iobuf.len, 1);
+    // ALPN: advertise h2 first (server preference order), http/1.1 fallback.
+    bssl.br_ssl_engine_set_protocol_names(@ptrCast(&ctx.eng), @ptrCast(&g_alpn_ptrs), 2);
     _ = bssl.br_ssl_server_reset(ctx);
 }
 
@@ -239,7 +244,11 @@ pub fn sendAppFeed(ctx: *Ctx, src: []const u8) usize {
 }
 
 pub fn flush(ctx: *Ctx) void {
-    bssl.br_ssl_engine_flush(&ctx.eng, 0);
+    // DEBUG FIX CANDIDATE: force=1 always emits a TLS record, even partial.
+    // force=0 (previous) only flushes when BearSSL deems a record complete —
+    // small H2 responses (SETTINGS+ACK+HEADERS ≈ 200 B) may sit buffered
+    // forever, with out_armed=true and no completion ever firing.
+    bssl.br_ssl_engine_flush(&ctx.eng, 1);
 }
 
 pub fn shutdown(ctx: *Ctx) void {
@@ -248,4 +257,11 @@ pub fn shutdown(ctx: *Ctx) void {
 
 pub fn lastError(ctx: *Ctx) c_int {
     return bssl.br_ssl_engine_last_error(&ctx.eng);
+}
+
+/// Negotiated ALPN protocol after the TLS handshake ("h2", "http/1.1"),
+/// or null if the client sent no ALPN extension / no match.
+pub fn selectedAlpn(ctx: *Ctx) ?[]const u8 {
+    const p = bssl.br_ssl_engine_get_selected_protocol(&ctx.eng) orelse return null;
+    return std.mem.span(p);
 }

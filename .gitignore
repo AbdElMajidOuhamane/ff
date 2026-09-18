@@ -9,3 +9,4 @@ examples
 vendor/bearssl 
 tests
 vendor/sqlite
+vendor/nghttp2

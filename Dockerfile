@@ -8,6 +8,8 @@ ARG BEARSSL_VERSION=0.6
 ARG BEARSSL_SHA256=6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14
 ARG SQLITE_VERSION=3.53.4
 ARG SQLITE_YEAR=2026
+ARG NGHTTP2_VERSION=1.70.0
+ARG NGHTTP2_SHA256=
 ARG TARGETARCH
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates xz-utils unzip && rm -rf /var/lib/apt/lists/*
@@ -41,6 +43,14 @@ RUN SQLITE_ENC=$(echo ${SQLITE_VERSION} | awk -F. '{if (NF==4) printf "%d%02d%02
   && cp /tmp/sqlite-src/sqlite-amalgamation-*/sqlite3.h vendor/sqlite/ \
   && printf '#ifndef FF_SQLITE_BRIDGE_H\n#define FF_SQLITE_BRIDGE_H\n\n#include "sqlite3.h"\n\n#endif\n' > vendor/sqlite/zig_bridge.h \
   && rm -rf /tmp/sqlite-src /tmp/sqlite.zip
+RUN curl -fsSL -o /tmp/nghttp2.tar.gz "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz" \
+  && if [ -n "${NGHTTP2_SHA256}" ]; then echo "${NGHTTP2_SHA256}  /tmp/nghttp2.tar.gz" | sha256sum -c -; fi \
+  && rm -rf vendor/nghttp2 \
+  && mkdir -p /tmp/nghttp2-src vendor/nghttp2/lib vendor/nghttp2/includes \
+  && tar -xzf /tmp/nghttp2.tar.gz -C /tmp/nghttp2-src --strip-components=1 \
+  && cp /tmp/nghttp2-src/lib/*.c /tmp/nghttp2-src/lib/*.h vendor/nghttp2/lib/ \
+  && cp -r /tmp/nghttp2-src/lib/includes/nghttp2 vendor/nghttp2/includes/ \
+  && rm -rf /tmp/nghttp2-src /tmp/nghttp2.tar.gz
 RUN case "${TARGETARCH}" in \
       arm64) ZT=aarch64-linux-musl ;; \
       *)     ZT=x86_64-linux-musl ;; \

@@ -8,6 +8,7 @@ const api_ws = @import("../api/websocket.zig");
 const builtin = @import("builtin");
 const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
+const http2_mod = @import("http2_server.zig");
 const response_mod = @import("../types/response.zig"); 
 const headers_mod = @import("../types/headers.zig"); 
 const gpa = std.heap.smp_allocator; 
@@ -21,7 +22,7 @@ const gpa = std.heap.smp_allocator;
 
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 4096;
-const WRITE_BUF_SIZE = 16384;
+pub const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
 
 const ConnState = enum(u8) { idle, reading, writing, closing };
@@ -34,8 +35,11 @@ const ConnFlags = packed struct(u16) {
     ws_pending_open: bool = false,
     tls: bool = false,
     tls_close_after_write: bool = false,
-    handler_parked: bool = false,  
-    _pad: u7 = 0,                   
+    handler_parked: bool = false,
+    h2_active: bool = false,
+    h2_checked: bool = false,
+    tls_read_armed: bool = false,
+    _pad: u4 = 0,
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
@@ -48,15 +52,15 @@ comptime {
 }
 const assert = std.debug.assert;
 
-const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
-var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
+pub const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
+pub var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
 var cflags: [MAX_CONN]ConnFlags = [_]ConnFlags{.{}} ** MAX_CONN;
 
-var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
-var write_offsets: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+pub var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+pub var write_offsets: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var methods: [MAX_CONN]Method = [_]Method{.none} ** MAX_CONN;
 var read_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
-var write_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
+pub var write_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
 var close_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
 var hdr_scan_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var fds: [MAX_CONN]xev.TCP = undefined;
@@ -80,7 +84,7 @@ inline fn wsSetPartialBinary(id: usize, is_bin: bool) void {
 var ws_sockets: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
 var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var read_bufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
-var write_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
+pub var write_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
 
 var ws_partial: [MAX_CONN][ws.WS_MSG_SIZE]u8 = undefined;
 
@@ -101,7 +105,7 @@ var tls_iobufs: [MAX_CONN][tls_mod.IOBUF_LEN]u8 = undefined;
 var tls_active: bool = false; // runtime switch (cert/key given), set before accept starts
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = 0;
-var slot_ids: [MAX_CONN]u16 = undefined;
+pub var slot_ids: [MAX_CONN]u16 = undefined;
 
 // ── Parked async handlers (one flat column per slot) ── // NEW
 // Generation counter guards late promise reactions against slot reuse.
@@ -242,7 +246,7 @@ fn findHeaderEnd(h: []const u8, from: usize) ?usize {
     }
     return null;
 }
-fn classifyMethod(s: []const u8) Method {
+pub fn classifyMethod(s: []const u8) Method {
     if (s.len == 3) {
         if (s[0] == 'G' and s[1] == 'E' and s[2] == 'T') return .get;
         if (s[0] == 'P' and s[1] == 'U' and s[2] == 'T') return .put;
@@ -361,6 +365,11 @@ fn formatResponseHeader(w: []u8, status: u16, content_length: ?usize, keep_alive
     return pos;
 }
 fn buildResponse(id: usize, status: u16, body: []const u8) void {
+    if (cflags[id].h2_active) {
+        // H2 has no reason phrases: status-only response, body dropped.
+        http2_mod.respondErrorH2(id, status);
+        return;
+    }
     const suppress = !wantsBodyBytes(id, status);
     const cl: ?usize = if (status == 204 or status == 304) null else body.len;
     const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
@@ -382,9 +391,11 @@ pub fn enableTls() void {
 
 fn armRead(id: usize, l: *xev.Loop) void {
     if (tls_on and cflags[id].tls) {
+        if (cflags[id].tls_read_armed) return; // already pending — prevent libxev double-push
         const sp = tls_mod.recvRecSpace(&tls_ctxs[id]);
         if (sp.len == 0) return;
         states[id] = .reading;
+        cflags[id].tls_read_armed = true;
         fds[id].read(l, &read_comps[id], .{ .slice = sp }, u16, &slot_ids[id], readCb);
         return;
     }
@@ -392,7 +403,7 @@ fn armRead(id: usize, l: *xev.Loop) void {
     fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
 }
 
-fn armWrite(id: usize, l: *xev.Loop) void {
+pub fn armWrite(id: usize, l: *xev.Loop) void {
     if (tls_on and cflags[id].tls) {
         var fed: usize = 0;
         while (write_lens[id] > fed) {
@@ -420,9 +431,11 @@ fn armWrite(id: usize, l: *xev.Loop) void {
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
 }
 
-/// Drive the BearSSL engine. br_ssl_engine_current_state() returns a BITMASK
-/// (flags combine; verified in bearssl_ssl.h), so check every applicable flag
-/// each pass, in BearSSL's documented priority: SENDREC > RECVAPP > SENDAPP > RECVREC.
+/// Drive the BearSSL engine. br_ssl_engine_current_state() returns a
+/// COMBINATION of bitmask flags (bearssl_ssl.h: BR_SSL_CLOSED=0x0001,
+/// SENDREC=0x0002, RECVREC=0x0004, SENDAPP=0x0008, RECVAPP=0x0010), so
+/// dispatch with & (like BearSSL's own run_until in ssl_io.c), never ==.
+/// Priority per pass: SENDREC > RECVAPP > SENDAPP > RECVREC.
 /// Called from readCb (after recvRecAck) and from writeCb (after ciphertext drained).
 fn tlsPump(id: usize, l: *xev.Loop) void {
     var spins: u8 = 0;
@@ -441,6 +454,17 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
             }
         }
         if (st & tls_mod.ST_RECVAPP != 0) {
+            // One-time ALPN check on first decrypted data: "h2" diverts
+            // this slot to nghttp2; anything else stays HTTP/1.1.
+            if (!cflags[id].h2_checked) {
+                cflags[id].h2_checked = true;
+                if (tls_mod.selectedAlpn(&tls_ctxs[id])) |proto| {
+                    if (std.mem.eql(u8, proto, "h2")) {
+                        cflags[id].h2_active = true;
+                        _ = http2_mod.initSession(id);
+                    }
+                }
+            }
             const app = tls_mod.recvAppReady(&tls_ctxs[id]);
             if (app.len > 0) {
                 if (buf_lens[id] + app.len > READ_BUF_SIZE) {
@@ -453,17 +477,31 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
                 continue;
             }
         }
-        if (st & tls_mod.ST_SENDAPP != 0 and write_lens[id] > 0) {
-            armWrite(id, l);
-            return;
-        }
-        if (st & tls_mod.ST_RECVREC != 0 and tls_mod.recvRecSpace(&tls_ctxs[id]).len > 0) {
-            if (buf_lens[id] > 0) {
-                processPlaintext(id, l);
+        if (st & tls_mod.ST_SENDAPP != 0) {
+            if (write_lens[id] > 0) {
+                armWrite(id, l);
                 return;
             }
-            if (cflags[id].ws_open) armReadId(id, l) else armRead(id, l);
-            return;
+            // Nothing staged: keep the read side armed so the peer's next
+            // records (handshake or app data) can arrive.
+            if (tls_mod.recvRecSpace(&tls_ctxs[id]).len > 0) {
+                if (buf_lens[id] > 0) {
+                    processPlaintext(id, l);
+                    return;
+                }
+                if (cflags[id].ws_open) armReadId(id, l) else armRead(id, l);
+                return;
+            }
+        }
+        if (st & tls_mod.ST_RECVREC != 0) {
+            if (tls_mod.recvRecSpace(&tls_ctxs[id]).len > 0) {
+                if (buf_lens[id] > 0) {
+                    processPlaintext(id, l);
+                    return;
+                }
+                if (cflags[id].ws_open) armReadId(id, l) else armRead(id, l);
+                return;
+            }
         }
         return;
     }
@@ -535,6 +573,10 @@ fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen:
 // property lookups), plain objects via properties (back-compat). User
 // headers serialize straight into write_bufs — zero dynamic allocations.
 fn stageHandlerResponse(id: usize, result: c.Value) void {
+    if (cflags[id].h2_active) {
+        http2_mod.respondH2(id, result);
+        return;
+    }
     const ctx = handler_ctx orelse {
         buildResponse(id, 500, "Internal Server Error");
         return;
@@ -647,7 +689,6 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
 }
 
 
-
 /// Claim a parked slot from a reaction's packed magic. Returns null when the
 /// connection was closed or the slot was reused (generation mismatch).
 fn claimParkedSlot(magic: c_int) ?usize {
@@ -671,6 +712,17 @@ fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) 
         buildResponse(id, 500, "Internal Server Error");
     } else {
         stageHandlerResponse(id, val);
+    }
+    // H2: the response was already queued by the stageHandlerResponse /
+    // buildResponse H2 branches above — flush frames and chain pending
+    // multiplexed streams instead of the H1 armWrite path.
+    if (cflags[id].h2_active) {
+        if (g_loop) |l| {
+            http2_mod.completeParkedH2(id, l);
+        } else {
+            closeConn(id);
+        }
+        return c.JS_UNDEFINED;
     }
     if (g_loop) |l| {
         states[id] = .writing;
@@ -734,9 +786,21 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
     parked_since_ms[id] = nowMs();
     return true;
 }
+pub fn isHandlerParked(id: usize) bool {
+    return cflags[id].handler_parked;
+}
+
+/// H2 stream completed (END_STREAM): dispatch unless a handler is parked
+/// (a parked slot leaves the stream complete+undispatched = pending, and
+/// drainPending chains it after the parked promise settles).
+pub fn h2StreamReady(id: usize, stream_id: i32) void {
+    if (cflags[id].handler_parked) return;
+    http2_mod.dispatchRequest(id, stream_id);
+}
+
 // callHandler — removes the dead tag==7 spin; detects promises via
 // the one-time class-id probe; parks pending promises; unwraps settled ones.
-fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
+pub fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     const ctx = handler_ctx orelse {
         buildResponse(id, 500, "");
         return;
@@ -895,7 +959,7 @@ pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..bytes.len], bytes);
     const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, bytes.len);
-    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..bytes.len], buf[ws.MAX_HDR..][0..bytes.len]);
+    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..hlen], buf[ws.MAX_HDR..][0..hlen]);
     write_lens[id] = tail + hlen + bytes.len;
     if (!cflags[id].ws_writing) wsKick(id);
 }
@@ -1046,7 +1110,7 @@ fn wsShutdown(id: usize) void {
     }
     cflags[id].ws_open = false;
     ws_partial_len[id] = 0;
-   wsSetPartialBinary(id, false);
+    wsSetPartialBinary(id, false);
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_writing = false;
 }
@@ -1094,7 +1158,9 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
 }
 
 // CHANGED: clears parked state so a late continuation no-ops.
+
 fn closeConn(id: usize) void {
+    http2_mod.removeSession(id);
     if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
     body_remaining[id] = 0;
     body_source_off[id] = 0;
@@ -1152,6 +1218,12 @@ fn watchdogCb(
         cflags[id].handler_parked = false;
         parked_since_ms[id] = 0;
         buildResponse(id, 504, "Gateway Timeout");
+        if (cflags[id].h2_active) {
+            http2_mod.flushNow(id, l);
+            http2_mod.drainPending(id);
+            http2_mod.flushNow(id, l);
+            continue;
+        }
         states[id] = .writing;
         armWrite(id, l);
     }
@@ -1188,6 +1260,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     body_source_off[id] = 0;
     body_lens[id] = 0;
     cflags[id] = .{ .keep_alive = true, .ws_read_armed = true, .tls = tls_active };
+    http2_mod.resetSlot(id);
     ws_partial_len[id] = 0;
     wsSetPartialBinary(id, false);
     if (tls_on and tls_active) tls_mod.slotInit(&tls_ctxs[id], &tls_iobufs[id]);
@@ -1228,6 +1301,7 @@ fn readCb(
     const raw = ud orelse return .disarm;
     const id: usize = @intCast(raw.*);
     cflags[id].ws_read_armed = false;
+    cflags[id].tls_read_armed = false;
     const n = r catch {
         closeConn(id);
         return .disarm;
@@ -1249,6 +1323,36 @@ fn readCb(
 /// HTTP/WS state machine over bytes in read_bufs[0..buf_lens]
 /// (plaintext for plain HTTP, decrypted app-data when TLS is active).
 fn processPlaintext(id: usize, l: *xev.Loop) void {
+    // HTTP/2 path runs BEFORE the handler_parked early-return so multiplexed
+    // streams keep flowing while one stream's promise is parked.
+    if (cflags[id].h2_active) {
+        const used = http2_mod.onRecv(id, read_bufs[id][0..buf_lens[id]], l);
+        if (used == http2_mod.FATAL) {
+            closeConn(id);
+            return;
+        }
+        const rem = buf_lens[id] - used;
+        if (rem > 0) {
+            @memmove(read_bufs[id][0..rem], read_bufs[id][used..buf_lens[id]]);
+            buf_lens[id] = rem;
+            // Progress made: re-feed immediately. Otherwise (incomplete frame,
+            // nothing consumed) fall through and wait for more bytes.
+            if (used > 0) {
+                processPlaintext(id, l);
+                return;
+            }
+        } else {
+            buf_lens[id] = 0;
+        }
+        states[id] = .reading;
+        // NOTE: never tlsPump() here. pumpWrite (via onRecv's flushNow
+        // above) already armed the write and its ciphertext; a nested pump
+        // would re-write on the same completion (intrusive double-push →
+        // libxev "invalid state in submission queue"). Ciphertext drains
+        // via writeCb; just rearm the read.
+        armRead(id, l);
+        return;
+    }
     if (cflags[id].handler_parked) {
         return;
     }
@@ -1302,6 +1406,10 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
         callHandler(id, &pr, body);
     }
+    if (cflags[id].h2_active) {
+        http2_mod.flushNow(id, l);
+        return;
+    }
     if (!cflags[id].handler_parked) {
         states[id] = .writing;
         armWrite(id, l);
@@ -1339,7 +1447,7 @@ fn keepAliveRearm(id: usize, l: *xev.Loop) void {
     armRead(id, l);
 }
 
-fn writeCb(
+pub fn writeCb(
     ud: ?*u16,
     l: *xev.Loop,
     _: *xev.Completion,
@@ -1353,6 +1461,18 @@ fn writeCb(
         closeConn(id);
         return .disarm;
     };
+
+    if (cflags[id].h2_active) {
+        const tls_ctx_ptr = if (tls_on and cflags[id].tls) &tls_ctxs[id] else null;
+        switch (http2_mod.onWriteComplete(id, written, tcp, l, tls_ctx_ptr)) {
+            .drained => {
+                states[id] = .reading;
+                if (tls_on and cflags[id].tls) tlsPump(id, l) else armRead(id, l);
+            },
+            .more_pending => {},
+        }
+        return .disarm;
+    }
 
     if (tls_on and cflags[id].tls) {
         tls_mod.sendRecAck(&tls_ctxs[id], written);
@@ -1497,7 +1617,7 @@ fn writeCb(
             body_source_off[id] += n;
             body_remaining[id] -= n;
         }
-        if (write_offsets[id] < write_lens[id]) {
+         if (write_offsets[id] < write_lens[id]) {
             tcp.write(
                 l,
                 &write_comps[id],

@@ -8,3 +8,4 @@ bench
 vendor/quickjs
 vendor/bearssl
 vendor/sqlite
+vendor/nghttp2

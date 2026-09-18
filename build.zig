@@ -68,6 +68,58 @@ pub fn build(b: *std.Build) void {
         bssl_lib = lib;
     }
 
+    // ── nghttp2: HTTP/2 framing + HPACK (always compiled in) ──
+    // Bindings are hand-written in src/net/nghttp2_c.zig (explicit extern
+    // declarations). The C sources below provide the link-time symbols.
+    const nghttp2_c_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/nghttp2_c.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const nghttp2_lib = blk: {
+        const io = b.graph.io;
+        var nghttp2_files: std.ArrayList([]const u8) = .empty;
+        var nghttp2_src = std.Io.Dir.cwd().openDir(io, "vendor/nghttp2/lib", .{ .iterate = true }) catch {
+            std.debug.print("error: vendor/nghttp2 missing — vendor nghttp2 v1.70.0 lib/*.c + includes/\n", .{});
+            return;
+        };
+        defer nghttp2_src.close(io);
+        var walker = nghttp2_src.walk(b.allocator) catch unreachable;
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".c")) continue;
+            const rel = b.allocator.dupe(u8, entry.path) catch unreachable;
+            nghttp2_files.append(b.allocator, rel) catch unreachable;
+        }
+        std.mem.sort([]const u8, nghttp2_files.items, {}, struct {
+            fn lt(_: void, a: []const u8, bb: []const u8) bool {
+                return std.mem.order(u8, a, bb) == .lt;
+            }
+        }.lt);
+
+        const lib = b.addLibrary(.{
+            .linkage = .static,
+            .name = "nghttp2",
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        lib.root_module.addIncludePath(b.path("vendor/nghttp2/lib"));
+        lib.root_module.addIncludePath(b.path("vendor/nghttp2/includes"));
+        lib.root_module.addCSourceFiles(.{
+            .root = b.path("vendor/nghttp2/lib"),
+            .files = nghttp2_files.items,
+            .flags = &.{"-std=c99"},
+        });
+        lib.installHeadersDirectory(b.path("vendor/nghttp2/includes"), "", .{});
+        break :blk lib;
+    };
+
     // ── SQLite: translated declarations module + compiled static library ──
     const sqltranslate = b.addTranslateC(.{
         .root_source_file = b.path("vendor/sqlite/zig_bridge.h"),
@@ -129,6 +181,7 @@ pub fn build(b: *std.Build) void {
                 }) },
                 .{ .name = "quickjs_c", .module = c_mod },
                 .{ .name = "sqlite_c", .module = sql_mod },
+                .{ .name = "nghttp2_c", .module = nghttp2_c_mod },
             },
         }),
     });
@@ -142,6 +195,10 @@ pub fn build(b: *std.Build) void {
 
     // Link SQLite static library
     exe.root_module.linkLibrary(sqlite_lib);
+
+    // Link nghttp2 static library (resolves the extern fn symbols
+    // declared in src/net/nghttp2_c.zig)
+    exe.root_module.linkLibrary(nghttp2_lib);
 
     // ── Compile QuickJS C sources ──
     const qjs_flags: []const []const u8 = &.{
