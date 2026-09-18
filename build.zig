@@ -114,7 +114,16 @@ pub fn build(b: *std.Build) void {
         lib.root_module.addCSourceFiles(.{
             .root = b.path("vendor/nghttp2/lib"),
             .files = nghttp2_files.items,
-            .flags = &.{"-std=c99"},
+            .flags = &.{
+                "-std=c99",
+                // No autotools/cmake here, so no generated config.h: tell
+                // nghttp2_net.h directly that the POSIX byte-order headers
+                // exist. Without these, htons/htonl/ntohs/ntohl are
+                // undeclared (hard error on musl; macOS libc declares them
+                // transitively, which is why native builds passed).
+                "-DHAVE_ARPA_INET_H",
+                "-DHAVE_NETINET_IN_H",
+            },
         });
         lib.installHeadersDirectory(b.path("vendor/nghttp2/includes"), "", .{});
         break :blk lib;
