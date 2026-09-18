@@ -7,7 +7,7 @@ const ExportType = types.ExportType;
 const PoolSlice = types.PoolSlice;
 const Allocator = std.mem.Allocator;
 
-// DOD-FIX 7: explicit interface so parse functions don't need to import Module.
+
 pub const Interner = struct {
     allocator: Allocator,
     strings: *std.ArrayList(u8),

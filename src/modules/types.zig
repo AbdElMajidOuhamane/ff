@@ -4,7 +4,7 @@ pub const ImportType = enum {
     namespace,
 };
 
-// DOD-FIX 7: strings are now PoolSlice handles into a Module-owned arena.
+
 pub const Import = struct {
     specifier: PoolSlice,
     local_name: PoolSlice,

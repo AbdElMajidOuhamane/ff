@@ -13,7 +13,6 @@ const http = std.http;
 // intentional: url/method/body/headers are transferred to the worker thread
 // via async_fetch.submit and freed in freeOwned. Do not micro-opt this into
 // stack-only lifetimes — the worker outlives this call frame.
-// Skill rules applied: batch reserve before header loops, single dense
 // HeadersData built in-place, no per-header reallocation, cached RequestData
 // lookup (no repeated getOpaque2 pointer chase).
 

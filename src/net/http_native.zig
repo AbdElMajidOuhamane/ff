@@ -8,9 +8,9 @@ const api_ws = @import("../api/websocket.zig");
 const builtin = @import("builtin");
 const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
-const response_mod = @import("../types/response.zig"); // NEW
-const headers_mod = @import("../types/headers.zig"); // NEW
-const gpa = std.heap.smp_allocator; // ← FIX: heap spill for >64KB bodies (cold path only)
+const response_mod = @import("../types/response.zig"); 
+const headers_mod = @import("../types/headers.zig"); 
+const gpa = std.heap.smp_allocator; 
 
 // F3: the Debug req_counter (CountingAllocator) that used to wrap this
 // file's allocator is deleted. Nothing in this file allocates through it
@@ -34,8 +34,8 @@ const ConnFlags = packed struct(u16) {
     ws_pending_open: bool = false,
     tls: bool = false,
     tls_close_after_write: bool = false,
-    handler_parked: bool = false,   // NEW
-    _pad: u7 = 0,                   // u8 -> u7
+    handler_parked: bool = false,  
+    _pad: u7 = 0,                   
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
@@ -51,7 +51,7 @@ const assert = std.debug.assert;
 const Method = enum(u8) { get, post, put, delete, head, options, patch, none };
 var states: [MAX_CONN]ConnState = [_]ConnState{.idle} ** MAX_CONN;
 var cflags: [MAX_CONN]ConnFlags = [_]ConnFlags{.{}} ** MAX_CONN;
-// DOD-FIX 11: removed unused `read_bytes` column.
+
 var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var write_offsets: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var methods: [MAX_CONN]Method = [_]Method{.none} ** MAX_CONN;
@@ -81,9 +81,9 @@ var ws_sockets: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
 var ws_batch: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var read_bufs: [MAX_CONN][READ_BUF_SIZE]u8 = undefined;
 var write_bufs: [MAX_CONN][WRITE_BUF_SIZE]u8 = undefined;
-// DOD-FIX 4: static per-slot WS partial buffer (no more heap pointer).
+
 var ws_partial: [MAX_CONN][ws.WS_MSG_SIZE]u8 = undefined;
-// DOD-FIX 3: chunked-write state for large response bodies.
+
 var body_remaining: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var body_source_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // body_bufs holds one fully-staged large response body per slot. Static
@@ -91,9 +91,9 @@ var body_source_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // get a 500 (JS body pointers are freed when callHandler returns, so the
 // whole body must be staged before the write pipeline starts).
 const BODY_BUF_SIZE = 64 * 1024;
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // ← FIX: 10 MB gate — matches fs.zig MAX_READ
+const MAX_BODY_SIZE = 10 * 1024 * 1024; //10 MB gate — matches fs.zig MAX_READ
 var body_bufs: [MAX_CONN][BODY_BUF_SIZE]u8 = undefined;
-var body_heap: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN; // ← FIX: heap spill for >64KB
+var body_heap: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN; // heap spill for >64KB
 var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // ── TLS (https/wss): per-slot BearSSL engine + bidirectional iobuf ──
 var tls_ctxs: [MAX_CONN]tls_mod.Ctx = undefined;
@@ -511,7 +511,7 @@ fn printException(ctx: ?*c.Context, exc: c.Value) void {
 // DOD-FIX 3: chunked large-body write helper. The caller has already
 // formatted the header block into write_bufs[id] (write_lens[id] = header
 // length); writeCb drains WRITE_BUF_SIZE chunks from the staged body afterwards.
-// ← FIX: ≤64KB stages into static body_bufs (unchanged fast path);
+// ≤64KB stages into static body_bufs (unchanged fast path);
 // >64KB spills to a per-slot heap buffer (cold path only).
 fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen: usize) void {
     write_lens[id] = header_len;
@@ -575,14 +575,14 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                 var size: usize = 0;
                 const p = c.getArrayBuffer(ctx, &size, body_out_val);
                 if (p != null and size > 0) {
-                    body_bytes = p[0..size];   // was: p.?[0..size]
+                    body_bytes = p[0..size];   
                     has_body = true;
                 }
             }        }
     }
 
     const suppress = !wantsBodyBytes(id, status);
-    if (has_body and !suppress and body_bytes.len > MAX_BODY_SIZE) { // ← FIX: was BODY_BUF_SIZE
+    if (has_body and !suppress and body_bytes.len > MAX_BODY_SIZE) {
         buildResponse(id, 500, "response body too large");
         return;
     }
@@ -611,7 +611,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
             if (std.mem.indexOfAny(u8, p.name, "\r\n") != null or
                 std.mem.indexOfAny(u8, p.value, "\r\n") != null) continue;
             if (std.ascii.eqlIgnoreCase(p.name, "content-type")) seen_ct = true;
-            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break; // budget: drop the rest
+            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break; 
             pushStr(w, &pos, p.name);
             pushStr(w, &pos, ": ");
             pushStr(w, &pos, p.value);
@@ -646,7 +646,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
     }
 }
 
-// NEW: park-and-resume machinery ─────────────────────────────────────
+
 
 /// Claim a parked slot from a reaction's packed magic. Returns null when the
 /// connection was closed or the slot was reused (generation mismatch).
@@ -734,7 +734,7 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
     parked_since_ms[id] = nowMs();
     return true;
 }
-// CHANGED: callHandler — removes the dead tag==7 spin; detects promises via
+// callHandler — removes the dead tag==7 spin; detects promises via
 // the one-time class-id probe; parks pending promises; unwraps settled ones.
 fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     const ctx = handler_ctx orelse {
@@ -1159,7 +1159,7 @@ fn watchdogCb(
     return .disarm;
 }
 
-// CHANGED: bumps generation, resets parked state (cflags reset below also
+// bumps generation, resets parked state (cflags reset below also
 // clears handler_parked).
 fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     const id = freePop() orelse {
@@ -1310,7 +1310,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
     }
 }
 
-// F4: keep-alive re-arm that preserves pipelined bytes. The finished request
+//  keep-alive re-arm that preserves pipelined bytes. The finished request
 // consumed read_bufs[0..req_consumed]; bytes beyond it belong to the next
 // pipelined request and must survive (the old code zeroed buf_lens and
 // re-read from offset 0, silently discarding them). Mirrors the WS leftover
@@ -1406,7 +1406,7 @@ fn writeCb(
             }
             if (cflags[id].keep_alive) {
                 states[id] = .reading;
-                keepAlivePreserve(id); // F4 (TLS: tlsPump re-arms + scans)
+                keepAlivePreserve(id); 
                 tlsPump(id, l);
             } else {
                 closeConn(id);
@@ -1423,7 +1423,7 @@ fn writeCb(
         }
         if (cflags[id].keep_alive) {
             states[id] = .reading;
-            keepAlivePreserve(id); // F4 (TLS: tlsPump re-arms + scans)
+            keepAlivePreserve(id); 
             tlsPump(id, l);
         } else {
             closeConn(id);
@@ -1468,10 +1468,10 @@ fn writeCb(
 
     write_offsets[id] += written;
 
-    // DOD-FIX 3: drain large-body chunks from the staged body with proper offsets.
+    
     if (body_lens[id] > 0) {
         if (write_offsets[id] >= write_lens[id]) {
-            // Current span (header or chunk) fully written; load the next chunk.
+           
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
                 if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
@@ -1481,13 +1481,13 @@ fn writeCb(
                 write_lens[id] = 0;
                 write_offsets[id] = 0;
                 if (cflags[id].keep_alive) {
-                    keepAliveRearm(id, l); // F4
+                    keepAliveRearm(id, l);
                 } else {
                     closeConn(id);
                 }
                 return .disarm;
             }
-            if (body_heap[id]) |hp| { // ← FIX
+            if (body_heap[id]) |hp| {
                 @memcpy(write_bufs[id][0..n], hp[body_source_off[id]..][0..n]);
             } else {
                 @memcpy(write_bufs[id][0..n], body_bufs[id][body_source_off[id]..][0..n]);
@@ -1519,7 +1519,7 @@ fn writeCb(
     write_offsets[id] = 0;
     if (cflags[id].keep_alive) {
         write_lens[id] = 0;
-        keepAliveRearm(id, l); // F4
+        keepAliveRearm(id, l); 
     } else {
         closeConn(id);
     }
@@ -1598,7 +1598,7 @@ pub fn deinit() void {
     g_loop = null;
 }
 
-// CHANGED: one-time probe capturing QuickJS's internal Promise class id so
+// one-time probe capturing QuickJS's internal Promise class id so
 // callHandler detects promises with a single JS_GetClassID call.
 pub fn setupStrings(ctx: ?*c.Context) void {
     if (promise_class_id != 0) return;

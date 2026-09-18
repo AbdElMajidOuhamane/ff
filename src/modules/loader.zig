@@ -13,7 +13,7 @@ pub const Module = struct {
     dir: []const u8,
     imports: std.ArrayList(Import),
     exports: std.ArrayList(Export),
-    // DOD-FIX 7: single arena for all interned identifier strings.
+   
     strings: std.ArrayList(u8),
 
     pub fn init(allocator: Allocator, source: []const u8, path: []const u8, dir: []const u8) Module {
@@ -29,7 +29,7 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module) void {
-        // Imports/exports no longer own per-entry strings; the arena does.
+       
         self.imports.deinit(self.allocator);
         self.exports.deinit(self.allocator);
         self.strings.deinit(self.allocator);
