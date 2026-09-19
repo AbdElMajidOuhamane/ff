@@ -100,5 +100,5 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.deinit();
     }
     _ = runtime.evalModule(source, main_name_z);
-    try runtime.event_loop.run();
+    runtime.event_loop.runWithMicrotasks(runtime.ctx);
 }
