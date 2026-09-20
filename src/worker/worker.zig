@@ -35,7 +35,7 @@ threadlocal var tls_perf_origin: i96 = 0;
 const WorkerData = struct {
     slot: u16,
     module_path: [:0]u8, // owned
-    initial_json: ?[]u8, // owned, options.data serialized on parent thread
+    initial_payload: ?[]u8, // owned, options.data cloned on parent thread
     channel: port_mod.MessagePort, // child end moved to the thread
 };
 
@@ -104,7 +104,11 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
     if (argc >= 2 and qjs.isObject(argv[1]) != 0) {
         const d = qjs.getPropertyStr(ctx, argv[1], "data");
         if (qjs.isUndefined(d) == 0 and qjs.isException(d) == 0) {
-            initial = serialize.stringify(ctx, d) catch null;
+            initial = serialize.stringify(ctx, d) catch {
+                // stringify left "value could not be cloned" pending — propagate.
+                qjs.freeValue(ctx, d);
+                return qjs.JS_EXCEPTION;
+            };
         }
         qjs.freeValue(ctx, d);
     }
@@ -133,7 +137,7 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
         _ = qjs.throwOutOfMemory(ctx);
         return qjs.JS_EXCEPTION;
     };
-    wdata.* = .{ .slot = slot, .module_path = abs, .initial_json = initial, .channel = ch.child };
+    wdata.* = .{ .slot = slot, .module_path = abs, .initial_payload = initial, .channel = ch.child };
 
     slots[slot].thread = std.Thread.spawn(.{ .stack_size = WORKER_STACK }, workerMain, .{wdata}) catch {
         gpa.destroy(wdata);
@@ -166,16 +170,16 @@ fn jsPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
         _ = qjs.throwTypeError(ctx, "postMessage requires an argument");
         return qjs.JS_EXCEPTION;
     }
-    const json = serialize.stringify(ctx, argv[0]) catch {
-        _ = qjs.throwTypeError(ctx, "postMessage argument must be JSON-serializable");
+    const payload = serialize.stringify(ctx, argv[0]) catch {
+        // stringify already threw "value could not be cloned" — propagate.
         return qjs.JS_EXCEPTION;
     };
-    defer gpa.free(json);
+    defer gpa.free(payload);
     var port = slots[slot].port orelse {
         _ = qjs.throwInternalError(ctx, "Worker channel closed");
         return qjs.JS_EXCEPTION;
     };
-    port.sendMessage(json) catch {
+    port.sendMessage(payload) catch {
         _ = qjs.throwInternalError(ctx, "failed to send message to worker");
         return qjs.JS_EXCEPTION;
     };
@@ -301,7 +305,7 @@ fn workerMain(data: *WorkerData) void {
     defer gpa.destroy(data);
     defer gpa.free(data.module_path);
     defer {
-        if (data.initial_json) |b| gpa.free(b);
+        if (data.initial_payload) |b| gpa.free(b);
     }
     defer data.channel.closeAll();
     tls_port = data.channel;
@@ -316,7 +320,7 @@ fn workerMain(data: *WorkerData) void {
     defer qjs.freeContext(ctx);
 
     console_api.setup(ctx);
-    setupWorkerGlobals(ctx, data.initial_json);
+    setupWorkerGlobals(ctx, data.initial_payload);
 
     const src = std.Io.Dir.cwd().readFileAlloc(workerIo(), data.module_path, gpa, .limited(10 * 1024 * 1024)) catch {
         sendErrorToParent("could not read worker module");
@@ -358,7 +362,7 @@ fn sendErrorToParent(msg: []const u8) void {
 // ── Worker-side globals: postMessage / onmessage / self / workerData /
 //    timers (numeric IDs — no Timeout class: class IDs are per-runtime) ──
 
-fn setupWorkerGlobals(ctx: *qjs.Context, initial_json: ?[]u8) void {
+fn setupWorkerGlobals(ctx: *qjs.Context, initial_payload: ?[]u8) void {
     const global = qjs.getGlobalObject(ctx);
     defer qjs.freeValue(ctx, global);
 
@@ -367,7 +371,7 @@ fn setupWorkerGlobals(ctx: *qjs.Context, initial_json: ?[]u8) void {
 
     _ = qjs.definePropertyValueStr(ctx, global, "self", qjs.dupValue(ctx, global), qjs.PROP_C_W_E);
 
-    const wd = if (initial_json) |j| serialize.parse(ctx, j) catch qjs.JS_UNDEFINED else qjs.JS_UNDEFINED;
+    const wd = if (initial_payload) |j| serialize.parse(ctx, j) catch qjs.JS_UNDEFINED else qjs.JS_UNDEFINED;
     _ = qjs.definePropertyValueStr(ctx, global, "workerData", wd, qjs.PROP_C_W_E);
 
     const st = qjs.newCFunction(ctx, wSetTimeout, "setTimeout", 2);
@@ -397,12 +401,12 @@ fn jsWorkerPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, arg
         _ = qjs.throwInternalError(ctx, "postMessage outside worker");
         return qjs.JS_EXCEPTION;
     };
-    const json = serialize.stringify(ctx, argv[0]) catch {
-        _ = qjs.throwTypeError(ctx, "postMessage argument must be JSON-serializable");
+    const payload = serialize.stringify(ctx, argv[0]) catch {
+        // stringify already threw "value could not be cloned" — propagate.
         return qjs.JS_EXCEPTION;
     };
-    defer gpa.free(json);
-    port.sendMessage(json) catch {
+    defer gpa.free(payload);
+    port.sendMessage(payload) catch {
         _ = qjs.throwInternalError(ctx, "failed to send message to parent");
         return qjs.JS_EXCEPTION;
     };
