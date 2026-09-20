@@ -1,4 +1,4 @@
-<img src="assets/ff.png" alt="Fairyfly logo" width="120" />
+<img src="assets/ff.webp" alt="Fairyfly logo" width="120" />
 
 # Fairyfly Runtime
 
@@ -34,6 +34,7 @@ and a small readable codebase.
    - [Crypto](#crypto)
    - [Text encoding](#text-encoding)
    - [Performance timing](#performance-timing)
+   - [Workers](#workers)
    - [Working with modules](#working-with-modules)
 5. [Built-in API reference](#built-in-api-reference)
 6. [Performance](#performance)
@@ -83,19 +84,23 @@ ff start
 
 ## Core concepts
 
-### Single-threaded event loop
+### Event loop + worker threads
 
-Like Node and Bun, Fairyfly runs JavaScript on a single OS thread. Concurrency
-comes from the event loop: when JS code finishes, the loop dispatches pending
-timers, I/O completions, and microtasks.
+Like Node and Bun, Fairyfly runs each JavaScript context on a single OS
+thread. Concurrency comes from the event loop: when JS code finishes, the loop
+dispatches pending timers, I/O completions, and microtasks.
+
+CPU-bound work goes to `Worker` threads (see [Workers](#workers)): each
+worker is an OS thread with its own JS runtime and event loop. Threads share
+no JS state — they communicate by message passing.
 
 ```
 ┌─ JS code runs ─┐    ┌─ pending timer fires ─┐
 │                 │ →  │                         │
 └─────────────────┘    └─ microtask pump ────────┘
-                                ↓
-                    ┌─ I/O completion (kqueue/epoll) ─┐
-                    └─ back to JS code ───────────────┘
+                                 ↓
+                     ┌─ I/O completion (kqueue/epoll) ─┐
+                     └─ back to JS code ───────────────┘
 ```
 
 ### No `process.nextTick`; use `queueMicrotask`
@@ -361,7 +366,7 @@ const html = await fetch("https://example.com").then(r => r.text());
 **Caveats:**
 
 - HTTPS uses the system trust store
-- HTTP/2 not supported (HTTP/1.1 only)
+- Outbound fetch is HTTP/1.1 only (the server accepts HTTP/2 over TLS)
 - Redirects are not followed yet — 3xx responses are returned as-is
 
 ### WebSocket server
@@ -790,6 +795,54 @@ console.log(`Work took ${elapsed.toFixed(2)}ms`);
 This uses `CLOCK_MONOTONIC` — it's not affected by system clock changes and
 is ideal for benchmarking code sections.
 
+### Workers
+
+CPU-bound work runs on `Worker` threads — each worker is an OS thread with
+its own JS runtime and event loop. Threads share no state; they talk through
+message passing with structured clone (same model as Node, Bun, and Deno).
+
+```js
+// main.js
+const w = new Worker("./hash-worker.js", {
+    data: { rounds: 100000 },   // cloned once, visible as workerData
+});
+w.onmessage = (e) => {
+    console.log("hash:", e.data.hex, "in", e.data.ms, "ms");
+    w.terminate();
+};
+w.onerror = (e) => console.error("worker failed:", e.message);
+w.postMessage({ password: "hunter2", salt: "pepper" });
+```
+
+```js
+// hash-worker.js (worker scope: console + timers only — pure JS here)
+const cfg = globalThis.workerData;   // { rounds: 100000 }
+function fnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return ("0000000" + (h >>> 0).toString(16)).slice(-8);
+}
+onmessage = (e) => {
+    const t0 = performance.now();
+    let acc = e.data.password + e.data.salt;
+    for (let i = 0; i < cfg.rounds; i++) acc = fnv1a(acc + i);
+    postMessage({ hex: acc, ms: Math.round(performance.now() - t0) });
+};
+```
+
+**Cloned as-is:** objects, arrays, `Date`, `RegExp`, `Map`/`Set`,
+`ArrayBuffer` (copied), `BigInt`, `undefined` keys, cyclic graphs.
+`Error` objects arrive revived with name/message/stack.
+
+**Rejected with `TypeError`:** functions, `WeakMap`/`WeakSet`, getters.
+
+**Limits:** max 8 workers, 32 MB heap + 1 MB stack each, 4 MB per message.
+Workers exit only via `terminate()`; the process exits once all workers
+are terminated. No nested workers yet.
+
 ### Working with modules
 
 ```js
@@ -846,6 +899,7 @@ console.log(import.meta.url);  // "file:///path/to/module.js"
 | `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (all sync) |
 | `process` | `exit`, `cwd`, `chdir`, `pid`, `platform`, `arch`, `env`, `argv` |
 | `http` | `http.serve(options, handler)` — start an HTTP/HTTPS server |
+| `Worker` | `new Worker(path, {data})`, `postMessage`, `onmessage`, `onerror`, `terminate` — threads with structured clone (max 8) |
 
 ### Response static methods
 
@@ -929,6 +983,8 @@ Fairyfly is:
 - URL objects: one refcounted allocation per URL (components pooled, zero-copy property reads)
 - Module interning: import/export strings interned into single arena
 - Boot arena owns runtime/event-loop/cache, no syscall-per-alloc at startup
+- Worker messaging: one small alloc + memcpy per message, zero
+  per-iteration cost when idle; parent drains per tick, exits at liveCount 0
 
 ---
 
@@ -946,13 +1002,8 @@ with: `zig build -Dbearssl=false`
 ```sh
 git clone <repo>
 cd fairyfly
-<<<<<<< HEAD
-make install         # ReleaseFast build
-ff examples/hello.js
-=======
 make install         # ReleaseFast build and install
-
->>>>>>> 746ad0e (update README content)
+ff examples/hello.js
 ```
 
 
@@ -961,10 +1012,6 @@ make install         # ReleaseFast build and install
 
 ```sh
 docker build -t fairyfly .
-<<<<<<< HEAD
-=======
-
->>>>>>> 746ad0e (update README content)
 ```
 
 
@@ -982,10 +1029,6 @@ ff imprint [pkg[@ver] ...]
                          Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
-<<<<<<< HEAD
-=======
-
->>>>>>> 746ad0e (update README content)
 ff --version             Print runtime version
 ```
 
@@ -1002,13 +1045,15 @@ Environment variables:
 - No `require()`, no CommonJS
 - No `node_modules` resolution
 - No `Buffer` (use `ArrayBuffer` / `Uint8Array`)
-- HTTP/1.1 only
+- HTTP/2 accepted by the server (TLS + ALPN); outbound clients are HTTP/1.1 only
 - No browser DOM
 - TLS 1.2 only (BearSSL does not implement TLS 1.3)
 - Response bodies buffered (64 KB cap per response); request bodies <= ~4 KB
 - Max 128 concurrent timers
 - Max 512 concurrent HTTP connections
 - Max 64 concurrent outbound TLS connections
+- Workers: max 8, 32 MB heap each; worker scope is console + timers
+  (no fs/fetch/crypto yet); no nested workers; 4 MB message cap
 
 ---
 
