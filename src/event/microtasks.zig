@@ -1,5 +1,9 @@
-const c = @import("../c.zig").c; 
+const c = @import("../c.zig").c;
 
-pub fn pumpMicrotasks(isolate: ?* c.Isolate) void {
-    c.v8__Isolate__PerformMicrotaskCheckpoint(@constCast(isolate));
+// Hot microtask drain: zero-alloc batch pump. The loop calls this after
+// every I/O batch, so completions stay contiguous and predictable.
+pub fn pumpMicrotasks(ctx: *c.Context) void {
+    const rt = c.getRuntime(ctx);
+    var pctx: ?*c.Context = undefined;
+    while (c.executePendingJob(rt, &pctx) != 0) {}
 }

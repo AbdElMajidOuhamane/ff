@@ -4,250 +4,200 @@ const c = @import("../c.zig").c;
 const Io = std.Io;
 const Dir = Io.Dir;
 
+const gpa = std.heap.smp_allocator;
+
 const MAX_PATH = 4096;
 const MAX_READ = 10 * 1024 * 1024;
-
-// ============================================================
-// Helpers
-// ============================================================
 
 fn getIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn jsStringToSlice(info: ?*const c.FunctionCallbackInfo, index: c_int) ?[:0]const u8 {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    if (c.v8__FunctionCallbackInfo__Length(info) <= index) return null;
-    const val = c.v8__FunctionCallbackInfo__INDEX(info, index);
-    if (!c.v8__Value__IsString(val)) return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(val, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    var buf: [MAX_PATH]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return std.heap.page_allocator.dupeZ(u8, buf[0..len]) catch null;
+fn jsPathArg(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_int, buf: []u8) ?[]const u8 {
+    if (argc <= index) return null;
+    const val = argv[@intCast(index)];
+    if (c.isString(val) == 0) return null;
+    var str_len: usize = 0;
+    const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return null;
+    defer c.freeCString(ctx, str_ptr);
+    const len = @min(str_len, buf.len);
+    @memcpy(buf[0..len], str_ptr[0..len]);
+    return buf[0..len];
 }
 
-fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__Error(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+fn throwErr(ctx: ?*c.Context, msg: []const u8) void {
+    const msg_val = c.newStringLen(ctx, msg.ptr, msg.len);
+    _ = c.throw(ctx, msg_val);
 }
 
-fn jsBoolArg(info: ?*const c.FunctionCallbackInfo, index: c_int) bool {
-    if (c.v8__FunctionCallbackInfo__Length(info) <= index) return false;
-    const val = c.v8__FunctionCallbackInfo__INDEX(info, index);
-    return c.v8__Value__BooleanValue(val, c.v8__FunctionCallbackInfo__GetIsolate(info));
+fn jsBoolArg(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_int) bool {
+    if (argc <= index) return false;
+    return c.toBool(ctx, argv[@intCast(index)]) != 0;
 }
 
-// ============================================================
-// readFile(path, "utf8")
-// ============================================================
-
-fn readFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+fn readFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
 
     const io = getIo();
     const content = Dir.cwd().readFileAlloc(
         io,
         path,
-        std.heap.page_allocator,
+        gpa,
         .limited(MAX_READ),
     ) catch |err| {
-        throw(isolate, @errorName(err));
-        return;
+        throwErr(ctx, @errorName(err));
+        return c.JS_UNDEFINED;
     };
-    defer std.heap.page_allocator.free(content);
+    defer gpa.free(content);
 
-    const result = c.v8__String__NewFromUtf8(
-        isolate,
-        @ptrCast(content.ptr),
-        0,
-        @intCast(content.len),
-    );
-
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(result));
+    // COMPAT: default string (restores server), opt-in binary for images.
+    // fs.readFile(path) / fs.readFile(path, "utf8") -> string (old behavior)
+    // fs.readFile(path, "buffer" | "binary") -> ArrayBuffer (PNG fix)
+    if (argc >= 2 and c.isString(argv[1]) != 0) {
+        var mode_len: usize = 0;
+        const mode_ptr = c.toCStringLen(ctx, &mode_len, argv[1]) orelse return c.JS_UNDEFINED;
+        defer c.freeCString(ctx, mode_ptr);
+        const mode = mode_ptr[0..mode_len];
+        if (std.mem.eql(u8, mode, "buffer") or std.mem.eql(u8, mode, "binary")) {
+            if (content.len == 0) return c.newArrayBufferCopy(ctx, "", 0);
+            return c.newArrayBufferCopy(ctx, content.ptr, content.len);
+        }
+    }
+    if (content.len == 0) return c.newStringLen(ctx, "", 0);
+    return c.newStringLen(ctx, content.ptr, content.len);
 }
 
-// ============================================================
-// writeFile(path, data)
-// ============================================================
+fn writeFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
 
-fn writeFileCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
-
-    if (c.v8__FunctionCallbackInfo__Length(info) < 2) return;
-    const data_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const data_str = c.v8__Value__ToDetailString(data_val, context);
-    if (data_str == null) return;
-    const data_len: usize = @intCast(c.v8__String__Utf8Length(data_str, isolate));
-    var data_buf: [MAX_READ]u8 = undefined;
-    const data_final = @min(data_len, data_buf.len);
-    _ = c.v8__String__WriteUtf8(data_str, isolate, &data_buf, @intCast(data_final), 0);
+    if (argc < 2) return c.JS_UNDEFINED;
+    const data_val = argv[1];
+    var str_len: usize = 0;
+    const str_ptr = c.toCStringLen(ctx, &str_len, data_val) orelse return c.JS_UNDEFINED;
+    defer c.freeCString(ctx, str_ptr);
+    const data_final = @min(str_len, MAX_READ);
 
     const io = getIo();
     Dir.cwd().writeFile(io, .{
         .sub_path = path,
-        .data = data_buf[0..data_final],
+        .data = str_ptr[0..data_final],
     }) catch |err| {
-        throw(isolate, @errorName(err));
+        throwErr(ctx, @errorName(err));
     };
+    return c.JS_UNDEFINED;
 }
 
-// ============================================================
-// exists(path)
-// ============================================================
-
-fn existsCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+fn existsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_FALSE;
 
     const io = getIo();
     const found = if (Dir.cwd().access(io, path, .{})) true else |_| false;
-
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    const result = if (found) c.v8__True(isolate) else c.v8__False(isolate);
-    c.v8__ReturnValue__Set(ret, @ptrCast(result));
+    return if (found) c.JS_TRUE else c.JS_FALSE;
 }
 
-// ============================================================
-// mkdir(path, recursive?)
-// ============================================================
+fn mkdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
 
-fn mkdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
-
-    const recursive = jsBoolArg(info, 1);
+    const recursive = jsBoolArg(ctx, argc, argv, 1);
     const io = getIo();
 
     if (recursive) {
         Dir.cwd().createDirPath(io, path) catch |err| {
-            throw(isolate, @errorName(err));
+            throwErr(ctx, @errorName(err));
         };
     } else {
         Dir.cwd().createDir(io, path, .default_dir) catch |err| {
-            throw(isolate, @errorName(err));
+            throwErr(ctx, @errorName(err));
         };
     }
+    return c.JS_UNDEFINED;
 }
 
-// ============================================================
-// rm(path, recursive?)
-// ============================================================
+fn rmCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
 
-fn rmCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
-
-    const recursive = jsBoolArg(info, 1);
+    const recursive = jsBoolArg(ctx, argc, argv, 1);
     const io = getIo();
 
     if (recursive) {
         Dir.cwd().deleteTree(io, path) catch |err| {
-            throw(isolate, @errorName(err));
+            throwErr(ctx, @errorName(err));
         };
     } else {
         Dir.cwd().deleteFile(io, path) catch {
             Dir.cwd().deleteDir(io, path) catch |err| {
-                throw(isolate, @errorName(err));
+                throwErr(ctx, @errorName(err));
             };
         };
     }
+    return c.JS_UNDEFINED;
 }
 
-// ============================================================
-// readdir(path)
-// ============================================================
+fn readdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
 
-fn readdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = jsStringToSlice(info, 0) orelse return;
-    defer std.heap.page_allocator.free(path);
+    var path_buf: [MAX_PATH]u8 = undefined;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
 
     const io = getIo();
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
-        throw(isolate, @errorName(err));
-        return;
+        throwErr(ctx, @errorName(err));
+        return c.JS_UNDEFINED;
     };
     defer dir.close(io);
 
     var names = std.ArrayList([:0]const u8).empty;
     defer {
-        for (names.items) |n| std.heap.page_allocator.free(n);
-        names.deinit(std.heap.page_allocator);
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
     }
 
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
-        const name = std.heap.page_allocator.dupeZ(u8, entry.name) catch continue;
-        names.append(std.heap.page_allocator, name) catch continue;
+        const name = gpa.dupeZ(u8, entry.name) catch continue;
+        names.append(gpa, name) catch continue;
     }
 
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const arr = c.v8__Array__New(isolate, @intCast(names.items.len));
-
+    const arr = c.newArray(ctx);
     for (names.items, 0..) |name, i| {
-        const js_name = c.v8__String__NewFromUtf8(isolate, @ptrCast(name.ptr), 0, @intCast(name.len));
-        var out: c.MaybeBool = undefined;
-        c.v8__Object__SetAtIndex(arr, context, @intCast(i), @ptrCast(js_name), &out);
+        const js_name = c.newStringLen(ctx, name.ptr, name.len);
+        _ = c.setPropertyUint32(ctx, arr, @intCast(i), js_name);
     }
-
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-    c.v8__ReturnValue__Set(ret, @ptrCast(arr));
+    return arr;
 }
 
-// ============================================================
-// Registration
-// ============================================================
+pub fn setup(ctx: *c.Context) void {
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+    const fs_obj = c.newObject(ctx);
 
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
+    const readFile_fn = c.newCFunction(ctx, readFileCallback, "readFile", 2);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "readFile", readFile_fn, c.PROP_C_W_E);
 
-    const global = c.v8__Context__Global(context);
-    const fs_obj = c.v8__Object__New(isolate);
-    var out: c.MaybeBool = undefined;
+    const writeFile_fn = c.newCFunction(ctx, writeFileCallback, "writeFile", 2);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "writeFile", writeFile_fn, c.PROP_C_W_E);
 
-    const readFile_fn = c.v8__Function__New__DEFAULT(context, readFileCallback);
-    const readFile_key = c.v8__String__NewFromUtf8(isolate, "readFile", 0, -1);
-    c.v8__Object__Set(fs_obj, context, readFile_key, readFile_fn, &out);
+    const exists_fn = c.newCFunction(ctx, existsCallback, "exists", 1);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "exists", exists_fn, c.PROP_C_W_E);
 
-    const writeFile_fn = c.v8__Function__New__DEFAULT(context, writeFileCallback);
-    const writeFile_key = c.v8__String__NewFromUtf8(isolate, "writeFile", 0, -1);
-    c.v8__Object__Set(fs_obj, context, writeFile_key, writeFile_fn, &out);
+    const mkdir_fn = c.newCFunction(ctx, mkdirCallback, "mkdir", 2);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "mkdir", mkdir_fn, c.PROP_C_W_E);
 
-    const exists_fn = c.v8__Function__New__DEFAULT(context, existsCallback);
-    const exists_key = c.v8__String__NewFromUtf8(isolate, "exists", 0, -1);
-    c.v8__Object__Set(fs_obj, context, exists_key, exists_fn, &out);
+    const rm_fn = c.newCFunction(ctx, rmCallback, "rm", 2);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "rm", rm_fn, c.PROP_C_W_E);
 
-    const mkdir_fn = c.v8__Function__New__DEFAULT(context, mkdirCallback);
-    const mkdir_key = c.v8__String__NewFromUtf8(isolate, "mkdir", 0, -1);
-    c.v8__Object__Set(fs_obj, context, mkdir_key, mkdir_fn, &out);
+    const readdir_fn = c.newCFunction(ctx, readdirCallback, "readdir", 1);
+    _ = c.definePropertyValueStr(ctx, fs_obj, "readdir", readdir_fn, c.PROP_C_W_E);
 
-    const rm_fn = c.v8__Function__New__DEFAULT(context, rmCallback);
-    const rm_key = c.v8__String__NewFromUtf8(isolate, "rm", 0, -1);
-    c.v8__Object__Set(fs_obj, context, rm_key, rm_fn, &out);
-
-    const readdir_fn = c.v8__Function__New__DEFAULT(context, readdirCallback);
-    const readdir_key = c.v8__String__NewFromUtf8(isolate, "readdir", 0, -1);
-    c.v8__Object__Set(fs_obj, context, readdir_key, readdir_fn, &out);
-
-    const fs_key = c.v8__String__NewFromUtf8(isolate, "fs", 0, -1);
-    _ = c.v8__Object__Set(global, context, fs_key, fs_obj, &out);
+    _ = c.definePropertyValueStr(ctx, global, "fs", fs_obj, c.PROP_C_W_E);
 }

@@ -14,3 +14,10 @@ install: build
 
 uninstall:
 	rm -f $(HOME)/.local/bin/ff
+	
+test: build
+	zig build test
+	sh test/run.sh
+
+ci: build
+	sh test/run.sh

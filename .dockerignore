@@ -5,3 +5,7 @@ docs
 tests
 bench
 *.md
+vendor/quickjs
+vendor/bearssl
+vendor/sqlite
+vendor/nghttp2

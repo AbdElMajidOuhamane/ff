@@ -1,99 +1,173 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const http_native = @import("http_native.zig");
+const tls_server = @import("tls_server.zig");
+const tls = @import("tls.zig");
 const engine = @import("../engine/engine.zig");
 const api_ws = @import("../api/websocket.zig");
 
 pub var server_running = std.atomic.Value(bool).init(false);
 
-fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__TypeError(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
+    _ = c.throwTypeError(ctx, "http.serve: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
 }
 
-fn extractIntFromVal(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, default: u16) u16 {
-    _ = isolate;
-    const v = val orelse return default;
-    if (c.v8__Value__IsUndefined(v) or c.v8__Value__IsNull(v)) return default;
-    var out: c.MaybeI32 = undefined;
-    c.v8__Value__Int32Value(v, context, &out);
-    return @intCast(out.value);
+fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
+    var out: i32 = 0;
+    if (c.toInt32(ctx, &out, val) == -1) return default;
+    return @intCast(out);
 }
 
-fn serveCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
+/// Copy a JS string into a page_allocator-owned Zig slice (caller frees).
+fn dupeJsString(ctx: ?*c.Context, val: c.Value) ?[]u8 {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    return std.heap.page_allocator.dupe(u8, cstr[0..std.mem.len(cstr)]) catch null;
+}
 
-    if (c.v8__FunctionCallbackInfo__Length(info) < 2) {
-        throwTypeError(isolate, "http.serve requires (options, handler)");
-        return;
+/// TLS input auto-detection: "-----BEGIN..." is PEM content (returned as-is),
+/// anything else is a file path read from cwd (fresh allocation).
+/// Caller frees the result unless it is the same pointer as `owned`.
+fn resolvePem(owned: []u8) ?[]u8 {
+    if (std.mem.startsWith(u8, owned, "-----BEGIN ")) return owned;
+    const io = tls.client().io;
+    return std.Io.Dir.cwd().readFileAlloc(io, owned, std.heap.page_allocator, .limited(512 * 1024)) catch {
+        std.debug.print("[https] could not read TLS file '{s}'\n", .{owned});
+        return null;
+    };
+}
+
+/// Apply `http.serve({ tls: { cert, key } })`: load the cert chain + key into
+/// the BearSSL server config and arm TLS before the listener starts.
+/// Returns false (with a JS exception thrown) on any failure.
+fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
+    // Cheap probe first so the no-tls path stays allocation-free.
+    const probe = c.getPropertyStr(ctx, opts_val, "tls");
+    if (c.isObject(probe) == 0) return true; // no tls requested — plain http
+    if (!tls_server.available) {
+        throwTypeError(ctx, "built without TLS (rebuild without -Dbearssl=false)");
+        return false;
     }
 
-    const opts_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    var port: u16 = 3000;
-
-    if (c.v8__Value__IsObject(opts_val)) {
-        const port_val = c.v8__Object__Get(@ptrCast(opts_val), context, c.v8__String__NewFromUtf8(isolate, "port", 0, -1));
-        port = extractIntFromVal(isolate, context, port_val, 3000);
-
-        const ws_obj_val = c.v8__Object__Get(@ptrCast(opts_val), context, c.v8__String__NewFromUtf8(isolate, "websocket", 0, -1));
-        if (ws_obj_val != null and c.v8__Value__IsObject(ws_obj_val)) {
-            http_native.ws_enabled = true;
-            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "open", 0, -1))) |v| {
-                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_open);
-            }
-            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "message", 0, -1))) |v| {
-                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_message);
-            }
-            if (c.v8__Object__Get(@ptrCast(ws_obj_val), context, c.v8__String__NewFromUtf8(isolate, "close", 0, -1))) |v| {
-                if (c.v8__Value__IsFunction(v)) c.v8__Global__New(isolate, @ptrCast(v), &http_native.ws_on_close);
-            }
-        }
-    } else if (c.v8__Value__IsNumber(opts_val)) {
-        port = extractIntFromVal(isolate, context, opts_val, 3000);
+    const cert_val = c.getPropertyStr(ctx, probe, "cert");
+    const key_val = c.getPropertyStr(ctx, probe, "key");
+    if (c.isString(cert_val) == 0 or c.isString(key_val) == 0) {
+        throwTypeError(ctx, "tls.cert and tls.key must be strings (PEM content or file path)");
+        return false;
     }
 
-    const handler_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-    if (!c.v8__Value__IsFunction(handler_val)) {
-        throwTypeError(isolate, "http.serve: handler must be a function");
-        return;
-    }
+    const cert_str = dupeJsString(ctx, cert_val) orelse {
+        throwTypeError(ctx, "out of memory reading tls.cert");
+        return false;
+    };
+    defer std.heap.page_allocator.free(cert_str);
+    const key_str = dupeJsString(ctx, key_val) orelse {
+        throwTypeError(ctx, "out of memory reading tls.key");
+        return false;
+    };
+    defer std.heap.page_allocator.free(key_str);
 
-    c.v8__Global__New(isolate, @ptrCast(handler_val), &http_native.handler_fn_global);
-    c.v8__Global__New(isolate, @ptrCast(context), &http_native.handler_context_global);
-    http_native.handler_isolate = isolate;
+    const cert_pem = resolvePem(cert_str) orelse {
+        throwTypeError(ctx, "could not read tls.cert");
+        return false;
+    };
+    defer if (cert_pem.ptr != cert_str.ptr) std.heap.page_allocator.free(cert_pem);
+    const key_pem = resolvePem(key_str) orelse {
+        throwTypeError(ctx, "could not read tls.key");
+        return false;
+    };
+    defer if (key_pem.ptr != key_str.ptr) std.heap.page_allocator.free(key_pem);
 
-    const loop_ptr = engine.getEventLoop() orelse {
-        throwTypeError(isolate, "http.serve: no event loop");
-        return;
+    tls_server.initServer(cert_pem, key_pem) catch |e| {
+        std.debug.print("[https] TLS init failed: {s}\n", .{@errorName(e)});
+        throwTypeError(ctx, "TLS init failed");
+        return false;
     };
 
-    http_native.init(&loop_ptr.loop, port) catch |err| {
+    // Best-effort: when the cert came from a path, also make the runtime's own
+    // fetch/wss client trust it (same as --cert). Process-lifetime by design.
+    // (Skipped for inline PEM content.)
+    if (cert_pem.ptr != cert_str.ptr and tls.ca_file == null) {
+        tls.ca_file = std.heap.page_allocator.dupe(u8, cert_str) catch null;
+    }
+
+    http_native.enableTls();
+    return true;
+}
+
+fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 2) {
+        throwTypeError(ctx, "http.serve requires (options, handler)");
+        return c.JS_EXCEPTION;
+    }
+
+    const opts_val = argv[0];
+    var port: u16 = 3000;
+
+    if (c.isObject(opts_val) != 0) {
+        const port_val = c.getPropertyStr(ctx, opts_val, "port");
+        port = extractIntFromVal(ctx, port_val, 3000);
+
+        const ws_obj_val = c.getPropertyStr(ctx, opts_val, "websocket");
+        if (c.isObject(ws_obj_val) != 0) {
+            http_native.ws_enabled = true;
+            const open_val = c.getPropertyStr(ctx, ws_obj_val, "open");
+            if (c.isFunction(ctx, open_val) != 0) {
+                http_native.ws_on_open = c.dupValue(ctx, open_val);
+            }
+            const msg_val = c.getPropertyStr(ctx, ws_obj_val, "message");
+            if (c.isFunction(ctx, msg_val) != 0) {
+                http_native.ws_on_message = c.dupValue(ctx, msg_val);
+            }
+            const close_val = c.getPropertyStr(ctx, ws_obj_val, "close");
+            if (c.isFunction(ctx, close_val) != 0) {
+                http_native.ws_on_close = c.dupValue(ctx, close_val);
+            }
+        }
+    } else if (c.isNumber(opts_val) != 0) {
+        port = extractIntFromVal(ctx, opts_val, 3000);
+    }
+
+    const handler_val = argv[1];
+    if (c.isFunction(ctx, handler_val) == 0) {
+        throwTypeError(ctx, "handler must be a function");
+        return c.JS_EXCEPTION;
+    }
+
+    http_native.handler_fn = c.dupValue(ctx, handler_val);
+    http_native.handler_ctx = ctx;
+
+    // TLS must be fully configured before the listener starts accepting.
+    if (!loadTlsFromOptions(ctx, opts_val)) {
+        return c.JS_EXCEPTION;
+    }
+
+    const loop_ptr = engine.getEventLoop() orelse {
+        throwTypeError(ctx, "no event loop");
+        return c.JS_EXCEPTION;
+    };
+
+        http_native.init(&loop_ptr.loop, port) catch |err| {
         std.debug.print("[http] FAILED: {}\n", .{err});
-        return;
+        throwTypeError(ctx, "failed to start server (is the port in use?)");
+        return c.JS_EXCEPTION;
     };
 
     server_running.store(true, .release);
 
-    c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
+    return c.JS_UNDEFINED;
 }
 
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
-    http_native.setupStrings(isolate);
-    api_ws.setupStrings(isolate);
+pub fn setup(ctx: ?*c.Context) void {
+    http_native.setupStrings(ctx);
+    api_ws.setup(ctx);
 
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
 
-    const global = c.v8__Context__Global(context);
-    var out: c.MaybeBool = undefined;
-
-    const http_obj = c.v8__Object__New(isolate);
-    const serve_func = c.v8__Function__New__DEFAULT(context, serveCallback);
-    _ = c.v8__Object__Set(http_obj, context, c.v8__String__NewFromUtf8(isolate, "serve", 0, -1), serve_func, &out);
-    _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "http", 0, -1), http_obj, &out);
+    const http_obj = c.newObject(ctx);
+    const serve_func = c.newCFunction(ctx, &serveCallback, "serve", 2);
+    _ = c.definePropertyValueStr(ctx, http_obj, "serve", serve_func, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    _ = c.definePropertyValueStr(ctx, global, "http", http_obj, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

@@ -36,10 +36,7 @@
             .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
             .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
-        .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig?ref=master#c22672f820280ccd17c77d3894e431c49b46061d",
-            .hash = "httpz-0.0.0-PNVzrMPnCAAWJqhMEZR8gDZeg1CQObCEMTEf8zDh-u-j",
-        },
+        
     },
     .paths = .{
         "build.zig",

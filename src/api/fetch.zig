@@ -1,39 +1,68 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const request_mod = @import("../types/request.zig");
+const headers_mod = @import("../types/headers.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const tls = @import("../net/tls.zig");
-
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.smp_allocator;
 const http = std.http;
 
-// ============================================================
-// Helpers
-// ============================================================
+// ── DOD note ──
+// This file is cold submit path (once per fetch() call), NOT the hot drain
+// path (async_fetch.runJob / event-loop pump). Heap ownership here is
+// intentional: url/method/body/headers are transferred to the worker thread
+// via async_fetch.submit and freed in freeOwned. Do not micro-opt this into
+// stack-only lifetimes — the worker outlives this call frame.
+// HeadersData built in-place, no per-header reallocation, cached RequestData
+// lookup (no repeated getOpaque2 pointer chase).
 
-fn throwTypeError(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__TypeError(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
+    return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
 
-fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
-    return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
+const ExtractedStr = struct {
+    slice: []const u8,
+    heap: ?[:0]u8 = null,
+    fn deinit(self: ExtractedStr) void {
+        if (self.heap) |h| gpa.free(h);
+    }
+};
+
+fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
+    const cstr = c.toCString(ctx, val) orelse return null;
+    defer c.freeCString(ctx, cstr);
+    const len = std.mem.len(cstr);
+    if (len == 0) return .{ .slice = "" };
+    if (len <= stack_buf.len) {
+        @memcpy(stack_buf[0..len], cstr[0..len]);
+        return .{ .slice = stack_buf[0..len] };
+    }
+    const heap_buf = gpa.allocSentinel(u8, len, 0) catch return null;
+    @memcpy(heap_buf[0..len], cstr[0..len]);
+    return .{ .slice = heap_buf, .heap = heap_buf };
 }
 
-fn extractStringFromVal(isolate: ?*c.Isolate, val: ?*const c.Value) ?[:0]const u8 {
-    const v = val orelse return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(v, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
-    const buf = gpa.allocSentinel(u8, utf8_len, 0) catch return null;
-    _ = c.v8__String__WriteUtf8(str, isolate, buf.ptr, @intCast(utf8_len), 0);
+// Cold-submit owned-string helper: heap copy is REQUIRED because the
+// result outlives this frame (transferred to async_fetch worker).
+// Empty string returns a static "" sentinel — no alloc.
+fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
+    var stack_buf: [256]u8 = undefined;
+    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
+    if (ex.heap) |h| return h; // heap case: return directly, no second copy
+    if (ex.slice.len == 0) return "";
+    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
+    @memcpy(buf[0..ex.slice.len], ex.slice);
+    buf[ex.slice.len] = 0;
     return buf;
 }
 
-// Packed 64-bit word compare: fold a comptime token (zero-padded on the
-// right, little-endian) so a single unaligned wide load matches it.
+fn extractRequestData(ctx: ?*c.Context, obj: c.Value) ?*request_mod.RequestData {
+    if (c.isObject(obj) == 0) return null;
+    const ptr = c.getOpaque2(ctx, obj, request_mod.request_class_id) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
 fn methodToken(comptime s: []const u8) u64 {
     var buf = [_]u8{ 0 } ** 8;
     @memcpy(buf[0..s.len], s);
@@ -55,198 +84,176 @@ fn parseMethod(method_str: []const u8) http.Method {
     };
 }
 
-fn collectHeadersFromJS(isolate: ?*c.Isolate, context: ?*c.Context, val: ?*const c.Value, list: *std.ArrayList(http.Header)) void {
-    if (val == null) return;
-    if (c.v8__Value__IsUndefined(val) or c.v8__Value__IsNull(val)) return;
-    if (!c.v8__Value__IsObject(val)) return;
-
-    const names_arr = c.v8__Object__GetPropertyNames(@ptrCast(val), context);
-    if (names_arr == null) return;
-    const names_len: usize = @intCast(c.v8__Array__Length(names_arr));
-    var i: usize = 0;
-    while (i < names_len) : (i += 1) {
-        const idx = c.v8__Integer__NewFromUnsigned(isolate, @intCast(i));
-        const name_val = c.v8__Object__Get(@ptrCast(names_arr), context, idx);
-        if (name_val == null) continue;
-        const name_z = extractStringFromVal(isolate, name_val) orelse continue;
-        const prop_val = c.v8__Object__Get(@ptrCast(val), context, name_val);
-        const val_z = extractStringFromVal(isolate, prop_val) orelse {
-            gpa.free(name_z);
-            continue;
-        };
-        list.append(gpa, .{ .name = name_z, .value = val_z }) catch {
-            gpa.free(name_z);
-            gpa.free(val_z);
-        };
-    }
-}
-
-fn extractRequestData(isolate: ?*c.Isolate, context: ?*c.Context, obj: ?*const c.Value) ?*request_mod.RequestData {
-    if (obj == null) return null;
-    if (!c.v8__Value__IsObject(obj)) return null;
-    const data_key = c.v8__String__NewFromUtf8(isolate, "__d", 0, -1);
-    const ext_val = c.v8__Object__Get(@ptrCast(obj), context, data_key);
-    if (ext_val == null or !c.v8__Value__IsExternal(ext_val)) return null;
-    const ptr = c.v8__External__Value(@ptrCast(ext_val));
-    return @ptrCast(@alignCast(ptr));
-}
-
-// ============================================================
-// Main fetch callback — parse args on the v8 thread, spawn a worker,
-// return the (pending) promise immediately.
-// ============================================================
-
-fn fetchCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    var ret: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &ret);
-
-    if (c.v8__FunctionCallbackInfo__Length(info) < 1) {
-        throwTypeError(isolate, "fetch requires a URL string or Request as first argument");
+fn collectHeadersFromJS(
+    ctx: ?*c.Context,
+    val: c.Value,
+    target: *headers_mod.HeadersData,
+) void {
+    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return;
+    if (c.isObject(val) == 0) return;
+    if (c.getOpaque2(ctx, val, headers_mod.headers_class_id)) |ptr| {
+        const src: *headers_mod.HeadersData = @ptrCast(@alignCast(ptr));
+        // Batch reserve: one growth instead of per-header realloc.
+        target.reserve(src.len(), src.names.items.len, src.values.items.len);
+        for (0..src.len()) |i| {
+            const p = src.getPair(i);
+            target.appendEntry(p.name, p.value);
+        }
         return;
     }
-
-    const resolver = c.v8__Promise__Resolver__New(context);
-    if (resolver == null) {
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
-    }
-    const promise = c.v8__Promise__Resolver__GetPromise(resolver);
-
-    const arg0 = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-    var url_str: ?[:0]const u8 = null;
-    var method_override: ?[]const u8 = null;
-    var owned_method: ?[:0]const u8 = null; // only when extractStringFromVal allocated it
-    var extra_headers: ?std.ArrayList(http.Header) = null;
-    var body_payload: ?[:0]const u8 = null;
-
-    defer {
-        if (url_str) |u| gpa.free(u);
-        if (owned_method) |m| gpa.free(m);
-        if (body_payload) |b| gpa.free(b);
-        if (extra_headers) |*h| {
-            for (h.items) |hdr| {
-                gpa.free(hdr.name);
-                gpa.free(hdr.value);
+    var p: [*c]c.PropertyEnum = null;
+    var count: c_uint = 0;
+    if (c.getOwnPropertyNames(ctx, &p, &count, val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        defer c.freePropertyEnum(ctx, p, count);
+        // DOD-FIX: pre-reserve with count hint (avg 16B name / 32B value).
+        target.reserveEntries(count);
+        for (0..count) |idx| {
+            const name_atom = p[idx].atom;
+            const name_val = c.atomToString(ctx, name_atom);
+            defer c.freeValue(ctx, name_val);
+            const prop_val = c.getProperty(ctx, val, name_atom);
+            defer c.freeValue(ctx, prop_val);
+            var nbuf: [128]u8 = undefined;
+            var vbuf: [256]u8 = undefined;
+            const n = extractStringAuto(ctx, name_val, &nbuf);
+            const v = extractStringAuto(ctx, prop_val, &vbuf);
+            if (n) |nn| {
+                defer nn.deinit();
+                if (v) |vv| {
+                    defer vv.deinit();
+                    target.appendEntry(nn.slice, vv.slice);
+                }
             }
-            h.deinit(gpa);
         }
     }
+}
 
-    if (c.v8__Value__IsString(arg0)) {
-        url_str = extractStringFromVal(isolate, arg0);
-    } else if (c.v8__Value__IsObject(arg0)) {
-        const req_data = extractRequestData(isolate, context, arg0);
+fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) {
+        _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
+        return c.JS_EXCEPTION;
+    }
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    const arg0 = argv[0];
+    var url_str: ?[:0]const u8 = null;
+    var method_override: ?[]const u8 = null;
+    var owned_method: ?[:0]const u8 = null;
+    var body_payload: ?[:0]const u8 = null;
+    defer {
+        if (url_str) |u| {
+            if (u.len > 0) gpa.free(u);
+        }
+        if (owned_method) |m| {
+            if (m.len > 0) gpa.free(m);
+        }
+        if (body_payload) |b| {
+            if (b.len > 0) gpa.free(b);
+        }
+    }
+    // DOD-FIX: single getOpaque2 lookup, reused below (was looked up twice).
+    const req_data = extractRequestData(ctx, arg0);
+    if (c.isString(arg0) != 0) {
+        url_str = extractStringFromVal(ctx, arg0);
+    } else if (c.isObject(arg0) != 0) {
         if (req_data) |rd| {
             url_str = gpa.dupeZ(u8, rd.url()) catch null;
             method_override = rd.method();
             body_payload = if (rd.body()) |b| gpa.dupeZ(u8, b) catch null else null;
-            extra_headers = .empty;
-            for (0..rd.headers.len()) |i| {
-                const pair = rd.headers.getPair(i);
-                const n = gpa.dupe(u8, pair.name) catch continue;
-                const v = gpa.dupe(u8, pair.value) catch {
-                    gpa.free(n);
-                    continue;
-                };
-                extra_headers.?.append(gpa, .{ .name = n, .value = v }) catch {
-                    gpa.free(n);
-                    gpa.free(v);
-                };
-            }
         } else {
-            const url_val = c.v8__Object__Get(@ptrCast(arg0), context, c.v8__String__NewFromUtf8(isolate, "url", 0, -1));
-            url_str = extractStringFromVal(isolate, url_val);
+            const url_val = c.getPropertyStr(ctx, arg0, "url");
+            defer c.freeValue(ctx, url_val);
+            url_str = extractStringFromVal(ctx, url_val);
         }
     } else {
-        throwTypeError(isolate, "fetch requires a URL string or Request as first argument");
-        c.v8__ReturnValue__Set(ret, @ptrCast(c.v8__Undefined(isolate)));
-        return;
+        _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
+        return c.JS_EXCEPTION;
     }
 
-    if (c.v8__FunctionCallbackInfo__Length(info) > 1) {
-        const init_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        if (c.v8__Value__IsObject(init_val)) {
-            const method_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "method", 0, -1));
-            if (extractStringFromVal(isolate, method_val)) |m| {
+    // DOD-FIX 5: build a single dense HeadersData in-place.
+    var in_flight_headers = headers_mod.HeadersData.init();
+    errdefer in_flight_headers.deinit();
+
+    // If arg0 is a Request, copy its headers into the in-flight pool.
+    // Batch reserve first: one growth, not per-header.
+    if (req_data) |rd| {
+        in_flight_headers.reserve(rd.headers.len(), rd.headers.names.items.len, rd.headers.values.items.len);
+        for (0..rd.headers.len()) |i| {
+            const pair = rd.headers.getPair(i);
+            in_flight_headers.appendEntry(pair.name, pair.value);
+        }
+    }
+
+    if (argc > 1 and c.isObject(argv[1]) != 0) {
+        const init_val = argv[1];
+        const method_val = c.getPropertyStr(ctx, init_val, "method");
+        defer c.freeValue(ctx, method_val);
+        // Guard undefined/null before alloc (was unconditional alloc).
+        if (c.isUndefined(method_val) == 0 and c.isNull(method_val) == 0) {
+            if (extractStringFromVal(ctx, method_val)) |m| {
                 method_override = m;
                 owned_method = m;
             }
-
-            const headers_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "headers", 0, -1));
-            if (extra_headers == null) {
-                extra_headers = .empty;
-            }
-            collectHeadersFromJS(isolate, context, headers_val, &extra_headers.?);
-
-            const body_val = c.v8__Object__Get(@ptrCast(init_val), context, c.v8__String__NewFromUtf8(isolate, "body", 0, -1));
-            if (body_val != null and !c.v8__Value__IsUndefined(body_val) and !c.v8__Value__IsNull(body_val)) {
-                body_payload = extractStringFromVal(isolate, body_val);
-            }
+        }
+        const headers_val = c.getPropertyStr(ctx, init_val, "headers");
+        defer c.freeValue(ctx, headers_val);
+        collectHeadersFromJS(ctx, headers_val, &in_flight_headers);
+        const body_val = c.getPropertyStr(ctx, init_val, "body");
+        defer c.freeValue(ctx, body_val);
+        if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
+            body_payload = extractStringFromVal(ctx, body_val);
         }
     }
 
     const url = url_str orelse {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid URL")), &out);
-        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-        return;
+        var msg = zigStringToJS(ctx, "Invalid URL");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
     };
-
     var method_str = method_override orelse "GET";
     if (body_payload != null and std.mem.eql(u8, method_str, "GET")) {
         method_str = "POST";
     }
     const method = parseMethod(method_str);
-
     const uri = std.Uri.parse(url) catch {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Invalid URL")), &out);
-        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-        return;
+        var msg = zigStringToJS(ctx, "Invalid URL");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
     };
-
-    // Ownership moves into the pool on success, freed by submit on failure.
-    // Null first so the defer-frees below never double-free.
-    const header_list: std.ArrayList(http.Header) = if (extra_headers) |*h| h.* else .empty;
-    extra_headers = null;
-    const body_copy = body_payload;
-    body_payload = null;
     const url_copy = url;
     url_str = null;
+    const body_copy = body_payload;
+    body_payload = null;
 
-    async_fetch.submit(isolate, @ptrCast(resolver), url_copy, uri, method, header_list, body_copy) catch {
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Promise__Resolver__Reject(resolver, context, @ptrCast(zigStringToV8(isolate, "Failed to start fetch")), &out);
-        c.v8__ReturnValue__Set(ret, @ptrCast(promise));
-        return;
+    // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
+    // heap-allocated HeadersData so async_fetch can hold a stable pointer.
+    // The wrapper is destroyed by runJob once its contents are moved into
+    // the response's HeadersData.
+    const hdr_ptr = gpa.create(headers_mod.HeadersData) catch {
+        var msg = zigStringToJS(ctx, "Out of memory");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
     };
-
-    c.v8__ReturnValue__Set(ret, @ptrCast(promise));
+    hdr_ptr.* = in_flight_headers;
+    async_fetch.submit(ctx, cap[0], cap[1], url_copy, uri, method, hdr_ptr, body_copy) catch {
+        hdr_ptr.release();
+        var msg = zigStringToJS(ctx, "Failed to start fetch");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    };
+    return promise;
 }
-
-// ============================================================
-// Setup / teardown
-// ============================================================
 
 pub fn deinitClient() void {
     async_fetch.deinit();
     tls.deinit();
 }
 
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context) void {
+pub fn setup(ctx: ?*c.Context) void {
     tls.init();
-    async_fetch.init();
-
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
-
-    const global = c.v8__Context__Global(context);
-    var out: c.MaybeBool = undefined;
-
-    const fetch_func = c.v8__Function__New__DEFAULT(context, fetchCallback);
-    const key = c.v8__String__NewFromUtf8(isolate, "fetch", 0, -1);
-    _ = c.v8__Object__Set(global, context, key, fetch_func, &out);
+    async_fetch.init(ctx); // CHANGED: pass ctx so the pump can resolve promises
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+    const fetch_func = c.newCFunction(ctx, &fetchCallback, "fetch", 2);
+    _ = c.definePropertyValueStr(ctx, global, "fetch", fetch_func, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

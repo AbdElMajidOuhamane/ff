@@ -1,7 +1,5 @@
 const std = @import("std");
 const http = std.http;
-const simd = std.simd;
-
 // ============================================================
 // Outbound TLS transport — DOD / SoA connection slot pool.
 //
@@ -10,37 +8,38 @@ const simd = std.simd;
 // single-connection-serial, so one slot is live at a time; the pool is
 // sized for the async-fetch buildout where several requests overlap.
 //
-// SIMD: everything we scan/case-fold ourselves uses vector lanes
-// (@Vector + @select), mirroring types/headers.zig.
+// Note: vectorized scanning/case-folding helpers live where they are used
+// (types/headers.zig: lowerAsciiSimd, net/http_native.zig: findHeaderEnd);
+// this module previously carried unused copies that have been removed.
 // ============================================================
-
+const Io =std.Io;
 pub const MAX_CONN = 64;
-const ConnState = enum(u8) { free, connecting, active, closing };
 
+/// Hard bound on any single socket read/write on pooled connections: a
+/// dead/slow upstream must fail the job (surfacing as a JS rejection via
+/// the existing catch paths) instead of parking a pool worker forever.
+pub const IO_TIMEOUT_SEC: u32 = 30;
+
+const ConnState = enum(u8) { free, connecting, active, closing };
 var states: [MAX_CONN]ConnState = [_]ConnState{.free} ** MAX_CONN;
 var fds: [MAX_CONN]std.posix.fd_t = undefined;
 var tls_active: [MAX_CONN]bool = [_]bool{false} ** MAX_CONN;
-var reuse_gen: [MAX_CONN]u32 = [_]u32{0} ** MAX_CONN;
 var free_list: [MAX_CONN]u16 = undefined;
 var free_count: usize = MAX_CONN;
-
 // Async-fetch buildout: workers call attach/detach from their own threads,
 // so the free-list head is guarded by a tiny spinlock (std.atomic.Mutex).
 var pool_lock: std.atomic.Mutex = .unlocked;
-
 fn poolLock() void {
     while (!pool_lock.tryLock()) std.atomic.spinLoopHint();
 }
 fn poolUnlock() void {
     pool_lock.unlock();
 }
-
 // ---- O(1) slot allocator ----
 fn poolInit() void {
     for (0..MAX_CONN) |i| free_list[i] = @intCast(MAX_CONN - 1 - i);
     free_count = MAX_CONN;
 }
-
 fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
@@ -48,30 +47,27 @@ fn acquireSlot() ?usize {
     states[s] = .connecting;
     return s;
 }
-
 fn releaseSlot(s: usize) void {
     states[s] = .free;
     fds[s] = 0;
+    tls_active[s] = false;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
-
 // ============================================================
 // TLS-capable HTTP client (std-backed, shared singleton)
 // ============================================================
-
-var io_backend: std.Io.Threaded = undefined;
+var io_backend: Io.Threaded = undefined;
 var http_client: http.Client = undefined;
 var client_initialized = false;
+
+/// Optional client CA file (PEM) loaded into the shared HTTP client's CA
+/// bundle at init(). Set by start.zig (--cert) or via FF_CA_FILE/FF_CERT env.
+pub var ca_file: ?[]const u8 = null;
 
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
-    // async_fetch spawns up to 10 concurrent connect+handshake paths through
-    // this io instance. The std default limit is cpus-1 (7 here), which the
-    // connect wave saturates — excess Io.async tasks then run inline on the
-    // calling worker, ~1 RTT of scheduling contention per straggler. Raise it
-    // so every connect+DNS dispatch gets a dedicated pool thread.
     io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
         .async_limit = .limited(64),
     });
@@ -79,78 +75,52 @@ pub fn init() void {
         .allocator = std.heap.page_allocator,
         .io = io_backend.io(),
     };
+    // DO NOT set http_client.now here — leave it null so request()
+    // auto-scans system root certificates on the first HTTPS call.
+    const ca_env: ?[]const u8 = ca_file orelse blk: {
+        const p = std.c.getenv("FF_CA_FILE") orelse std.c.getenv("FF_CERT") orelse break :blk null;
+        break :blk std.mem.span(p);
+    };
+    if (ca_env) |path| {
+        var file = std.Io.Dir.cwd().openFile(http_client.io, path, .{}) catch {
+            std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
+            return;
+        };
+        defer file.close(http_client.io);
+        var file_reader = file.reader(http_client.io, &.{});
+        http_client.ca_bundle.addCertsFromFile(
+            std.heap.page_allocator,
+            &file_reader,
+            0,
+        ) catch |e| {
+            std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
+        };
+    }
     client_initialized = true;
 }
-
 pub fn deinit() void {
     if (!client_initialized) return;
     http_client.deinit();
     io_backend.deinit();
     client_initialized = false;
 }
-
 pub fn client() *http.Client {
     return &http_client;
 }
-
 // ============================================================
-// SIMD hot paths (vector, then scalar tail — headers.zig idiom)
+// Transport tuning
 // ============================================================
-
-/// In-place ASCII uppercase->lowercase. Lanes in 'A'..'Z' get += 0x20.
-pub fn lowerAsciiSimd(buf: []u8) void {
-    const N = simd.suggestVectorLength(u8) orelse 16;
-    const V = @Vector(N, u8);
-    const spl_a: V = @splat('A');
-    const spl_z: V = @splat('Z');
-    const spl_32: V = @splat(0x20);
-    const spl_0: V = @splat(0);
-    var i: usize = 0;
-    const tail = buf.len % N;
-    const main_end = buf.len - tail;
-    while (i < main_end) : (i += N) {
-        var v: V = buf[i..][0..N].*;
-        const upper = (v >= spl_a) & (v <= spl_z);
-        v += @select(u8, upper, spl_32, spl_0);
-        const arr: [N]u8 = v;
-        buf[i..][0..N].* = arr;
-    }
-    while (i < buf.len) : (i += 1) {
-        buf[i] = std.ascii.toLower(buf[i]);
-    }
-}
-
-/// First index of any '\r' or '\n' lane, or null. Single vectorized pass
-/// over the main body — the scan point for future chunked/record-boundary
-/// parsing in the drain path.
-pub fn findCrLf(haystack: []const u8) ?usize {
-    const N = simd.suggestVectorLength(u8) orelse 16;
-    const V = @Vector(N, u8);
-    const spl_cr: V = @splat(0x0D);
-    const spl_lf: V = @splat(0x0A);
-    const M = std.meta.Int(.unsigned, N);
-    var i: usize = 0;
-    const tail = haystack.len % N;
-    const main_end = haystack.len - tail;
-    while (i < main_end) : (i += N) {
-        const v: V = haystack[i..][0..N].*;
-        const bits: M = @bitCast((v == spl_cr) | (v == spl_lf));
-        if (bits != 0) return i + @ctz(bits);
-    }
-    while (i < haystack.len) : (i += 1) {
-        const b = haystack[i];
-        if (b == 0x0D or b == 0x0A) return i;
-    }
-    return null;
-}
-
-// ============================================================
-// Transport tuning (batch over the pool)
-// ============================================================
-
-/// TCP_NODELAY for one fd: std.http never sets it, so each small second
-/// write (TLS Finished record, then the request segment) awaits a
-/// delayed-ACK round trip — up to ~2 RTTs (~90ms) per fresh connection.
+/// Per-connection transport tuning: TCP_NODELAY + bounded idle waits.
+///
+/// NODELAY: std.http never sets it, so each small second write (TLS
+/// Finished record, then the request segment) awaits a delayed-ACK round
+/// trip — up to ~2 RTTs (~90ms) per fresh connection.
+///
+/// RCVTIMEO/SNDTIMEO: without them, any stalled upstream (half-open conn,
+/// throttled host, mid-body stall) blocks a pool worker's read forever —
+/// there is no other deadline in the fetch path. With them, the stalled
+/// op errors after IO_TIMEOUT_SEC and the existing catch paths turn it
+/// into a normal job failure -> JS rejection -> slot recycles.
 pub fn tuneFd(fd: std.posix.fd_t) void {
     const one: c_int = 1;
     std.posix.setsockopt(
@@ -159,16 +129,20 @@ pub fn tuneFd(fd: std.posix.fd_t) void {
         @intCast(std.posix.TCP.NODELAY),
         std.mem.asBytes(&one),
     ) catch {};
+    const tv = std.posix.timeval{ .sec = @intCast(IO_TIMEOUT_SEC), .usec = 0 };
+    std.posix.setsockopt(
+        fd,
+        @intCast(std.posix.SOL.SOCKET),
+        @intCast(std.posix.SO.RCVTIMEO),
+        std.mem.asBytes(&tv),
+    ) catch {};
+    std.posix.setsockopt(
+        fd,
+        @intCast(std.posix.SOL.SOCKET),
+        @intCast(std.posix.SO.SNDTIMEO),
+        std.mem.asBytes(&tv),
+    ) catch {};
 }
-
-/// Apply NODELAY to every live slot (branchless stride over the SoA array).
-/// Called after acquiring slots; hands off straight to std's request.
-pub fn tuneAllLive() void {
-    for (0..MAX_CONN) |s| {
-        if (states[s] == .active) tuneFd(fds[s]);
-    }
-}
-
 /// Register a connection handed back by std.http into the pool: records its
 /// fd + TLS flag so reuse/tuning is data-oriented at fetch time.
 /// Thread-safe (spinlock-guarded) for the async worker buildout.
@@ -182,7 +156,6 @@ pub fn attach(conn: *http.Client.Connection) ?usize {
     tuneFd(fds[s]);
     return s;
 }
-
 pub fn detach(s: usize) void {
     poolLock();
     defer poolUnlock();

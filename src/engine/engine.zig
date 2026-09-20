@@ -1,498 +1,541 @@
 const std = @import("std");
-const c = @import("../c.zig").c;
+const qjs = @import("quickjs_shim.zig");
 const mod = @import("../modules/mod.zig");
 const EventLoop = @import("../event/loop.zig").EventLoop;
+const loop_mod = @import("../event/loop.zig");
 const TimerManager = @import("../event/timers.zig").TimerManager;
 const microtasks = @import("../event/microtasks.zig");
 const console_api = @import("../api/console.zig");
-const fs_api =@import("../api/fs.zig");
+const fs_api = @import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
-const crypto_api=@import("../api/crypto.zig");
+const crypto_api = @import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
-const fetch_api =@import("../api/fetch.zig");
-const header=@import("../types/headers.zig");
-const request= @import("../types/request.zig");
-const response= @import("../types/response.zig");
+const fetch_api = @import("../api/fetch.zig");
+const header = @import("../types/headers.zig");
+const request = @import("../types/request.zig");
+const response = @import("../types/response.zig");
 const http = @import("../net/http.zig");
-const simd = std.simd;
+const websocket_client = @import("../api/websocket_client.zig");
+const http_native = @import("../net/http_native.zig");
+const async_fetch = @import("../net/async_fetch.zig");
+const ws_client = @import("../net/ws_client.zig");
+const text_encoding = @import("../api/text_encoding.zig");
+const formdata = @import("../types/formdata.zig");
+const blob = @import("../types/blob.zig");
+const sqlite_api = @import("../api/sqlite.zig");
+const worker_mod = @import("../worker/worker.zig");
 
+const gpa = std.heap.smp_allocator;
+var boot_arena: std.heap.ArenaAllocator = undefined;
+var boot_inited: bool = false;
 
-const DepEntry = struct { key: [:0]const u8, src: []const u8 };
-const FunctionCallback = *const fn (?*const c.FunctionCallbackInfo) callconv(.c) void;
-
-var g_platform: ?*c.Platform = null;
-var g_runtime: ?*Runtime = null;
-fn initGlobal() void {
-    if (g_platform != null) return;
-    _ = c.unsetenv("NODE_OPTIONS");
-    _ = c.unsetenv("V8_OPTIONS");
-    c.v8__V8__SetFlagsFromString("--turbo-fast-api-calls", 22);
-    const nproc: c_int = @intCast(std.Thread.getCpuCount() catch 4);
-    g_platform = c.v8__Platform__NewDefaultPlatform(nproc, 1);
-    c.v8__V8__InitializePlatform(g_platform);
-    c.v8__V8__Initialize();
-}
 pub fn getEventLoop() ?*EventLoop {
     if (g_runtime) |rt| return rt.event_loop else return null;
 }
 
+pub fn deinitNetwork() void {
+    http_native.deinit();
+}
+
+var g_runtime: ?*Runtime = null;
+
+var timeout_class_id: qjs.ClassID = 0;
+
+// F2: no TimeoutData heap node. The timer slot (u8, max 128) is encoded
+// directly in the opaque pointer as (slot + 1); +1 keeps slot 0 distinct
+// from NULL. Type safety is preserved: getOpaque2 still NULL-guards on the
+// Timeout class id, so a forged integer can never be misread from a
+// non-Timeout object. Zero heap allocation per setTimeout/setInterval and
+// no pointer chase on ref/unref/refresh/hasRef/clear.
+fn slotFromOpaque(ptr: *anyopaque) ?u8 {
+    const v: usize = @intFromPtr(ptr);
+    if (v == 0 or v > 128) return null;
+    return @intCast(v - 1);
+}
+
+fn timeoutFinalizer(rt: ?*qjs.Runtime, val: qjs.Value) callconv(.c) void {
+    _ = rt;
+    _ = val;
+    // No-op: the opaque is a tagged slot index, not a heap pointer.
+}
+
+fn timeoutSlotFromThis(ctx: ?*qjs.Context, this_val: qjs.Value) ?u8 {
+    const data_ptr = qjs.getOpaque2(ctx, this_val, timeout_class_id) orelse return null;
+    return slotFromOpaque(data_ptr);
+}
+
+fn makeTimeout(ctx: ?*qjs.Context, id: usize) ?qjs.Value {
+    const obj = qjs.newObjectClass(ctx, @intCast(timeout_class_id));
+    qjs.setOpaque(obj, @ptrFromInt(id + 1));
+    return obj;
+}
+
+// CHANGED: source-based module detection (replaces buggy JS_DetectModule)
+fn sourceHasModuleSyntax(source: []const u8) bool {
+    var i: usize = 0;
+    while (i < source.len) {
+        const ch = source[i];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == ';' or ch == ',') {
+            i += 1;
+            continue;
+        }
+        if (ch == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') i += 1;
+            continue;
+        }
+        if (ch == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+            if (i + 1 < source.len) i += 2;
+            continue;
+        }
+        if (ch == '-' and i + 1 < source.len and source[i + 1] == '-') {
+            i += 2;
+            while (i < source.len and source[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "import ")) return true;
+        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "export ")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import{")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "export{")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import('")) return true;
+        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import(\"")) return true;
+        return false;
+    }
+    return false;
+}
+
+fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = opaque_;
+    const base = std.mem.span(base_name);
+    const spec = std.mem.span(name);
+    const dir = std.fs.path.dirname(base) orelse ".";
+    const resolved = mod.resolveSpec(gpa, dir, spec) catch return null;
+    defer gpa.free(resolved);
+    const has_ext = std.mem.lastIndexOfScalar(u8, std.fs.path.basename(resolved), '.') != null;
+    var path_z: [:0]u8 = undefined;
+    if (has_ext) {
+        path_z = gpa.allocSentinel(u8, resolved.len, 0) catch return null;
+        @memcpy(path_z[0..resolved.len], resolved);
+    } else {
+        // Extensionless import: try P.js, then P/index.js (directory import).
+        // Fall back to P.js so the loader error names a concrete file.
+        const js_path = std.fmt.allocPrint(gpa, "{s}.js", .{resolved}) catch return null;
+        defer gpa.free(js_path);
+        const idx_path = std.fmt.allocPrint(gpa, "{s}/index.js", .{resolved}) catch return null;
+        defer gpa.free(idx_path);
+        const chosen: []const u8 = if (mod.pathExists(gpa, js_path))
+            js_path
+        else if (mod.pathExists(gpa, idx_path))
+            idx_path
+        else
+            js_path;
+        path_z = gpa.allocSentinel(u8, chosen.len, 0) catch return null;
+        @memcpy(path_z[0..chosen.len], chosen);
+    }
+    defer gpa.free(path_z);
+    return qjs.js_strdup(ctx, path_z.ptr);
+}
+
+fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) ?*qjs.ModuleDef {
+    _ = opaque_;
+    const name = std.mem.span(module_name);
+    const src = mod.readFile(gpa, name) catch {
+        _ = qjs.throwReferenceError(ctx, "could not load module filename '%s'", name.ptr);
+        return null;
+    };
+    defer gpa.free(src);
+    // QuickJS requires input[input_len] == '\0' (quickjs.h:1034).
+    // readFile returns a non-sentinel buffer, so dupeZ it — same
+    // pattern as start.zig uses for the entry file.
+    const src_z = gpa.dupeZ(u8, src) catch {
+        _ = qjs.throwReferenceError(ctx, "out of memory loading module '%s'", name.ptr);
+        return null;
+    };
+    defer gpa.free(src_z);
+    std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
+        name,
+        src.len,
+        if (src.len >= 16) src[0..16] else src,
+        if (src.len >= 16) src[src.len - 16 ..] else src,
+    });
+    const func_val = qjs.eval(ctx, src_z.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
+    if (qjs.isException(func_val) != 0) return null;
+    const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
+    const meta = qjs.getImportMeta(ctx, m);
+    if (qjs.isException(meta) == 0 and qjs.isNull(meta) == 0 and qjs.isUndefined(meta) == 0) {
+        if (std.mem.indexOfScalar(u8, name, ':') == null) {
+            const us = gpa.allocSentinel(u8, name.len + 7, 0) catch null;
+            if (us) |uz| {
+                defer gpa.free(uz);
+                @memcpy(uz[0..7], "file://");
+                @memcpy(uz[7..][0..name.len], name);
+                _ = qjs.definePropertyValueStr(ctx, meta, "url", qjs.newStringLen(ctx, uz.ptr, name.len + 7), qjs.PROP_C_W_E);
+            }
+        }
+    }
+    qjs.freeValue(ctx, meta);
+    qjs.freeValue(ctx, func_val);
+    return m;
+}
+
 pub const Runtime = struct {
-    isolate: ?*c.Isolate,
-    params: c.CreateParams,
-    context: ?*c.Context,
-    module_cache: mod.ModuleCache,
-    modules_initialized: bool,
+    ctx: *qjs.Context,
     event_loop: *EventLoop,
     timer_manager: TimerManager,
 
     pub fn init(args: std.process.Args) !*Runtime {
-        initGlobal();
-        var params: c.CreateParams = undefined;
-        c.v8__Isolate__CreateParams__CONSTRUCT(&params);
-        params.array_buffer_allocator = c.v8__ArrayBuffer__Allocator__NewDefaultAllocator();
+        const rt = qjs.newRuntime() orelse return error.InitFailed;
+        qjs.setMaxStackSize(rt, 1024 * 1024);
+        qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
+        qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
 
-        var constraints: c.ResourceConstraints = undefined;
-        c.v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(&constraints, 0, 256 * 1024 * 1024);
-        params.constraints = constraints;
+        const ctx = qjs.newContext(rt) orelse return error.InitFailed;
 
-        const isolate = c.v8__Isolate__New(&params);
-        c.v8__Isolate__Enter(isolate);
-        var handle_scope: c.HandleScope = undefined;
-        c.v8__HandleScope__CONSTRUCT(&handle_scope, isolate);
+        console_api.setup(ctx);
+        fs_api.setup(ctx);
+        process_api.setup(ctx, args);
+        crypto_api.setup(ctx);
+        url_api.setup(ctx);
+        fetch_api.setup(ctx);
+        header.setup(ctx);
+        blob.setup(ctx);
+        formdata.setup(ctx);
+        request.setup(ctx);
+        response.setup(ctx);
+        http.setup(ctx);
+        websocket_client.setup(ctx);
+        text_encoding.setup(ctx);
+        sqlite_api.setup(ctx);
+        worker_mod.setup(ctx);
+        {
+            var timeout_def = qjs.ClassDef{
+                .class_name = "Timeout",
+                .finalizer = timeoutFinalizer,
+            };
+            _ = qjs.newClassID(qjs.getRuntime(ctx), &timeout_class_id);
+            _ = qjs.newClass(qjs.getRuntime(ctx), timeout_class_id, &timeout_def);
+            const timeout_proto = qjs.newObject(ctx);
+            const unref_fn = qjs.newCFunction(ctx, timeoutUnref, "unref", 0);
+            _ = qjs.definePropertyValueStr(ctx, timeout_proto, "unref", unref_fn, qjs.PROP_C_W_E);
+            const ref_fn = qjs.newCFunction(ctx, timeoutRef, "ref", 0);
+            _ = qjs.definePropertyValueStr(ctx, timeout_proto, "ref", ref_fn, qjs.PROP_C_W_E);
+            const refresh_fn = qjs.newCFunction(ctx, timeoutRefresh, "refresh", 0);
+            _ = qjs.definePropertyValueStr(ctx, timeout_proto, "refresh", refresh_fn, qjs.PROP_C_W_E);
+            const has_ref_fn = qjs.newCFunction(ctx, timeoutHasRef, "hasRef", 0);
+            _ = qjs.definePropertyValueStr(ctx, timeout_proto, "hasRef", has_ref_fn, qjs.PROP_C_W_E);
+            qjs.setClassProto(ctx, timeout_class_id, timeout_proto);
+        }
+        const global = qjs.getGlobalObject(ctx);
+        defer qjs.freeValue(ctx, global);
 
-        const context = c.v8__Context__New(isolate, null, null);
-        c.v8__Context__Enter(context);
+        const setTimeout_func = qjs.newCFunction(ctx, setTimeoutCallback, "setTimeout", 2);
+        const setInterval_func = qjs.newCFunction(ctx, setIntervalCallback, "setInterval", 2);
+        const clearTimeout_func = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
+        const clearInterval_func = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
+        const queue_microtask_func = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1);
 
-        console_api.setup(isolate, context);
-        fs_api.setup(isolate, context);
-        process_api.setup(isolate, context,args);
-        crypto_api.setup(isolate, context);
-        url_api.setup(isolate, context);
-        fetch_api.setup(isolate, context);
+        _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", setTimeout_func, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "setInterval", setInterval_func, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", clearTimeout_func, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "clearInterval", clearInterval_func, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "queueMicrotask", queue_microtask_func, qjs.PROP_C_W_E);
+        setupPerformance(ctx);
 
-        header.setup(isolate, context);
-        request.setup(isolate, context);
-        response.setup(isolate, context);
-        http.setup(isolate, context);
-        const setTimeout_func = c.v8__Function__New__DEFAULT(context, setTimeoutCallback);
-        const setInterval_func = c.v8__Function__New__DEFAULT(context, setIntervalCallback);
-        const clearTimeout_func = c.v8__Function__New__DEFAULT(context, clearTimeoutCallback);
-        const clearInterval_func = c.v8__Function__New__DEFAULT(context, clearIntervalCallback);
-        const global = c.v8__Context__Global(context);
-        var out: c.MaybeBool = undefined;
-        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setTimeout", 0, -1), setTimeout_func, &out);
-        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "setInterval", 0, -1), setInterval_func, &out);
-        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearTimeout", 0, -1), clearTimeout_func, &out);
-        _ = c.v8__Object__Set(global, context, c.v8__String__NewFromUtf8(isolate, "clearInterval", 0, -1), clearInterval_func, &out);
+        if (!boot_inited) {
+            boot_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            boot_inited = true;
+        }
+        const boot = boot_arena.allocator();
 
-        const loop_ptr = try EventLoop.initHeap(std.heap.page_allocator);
+        const loop_ptr = try boot.create(EventLoop);
+        EventLoop.initInto(loop_ptr);
+        async_fetch.setLoop(&loop_ptr.loop);
+        ws_client.setLoop(&loop_ptr.loop);
 
-        const runtime = try std.heap.page_allocator.create(Runtime);
+        const runtime = try boot.create(Runtime);
         runtime.* = .{
-            .isolate = isolate,
-            .params = params,
-            .context = context,
-            .module_cache = mod.ModuleCache.init(std.heap.page_allocator),
-            .modules_initialized = false,
+            .ctx = ctx,
             .event_loop = loop_ptr,
             .timer_manager = TimerManager.init(&loop_ptr.loop),
         };
+        loop_mod.timer_mgr = &runtime.timer_manager;
         g_runtime = runtime;
         return runtime;
     }
 
-    fn scheduleCallback(info: ?*const c.FunctionCallbackInfo, interval: bool) void {
-        const rt = g_runtime orelse return;
-        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-        const argc = c.v8__FunctionCallbackInfo__Length(info);
-        if (argc < 2) return;
-        const fn_val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-        const ms_val = c.v8__FunctionCallbackInfo__INDEX(info, 1);
-        const context = c.v8__Isolate__GetCurrentContext(isolate);
-        var maybe: c.MaybeF64 = undefined;
-        c.v8__Value__NumberValue(ms_val, context, &maybe);
-        if (!maybe.has_value) return;
-        const ms: u64 = @intFromFloat(maybe.value);
+    fn setTimeoutCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        return scheduleTimeout(ctx, argc, argv, false, true);
+    }
 
-        const result = if (interval)
-            rt.timer_manager.setInterval(isolate, fn_val, ms)
+    fn setIntervalCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        return scheduleTimeout(ctx, argc, argv, true, true);
+    }
+
+    // Numeric-id variants for worker runtimes (no Timeout class there:
+    // class IDs are parent-runtime globals). Workers phase consumes these.
+    fn wSetTimeoutCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        return scheduleTimeout(ctx, argc, argv, false, false);
+    }
+
+    fn wSetIntervalCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        return scheduleTimeout(ctx, argc, argv, true, false);
+    }
+
+    pub fn setupWorkerTimers(ctx: ?*qjs.Context) void {
+        const global = qjs.getGlobalObject(ctx);
+        defer qjs.freeValue(ctx, global);
+        const st = qjs.newCFunction(ctx, wSetTimeoutCallback, "setTimeout", 2);
+        _ = qjs.definePropertyValueStr(ctx, global, "setTimeout", st, qjs.PROP_C_W_E);
+        const si = qjs.newCFunction(ctx, wSetIntervalCallback, "setInterval", 2);
+        _ = qjs.definePropertyValueStr(ctx, global, "setInterval", si, qjs.PROP_C_W_E);
+        const ct = qjs.newCFunction(ctx, clearTimeoutCallback, "clearTimeout", 1);
+        _ = qjs.definePropertyValueStr(ctx, global, "clearTimeout", ct, qjs.PROP_C_W_E);
+        const ci = qjs.newCFunction(ctx, clearIntervalCallback, "clearInterval", 1);
+        _ = qjs.definePropertyValueStr(ctx, global, "clearInterval", ci, qjs.PROP_C_W_E);
+        const qm = qjs.newCFunction(ctx, queueMicrotaskCallback, "queueMicrotask", 1);
+        _ = qjs.definePropertyValueStr(ctx, global, "queueMicrotask", qm, qjs.PROP_C_W_E);
+        setupPerformance(ctx);
+    }
+
+    fn scheduleTimeout(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value, interval: bool, as_object: bool) qjs.Value {
+        if (argc < 1 or qjs.isFunction(ctx, argv[0]) == 0) {
+            _ = qjs.throwTypeError(ctx, "setTimeout requires a function as first argument");
+            return qjs.JS_EXCEPTION;
+        }
+        var ms: i64 = 0;
+        if (argc >= 2) _ = qjs.toInt64(ctx, &ms, argv[1]);
+        if (ms < 0) ms = 0; // clamp: browsers/Node never drop, they defer
+        var nargs: usize = 0;
+        if (argc > 2) {
+            nargs = @intCast(argc - 2);
+            if (nargs > 8) {
+                _ = qjs.throwTypeError(ctx, "setTimeout accepts at most 8 callback arguments");
+                return qjs.JS_EXCEPTION;
+            }
+        }
+        const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        const args_slice: []const qjs.Value = if (nargs > 0) argv[2..][0..nargs] else &.{};
+        const id = if (interval)
+            rt.timer_manager.setInterval(ctx.?, argv[0], @intCast(ms), args_slice)
         else
-            rt.timer_manager.setTimeout(isolate, fn_val, ms);
-        const id = result catch return;
-
-        var retval: c.ReturnValue = undefined;
-        c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
-        const num = c.v8__Number__New(isolate, @floatFromInt(@as(i64, @intCast(id))));
-        c.v8__ReturnValue__Set(retval, @ptrCast(num));
+            rt.timer_manager.setTimeout(ctx.?, argv[0], @intCast(ms), args_slice);
+        const slot = id catch {
+            // TypeError, not RangeError: only throwTypeError is verified in-tree.
+            _ = qjs.throwTypeError(ctx, "too many timers (max 128)");
+            return qjs.JS_EXCEPTION;
+        };
+        if (as_object) {
+            return makeTimeout(ctx, slot) orelse qjs.throwOutOfMemory(ctx);
+        }
+        return qjs.newInt32(ctx, @intCast(slot));
     }
 
-    fn clearCallback(info: ?*const c.FunctionCallbackInfo) void {
+    fn extractTimeoutId(ctx: ?*qjs.Context, val: qjs.Value) ?usize {
+        // Timeout object or bare numeric id (back-compat + worker numerics).
+        if (qjs.getOpaque2(ctx, val, timeout_class_id)) |ptr| {
+            const slot = slotFromOpaque(ptr) orelse return null;
+            return @intCast(slot);
+        }
+        var id: i32 = 0;
+        _ = qjs.toInt32(ctx, &id, val);
+        if (id < 0 or id >= 128) return null;
+        return @intCast(id);
+    }
+
+    fn clearTimeoutCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        clearCallback(ctx, argc, argv);
+        return qjs.JS_UNDEFINED;
+    }
+
+    fn clearIntervalCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        clearCallback(ctx, argc, argv);
+        return qjs.JS_UNDEFINED;
+    }
+
+    fn clearCallback(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value) void {
         const rt = g_runtime orelse return;
-        const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-        if (c.v8__FunctionCallbackInfo__Length(info) < 1) return;
-        const id_val = c.v8__FunctionCallbackInfo__INDEX(info, 0) orelse return;
-        const context = c.v8__Isolate__GetCurrentContext(isolate);
-        var maybe: c.MaybeI32 = undefined;
-        c.v8__Value__Int32Value(id_val, context, &maybe);
-        if (!maybe.has_value or maybe.value < 0) return;
-        rt.timer_manager.clear(@intCast(maybe.value));
+        if (argc < 1) return;
+        const id = extractTimeoutId(ctx, argv[0]) orelse return;
+        rt.timer_manager.clear(id);
     }
 
-    fn setTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-        scheduleCallback(info, false);
+    fn timeoutUnref(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        _ = argv;
+        const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_UNDEFINED;
+        rt.timer_manager.unrefSlot(id);
+    return qjs.dupValue(ctx, this_val);
     }
-    fn setIntervalCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-        scheduleCallback(info, true);
+
+    fn timeoutRef(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        _ = argv;
+        const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_UNDEFINED;
+        rt.timer_manager.refSlot(id);
+        return qjs.dupValue(ctx, this_val);
     }
-    fn clearTimeoutCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-        clearCallback(info);
+
+    fn timeoutRefresh(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        _ = argv;
+        const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_UNDEFINED;
+        rt.timer_manager.refreshSlot(id);
+        return qjs.dupValue(ctx, this_val);
     }
-    fn clearIntervalCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-        clearCallback(info);
+
+    fn timeoutHasRef(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        _ = argv;
+        const rt = g_runtime orelse return qjs.JS_FALSE;
+        const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_FALSE;
+        if (id >= 128) return qjs.JS_FALSE;
+        return if (rt.timer_manager.isReferenced(id)) qjs.JS_TRUE else qjs.JS_FALSE;
+    }
+
+    var perf_origin_ns: i96 = 0;
+
+    fn performanceNow(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        _ = argc;
+        _ = argv;
+        // Same Io spelling as fs.zig's getIo(); .awake = monotonic
+        // (CLOCK_MONOTONIC / UPTIME_RAW), the correct performance.now basis.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const now_ns = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+        if (perf_origin_ns == 0) perf_origin_ns = now_ns;
+        const ms: f64 = @as(f64, @floatFromInt(now_ns - perf_origin_ns)) / 1e6;
+        return qjs.newFloat64(ctx, ms);
+    }
+
+    fn setupPerformance(ctx: ?*qjs.Context) void {
+        const global = qjs.getGlobalObject(ctx);
+        defer qjs.freeValue(ctx, global);
+        const perf = qjs.newObject(ctx);
+        const now_fn = qjs.newCFunction(ctx, performanceNow, "now", 0);
+        _ = qjs.definePropertyValueStr(ctx, perf, "now", now_fn, qjs.PROP_C_W_E);
+        _ = qjs.definePropertyValueStr(ctx, global, "performance", perf, qjs.PROP_C_W_E);
+    }
+
+    fn microtaskJob(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = argc;
+        const ret = qjs.call(ctx, argv[0], qjs.JS_UNDEFINED, 0, null);
+        if (qjs.isException(ret) != 0) {
+            const exc = qjs.getException(ctx);
+            defer qjs.freeValue(ctx, exc);
+            const msg = qjs.toCString(ctx, exc);
+            if (msg) |m| {
+                defer qjs.freeCString(ctx, m);
+                std.debug.print("queueMicrotask error: {s}\n", .{m});
+            }
+            return qjs.JS_UNDEFINED;
+        }
+        return ret;
+    }
+
+    fn queueMicrotaskCallback(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
+        _ = this_val;
+        if (argc < 1 or qjs.isFunction(ctx, argv[0]) == 0) {
+            _ = qjs.throwTypeError(ctx, "queueMicrotask requires a function argument");
+            return qjs.JS_EXCEPTION;
+        }
+        if (qjs.enqueueJob(ctx, microtaskJob, 1, argv) != 0) return qjs.JS_EXCEPTION;
+        return qjs.JS_UNDEFINED;
     }
 
     pub fn deinit(self: *Runtime) void {
         fetch_api.deinitClient();
-        self.module_cache.deinit();
         self.timer_manager.cancelAll();
-        c.v8__Context__Exit(self.context);
-        c.v8__Isolate__Exit(self.isolate);
-        c.v8__Isolate__Dispose(self.isolate);
-        c.v8__ArrayBuffer__Allocator__DELETE(self.params.array_buffer_allocator);
+        const rt = qjs.getRuntime(self.ctx);
+        qjs.freeContext(self.ctx);
+        qjs.freeRuntime(rt);
+        loop_mod.timer_mgr = null;
+        if (boot_inited) {
+            boot_arena.deinit();
+            boot_inited = false;
+        }
     }
 
     pub fn eval(self: *Runtime, source: [:0]const u8, filename: [:0]const u8) bool {
-        var handle_scope: c.HandleScope = undefined;
-        c.v8__HandleScope__CONSTRUCT(&handle_scope, self.isolate);
-        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
-        const js_src = c.v8__String__NewFromUtf8(self.isolate, source.ptr, 0, -1);
-        const js_name = c.v8__String__NewFromUtf8(self.isolate, filename.ptr, 0, -1);
-        var origin: c.ScriptOrigin = undefined;
-        c.v8__ScriptOrigin__CONSTRUCT(&origin, js_name);
-        var try_catch_buf: [@sizeOf(c.TryCatch)]u8 align(@alignOf(c.TryCatch)) = undefined;
-        c.v8__TryCatch__CONSTRUCT(@ptrCast(&try_catch_buf), self.isolate);
-        defer c.v8__TryCatch__DESTRUCT(@ptrCast(&try_catch_buf));
-        const try_catch: *c.TryCatch = @ptrCast(&try_catch_buf);
-        const script = c.v8__Script__Compile(self.context, js_src, &origin);
-        if (script == null) {
-            if (c.v8__TryCatch__HasCaught(try_catch)) {
-                const msg = c.v8__TryCatch__StackTrace(try_catch, self.context);
-                if (msg != null) {
-                    const err_str = c.v8__Value__ToString(msg, self.context);
-                    if (err_str != null) {
-                        const utf8_len = c.v8__String__Utf8Length(err_str, self.isolate);
-                        var buf: [4096]u8 = undefined;
-                        const len = @min(@as(usize, @intCast(utf8_len)), buf.len);
-                        _ = c.v8__String__WriteUtf8(err_str, self.isolate, &buf, @intCast(len), 0);
-                        std.debug.print("Compile error: {s}\n", .{buf[0..len]});
-                    }
+        const result = qjs.eval(
+            self.ctx,
+            source.ptr,
+            source.len,
+            filename.ptr,
+            qjs.EVAL_TYPE_GLOBAL,
+        );
+        defer qjs.freeValue(self.ctx, result);
+        if (qjs.isException(result) != 0) {
+            const exc = qjs.getException(self.ctx);
+            defer qjs.freeValue(self.ctx, exc);
+            const msg = qjs.toCString(self.ctx, exc);
+            if (msg) |m| {
+                defer qjs.freeCString(self.ctx, m);
+                std.debug.print("Error: {s}\n", .{m});
+            }
+            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+            defer qjs.freeValue(self.ctx, stack_val);
+            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+                const smsg = qjs.toCString(self.ctx, stack_val);
+                if (smsg) |sm| {
+                    defer qjs.freeCString(self.ctx, sm);
+                    std.debug.print("{s}\n", .{sm});
                 }
             }
             return false;
         }
-        const result = c.v8__Script__Run(script, self.context);
-        if (result == null) {
-            if (c.v8__TryCatch__HasCaught(try_catch)) {
-                const exception = c.v8__TryCatch__Exception(try_catch);
-                if (exception != null) {
-                    const err_str = c.v8__Value__ToString(exception, self.context);
-                    if (err_str != null) {
-                        const utf8_len = c.v8__String__Utf8Length(err_str, self.isolate);
-                        var buf: [4096]u8 = undefined;
-                        const len = @min(@as(usize, @intCast(utf8_len)), buf.len);
-                        _ = c.v8__String__WriteUtf8(err_str, self.isolate, &buf, @intCast(len), 0);
-                        std.debug.print("Runtime error: {s}\n", .{buf[0..len]});
-                    }
-                }
-            }
-            return false;
-        }
-        microtasks.pumpMicrotasks(self.isolate);
+        microtasks.pumpMicrotasks(self.ctx);
         return true;
     }
 
+    // CHANGED: source-based module detection instead of buggy JS_DetectModule
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
-        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const allocator = arena_state.allocator();
-        defer arena_state.deinit();
-
-        var sources = std.ArrayList(DepEntry).empty;
-        sources.ensureTotalCapacity(allocator, 16) catch return false;
-
-        self.collectDeps(allocator, source, filename, &sources) catch return false;
-
-        self.setupModuleRegistry() catch return false;
-
-        std.mem.reverse(DepEntry, sources.items);
-
-        for (sources.items) |s| {
-            var m = mod.Module.init(allocator, s.src, s.key, ".");
-            m.parseImports() catch continue;
-            m.parseExports() catch continue;
-            const wrapped = self.wrapModule(s.src, s.key, &m) catch continue;
-            defer std.heap.page_allocator.free(wrapped);
-            _ = self.eval(wrapped, s.key);
-            m.deinit();
-        }
-
-        var m = mod.Module.init(allocator, source, filename, std.fs.path.dirname(filename) orelse ".");
-        defer m.deinit();
-        m.parseImports() catch return false;
-        m.parseExports() catch return false;
-        const wrapped = self.wrapModule(source, filename, &m) catch return false;
-        defer std.heap.page_allocator.free(wrapped);
-        const result = self.eval(wrapped, filename);
-        microtasks.pumpMicrotasks(self.isolate);
-        return result;
-    }
-
-    fn collectDeps(
-        self: *Runtime,
-        allocator: std.mem.Allocator,
-        source: []const u8,
-        filename: [:0]const u8,
-        out: *std.ArrayList(DepEntry),
-    ) !void {
-        const dir = std.fs.path.dirname(filename) orelse ".";
-        try out.ensureTotalCapacity(allocator, 16);
-        var m = mod.Module.init(allocator, source, filename, dir);
-        defer m.deinit();
-        m.parseImports() catch return;
-
-        for (m.imports.items) |imp| {
-            const resolved = mod.resolveSpec(allocator, dir, imp.specifier) catch continue;
-            defer allocator.free(resolved);
-            if (self.module_cache.get(resolved) != null) continue;
-            const dep_source = mod.readFile(allocator, resolved) catch continue;
-            const dep_dir = std.fs.path.dirname(resolved) orelse ".";
-            var dep = mod.Module.init(allocator, dep_source, resolved, dep_dir);
-            dep.parseImports() catch {
-                allocator.free(dep_source);
-                continue;
-            };
-            dep.parseExports() catch {
-                allocator.free(dep_source);
-                continue;
-            };
-            const dep_ptr = allocator.create(mod.Module) catch {
-                allocator.free(dep_source);
-                continue;
-            };
-            dep_ptr.* = dep;
-            self.module_cache.put(resolved, dep_ptr) catch {
-                allocator.free(dep_source);
-                continue;
-            };
-
-            const key_z = allocator.dupeZ(u8, imp.specifier) catch continue;
-            const src_z = allocator.dupe(u8, dep_source) catch {
-                allocator.free(key_z);
-                continue;
-            };
-            try out.append(allocator, .{ .key = key_z, .src = src_z });
-
-            const resolved_z = allocator.dupeZ(u8, resolved) catch continue;
-            self.collectDeps(allocator, dep_source, resolved_z, out) catch {
-                allocator.free(resolved_z);
-                continue;
-            };
-            allocator.free(resolved_z);
-        }
-    }
-
-    fn evalModuleKey(self: *Runtime, source: []const u8, filename: [:0]const u8, registry_key: [:0]const u8) bool {
-        const dir = std.fs.path.dirname(filename) orelse ".";
-        var m = mod.Module.init(std.heap.page_allocator, source, filename, dir);
-        defer m.deinit();
-        m.parseImports() catch return false;
-        m.parseExports() catch return false;
-
-        self.setupModuleRegistry() catch return false;
-
-        var dep_keys = std.ArrayList([:0]const u8).empty;
-        dep_keys.ensureTotalCapacity(std.heap.page_allocator, 16) catch return false;
-        defer {
-            for (dep_keys.items) |k| std.heap.page_allocator.free(k);
-            dep_keys.deinit(std.heap.page_allocator);
-        }
-
-        for (m.imports.items) |imp| {
-            const resolved = mod.resolveSpec(std.heap.page_allocator, dir, imp.specifier) catch continue;
-            defer std.heap.page_allocator.free(resolved);
-            if (self.module_cache.get(resolved) == null) {
-                const dep_source = mod.readFile(std.heap.page_allocator, resolved) catch continue;
-                const dep_dir = std.fs.path.dirname(resolved) orelse ".";
-                var dep = mod.Module.init(std.heap.page_allocator, dep_source, resolved, dep_dir);
-                dep.parseImports() catch {
-                    std.heap.page_allocator.free(dep_source);
-                    continue;
-                };
-                dep.parseExports() catch {
-                    std.heap.page_allocator.free(dep_source);
-                    continue;
-                };
-                const dep_ptr = std.heap.page_allocator.create(mod.Module) catch {
-                    std.heap.page_allocator.free(dep_source);
-                    continue;
-                };
-                dep_ptr.* = dep;
-                self.module_cache.put(resolved, dep_ptr) catch {
-                    std.heap.page_allocator.free(dep_source);
-                    continue;
-                };
-
-                const dep_z = std.heap.page_allocator.dupeZ(u8, resolved) catch continue;
-                defer std.heap.page_allocator.free(dep_z);
-                const key_z = std.heap.page_allocator.dupeZ(u8, imp.specifier) catch continue;
-                dep_keys.append(std.heap.page_allocator, key_z) catch continue;
-                _ = self.evalModuleKey(dep_source, dep_z, key_z);
-            } else {
-                const key_z = std.heap.page_allocator.dupeZ(u8, imp.specifier) catch continue;
-                dep_keys.append(std.heap.page_allocator, key_z) catch continue;
+        const is_module = blk: {
+            if (std.mem.endsWith(u8, filename, ".mjs")) break :blk true;
+            break :blk sourceHasModuleSyntax(source);
+        };
+        const flags: c_int = if (is_module)
+            qjs.EVAL_TYPE_MODULE
+        else
+            qjs.EVAL_TYPE_GLOBAL;
+        const result = qjs.eval(
+            self.ctx,
+            source.ptr,
+            source.len,
+            filename.ptr,
+            flags,
+        );
+        defer qjs.freeValue(self.ctx, result);
+        if (qjs.isException(result) != 0) {
+            const exc = qjs.getException(self.ctx);
+            defer qjs.freeValue(self.ctx, exc);
+            const msg = qjs.toCString(self.ctx, exc);
+            if (msg) |m| {
+                defer qjs.freeCString(self.ctx, m);
+                std.debug.print("Error: {s}\n", .{m});
             }
+            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+            defer qjs.freeValue(self.ctx, stack_val);
+            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+                const smsg = qjs.toCString(self.ctx, stack_val);
+                if (smsg) |sm| {
+                    defer qjs.freeCString(self.ctx, sm);
+                    std.debug.print("{s}\n", .{sm});
+                }
+            }
+            return false;
         }
-
-        const wrapped = self.wrapModule(source, registry_key, &m) catch return false;
-        defer std.heap.page_allocator.free(wrapped);
-        return self.eval(wrapped, filename);
+        microtasks.pumpMicrotasks(self.ctx);
+        return true;
     }
-
-    fn setupModuleRegistry(self: *Runtime) !void {
-        if (self.modules_initialized) return;
-        self.modules_initialized = true;
-        var handle_scope: c.HandleScope = undefined;
-        c.v8__HandleScope__CONSTRUCT(&handle_scope, self.isolate);
-        defer c.v8__HandleScope__DESTRUCT(&handle_scope);
-        const global = c.v8__Context__Global(self.context);
-        const registry = c.v8__Object__New(self.isolate);
-        const key = c.v8__String__NewFromUtf8(self.isolate, "__modules", 0, -1);
-        var out: c.MaybeBool = undefined;
-        c.v8__Object__Set(global, self.context, key, registry, &out);
-    }
-
-const LineKind = enum { import_statement, export_default, export_statement, body };
-
-// Comptime-padded literal prefix as a vector. Pad lanes are never inspected —
-// only the first lit.len lanes are compared.
-fn packedPrefix(comptime n: usize, comptime lit: []const u8) @Vector(n, u8) {
-    const arr: [n]u8 = comptime blk: {
-        var a: [n]u8 = [_]u8{0x00} ** n;
-        @memcpy(a[0..lit.len], lit);
-        break :blk a;
-    };
-    return arr;
-}
-
-// Single vector compare of a literal prefix starting at lane 0. Masked to the
-// first lit.len lanes via @bitCast -> integer mask (TigerBeetle style); the
-// pad lanes are masked off so they never affect the match.
-fn vecHasPrefix(comptime n: usize, v: @Vector(n, u8), comptime lit: []const u8) bool {
-    const M = std.meta.Int(.unsigned, n);
-    const raw: M = @bitCast(v == packedPrefix(n, lit));
-    const m: M = (@as(M, 1) << @intCast(lit.len)) - 1;
-    return (raw & m) == m;
-}
-
-// Vectorized line-kind classifier: full-vector path for lines wide enough to
-// hold a literal, scalar startsWith fallback for ragged/short lines.
-fn classifyLineStart(trimmed: []const u8) LineKind {
-    const N = simd.suggestVectorLength(u8) orelse 16;
-    if (trimmed.len >= N) {
-        const v: @Vector(N, u8) = trimmed[0..N].*;
-        if (vecHasPrefix(N, v, "import ")) return .import_statement;
-        if (vecHasPrefix(N, v, "export default ")) return .export_default;
-        if (vecHasPrefix(N, v, "export ")) return .export_statement;
-    }
-    if (std.mem.startsWith(u8, trimmed, "import ")) return .import_statement;
-    if (std.mem.startsWith(u8, trimmed, "export default ")) return .export_default;
-    if (std.mem.startsWith(u8, trimmed, "export ")) return .export_statement;
-    return .body;
-}
-
-// Vectorized leading-' ' / '\t' count: per-chunk lane mask -> @bitCast integer
-// bitset, first clear lane is the trim width; scalar tail for leftover bytes.
-fn trimStartWidth(line: []const u8) usize {
-    const N = simd.suggestVectorLength(u8) orelse 16;
-    const V = @Vector(N, u8);
-    const M = std.meta.Int(.unsigned, N);
-    const spl_space: V = @splat(' ');
-    const spl_tab: V = @splat('\t');
-    var i: usize = 0;
-    const tail = line.len % N;
-    const main_end = line.len - tail;
-    while (i < main_end) : (i += N) {
-        const v: V = line[i..][0..N].*;
-        const ws: M = @bitCast((v == spl_space) | (v == spl_tab));
-        if (ws != ~@as(M, 0)) return i + @ctz(~ws);
-    }
-    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
-    return i;
-}
-
-fn wrapModule(self: *Runtime, source: []const u8, registry_key: [:0]const u8, m: *mod.Module) ![:0]const u8 {
-    _ = self;
-    const gpa = std.heap.page_allocator;
-    var buf = std.ArrayList(u8).empty;
-    try buf.appendSlice(gpa, "(function (__modules) {\n");
-    try buf.appendSlice(gpa, "var __exports = {};\n");
-    for (m.imports.items) |imp| {
-        try buf.appendSlice(gpa, "var ");
-        try buf.appendSlice(gpa, imp.local_name);
-        switch (imp.import_type) {
-            .namespace => {
-                try buf.appendSlice(gpa, " = (__modules['");
-                try buf.appendSlice(gpa, imp.specifier);
-                try buf.appendSlice(gpa, "'] || {});\n");
-            },
-            .default => {
-                try buf.appendSlice(gpa, " = (__modules['");
-                try buf.appendSlice(gpa, imp.specifier);
-                try buf.appendSlice(gpa, "'] || {}).default;\n");
-            },
-            .named => {
-                try buf.appendSlice(gpa, " = (__modules['");
-                try buf.appendSlice(gpa, imp.specifier);
-                try buf.appendSlice(gpa, "'] || {}).");
-                try buf.appendSlice(gpa, imp.export_name);
-                try buf.appendSlice(gpa, ";\n");
-            },
-        }
-    }
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |line| {
-        const off = trimStartWidth(line);
-        switch (classifyLineStart(line[off..])) {
-            .import_statement, .export_default => continue,
-            .export_statement => {
-                try buf.appendSlice(gpa, line[0..off]);
-                try buf.appendSlice(gpa, line[off + 7 ..]);
-                try buf.append(gpa, '\n');
-            },
-            .body => {
-                try buf.appendSlice(gpa, line);
-                try buf.append(gpa, '\n');
-            },
-        }
-    }
-    for (m.exports.items) |exp| {
-        if (exp.export_type == .named) {
-            try buf.appendSlice(gpa, "__exports['");
-            try buf.appendSlice(gpa, exp.name);
-            try buf.appendSlice(gpa, "'] = ");
-            try buf.appendSlice(gpa, exp.local_name);
-            try buf.appendSlice(gpa, ";\n");
-        } else if (exp.export_type == .default) {
-            try buf.appendSlice(gpa, "__exports['");
-            try buf.appendSlice(gpa, exp.name);
-            try buf.appendSlice(gpa, "'] = ");
-            try buf.appendSlice(gpa, exp.local_name);
-            try buf.appendSlice(gpa, ";\n");
-        }
-    }
-    try buf.appendSlice(gpa, "__modules['");
-    try buf.appendSlice(gpa, registry_key);
-    try buf.appendSlice(gpa, "'] = __exports;\n");
-    try buf.appendSlice(gpa, "})(__modules);\n");
-    return try buf.toOwnedSliceSentinel(gpa, 0);
-}
 };

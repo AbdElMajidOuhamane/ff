@@ -12,6 +12,7 @@ pub const Module = loader.Module;
 pub const ModuleCache = cache.ModuleCache;
 
 pub const resolveSpec = resolver.resolveSpec;
+pub const pathExists = resolver.pathExists;
 pub const readFile = resolver.readFile;
 pub const findImportEnd = parse.findImportEnd;
 pub const findExportEnd = parse.findExportEnd;

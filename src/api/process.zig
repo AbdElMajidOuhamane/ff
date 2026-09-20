@@ -4,129 +4,91 @@ const builtin = @import("builtin");
 
 const Io = std.Io;
 
-// ============================================================
-// Helpers
-// ============================================================
+const gpa = std.heap.smp_allocator;
 
 fn getIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn throw(isolate: ?*c.Isolate, msg: []const u8) void {
-    const v8_msg = c.v8__String__NewFromUtf8(isolate, @ptrCast(msg.ptr), 0, @intCast(msg.len));
-    const exc = c.v8__Exception__Error(v8_msg);
-    _ = c.v8__Isolate__ThrowException(isolate, exc);
+fn throwErr(ctx: ?*c.Context, msg: []const u8) void {
+    const msg_val = c.newStringLen(ctx, msg.ptr, msg.len);
+    _ = c.throw(ctx, msg_val);
 }
 
-fn zigStringToV8(isolate: ?*c.Isolate, str: []const u8) *const c.Value {
-    return @ptrCast(c.v8__String__NewFromUtf8(isolate, @ptrCast(str.ptr), 0, @intCast(str.len)));
+fn zigStringToVal(ctx: ?*c.Context, str: []const u8) c.Value {
+    return c.newStringLen(ctx, str.ptr, str.len);
 }
 
-fn extractString(info: ?*const c.FunctionCallbackInfo, index: c_int) ?[:0]const u8 {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    if (c.v8__FunctionCallbackInfo__Length(info) <= index) return null;
-    const val = c.v8__FunctionCallbackInfo__INDEX(info, index);
-    if (!c.v8__Value__IsString(val)) return null;
-    const context = c.v8__Isolate__GetCurrentContext(isolate);
-    const str = c.v8__Value__ToDetailString(val, context);
-    if (str == null) return null;
-    const utf8_len: usize = @intCast(c.v8__String__Utf8Length(str, isolate));
+fn extractString(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_int) ?[:0]const u8 {
+    if (argc <= index) return null;
+    const val = argv[@intCast(index)];
+    if (c.isString(val) == 0) return null;
+    var str_len: usize = 0;
+    const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return null;
+    defer c.freeCString(ctx, str_ptr);
     var buf: [4096]u8 = undefined;
-    const len = @min(utf8_len, buf.len);
-    _ = c.v8__String__WriteUtf8(str, isolate, &buf, @intCast(len), 0);
-    return std.heap.page_allocator.dupeZ(u8, buf[0..len]) catch null;
+    const len = @min(str_len, buf.len);
+    @memcpy(buf[0..len], str_ptr[0..len]);
+    return gpa.dupeZ(u8, buf[0..len]) catch null;
 }
 
-// ============================================================
-// process.exit(code)
-// ============================================================
-
-fn exitCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+fn exitCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
     var code: u8 = 0;
-    if (c.v8__FunctionCallbackInfo__Length(info) > 0) {
-        const val = c.v8__FunctionCallbackInfo__INDEX(info, 0);
-        var maybe: c.MaybeF64 = undefined;
-        const ctx = c.v8__Isolate__GetCurrentContext(isolate);
-        c.v8__Value__NumberValue(val, ctx, &maybe);
-        if (maybe.has_value) {
-            code = @intFromFloat(maybe.value);
-        }
+    if (argc > 0) {
+        var pres: i64 = 0;
+        _ = c.toInt64(ctx, &pres, argv[0]);
+        const clamped: i64 = @max(0, @min(pres, 255));
+        code = @intCast(clamped);
     }
     std.process.exit(code);
 }
 
-// ============================================================
-// process.cwd()
-// ============================================================
-
-fn cwdCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
+fn cwdCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
     const io = getIo();
     var buf: [std.posix.PATH_MAX]u8 = undefined;
     const len = std.process.currentPath(io, &buf) catch {
-        throw(isolate, "getcwd failed");
-        return;
+        throwErr(ctx, "getcwd failed");
+        return c.JS_UNDEFINED;
     };
-    const ret = zigStringToV8(isolate, buf[0..len]);
-
-    var retval: c.ReturnValue = undefined;
-    c.v8__FunctionCallbackInfo__GetReturnValue(info, &retval);
-    c.v8__ReturnValue__Set(retval, ret);
+    return zigStringToVal(ctx, buf[0..len]);
 }
 
-// ============================================================
-// process.chdir(path)
-// ============================================================
-
-fn chdirCallback(info: ?*const c.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = c.v8__FunctionCallbackInfo__GetIsolate(info);
-    const path = extractString(info, 0) orelse {
-        throw(isolate, "chdir requires a path argument");
-        return;
+fn chdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    const path = extractString(ctx, argc, argv, 0) orelse {
+        throwErr(ctx, "chdir requires a path argument");
+        return c.JS_UNDEFINED;
     };
-    defer std.heap.page_allocator.free(path);
+    defer gpa.free(path);
 
     const io = getIo();
     std.process.setCurrentPath(io, path) catch {
-        throw(isolate, "chdir failed");
+        throwErr(ctx, "chdir failed");
     };
+    return c.JS_UNDEFINED;
 }
 
-// ============================================================
-// Registration
-// ============================================================
+pub fn setup(ctx: *c.Context, args: std.process.Args) void {
+    const global = c.getGlobalObject(ctx);
+    defer c.freeValue(ctx, global);
+    const process_obj = c.newObject(ctx);
 
-pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context, args: std.process.Args) void {
-    var hs: c.HandleScope = undefined;
-    c.v8__HandleScope__CONSTRUCT(&hs, isolate);
-    defer c.v8__HandleScope__DESTRUCT(&hs);
+    const exit_fn = c.newCFunction(ctx, exitCallback, "exit", 1);
+    _ = c.definePropertyValueStr(ctx, process_obj, "exit", exit_fn, c.PROP_C_W_E);
 
-    const global = c.v8__Context__Global(context);
-    const process_obj = c.v8__Object__New(isolate);
-    var out: c.MaybeBool = undefined;
+    const cwd_fn = c.newCFunction(ctx, cwdCallback, "cwd", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "cwd", cwd_fn, c.PROP_C_W_E);
 
-    // --- process.exit(code) ---
-    const exit_fn = c.v8__Function__New__DEFAULT(context, exitCallback);
-    const exit_key = c.v8__String__NewFromUtf8(isolate, "exit", 0, -1);
-    c.v8__Object__Set(process_obj, context, exit_key, exit_fn, &out);
+    const chdir_fn = c.newCFunction(ctx, chdirCallback, "chdir", 1);
+    _ = c.definePropertyValueStr(ctx, process_obj, "chdir", chdir_fn, c.PROP_C_W_E);
 
-    // --- process.cwd() ---
-    const cwd_fn = c.v8__Function__New__DEFAULT(context, cwdCallback);
-    const cwd_key = c.v8__String__NewFromUtf8(isolate, "cwd", 0, -1);
-    c.v8__Object__Set(process_obj, context, cwd_key, cwd_fn, &out);
+    const pid_val = c.newInt64(ctx, @intCast(@as(i64, std.c.getpid())));
+    _ = c.definePropertyValueStr(ctx, process_obj, "pid", pid_val, c.PROP_C_W_E);
 
-    // --- process.chdir(path) ---
-    const chdir_fn = c.v8__Function__New__DEFAULT(context, chdirCallback);
-    const chdir_key = c.v8__String__NewFromUtf8(isolate, "chdir", 0, -1);
-    c.v8__Object__Set(process_obj, context, chdir_key, chdir_fn, &out);
-
-    // --- process.pid ---
-    const pid_val = c.v8__Number__New(isolate, @floatFromInt(@as(i64, std.c.getpid())));
-    const pid_key = c.v8__String__NewFromUtf8(isolate, "pid", 0, -1);
-    c.v8__Object__Set(process_obj, context, pid_key, @ptrCast(pid_val), &out);
-
-    // --- process.platform ---
     const platform_str = comptime switch (builtin.os.tag) {
         .macos => "darwin",
         .linux => "linux",
@@ -134,11 +96,8 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context, args: std.process.Args)
         .freebsd => "freebsd",
         else => "unknown",
     };
-    const platform_val = zigStringToV8(isolate, platform_str);
-    const platform_key = c.v8__String__NewFromUtf8(isolate, "platform", 0, -1);
-    c.v8__Object__Set(process_obj, context, platform_key, platform_val, &out);
+    _ = c.definePropertyValueStr(ctx, process_obj, "platform", zigStringToVal(ctx, platform_str), c.PROP_C_W_E);
 
-    // --- process.arch ---
     const arch_str = comptime switch (builtin.cpu.arch) {
         .aarch64 => "arm64",
         .x86_64 => "x64",
@@ -146,40 +105,31 @@ pub fn setup(isolate: ?*c.Isolate, context: ?*c.Context, args: std.process.Args)
         .riscv64 => "riscv64",
         else => "unknown",
     };
-    const arch_val = zigStringToV8(isolate, arch_str);
-    const arch_key = c.v8__String__NewFromUtf8(isolate, "arch", 0, -1);
-    c.v8__Object__Set(process_obj, context, arch_key, arch_val, &out);
+    _ = c.definePropertyValueStr(ctx, process_obj, "arch", zigStringToVal(ctx, arch_str), c.PROP_C_W_E);
 
-    // --- process.env ---
-    const env_obj = c.v8__Object__New(isolate);
+    const env_obj = c.newObject(ctx);
     const c_environ = std.c.environ;
     var i: usize = 0;
     while (c_environ[i]) |entry| : (i += 1) {
         const entry_str = std.mem.span(entry);
         if (std.mem.indexOfScalar(u8, entry_str, '=')) |eq_pos| {
-            const key = entry_str[0..eq_pos];
+            const key_atom = c.newAtomLen(ctx, entry_str.ptr, eq_pos);
+            if (key_atom == 0) continue;
             const val = entry_str[eq_pos + 1 ..];
-            const v8_key = zigStringToV8(isolate, key);
-            const v8_val = zigStringToV8(isolate, val);
-            c.v8__Object__Set(env_obj, context, v8_key, v8_val, &out);
+            _ = c.definePropertyValue(ctx, env_obj, key_atom, zigStringToVal(ctx, val), c.PROP_C_W_E);
+            c.freeAtom(ctx, key_atom);
         }
     }
-    const env_key = c.v8__String__NewFromUtf8(isolate, "env", 0, -1);
-    c.v8__Object__Set(process_obj, context, env_key, env_obj, &out);
+    _ = c.definePropertyValueStr(ctx, process_obj, "env", env_obj, c.PROP_C_W_E);
 
-    // --- process.argv ---
-    const argv_arr = c.v8__Array__New(isolate, 0);
+    const argv_arr = c.newArray(ctx);
     var arg_idx: u32 = 0;
     var args_iter = args.iterate();
     while (args_iter.next()) |arg| {
-        const v8_arg = zigStringToV8(isolate, arg);
-        c.v8__Object__SetAtIndex(argv_arr, context, arg_idx, v8_arg, &out);
+        _ = c.setPropertyUint32(ctx, argv_arr, arg_idx, zigStringToVal(ctx, arg));
         arg_idx += 1;
     }
-    const argv_key = c.v8__String__NewFromUtf8(isolate, "argv", 0, -1);
-    c.v8__Object__Set(process_obj, context, argv_key, argv_arr, &out);
+    _ = c.definePropertyValueStr(ctx, process_obj, "argv", argv_arr, c.PROP_C_W_E);
 
-    // --- set globalThis.process ---
-    const process_key = c.v8__String__NewFromUtf8(isolate, "process", 0, -1);
-    _ = c.v8__Object__Set(global, context, process_key, process_obj, &out);
+    _ = c.definePropertyValueStr(ctx, global, "process", process_obj, c.PROP_C_W_E);
 }

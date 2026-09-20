@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const Import = types.Import;
 const Export = types.Export;
+const PoolSlice = types.PoolSlice;
 const parse = @import("parse.zig");
 
 pub const Module = struct {
@@ -12,6 +13,8 @@ pub const Module = struct {
     dir: []const u8,
     imports: std.ArrayList(Import),
     exports: std.ArrayList(Export),
+   
+    strings: std.ArrayList(u8),
 
     pub fn init(allocator: Allocator, source: []const u8, path: []const u8, dir: []const u8) Module {
         return .{
@@ -21,29 +24,30 @@ pub const Module = struct {
             .dir = dir,
             .imports = .empty,
             .exports = .empty,
+            .strings = .empty,
         };
     }
 
-   pub fn deinit(self: *Module) void {
-    for (self.imports.items) |imp| {
-        self.allocator.free(imp.specifier);
-        self.allocator.free(imp.local_name);
-        self.allocator.free(imp.export_name);
+    pub fn deinit(self: *Module) void {
+       
+        self.imports.deinit(self.allocator);
+        self.exports.deinit(self.allocator);
+        self.strings.deinit(self.allocator);
     }
-    for (self.exports.items) |exp| {
-        if (exp.name.len > 0) self.allocator.free(exp.name);
-        self.allocator.free(exp.local_name);
-        if (exp.source) |s| self.allocator.free(s);
+
+    pub fn sliceAt(self: *const Module, ps: PoolSlice) []const u8 {
+        return self.strings.items[ps.off .. ps.off + ps.len];
     }
-    self.imports.deinit(self.allocator);
-    self.exports.deinit(self.allocator);
-}
+
+    fn interner(self: *Module) parse.Interner {
+        return .{ .allocator = self.allocator, .strings = &self.strings };
+    }
 
     pub fn parseImports(self: *Module) !void {
-        try parse.parseImports(self.allocator, self.source, &self.imports);
+        try parse.parseImports(self.allocator, self.interner(), self.source, &self.imports);
     }
 
     pub fn parseExports(self: *Module) !void {
-        try parse.parseExports(self.allocator, self.source, &self.exports);
+        try parse.parseExports(self.allocator, self.interner(), self.source, &self.exports);
     }
 };
