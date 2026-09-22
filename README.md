@@ -1020,15 +1020,24 @@ docker build -t fairyfly .
 ## CLI reference
 
 ```
-ff <file.js>             Run a JavaScript file
-ff -e <code>             Run inline JavaScript code
-ff init [<dir>]          Write ff.json in <dir> (default: cwd)
-ff start [--cert cert.pem --key key.pem]
-                         Run ff.json's "main" (TLS enabled with cert+key)
+ff init [-y|--yes] [<dir>]
+                         Initialize a new project (writes ff.json)
 ff imprint [pkg[@ver] ...]
                          Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
+ff start [--cert cert.pem --key key.pem]
+                         Run ff.json's "main" (TLS enabled with cert+key)
+
+ff test [filter]         Run test/*.test.js
+ff repl                  Interactive REPL
+ff upgrade [--check]     Self-update from GitHub Releases
+ff compile <f.js> [-o out.ffbc]
+                         Compile to bytecode (run back with ff <file.ffbc>)
+ff fmt [--write|--check] <files...>
+                         Format via prettier (needs npx/network)
+ff -e <code>             Run inline JavaScript code
+ff <file.js>             Run a JavaScript file
 ff --version             Print runtime version
 ```
 
