@@ -36,9 +36,9 @@ check("blob-val", gv instanceof Blob && (await gv.text()) === "abc");
 
 // --- urlencoded parse via Request ---
 const q = new Request("https://x.test/", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: "a=1&b=hello+world&c=%26%3D",
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded" },
+  body: "a=1&b=hello+world&c=%26%3D",
 });
 const qf = await q.formData();
 check("url-a", qf.get("a") === "1");
@@ -47,15 +47,24 @@ check("url-pct", qf.get("c") === "&=");
 
 // --- multipart parse via Response ---
 const boundary = "----fftest123";
-const mp = "--" + boundary + "\r\n" +
-    'Content-Disposition: form-data; name="field1"\r\n\r\n' +
-    "value1\r\n" +
-    "--" + boundary + "\r\n" +
-    'Content-Disposition: form-data; name="file1"; filename="hello.txt"\r\n' +
-    "Content-Type: text/plain\r\n\r\n" +
-    "file-bytes\r\n" +
-    "--" + boundary + "--\r\n";
-const r = new Response(mp, { headers: { "content-type": "multipart/form-data; boundary=" + boundary } });
+const mp =
+  "--" +
+  boundary +
+  "\r\n" +
+  'Content-Disposition: form-data; name="field1"\r\n\r\n' +
+  "value1\r\n" +
+  "--" +
+  boundary +
+  "\r\n" +
+  'Content-Disposition: form-data; name="file1"; filename="hello.txt"\r\n' +
+  "Content-Type: text/plain\r\n\r\n" +
+  "file-bytes\r\n" +
+  "--" +
+  boundary +
+  "--\r\n";
+const r = new Response(mp, {
+  headers: { "content-type": "multipart/form-data; boundary=" + boundary },
+});
 const rf = await r.formData();
 check("mp-field", rf.get("field1") === "value1");
 const mf = rf.get("file1");
@@ -64,8 +73,12 @@ check("mp-file", mf instanceof Blob && (await mf.text()) === "file-bytes");
 // --- unsupported type rejects ---
 let rejected = false;
 try {
-    await new Response("{}", { headers: { "content-type": "application/json" } }).formData();
-} catch (e) { rejected = true; }
+  await new Response("{}", {
+    headers: { "content-type": "application/json" },
+  }).formData();
+} catch (e) {
+  rejected = true;
+}
 check("rejects-json", rejected === true);
 
 done("formdata");
