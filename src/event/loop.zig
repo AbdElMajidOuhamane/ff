@@ -7,6 +7,7 @@ const async_fetch = @import("../net/async_fetch.zig");
 const ws_client = @import("../net/ws_client.zig");
 const timers_mod = @import("timers.zig");
 const worker_mod = @import("../worker/worker.zig");
+const pg_client = @import("../net/pg_client.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -100,6 +101,7 @@ pub const EventLoop = struct {
                 !work_left and
                 async_fetch.pending.load(.acquire) == 0 and
                 ws_client.pending.load(.acquire) == 0 and
+                pg_client.pending.load(.acquire) == 0 and
                 worker_mod.liveCount() == 0 and
                 !timersAlive()) break;
             if (!work_left and !did_work) {

@@ -25,6 +25,8 @@ const formdata = @import("../types/formdata.zig");
 const blob = @import("../types/blob.zig");
 const sqlite_api = @import("../api/sqlite.zig");
 const worker_mod = @import("../worker/worker.zig");
+const sql_api = @import("../api/sql.zig");
+const pg_client = @import("../net/pg_client.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -36,6 +38,7 @@ pub fn getEventLoop() ?*EventLoop {
 
 pub fn deinitNetwork() void {
     http_native.deinit();
+    sql_api.deinit();
 }
 
 var g_runtime: ?*Runtime = null;
@@ -213,6 +216,7 @@ pub const Runtime = struct {
         websocket_client.setup(ctx);
         text_encoding.setup(ctx);
         sqlite_api.setup(ctx);
+        sql_api.setup(ctx);
         worker_mod.setup(ctx);
         {
             var timeout_def = qjs.ClassDef{
@@ -258,6 +262,7 @@ pub const Runtime = struct {
         EventLoop.initInto(loop_ptr);
         async_fetch.setLoop(&loop_ptr.loop);
         ws_client.setLoop(&loop_ptr.loop);
+        pg_client.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{

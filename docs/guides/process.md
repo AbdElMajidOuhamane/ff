@@ -155,7 +155,7 @@ ff tool.js bogus       # usage… (exit 1)
 | `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
 | `stdin` / `stdout` streams | `console.log` writes stdout; no readable stdin |
 
-Needing Postgres? Same answer as `spawn`: no in-process driver — talk to PostgREST (or any HTTP API) with `fetch`.
+Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver to install.
 
 ## Troubleshooting
 

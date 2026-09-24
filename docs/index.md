@@ -5,7 +5,7 @@ hidden: "true"
 
 # Documentation
 
-Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, batteries included (HTTP, fetch, WebSocket, SQLite, workers).
+Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, batteries included (HTTP, fetch, WebSocket, SQLite, Postgres, workers).
 
 ## Getting started
 
@@ -39,6 +39,8 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, bat
 | [`http`](/docs/api/http) | `http.serve` signatures, options, handler contract |
 | [`fetch`](/docs/api/fetch) | `fetch`, `Request`, `Response`, `Headers` |
 | [`fs`](/docs/api/fs) | Sync filesystem calls |
+| [SQLite](/docs/api/sqlite) | `Database` — open, query, write, transactions |
+| [`SQL`](/docs/api/postgres) | Postgres — queries, types, errors, transactions |
 
 ## Reference
 

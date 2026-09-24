@@ -25,6 +25,7 @@ method: `http.serve`.
 | `WebSocket` | Outbound WS client | [WebSocket](#websocket) |
 | `Worker` | Multi-threaded JS, up to 8 threads | [Workers](#workers) |
 | `Database` | Open SQLite files, run queries, transactions | Built-in, no packages |
+| `SQL`, `sql` | Connect to Postgres — queries, types, transactions | [Postgres API](/docs/api/postgres) |
 | `fs` | Sync files: read, write, mkdir, rm, readdir | [FS](#fs) |
 | `process` | argv, env, cwd, exit, pid | [Process](#process) |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [Crypto](#crypto) |
@@ -167,7 +168,7 @@ w.postMessage("hello worker");
 // worker.js
 onmessage = (e) => {
   console.log("from parent:", e.data);
-  postMessage("hello parent");
+  postMessage("hello worker");
 };
 ```
 

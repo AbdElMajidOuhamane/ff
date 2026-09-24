@@ -14,6 +14,6 @@ pub const ReadBuffer = chosen.ReadBuffer;
 pub const WriteBuffer = chosen.WriteBuffer;
 pub const ReadError = chosen.ReadError;
 pub const WriteError = chosen.WriteError;
+pub const ConnectError = chosen.ConnectError;
 pub const ThreadPool = inner.ThreadPool;
 pub const Async = chosen.Async;
-

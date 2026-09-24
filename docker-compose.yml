@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fairyfly
+      POSTGRES_PASSWORD: fairyfly
+      POSTGRES_DB: fairyfly
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fairyfly"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
