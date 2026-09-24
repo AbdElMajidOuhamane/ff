@@ -204,6 +204,9 @@ pub const ResponseData = struct {
         }
     }
     pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) void {
+        // FIX: reserve the pool BEFORE appendSlice (was after → no-op warm).
+        // Single growth for the whole copy instead of per-chunk growth.
+        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
         self.pool.appendSlice(gpa, src.pool.items) catch {};
         self.status = src.status;
         self.status_text = src.status_text;
@@ -213,7 +216,6 @@ pub const ResponseData = struct {
         self._url = src._url;
         self.redirected = src.redirected;
         self.response_type = src.response_type;
-        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
         self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
         self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
         if (src.cold) |sc| {
@@ -245,6 +247,8 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
+        // FIX: batch reserve — one growth for the whole array load.
+        if (len > 0) target.reserveEntries(@intCast(len));
         var i: c_uint = 0;
         while (i < @as(c_uint, @intCast(len))) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
@@ -268,6 +272,8 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     var p: [*c]c.PropertyEnum = null;
     var count: c_uint = 0;
     if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        // FIX: batch reserve — one growth for the whole object load.
+        if (count > 0) target.reserveEntries(count);
         for (0..count) |idx| {
             const name_atom = p[idx].atom;
             const name_val = c.atomToString(ctx, name_atom);

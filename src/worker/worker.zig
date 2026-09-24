@@ -170,16 +170,18 @@ fn jsPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
         _ = qjs.throwTypeError(ctx, "postMessage requires an argument");
         return qjs.JS_EXCEPTION;
     }
-    const payload = serialize.stringify(ctx, argv[0]) catch {
-        // stringify already threw "value could not be cloned" — propagate.
+    // FIX (DOD §12): engine-owned view, zero Zig heap per send. The pipe
+    // write is synchronous, so the buffer outlives the send by construction.
+    const payload = serialize.stringifyView(ctx, argv[0]) catch {
+        // stringifyView already threw "value could not be cloned" — propagate.
         return qjs.JS_EXCEPTION;
     };
-    defer gpa.free(payload);
+    defer payload.deinit();
     var port = slots[slot].port orelse {
         _ = qjs.throwInternalError(ctx, "Worker channel closed");
         return qjs.JS_EXCEPTION;
     };
-    port.sendMessage(payload) catch {
+    port.sendMessage(payload.slice()) catch {
         _ = qjs.throwInternalError(ctx, "failed to send message to worker");
         return qjs.JS_EXCEPTION;
     };
@@ -255,8 +257,9 @@ pub fn drainCompleted(ctx: *qjs.Context) void {
     for (0..MAX_WORKERS) |s| {
         if (slots[s].state != .alive) continue;
         var port = slots[s].port orelse continue;
+        // FIX (DOD §12): payload is thread-local scratch — borrowed, not
+        // owned. No per-frame free; valid until the next recv on this thread.
         while (port.tryRecvFrame()) |fr| {
-            defer gpa.free(fr.payload);
             deliverToParent(ctx, @intCast(s), fr);
         }
     }
@@ -401,12 +404,13 @@ fn jsWorkerPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, arg
         _ = qjs.throwInternalError(ctx, "postMessage outside worker");
         return qjs.JS_EXCEPTION;
     };
-    const payload = serialize.stringify(ctx, argv[0]) catch {
-        // stringify already threw "value could not be cloned" — propagate.
+    // FIX (DOD §12): same engine-owned view as the parent side.
+    const payload = serialize.stringifyView(ctx, argv[0]) catch {
+        // stringifyView already threw "value could not be cloned" — propagate.
         return qjs.JS_EXCEPTION;
     };
-    defer gpa.free(payload);
-    port.sendMessage(payload) catch {
+    defer payload.deinit();
+    port.sendMessage(payload.slice()) catch {
         _ = qjs.throwInternalError(ctx, "failed to send message to parent");
         return qjs.JS_EXCEPTION;
     };
@@ -531,7 +535,6 @@ fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
     while (true) {
         if (port.pollReadable(POLL_QUANTUM_MS)) {
             const fr = port.recvFrameBlocking() catch break; // EOF → shutdown
-            defer gpa.free(fr.payload);
             deliverToWorker(ctx, fr);
         }
         loop.run(.no_wait) catch {};

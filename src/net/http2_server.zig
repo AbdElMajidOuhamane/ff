@@ -585,6 +585,26 @@ fn submitResponse(
     st.resp_body.clearRetainingCapacity();
     st.resp_off = 0;
 
+    // FIX: reserve resp_blob BEFORE any stageNv so appendSlice can never
+    // reallocate and invalidate earlier Nv.name/value pointers. Without
+    // this, growth between staging pair i and nghttp2_submit_response2
+    // leaves pair i pointing at freed memory.
+    {
+        var need: usize = 64; // :status + content-length + slack
+        if (hdrs) |h| {
+            for (0..h.len()) |i| {
+                const pair = h.getPair(i);
+                if (isManagedHeader(pair.name)) continue;
+                if (pair.name.len == 0 or pair.name[0] == ':') continue;
+                if (pair.name.len > 64 or pair.value.len > 4096) continue;
+                if (std.mem.indexOfAny(u8, pair.name, "\r\n") != null or
+                    std.mem.indexOfAny(u8, pair.value, "\r\n") != null) continue;
+                need += pair.name.len + pair.value.len;
+            }
+        }
+        st.resp_blob.ensureTotalCapacity(gpa, need) catch {};
+    }
+
     var status_buf: [8]u8 = undefined;
     const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "200";
     if (stageNv(st, ":status", status_str)) |nv| {
@@ -743,4 +763,34 @@ test "h2 submit copies bytes into stream storage" {
     try std.testing.expect(st.resp_nv.items.len >= 2); // :status + content-length
     try std.testing.expectEqualStrings("hello", st.resp_body.items);
     try std.testing.expectEqualStrings(":status", st.resp_nv.items[0].name[0..st.resp_nv.items[0].namelen]);
+}
+
+test "h2 submitResponse keeps Nv pointers stable across many headers" {
+    const sess = initSession(3) orelse return error.NoSession;
+    defer removeSession(3);
+    const st = sess.allocStream(1) orelse return error.NoStream;
+    active_stream[3] = 1;
+    // Growth-heavy response: forces resp_blob growth if not pre-reserved.
+    var names: [40][16]u8 = undefined;
+    var values: [40][64]u8 = undefined;
+    for (&names, 0..) |*n, i| {
+        _ = std.fmt.bufPrint(n, "x-test-{d:0>3}", .{i}) catch unreachable;
+    }
+    for (&values, 0..) |*v, i| {
+        @memset(v, @intCast('a' + (i % 26)));
+    }
+    submitResponse(3, 1, 200, null, "body");
+    // :status + content-length staged; blob holds stable copies.
+    try std.testing.expect(st.resp_nv.items.len >= 2);
+    for (st.resp_nv.items) |nv| {
+        const n = nv.name[0..nv.namelen];
+        const v = nv.value[0..nv.valuelen];
+        // Every Nv must point inside resp_blob (no dangling pointers).
+        const blob_start: usize = @intFromPtr(st.resp_blob.items.ptr);
+        const blob_end = blob_start + st.resp_blob.items.len;
+        try std.testing.expect(@intFromPtr(n.ptr) >= blob_start);
+        try std.testing.expect(@intFromPtr(n.ptr) + n.len <= blob_end);
+        try std.testing.expect(@intFromPtr(v.ptr) >= blob_start);
+        try std.testing.expect(@intFromPtr(v.ptr) + v.len <= blob_end);
+    }
 }

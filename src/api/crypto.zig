@@ -245,6 +245,14 @@ fn btoaCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     defer input.deinit();
     const enc = std.base64.standard.Encoder;
     const out_len = enc.calcSize(input.slice.len);
+    // FIX (DOD §7): stack-first output. A 512B stack input encodes to at
+    // most 684B, so any input that fit the stack input buffer also fits the
+    // 1024B stack output; heap input spills to a heap output as before.
+    var stack_out: [1024]u8 = undefined;
+    if (out_len <= stack_out.len) {
+        _ = enc.encode(stack_out[0..out_len], input.slice);
+        return c.newStringLen(ctx, stack_out[0..out_len].ptr, out_len);
+    }
     const out = gpa.alloc(u8, out_len) catch return c.throwOutOfMemory(ctx);
     defer gpa.free(out);
     _ = enc.encode(out, input.slice);
@@ -261,6 +269,16 @@ fn atobCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
         _ = c.throwTypeError(ctx, "atob: invalid base64 input");
         return c.JS_EXCEPTION;
     };
+    // FIX (DOD §7): stack-first output. Decoded output is always shorter
+    // than its base64 input, so any stack-fit input decodes into the stack.
+    var stack_out: [512]u8 = undefined;
+    if (out_len <= stack_out.len) {
+        dec.decode(stack_out[0..out_len], input.slice) catch {
+            _ = c.throwTypeError(ctx, "atob: invalid base64 input");
+            return c.JS_EXCEPTION;
+        };
+        return c.newStringLen(ctx, stack_out[0..out_len].ptr, out_len);
+    }
     const out = gpa.alloc(u8, out_len) catch return c.throwOutOfMemory(ctx);
     defer gpa.free(out);
     dec.decode(out, input.slice) catch {
@@ -289,7 +307,7 @@ pub fn setup(ctx: *c.Context) void {
     const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1);
     _ = c.definePropertyValueStr(ctx, global, "btoa", btoa_fn, c.PROP_C_W_E);
 
-    const atob_fn = c.newCFunction(ctx, atobCallback, "atob", 1);
+    const atob_fn = c.newCFunction(ctx, atobCallback, "atob", c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, global, "atob", atob_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "crypto", crypto_obj, c.PROP_C_W_E);

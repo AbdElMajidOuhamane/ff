@@ -28,11 +28,25 @@ const MAX_FRAME: usize = 4 * 1024 * 1024; // mirrors message_port cap
 // same-process — acceptable).
 const ERROR_MARKER = "__ff_cloned_error__";
 
-/// Serialize a JS value into an owned binary buffer.
-/// On failure a `TypeError("value could not be cloned")` is left pending on
-/// ctx (specific reason goes to stderr) — callers must return JS_EXCEPTION
-/// WITHOUT throwing again (throwing over a pending exception is unsafe).
-pub fn stringify(ctx: ?*qjs.Context, val: qjs.Value) ![]u8 {
+/// Engine-owned view of a serialized value. Safe while the JS buffer is
+/// alive; deinit() must run on the same ctx that created it. Used for
+/// synchronous postMessage (write completes before deinit).
+pub const View = struct {
+    ctx: ?*qjs.Context,
+    ptr: [*]u8,
+    len: usize,
+
+    pub fn slice(self: View) []const u8 {
+        return self.ptr[0..self.len];
+    }
+    pub fn deinit(self: View) void {
+        qjs.js_free(self.ctx, self.ptr);
+    }
+};
+
+/// Serialize into an engine-owned buffer (no Zig gpa copy).
+/// On failure a TypeError is left pending — same contract as stringify.
+pub fn stringifyView(ctx: ?*qjs.Context, val: qjs.Value) !View {
     var owned: ?qjs.Value = null;
     const src = if (qjs.isError(ctx, val) != 0) blk: {
         owned = errorToPlain(ctx, val) catch return error.NotSerializable;
@@ -48,9 +62,19 @@ pub fn stringify(ctx: ?*qjs.Context, val: qjs.Value) ![]u8 {
         rethrowAsCloneError(ctx);
         return error.NotSerializable;
     }
-    defer qjs.js_free(ctx, buf);
-    if (out_len == 0 or out_len > MAX_FRAME) return error.FrameTooLarge;
-    return gpa.dupe(u8, buf[0..out_len]) catch return error.OutOfMemory;
+    if (out_len == 0 or out_len > MAX_FRAME) {
+        qjs.js_free(ctx, buf);
+        return error.FrameTooLarge;
+    }
+    return .{ .ctx = ctx, .ptr = buf, .len = out_len };
+}
+
+/// Serialize a JS value into an owned Zig buffer (cross-thread lifetime,
+/// e.g. Worker initial payload). Prefer stringifyView on the hot send path.
+pub fn stringify(ctx: ?*qjs.Context, val: qjs.Value) ![]u8 {
+    var view = stringifyView(ctx, val) catch |e| return e;
+    defer view.deinit();
+    return gpa.dupe(u8, view.slice()) catch return error.OutOfMemory;
 }
 
 /// Deserialize a binary buffer into an owned JS value. Marked error objects

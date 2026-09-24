@@ -9,16 +9,16 @@ const builtin = @import("builtin");
 const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
 const http2_mod = @import("http2_server.zig");
-const response_mod = @import("../types/response.zig"); 
-const headers_mod = @import("../types/headers.zig"); 
-const gpa = std.heap.smp_allocator; 
+const response_mod = @import("../types/response.zig");
+const headers_mod = @import("../types/headers.zig");
+const gpa = std.heap.smp_allocator;
 
 // F3: the Debug req_counter (CountingAllocator) that used to wrap this
-// file's allocator is deleted. Nothing in this file allocates through it
-// (zero `gpa.` call sites) and the real per-request heap traffic — QuickJS
-// values plus types/response.zig via raw smp_allocator — bypasses it, so
-// `balanced=true` was vacuous false assurance. The meaningful per-job
-// counter lives in net/async_fetch.zig.
+// file's allocator was deleted: a process-wide counter only proved "allocs
+// matched frees", not "zero allocs per request" — vacuous false assurance.
+// The meaningful per-job counter lives in net/async_fetch.zig. Exception:
+// response bodies above BODY_BUF_SIZE still take a documented gpa spill in
+// stageLargeResponse (measured via stat_body_spill, reused while large).
 
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 4096;
@@ -99,6 +99,8 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; //10 MB gate — matches fs.zig MAX_READ
 var body_bufs: [MAX_CONN][BODY_BUF_SIZE]u8 = undefined;
 var body_heap: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN; // heap spill for >64KB
 var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+// Spill telemetry for the >64KB response path (mirrors async_fetch stat_*).
+pub var stat_body_spill: std.atomic.Value(u64) = .{ .raw = 0 };
 // ── TLS (https/wss): per-slot BearSSL engine + bidirectional iobuf ──
 var tls_ctxs: [MAX_CONN]tls_mod.Ctx = undefined;
 var tls_iobufs: [MAX_CONN][tls_mod.IOBUF_LEN]u8 = undefined;
@@ -550,14 +552,29 @@ fn printException(ctx: ?*c.Context, exc: c.Value) void {
 // formatted the header block into write_bufs[id] (write_lens[id] = header
 // length); writeCb drains WRITE_BUF_SIZE chunks from the staged body afterwards.
 // ≤64KB stages into static body_bufs (unchanged fast path);
-// >64KB spills to a per-slot heap buffer (cold path only).
+// >64KB spills to a per-slot heap buffer (measured via stat_body_spill,
+// reused while large instead of free+dupe per response).
 fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen: usize) void {
     write_lens[id] = header_len;
     write_offsets[id] = 0;
     if (blen <= BODY_BUF_SIZE) {
         @memcpy(body_bufs[id][0..blen], body_ptr[0..blen]);
     } else {
-        if (body_heap[id]) |old| gpa.free(old);
+        _ = stat_body_spill.fetchAdd(1, .release);
+        // Reuse capacity when the previous spill still fits: avoids a
+        // free+dupe cycle on every large response (body_lens tracks the
+        // logical length; the drain reads [body_source_off..][0..n]).
+        if (body_heap[id]) |old| {
+            if (old.len >= blen) {
+                @memcpy(old[0..blen], body_ptr[0..blen]);
+                body_lens[id] = blen;
+                body_remaining[id] = blen;
+                body_source_off[id] = 0;
+                return;
+            }
+            gpa.free(old);
+            body_heap[id] = null;
+        }
         body_heap[id] = gpa.dupe(u8, body_ptr[0..blen]) catch {
             buildResponse(id, 500, "Internal Server Error");
             return;
@@ -617,7 +634,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                 var size: usize = 0;
                 const p = c.getArrayBuffer(ctx, &size, body_out_val);
                 if (p != null and size > 0) {
-                    body_bytes = p[0..size];   
+                    body_bytes = p[0..size];
                     has_body = true;
                 }
             }        }
@@ -653,7 +670,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
             if (std.mem.indexOfAny(u8, p.name, "\r\n") != null or
                 std.mem.indexOfAny(u8, p.value, "\r\n") != null) continue;
             if (std.ascii.eqlIgnoreCase(p.name, "content-type")) seen_ct = true;
-            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break; 
+            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break;
             pushStr(w, &pos, p.name);
             pushStr(w, &pos, ": ");
             pushStr(w, &pos, p.value);
@@ -959,7 +976,8 @@ pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..bytes.len], bytes);
     const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, bytes.len);
-    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..hlen], buf[ws.MAX_HDR..][0..hlen]);
+    // FIX: move bytes.len payload bytes (was hlen — corrupts non-10B headers).
+    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..bytes.len], buf[ws.MAX_HDR..][0..bytes.len]);
     write_lens[id] = tail + hlen + bytes.len;
     if (!cflags[id].ws_writing) wsKick(id);
 }
@@ -1526,7 +1544,7 @@ pub fn writeCb(
             }
             if (cflags[id].keep_alive) {
                 states[id] = .reading;
-                keepAlivePreserve(id); 
+                keepAlivePreserve(id);
                 tlsPump(id, l);
             } else {
                 closeConn(id);
@@ -1543,7 +1561,7 @@ pub fn writeCb(
         }
         if (cflags[id].keep_alive) {
             states[id] = .reading;
-            keepAlivePreserve(id); 
+            keepAlivePreserve(id);
             tlsPump(id, l);
         } else {
             closeConn(id);
@@ -1588,10 +1606,10 @@ pub fn writeCb(
 
     write_offsets[id] += written;
 
-    
+
     if (body_lens[id] > 0) {
         if (write_offsets[id] >= write_lens[id]) {
-           
+
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
                 if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
@@ -1639,7 +1657,7 @@ pub fn writeCb(
     write_offsets[id] = 0;
     if (cflags[id].keep_alive) {
         write_lens[id] = 0;
-        keepAliveRearm(id, l); 
+        keepAliveRearm(id, l);
     } else {
         closeConn(id);
     }

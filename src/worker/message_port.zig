@@ -11,9 +11,15 @@ pub const FRAME_ERROR: u8 = 2;
 /// 4 MB cap guards against a corrupt length prefix causing a huge alloc.
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 
+// DOD: reusable per-thread receive scratch — zero heap alloc per frame
+// after thread start. Payload is valid only until the next recv on this thread.
+threadlocal var recv_scratch: [MAX_FRAME]u8 = undefined;
+
 pub const Frame = struct {
     ftype: u8,
-    payload: []u8, // owned by gpa; caller must gpa.free()
+    /// Borrowed from this thread's recv_scratch; valid only until the next
+    /// recv on the same thread. Do NOT free.
+    payload: []u8,
 };
 
 /// One direction of a bidirectional channel. The parent owns one end of
@@ -57,8 +63,8 @@ pub const MessagePort = struct {
         return self.sendFrame(FRAME_ERROR, msg);
     }
 
-    /// Blocking receive. Returns error.EndOfStream when the other end
-    /// closed its write fd (clean shutdown signal).
+    /// Blocking receive into thread-local scratch (no per-frame heap).
+    /// Returns error.EndOfStream when the other end closed its write fd.
     pub fn recvFrameBlocking(self: *const MessagePort) !Frame {
         var hdr: [5]u8 = undefined;
         try readExact(self.recv_fd, &hdr);
@@ -66,8 +72,7 @@ pub const MessagePort = struct {
         if (len > MAX_FRAME) return error.FrameTooLarge;
         const ftype = hdr[4];
         if (ftype != FRAME_MESSAGE and ftype != FRAME_ERROR) return error.BadFrame;
-        const buf = try gpa.alloc(u8, len);
-        errdefer gpa.free(buf);
+        const buf = recv_scratch[0..len];
         try readExact(self.recv_fd, buf);
         return .{ .ftype = ftype, .payload = buf };
     }

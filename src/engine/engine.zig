@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const qjs = @import("quickjs_shim.zig");
 const mod = @import("../modules/mod.zig");
 const EventLoop = @import("../event/loop.zig").EventLoop;
@@ -154,12 +155,16 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
         return null;
     };
     defer gpa.free(src_z);
-    std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
-        name,
-        src.len,
-        if (src.len >= 16) src[0..16] else src,
-        if (src.len >= 16) src[src.len - 16 ..] else src,
-    });
+    // FIX: blocking stdout write on every module load is Debug-only.
+    // In release it stalls the loader path for zero user benefit.
+    if (builtin.mode == .Debug) {
+        std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
+            name,
+            src.len,
+            if (src.len >= 16) src[0..16] else src,
+            if (src.len >= 16) src[src.len - 16 ..] else src,
+        });
+    }
     const func_val = qjs.eval(ctx, src_z.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     if (qjs.isException(func_val) != 0) return null;
     const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));

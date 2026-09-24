@@ -41,7 +41,8 @@ var resolve_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var reject_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var results: [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
 var errs: [MAX_FETCH]?[]const u8 = [_]?[]const u8{null} ** MAX_FETCH;
-var url_bufs: [MAX_FETCH][:0]const u8 = undefined;
+// Optional so freeOwned is idempotent (null after free → safe re-entry).
+var url_bufs: [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
 var uris: [MAX_FETCH]std.Uri = undefined;
 var methods: [MAX_FETCH]http.Method = undefined;
 var headers: [MAX_FETCH]?*headers_mod.HeadersData = [_]?*headers_mod.HeadersData{null} ** MAX_FETCH;
@@ -104,7 +105,7 @@ fn acquireSlot() ?usize {
 }
 fn releaseSlot(s: usize) void {
     states[s].store(JOB_FREE, .release);
-    url_bufs[s] = undefined;
+    url_bufs[s] = null;
     uris[s] = undefined;
     methods[s] = undefined;
     headers[s] = null;
@@ -164,10 +165,12 @@ pub fn deinit() void {
     }
 }
 fn freeOwned(s: usize) void {
-    gpa.free(url_bufs[s]);
+    if (url_bufs[s]) |u| gpa.free(u);
+    url_bufs[s] = null;
     if (headers[s]) |h| h.release();
-    headers[s]=null;
+    headers[s] = null;
     if (bodies[s]) |b| gpa.free(b);
+    bodies[s] = null;
 }
 fn workerLoop() void {
     while (true) {
@@ -243,7 +246,7 @@ fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]c
     const dir_end = std.mem.lastIndexOfScalar(u8, path[0..q], '/') orelse 0;
     if (auth_end+dir_end+1+loc.len>out.len) return null;
     var n: usize=0;
-    @memcpy(out[0..auth_end], current_url[0..auth_end]); n=auth_end;
+    @memcpy(out[0..auth_end], current_url[0..auth_end]); n=auth_start;
     @memcpy(out[n..][0..dir_end+1], path[0..dir_end+1]); n+=dir_end+1;
     @memcpy(out[n..][0..loc.len], loc);
     return out[0..n];
@@ -270,7 +273,7 @@ fn runJob(slot_id: u16) void {
         http_hdrs=hdr_view.items;
     }
     var current_method = methods[s];
-    var current_url: []const u8 = url_bufs[s];
+    var current_url: []const u8 = url_bufs[s] orelse "";
     var current_body: ?[:0]const u8 = bodies[s];
     var redirect_count: u32=0;
     var redirected=false;
@@ -503,6 +506,10 @@ fn completeJob(ctx: ?*c.Context, s: usize) void {
         _ = c.call(ctx, reject, c.JS_UNDEFINED, 1, &args);
     }
     freeResolvers(s);
-    results[s]=null; url_bufs[s]=undefined; uris[s]=undefined; methods[s]=undefined; headers[s]=null; bodies[s]=null; errs[s]=null;
+    // FIX: release submit-owned url/body/Headers on the normal path too
+    // (ownership was documented as freeOwned but only deinit/shutdown called it).
+    freeOwned(s);
+    results[s]=null;
+    errs[s]=null;
     releaseSlot(s);
 }

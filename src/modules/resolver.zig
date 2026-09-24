@@ -15,6 +15,15 @@ pub fn resolveSpec(allocator: Allocator, importer_dir: []const u8, specifier: []
 }
 
 pub fn pathExists(gpa: Allocator, path: []const u8) bool {
+    // FIX (DOD §7): stack-first probe — zero heap per existence check.
+    // Heap only when the path exceeds max_path_bytes (never in practice).
+    if (path.len < std.fs.max_path_bytes) {
+        var stack_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&stack_buf, "{s}", .{path}) catch return false;
+        const file = c.fopen(path_z.ptr, "rb") orelse return false;
+        _ = c.fclose(file);
+        return true;
+    }
     const path_z = gpa.dupeZ(u8, path) catch return false;
     defer gpa.free(path_z);
     const file = c.fopen(path_z.ptr, "rb") orelse return false;
