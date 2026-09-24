@@ -724,6 +724,48 @@ db.transaction(() => {
 db.close();
 ```
 
+### PostgreSQL database
+
+Fairyfly includes a native PostgreSQL client written in pure Zig — `SQL` is global, no packages needed.
+
+**Connecting and querying:**
+
+```js
+// DSN argument — or read the environment: PG_TEST_DSN, DATABASE_URL, PGHOST/…
+const sql = new SQL("postgres://fairyfly:fairyfly@127.0.0.1:5432/app");
+
+// Tagged template: ${} values become parameters; result is an array of row objects
+const rows = await sql`SELECT id, title FROM todos WHERE done = ${false}`;
+console.log(rows[0].title);
+
+// unsafe() — $N placeholders for dynamic SQL shapes
+const open = await sql.unsafe(
+    "SELECT id, title FROM todos ORDER BY id LIMIT $1",
+    [10],
+);
+
+await sql`INSERT INTO todos(title) VALUES (${"buy milk"})`;
+sql.close();
+```
+
+**Transactions:**
+
+```js
+// Userland helper over native begin/commit/rollback
+function transaction(fn) {
+    return sql.begin().then((tx) => fn(tx).then(
+        (r) => tx.commit().then(() => r),
+        (e) => tx.rollback().then(() => { throw e; }),
+    ));
+}
+// Committed together; any failure rolls everything back.
+```
+
+**Types:** send `null`, booleans, numbers, strings, bigints, arrays (→ `text[]`/`int8[]`…), plain objects and `Date` (→ `jsonb`), `Uint8Array` (→ `bytea`). Rows come back as JS primitives — `jsonb` → objects, arrays → arrays, `NULL` → `null`, timestamps → strings, huge `int8` → `bigint`. Failures reject with `err.code` / `err.severity` / `err.message` (e.g. `23505`).
+
+Full reference: [`docs/api/postgres.md`](docs/api/postgres.md). Working example: [`examples/todo-app/`](examples/todo-app/).
+
+
 ### Crypto
 
 Fairyfly includes the `crypto` global for random values, UUIDs, and
