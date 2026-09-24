@@ -15,6 +15,7 @@ const repl_cmd = @import("commands/repl.zig");
 const upgrade_cmd = @import("commands/upgrade.zig");
 const compile_cmd = @import("commands/compile.zig");
 const fmt_cmd = @import("commands/fmt.zig");
+const watch_cmd = @import("commands/watch.zig");
 const c = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
@@ -30,6 +31,7 @@ const Command = enum {
     upgrade,
     compile,
     fmt,
+    watch,
     e_flag,
     file,
     version,
@@ -48,6 +50,7 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "fmt")) return .fmt;
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
     if (std.mem.eql(u8, arg, "--version")) return .version;
+    if (std.mem.eql(u8, arg, "--watch")) return .watch;
     return .file;
 }
 fn shutdownRuntime(runtime: *engine.Runtime) void {
@@ -69,7 +72,10 @@ fn parseCaFlag(init: std.process.Init) void {
 }
 pub fn main(init: std.process.Init) !void {
     var args_iter = init.minimal.args.iterate();
-    _ = args_iter.next();
+    const exe = args_iter.next() orelse {
+        printUsage();
+        return;
+    };
     const first_arg = args_iter.next() orelse {
         printUsage();
         return;
@@ -110,6 +116,36 @@ pub fn main(init: std.process.Init) !void {
         .upgrade => try upgrade_cmd.run(init.io, init),
         .compile => try compile_cmd.run(init.io, init),
         .fmt => try fmt_cmd.run(init.io, init),
+        .watch => {
+            var target: ?[]const u8 = null;
+            var forward = std.ArrayList([]const u8).empty;
+            defer forward.deinit(std.heap.page_allocator);
+            while (args_iter.next()) |a| {
+                if (target == null) {
+                    if (std.mem.eql(u8, a, "--ca")) {
+                        const v = args_iter.next() orelse {
+                            std.debug.print("Error: --ca requires a path\n", .{});
+                            std.process.exit(1);
+                        };
+                        try forward.append(std.heap.page_allocator, a);
+                        try forward.append(std.heap.page_allocator, v);
+                    } else {
+                        target = a;
+                    }
+                } else {
+                    try forward.append(std.heap.page_allocator, a);
+                }
+            }
+            const t = target orelse {
+                std.debug.print("Error: --watch requires a file or 'start'\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, t, "start")) {
+                try watch_cmd.run(init.io, exe, .start, t, forward.items);
+            } else {
+                try watch_cmd.run(init.io, exe, .file, t, forward.items);
+            }
+        },
         .version => {
             std.debug.print("ff {s} ({s}-{s})\n", .{
                 ffcfg.version,
@@ -188,7 +224,8 @@ fn printUsage() void {
     std.debug.print("  ff upgrade [--check] Self-update from GitHub Releases", .{});
     std.debug.print("  ff compile <f.js> [-o out.ffbc]  Compile to bytecode", .{});
     std.debug.print("  ff fmt [--write|--check] <files...>  Format via prettier", .{});
+    std.debug.print("  ff --watch <file|start>  Restart on file changes", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
     std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
-    std.debug.print("  ff --version         Print runtime version", .{});
+std.debug.print("  ff --version         Print runtime version", .{});
 }
