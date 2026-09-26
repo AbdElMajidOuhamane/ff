@@ -70,7 +70,49 @@ fn parseCaFlag(init: std.process.Init) void {
         }
     }
 }
+
+// POSIX forces SIGINT/SIGQUIT to ignore for background jobs, so `kill -INT`
+// on a backgrounded ff was a no-op. Restore the default action when a
+// signal was ignored; caught handlers are left alone (exec already reset
+// them to default for us).
+fn resetIgnoredInterrupt() void {
+    for ([_]std.posix.SIG{ .INT, .TERM }) |sig| {
+        var old: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &old);
+        if (old.handler.handler == std.posix.SIG.IGN) {
+            const act = std.posix.Sigaction{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            std.posix.sigaction(sig, &act, null);
+        }
+    }
+}
+
+// Under `ff --watch` the supervisor exports FF_WATCH_PARENT before spawn;
+// if the supervisor dies (even SIGKILL), exit within 500ms instead of
+// living on as an orphan.
+fn maybeStartParentWatchdog() void {
+    const env = std.c.getenv("FF_WATCH_PARENT") orelse return;
+    const parent = std.fmt.parseInt(std.posix.pid_t, std.mem.span(env), 10) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parentWatchdog, .{parent}) catch return;
+    t.detach();
+}
+
+fn parentWatchdog(parent: std.posix.pid_t) void {
+    const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    while (true) {
+        _ = std.c.nanosleep(&ts, null);
+        if (std.posix.getppid() != parent) std.c._exit(0);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
+    if (builtin.os.tag != .windows) {
+        resetIgnoredInterrupt();
+        maybeStartParentWatchdog();
+    }
     var args_iter = init.minimal.args.iterate();
     const exe = args_iter.next() orelse {
         printUsage();

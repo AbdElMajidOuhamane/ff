@@ -128,11 +128,25 @@ fn collectHeadersFromJS(
     }
 }
 
+// The fetch worker pool (16 threads + job pipe + xev.Async) starts on the
+// first fetch() call — HTTP-only processes pay zero thread footprint at
+// boot. async_fetch.init is idempotent-by-flag; the event loop is safe
+// pre-init (drainCompleted no-ops while all slots are JOB_FREE, arm is
+// gated on pending > 0).
+var fetch_inited = false;
+
+fn ensureFetchInit(ctx: ?*c.Context) void {
+    if (fetch_inited) return;
+    async_fetch.init(ctx); // pump ctx: completions resolve promises here
+    fetch_inited = true;
+}
+
 fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
         return c.JS_EXCEPTION;
     }
+    ensureFetchInit(ctx);
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
     const arg0 = argv[0];
@@ -245,13 +259,12 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
 }
 
 pub fn deinitClient() void {
-    async_fetch.deinit();
-    tls.deinit();
+    if (fetch_inited) async_fetch.deinit();
+    tls.deinit(); // self-guards when never initialized
 }
 
 pub fn setup(ctx: ?*c.Context) void {
-    tls.init();
-    async_fetch.init(ctx); // CHANGED: pass ctx so the pump can resolve promises
+    tls.init(); // eager: wss/PEM paths share tls.client() without fetch
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const fetch_func = c.newCFunction(ctx, &fetchCallback, "fetch", 2);

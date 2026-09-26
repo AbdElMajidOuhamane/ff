@@ -16,6 +16,14 @@ const TERM_GRACE_NS: i96 = 10_000_000;
 const TERM_GRACE_TICKS: usize = 50; // 50 x 10ms, then SIGKILL
 const WNOHANG: c_int = 1; // POSIX value on darwin + linux
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+// Signal forwarding: INT/TERM on the supervisor terminate the child and exit
+// the watcher. Stored before spawn, cleared on every reap so the handler
+// never signals a recycled pid — the child's FF_WATCH_PARENT watchdog
+// covers the residual reap race.
+var g_child_pid: std.atomic.Value(std.posix.pid_t) = .{ .raw = 0 };
+
 const Snap = struct {
     path: []const u8,
     mtime_ns: i96,
@@ -23,6 +31,28 @@ const Snap = struct {
 };
 
 const skip_dirs = [_][]const u8{ ".git", "node_modules", "zig-out", ".zig-cache", "zig-cache" };
+
+fn forwardSignal(sig: std.posix.SIG) callconv(.c) void {
+    const pid = g_child_pid.load(.acquire);
+    if (pid > 0) std.posix.kill(pid, .TERM) catch {};
+    std.c._exit(@intCast(128 + @intFromEnum(sig)));
+}
+
+fn installForwarders() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = forwardSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
+
+fn exportParentPid() void {
+    var buf: [20]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "{d}", .{std.c.getpid()}) catch return;
+    _ = setenv("FF_WATCH_PARENT", s, 1);
+}
 
 pub fn run(io: std.Io, exe: []const u8, mode: Mode, target: []const u8, forward: []const []const u8) !void {
     if (builtin.os.tag == .windows) {
@@ -66,6 +96,8 @@ fn supervise(io: std.Io, exe: []const u8, mode: Mode, target: []const u8, forwar
     var running = false;
     var status: c_int = 0;
 
+    installForwarders();
+    exportParentPid();
     spawnChild(io, argv.items, disp, &pid);
     running = true;
 
@@ -76,9 +108,11 @@ fn supervise(io: std.Io, exe: []const u8, mode: Mode, target: []const u8, forwar
         if (running) {
             const r = std.c.waitpid(@intCast(pid), &status, WNOHANG);
             if (r == pid) {
+                g_child_pid.store(0, .release);
                 running = false;
                 printExit(status);
             } else if (r == -1) {
+                g_child_pid.store(0, .release);
                 running = false;
             }
         }
@@ -110,6 +144,7 @@ fn spawnChild(io: std.Io, argv: []const []const u8, disp: []const u8, pid: *std.
         std.process.exit(1);
     };
     pid.* = child.id.?;
+    g_child_pid.store(pid.*, .release);
     std.debug.print("[watch] running: ff {s}\n", .{disp});
 }
 
@@ -120,6 +155,7 @@ fn stopChild(io: std.Io, pid: *std.posix.pid_t, running: *bool, status: *c_int) 
     while (i < TERM_GRACE_TICKS) : (i += 1) {
         const r = std.c.waitpid(@intCast(pid.*), status, WNOHANG);
         if (r == pid.* or r == -1) {
+            g_child_pid.store(0, .release);
             running.* = false;
             return;
         }
@@ -127,6 +163,7 @@ fn stopChild(io: std.Io, pid: *std.posix.pid_t, running: *bool, status: *c_int) 
     }
     std.posix.kill(pid.*, .KILL) catch {};
     _ = std.c.waitpid(@intCast(pid.*), status, 0);
+    g_child_pid.store(0, .release);
     running.* = false;
 }
 
