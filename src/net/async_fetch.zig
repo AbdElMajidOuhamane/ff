@@ -161,16 +161,33 @@ pub fn deinit() void {
     job_pipe=.{-1,-1};
     async_h.deinit();
     for (0..MAX_FETCH) |s| {
-        if (states[s].load(.acquire)!=JOB_FREE) { freeResolvers(s); freeOwned(s); }
+        // BUG-5 FIX: a slot retired while JOB_DONE/JOB_CLAIMED still holds a
+        // heap ResponseData that no JS object ever wrapped — release it, else
+        // the wrapper + its body buffer leak at shutdown.
+        if (states[s].load(.acquire)!=JOB_FREE) { freeResolvers(s); freeOwned(s); freeResult(s); }
     }
 }
 fn freeOwned(s: usize) void {
+    // BUG-7 FIX NOTE: these frees stay unconditional BY DESIGN. Every value
+    // that reaches url_bufs[]/bodies[] is heap-owned — fetch.extractStringFromVal
+    // no longer returns a static "" sentinel, and dupeSentinel allocates
+    // len+1 bytes even for empty input (Allocator.zig:472), so a `len > 0`
+    // guard here would leak those. Ownership is made uniform at the source
+    // instead of branched at the sink (DOD: explicit ownership & lifetime).
     if (url_bufs[s]) |u| gpa.free(u);
     url_bufs[s] = null;
     if (headers[s]) |h| h.release();
     headers[s] = null;
     if (bodies[s]) |b| gpa.free(b);
     bodies[s] = null;
+}
+fn freeResult(s: usize) void {
+    // Mirrors responseFinalizer (response.zig:504): deinit + destroy.
+    if (results[s]) |data| {
+        data.deinit();
+        gpa.destroy(data);
+        results[s] = null;
+    }
 }
 fn workerLoop() void {
     while (true) {
@@ -340,6 +357,17 @@ fn runJob(slot_id: u16) void {
         // create+release of a throwaway HeadersData per fetch.
         resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
         headers[s]=null;
+        // BUG-2 FIX: the adopted container still holds the REQUEST headers
+        // from fetch.zig's in_flight pool. Reset it in place BEFORE the
+        // response headers are appended below, otherwise res.headers still
+        // exposes the request's x-api-key and every other request header.
+        // clearRetainingCapacity preserves the reserved byte pools, so the
+        // append stays zero-alloc — the F1 "one HeadersData + one growth per
+        // fetch" invariant is untouched (DOD / TigerBeetle §1).
+        // Safe: http_hdrs was consumed by sendBodiless/sendBody at :304/:309,
+        // and std.http.Client.Request.deinit (client.zig:890) only touches
+        // the connection then does `r.* = undefined` — never extra_headers.
+        resp_data.headers.clear();
         resp_data.status=status_code;
         resp_data.setStatusText(response.head.status.phrase() orelse "OK");
         resp_data.redirected=redirected;
@@ -493,15 +521,23 @@ pub fn drainCompleted(ctx: ?*c.Context) void {
     while (mask!=0){ const s:usize=@ctz(mask); mask &= mask-1; if (claimSlot(s)) completeJob(ctx,s); }
 }
 fn completeJob(ctx: ?*c.Context, s: usize) void {
-    const resolve=resolve_funcs[s] orelse { freeResolvers(s); freeOwned(s); releaseSlot(s); return; };
-    const reject=reject_funcs[s] orelse { freeResolvers(s); freeOwned(s); releaseSlot(s); return; };
+    // BUG-5 FIX: freeResult on the resolver-missing paths — results[s] held
+    // a heap ResponseData that releaseSlot would otherwise just null out.
+    const resolve=resolve_funcs[s] orelse { freeResolvers(s); freeOwned(s); freeResult(s); releaseSlot(s); return; };
+    const reject=reject_funcs[s] orelse { freeResolvers(s); freeOwned(s); freeResult(s); releaseSlot(s); return; };
     if (results[s]) |data| {
         const obj=response_mod.buildResponseJSObject(ctx, data);
+        // BUG-5 FIX: JS_Call borrows argv, it does not consume it — one
+        // Response (and its HeadersData + body) leaked per successful fetch.
+        defer c.freeValue(ctx, obj);
         var args=[_]c.Value{obj};
         _ = c.call(ctx, resolve, c.JS_UNDEFINED, 1, &args);
     } else {
         const msg=errs[s] orelse "fetch failed";
         const ev=c.newStringLen(ctx, msg.ptr, @intCast(msg.len));
+        // BUG-5 FIX: same borrow semantics — one Error string leaked per
+        // failed fetch.
+        defer c.freeValue(ctx, ev);
         var args=[_]c.Value{ev};
         _ = c.call(ctx, reject, c.JS_UNDEFINED, 1, &args);
     }

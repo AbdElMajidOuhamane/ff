@@ -182,13 +182,17 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
     }
     // ArrayBufferView — try buffer property
     const buf_val = c.getPropertyStr(ctx, arg, "buffer");
+    // FIX: JS_GetPropertyStr returns a new ref — freed on every path below.
+    defer c.freeValue(ctx, buf_val);
     if (c.isObject(buf_val) != 0) {
         const p2 = c.getArrayBuffer(ctx, &size, buf_val);
         if (p2 != null and size > 0) {
             const offset_val = c.getPropertyStr(ctx, arg, "byteOffset");
+            defer c.freeValue(ctx, offset_val);
             var offset: i32 = 0;
             _ = c.toInt32(ctx, &offset, offset_val);
             const len_val = c.getPropertyStr(ctx, arg, "byteLength");
+            defer c.freeValue(ctx, len_val);
             var view_len: i32 = 0;
             _ = c.toInt32(ctx, &view_len, len_val);
            const start = @as(usize, @intCast(@max(offset, 0)));

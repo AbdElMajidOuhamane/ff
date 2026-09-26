@@ -19,6 +19,15 @@ fn timersAlive() bool {
     return tm.hasReferencedTimers();
 }
 
+// Timer completions armed in the loop that JS has unref'd. Saturating
+// subtract is required: sched_bits is set at setTimeout() time while
+// loop.active only rises once the submission is processed, so sched can
+// legitimately lead active by one.
+inline fn unrefArmed() usize {
+    const tm = timer_mgr orelse return 0;
+    return tm.unrefScheduledCount();
+}
+
 pub const EventLoop = struct {
     loop: xev.Loop,
 
@@ -56,6 +65,33 @@ pub const EventLoop = struct {
             hasPendingCompletions(loop);
     }
 
+    // Should the process stay alive / should we block on the loop?
+    //
+    // Identical to hasWork() except that armed-but-unref'd timers are
+    // excluded. Those timers keep loop.active > 0, which is exactly why
+    // the old break condition — `!work_left and ... and !timersAlive()` —
+    // could never be satisfied: `!work_left` was already false whenever
+    // any timer existed, so `timersAlive()` never got to decide anything.
+    inline fn hasRelevantWork(loop: *const xev.Loop) bool {
+        if ((loop.active -| unrefArmed()) > 0) return true;
+        if (timersAlive()) return true;
+        if (http_api.server_running.load(.acquire)) return true;
+        if (async_fetch.pending.load(.acquire) > 0) return true;
+        if (ws_client.pending.load(.acquire) > 0) return true;
+        if (pg_client.pending.load(.acquire) > 0) return true;
+        if (worker_mod.liveCount() > 0) return true;
+        // Queue entries only count as blocking when nothing is unref'd:
+        // with an unref'd timer pending, an entry in submissions may be that
+        // timer's own submission, and waiting on it is precisely the bug.
+        // Every other producer (server / fetch / ws / pg / worker) is covered
+        // by its own counter above, so skipping the queue here drops no work.
+        if (unrefArmed() == 0) {
+            if (!loop.submissions.empty()) return true;
+            if (hasPendingCompletions(loop)) return true;
+        }
+        return false;
+    }
+
     // Cold tuning knobs — kept out of the per-iteration working set.
     const GC_POLICE = (1 << 13);
     const GC_MIN_HEAP = 8 * 1024 * 1024;
@@ -69,8 +105,16 @@ pub const EventLoop = struct {
 
         while (true) {
             var did_work = false;
-            if (hasWork(&self.loop)) {
+            if ((self.loop.active -| unrefArmed()) > 0) {
+                // Real work armed (referenced timers, sockets, fetch…):
+                // block until at least one completion arrives.
                 self.loop.run(.once) catch {};
+                did_work = true;
+            } else if (!self.loop.submissions.empty() or hasPendingCompletions(&self.loop)) {
+                // Only queued entries remain — possibly an unref'd timer's
+                // own submission. Drain them without blocking, then decide;
+                // blocking here is what made `t.unref()` wait out the timer.
+                self.loop.run(.no_wait) catch {};
                 did_work = true;
             }
             // Batched completion drains: contiguous, reusable slot storage,
@@ -96,15 +140,8 @@ pub const EventLoop = struct {
             }
             gc_ticks +%= 1;
             if (self.loop.stopped()) break;
-            const work_left = hasWork(&self.loop);
-            if (!http_api.server_running.load(.acquire) and
-                !work_left and
-                async_fetch.pending.load(.acquire) == 0 and
-                ws_client.pending.load(.acquire) == 0 and
-                pg_client.pending.load(.acquire) == 0 and
-                worker_mod.liveCount() == 0 and
-                !timersAlive()) break;
-            if (!work_left and !did_work) {
+            if (!hasRelevantWork(&self.loop)) break;
+            if (!did_work) {
                 const ts: std.c.timespec = .{
                     .sec = @intCast(idle_delay_ns / std.time.ns_per_s),
                     .nsec = @intCast(idle_delay_ns % std.time.ns_per_s),

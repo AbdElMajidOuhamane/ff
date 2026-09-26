@@ -113,6 +113,7 @@ if (badConfig) {
 - Code is clamped to 0–255 (`exit(300)` → 44? no — clamped into range, negatives become 0).
 - `exit()` stops the event loop immediately — pending timers, connections, and workers do not drain. The test helper `done()` relies on this to end server-fixture tests cleanly.
 - Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
+- An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
 Graceful shutdown instead of a hard cut:
 
@@ -163,6 +164,6 @@ Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
 
 **`chdir` throws** — path missing or no permission. It throws rather than returning false — wrap in `try/catch` when the dir is user-supplied.
 
-**Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit.
+**Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
 
 **`spawn is not a function`** — by design. There is no subprocess API; use HTTP sidecars.

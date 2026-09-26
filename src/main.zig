@@ -5,6 +5,7 @@ const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
 const loop_mod = @import("event/loop.zig");
+const microtasks = @import("event/microtasks.zig");
 const init_cmd = @import("commands/init.zig");
 const imprint_cmd = @import("commands/imprint.zig");
 const sever_cmd = @import("commands/sever.zig");
@@ -80,7 +81,7 @@ fn resetIgnoredInterrupt() void {
         var old: std.posix.Sigaction = undefined;
         std.posix.sigaction(sig, null, &old);
         if (old.handler.handler == std.posix.SIG.IGN) {
-            const act = std.posix.Sigaction{
+            const act: std.posix.Sigaction = .{
                 .handler = .{ .handler = std.posix.SIG.DFL },
                 .mask = std.posix.sigemptyset(),
                 .flags = 0,
@@ -106,6 +107,14 @@ fn parentWatchdog(parent: std.posix.pid_t) void {
         _ = std.c.nanosleep(&ts, null);
         if (std.posix.getppid() != parent) std.c._exit(0);
     }
+}
+
+// Runs the event loop to quiescence, then exits 1 if anything threw —
+// a top-level throw, a rejected module promise, a failed job, or a
+// timer/microtask error. Previously every one of these exited 0.
+fn runAndExit(runtime: *engine.Runtime) void {
+    runtime.event_loop.runWithMicrotasks(runtime.ctx);
+    if (microtasks.had_error) std.process.exit(1);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -197,21 +206,21 @@ pub fn main(init: std.process.Init) !void {
         },
         .e_flag => {
             const code = args_iter.next() orelse {
-                std.debug.print("Error: -e requires an argument", .{});
+                std.debug.print("Error: -e requires an argument\n", .{});
                 std.process.exit(1);
             };
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
-            _ = runtime.eval(code, "<eval>");
-            runtime.event_loop.runWithMicrotasks(runtime.ctx);
+            if (!runtime.eval(code, "<eval>")) microtasks.had_error = true;
+            runAndExit(runtime);
         },
         .file => {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
             const file = c.fopen(first_arg.ptr, "rb") orelse {
-                std.debug.print("Error: could not open file '{s}'", .{first_arg});
+                std.debug.print("Error: could not open file '{s}'\n", .{first_arg});
                 std.process.exit(1);
             };
             defer _ = c.fclose(file);
@@ -245,11 +254,12 @@ pub fn main(init: std.process.Init) !void {
                     }
                     std.process.exit(1);
                 }
+                runAndExit(runtime);
             } else {
                 const source: [:0]const u8 = buf;
-                _ = runtime.evalModule(source, first_arg);
+                if (!runtime.evalModule(source, first_arg)) microtasks.had_error = true;
+                runAndExit(runtime);
             }
-            runtime.event_loop.runWithMicrotasks(runtime.ctx);
         },
         .none => printUsage(),
     }
@@ -269,5 +279,5 @@ fn printUsage() void {
     std.debug.print("  ff --watch <file|start>  Restart on file changes", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
     std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
-std.debug.print("  ff --version         Print runtime version", .{});
+    std.debug.print("  ff --version         Print runtime version", .{});
 }

@@ -140,7 +140,7 @@ function poll() {
 poll();
 ```
 
-Unhealthy stretches back off to 5s; the `.unref()` means `Ctrl-C`… actually `process.exit` aside, the process can still end when nothing else holds the loop.
+Unhealthy stretches back off to 5s; the `.unref()` keeps the reschedule timer from holding the process open, so once the in-flight fetch settles and nothing else holds the loop, the process ends on its own instead of waiting out the delay.
 
 ## Reference
 

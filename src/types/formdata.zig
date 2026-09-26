@@ -307,6 +307,10 @@ fn formDataForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
             zigStringToJS(ctx, fd.nameOf(e)),
             this_val,
         };
+        // FIX: JS_Call copies argv (JS_CALL_FLAG_COPY_ARGV), so these two
+        // fresh refs stay ours — they used to leak on every iteration.
+        defer c.freeValue(ctx, args[0]);
+        defer c.freeValue(ctx, args[1]);
         _ = c.call(ctx, callback, this_val, 3, &args);
     }
     return c.JS_UNDEFINED;

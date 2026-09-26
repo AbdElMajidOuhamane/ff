@@ -15,7 +15,8 @@ const MS_ONESHOT: u64 = 0;
 // Cancel flows only through cancel+cancelCb (clear path, proven); restart
 // flows only through run-from-fire (interval, proven) and reset() (refresh,
 // libxev-owned). unref/ref touch NOTHING but bits — loop exit for unref'd
-// timers comes from the loop predicate consulting hasReferencedTimers().
+// timers comes from the loop predicate consulting hasReferencedTimers() and
+// unrefScheduledCount().
 //
 // Reentrancy note: clear() called from inside a firing callback (directly,
 // or via anything the callback runs, including the microtask pump) frees
@@ -83,6 +84,19 @@ pub const TimerManager = struct {
             if (self.active_bits[w] & self.ref_bits[w] != 0) return true;
         }
         return false;
+    }
+
+    // Number of timer completions currently registered with the libxev loop
+    // that JS has unref'd. Armed timers keep loop.active > 0, which is why
+    // the old break condition could never fire: the loop predicate subtracts
+    // this from loop.active so an unref'd timer alone cannot hold the
+    // process open. sched_bits is set immediately after timers[idx].run(...)
+    // and cleared when the completion is consumed, so it mirrors the timer's
+    // share of loop.active word-by-word. O(1) — two ANDs and two popcounts.
+    pub fn unrefScheduledCount(self: *const TimerManager) usize {
+        const unref0 = self.sched_bits[0] & ~self.ref_bits[0];
+        const unref1 = self.sched_bits[1] & ~self.ref_bits[1];
+        return @as(usize, @intCast(@popCount(unref0) + @popCount(unref1)));
     }
 
     fn popFree(self: *TimerManager) ?u8 {
@@ -182,7 +196,8 @@ pub const TimerManager = struct {
         if (idx >= MAX_TIMERS or !self.isActive(idx)) return;
         // Bits only — deliberately no xev interaction. The timer stays
         // armed and fires normally if the loop outlives it (Node parity);
-        // process exit is the loop predicate's job (hasReferencedTimers).
+        // process exit is the loop predicate's job (hasReferencedTimers +
+        // unrefScheduledCount).
         bitOp(&self.ref_bits, idx, false);
     }
     pub fn refSlot(self: *TimerManager, idx: u8) void {
@@ -256,13 +271,7 @@ fn timerCallback(
             // Surface timer exceptions like microtaskJob does; free the
             // (previously leaked) non-exception return value here.
             if (c.isException(ret) != 0) {
-                const exc = c.getException(ctx);
-                defer c.freeValue(ctx, exc);
-                const msg = c.toCString(ctx, exc);
-                if (msg) |m| {
-                    defer c.freeCString(ctx, m);
-                    std.debug.print("timer error: {s}\n", .{m});
-                }
+                microtasks.reportUncaught(ctx, "timer error");
             } else {
                 c.freeValue(ctx, ret);
             }

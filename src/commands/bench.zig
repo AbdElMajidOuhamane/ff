@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine/engine.zig");
+const microtasks = @import("../event/microtasks.zig");
 
 const bench_files = [_][]const u8{
     "bench/fib.js",
@@ -46,7 +47,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         var start_ts: std.c.timespec = undefined;
         var end_ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &start_ts);
-        _ = runtime.eval(source, path_z);
+        if (!runtime.eval(source, path_z)) microtasks.had_error = true;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &end_ts);
 
         const elapsed_ns = (@as(i64, @intCast(end_ts.sec)) - @as(i64, @intCast(start_ts.sec))) * 1_000_000_000 +
@@ -60,4 +61,6 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     }
 
     std.debug.print("\n  Total: {d}ms ({d} benchmarks)\n\n", .{ total_ms, bench_count });
+    runtime.event_loop.runWithMicrotasks(runtime.ctx);
+    if (microtasks.had_error) std.process.exit(1);
 }

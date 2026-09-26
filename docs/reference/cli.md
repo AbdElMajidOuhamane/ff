@@ -203,9 +203,12 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 
 | Situation | Effect |
 |-----------|--------|
+| No releases published or network failure | Prints `upgrade: <reason>`, exits `1` |
 | Already latest | Prints up-to-date, exits |
 | `--check` | Prints the newer version, exits without downloading |
 | Update available | Downloads `ff-<os>-<arch>`, `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
+
+> **Note:** The repository currently publishes no releases, so today `ff upgrade` always takes the failure row: `upgrade: no releases published for AbdElMajidOuhamane/ff` with exit code `1`. Release a version (or wait for the first one) for the other rows to apply.
 
 ## Print the version
 

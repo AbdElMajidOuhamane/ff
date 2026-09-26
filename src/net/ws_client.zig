@@ -841,12 +841,20 @@ fn dispatchEvent(
     event_val: ?c.Value,
 ) void {
     const prop = c.getPropertyStr(ctx, sock_val, event_name);
+    // FIX: JS_GetPropertyStr returns a new ref — previously dropped on both
+    // the non-function early return and the normal path.
+    defer c.freeValue(ctx, prop);
     if (c.isFunction(ctx, prop) == 0) return;
     if (event_val) |ev| {
+        // FIX: every caller passes a freshly built event (make*Event) — we own
+        // it. JS_Call copies argv, so the ref stays ours after the dispatch.
+        defer c.freeValue(ctx, ev);
         var argv = [_]c.Value{ev};
-        _ = c.call(ctx, prop, sock_val, 1, &argv);
+        const ret = c.call(ctx, prop, sock_val, 1, &argv);
+        defer c.freeValue(ctx, ret);
     } else {
-        _ = c.call(ctx, prop, sock_val, 0, null);
+        const ret = c.call(ctx, prop, sock_val, 0, null);
+        defer c.freeValue(ctx, ret);
     }
 }
 

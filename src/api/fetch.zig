@@ -44,16 +44,28 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 
 // Cold-submit owned-string helper: heap copy is REQUIRED because the
 // result outlives this frame (transferred to async_fetch worker).
-// Empty string returns a static "" sentinel — no alloc.
+//
+// BUG-7 FIX: the old `if (len == 0) return "";` handed back a STATIC
+// sentinel, so empty and non-empty inputs had two different owners.
+// gpa.free on that sentinel is NOT a no-op: mem.absorbSentinel
+// (std/mem.zig:4733) does `ptr[0..len + 1]`, giving bytes.len == 1, which
+// sails past Allocator.free's `if (bytes.len == 0) return` (Allocator.zig:447)
+// and @memsets + rawFree's a .rodata pointer → heap corruption / crash.
+// The old `len > 0` guard at the free sites could not fix this either:
+// dupeSentinel allocates len+1 (Allocator.zig:472), so a heap "" MUST be
+// freed unconditionally or it leaks.
+// Fix by construction — one owner for every value: allocSentinel already
+// allocates n+1 even for n == 0 (Allocator.zig:222), so letting the general
+// path handle the empty case yields a real heap block every time. All free
+// sites then stay unconditional, with no branch.
 fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
     var stack_buf: [256]u8 = undefined;
     const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
     if (ex.heap) |h| return h; // heap case: return directly, no second copy
-    if (ex.slice.len == 0) return "";
     const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
     @memcpy(buf[0..ex.slice.len], ex.slice);
-    buf[ex.slice.len] = 0;
+    buf[ex.slice.len] = 0; // sentinel slot at index len — legal on [:0]T
     return buf;
 }
 
@@ -149,21 +161,26 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     ensureFetchInit(ctx);
     var cap: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &cap);
+    // BUG-5: JS_NewPromiseCapability gives the caller owning refs on BOTH
+    // resolving functions. async_fetch.submit dupValue()s them into the
+    // slot, so ours must be freed on every path — pattern matches the two
+    // correct sites already in the tree (sql.zig:303-314, crypto.zig:216-237).
+    // Registered after the exception guard so cap[] is never touched when
+    // capability creation itself failed.
+    if (c.isException(promise) != 0) return promise;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const arg0 = argv[0];
     var url_str: ?[:0]const u8 = null;
     var method_override: ?[]const u8 = null;
     var owned_method: ?[:0]const u8 = null;
     var body_payload: ?[:0]const u8 = null;
     defer {
-        if (url_str) |u| {
-            if (u.len > 0) gpa.free(u);
-        }
-        if (owned_method) |m| {
-            if (m.len > 0) gpa.free(m);
-        }
-        if (body_payload) |b| {
-            if (b.len > 0) gpa.free(b);
-        }
+        // BUG-7: unconditional by design — every non-null value is heap-owned
+        // now that extractStringFromVal no longer returns a static "" .
+        if (url_str) |u| gpa.free(u);
+        if (owned_method) |m| gpa.free(m);
+        if (body_payload) |b| gpa.free(b);
     }
     // DOD-FIX: single getOpaque2 lookup, reused below (was looked up twice).
     const req_data = extractRequestData(ctx, arg0);
@@ -181,12 +198,14 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
     } else {
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
+        // BUG-5: promise + cap[0] + cap[1] are owned by this frame and
+        // referenced by nothing yet — 3 JSValues leaked per bad-argument call.
+        c.freeValue(ctx, promise);
         return c.JS_EXCEPTION;
     }
 
     // DOD-FIX 5: build a single dense HeadersData in-place.
     var in_flight_headers = headers_mod.HeadersData.init();
-    errdefer in_flight_headers.deinit();
 
     // If arg0 is a Request, copy its headers into the in-flight pool.
     // Batch reserve first: one growth, not per-header.
@@ -220,8 +239,13 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     }
 
     const url = url_str orelse {
+        // BUG-5: the old `errdefer in_flight_headers.deinit()` never fired
+        // (this function has no error returns) → the reserved name/value
+        // pools leaked on every early return. Explicit cleanup instead.
+        in_flight_headers.deinit();
         var msg = zigStringToJS(ctx, "Invalid URL");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        c.freeValue(ctx, msg);
         return promise;
     };
     var method_str = method_override orelse "GET";
@@ -230,29 +254,43 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     }
     const method = parseMethod(method_str);
     const uri = std.Uri.parse(url) catch {
+        in_flight_headers.deinit();
         var msg = zigStringToJS(ctx, "Invalid URL");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        c.freeValue(ctx, msg);
         return promise;
     };
+
+    // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
+    // heap-allocated HeadersData so async_fetch can hold a stable pointer.
+    // The wrapper is released by freeOwned once runJob has adopted its
+    // contents into the response's HeadersData.
+    const hdr_ptr = gpa.create(headers_mod.HeadersData) catch {
+        in_flight_headers.deinit();
+        var msg = zigStringToJS(ctx, "Out of memory");
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        c.freeValue(ctx, msg);
+        // url_str / body_payload are still non-null here, so the deferred
+        // free above reclaims them — the null-outs below are deliberately
+        // placed AFTER this block to avoid leaking url_copy/body_copy.
+        return promise;
+    };
+    hdr_ptr.* = in_flight_headers;
+    // Ownership of url/body moves to submit() from here on; null the
+    // deferred-free handles so this frame's defer stops tracking them.
     const url_copy = url;
     url_str = null;
     const body_copy = body_payload;
     body_payload = null;
-
-    // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
-    // heap-allocated HeadersData so async_fetch can hold a stable pointer.
-    // The wrapper is destroyed by runJob once its contents are moved into
-    // the response's HeadersData.
-    const hdr_ptr = gpa.create(headers_mod.HeadersData) catch {
-        var msg = zigStringToJS(ctx, "Out of memory");
-        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
-        return promise;
-    };
-    hdr_ptr.* = in_flight_headers;
     async_fetch.submit(ctx, cap[0], cap[1], url_copy, uri, method, hdr_ptr, body_copy) catch {
-        hdr_ptr.release();
+        // BUG-6 FIX (double-release UAF): submit() takes ownership the moment
+        // it is called and has ALREADY freed url/body/headers on BOTH of its
+        // failure paths — pool-full at async_fetch:200-206 and shutdown at
+        // :213-218. Releasing hdr_ptr here drove the refcount 1→0→destroy
+        // then read gpa.destroy'd memory. Do not touch it again.
         var msg = zigStringToJS(ctx, "Failed to start fetch");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        c.freeValue(ctx, msg);
         return promise;
     };
     return promise;

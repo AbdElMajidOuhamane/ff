@@ -149,7 +149,11 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
 
     const obj = qjs.newObjectClass(ctx, worker_class_id);
     qjs.setOpaque(obj, @ptrFromInt(slot + 1));
-    slots[slot].js_obj = qjs.dupValue(ctx, obj);
+    // FIX: transfer the newObjectClass ref to the slot and hand the caller a
+    // dup. The old code dup'd twice and never released the base ref, so the
+    // Worker object could never reach refcount 0 and workerFinalizer (the GC
+    // path that terminates + joins the thread) was unreachable after terminate().
+    slots[slot].js_obj = obj;
     return qjs.dupValue(ctx, obj);
 }
 

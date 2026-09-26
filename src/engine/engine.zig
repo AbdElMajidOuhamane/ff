@@ -188,6 +188,28 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
     return m;
 }
 
+// Print an exception value (message, then stack if present) and mark the
+// run as failed. Takes ownership of `exc` — the caller must not free it.
+// Shared by eval() and evalModule().
+fn reportAndFail(self: *Runtime, exc: qjs.Value) void {
+    defer qjs.freeValue(self.ctx, exc);
+    microtasks.had_error = true;
+    const msg = qjs.toCString(self.ctx, exc);
+    if (msg) |m| {
+        defer qjs.freeCString(self.ctx, m);
+        std.debug.print("Error: {s}\n", .{m});
+    }
+    const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+    defer qjs.freeValue(self.ctx, stack_val);
+    if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+        const smsg = qjs.toCString(self.ctx, stack_val);
+        if (smsg) |sm| {
+            defer qjs.freeCString(self.ctx, sm);
+            std.debug.print("{s}\n", .{sm});
+        }
+    }
+}
+
 pub const Runtime = struct {
     ctx: *qjs.Context,
     event_loop: *EventLoop,
@@ -383,7 +405,7 @@ pub const Runtime = struct {
         const rt = g_runtime orelse return qjs.JS_UNDEFINED;
         const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_UNDEFINED;
         rt.timer_manager.unrefSlot(id);
-    return qjs.dupValue(ctx, this_val);
+        return qjs.dupValue(ctx, this_val);
     }
 
     fn timeoutRef(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
@@ -441,13 +463,10 @@ pub const Runtime = struct {
         _ = argc;
         const ret = qjs.call(ctx, argv[0], qjs.JS_UNDEFINED, 0, null);
         if (qjs.isException(ret) != 0) {
-            const exc = qjs.getException(ctx);
-            defer qjs.freeValue(ctx, exc);
-            const msg = qjs.toCString(ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(ctx, m);
-                std.debug.print("queueMicrotask error: {s}\n", .{m});
-            }
+            // ctx is optional at the ABI boundary; reportUncaught needs a
+            // non-null one. QuickJS never hands us null here, but guard so a
+            // null can never panic the runtime.
+            if (ctx) |jc| microtasks.reportUncaught(jc, "queueMicrotask error");
             return qjs.JS_UNDEFINED;
         }
         return ret;
@@ -486,22 +505,7 @@ pub const Runtime = struct {
         );
         defer qjs.freeValue(self.ctx, result);
         if (qjs.isException(result) != 0) {
-            const exc = qjs.getException(self.ctx);
-            defer qjs.freeValue(self.ctx, exc);
-            const msg = qjs.toCString(self.ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(self.ctx, m);
-                std.debug.print("Error: {s}\n", .{m});
-            }
-            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
-            defer qjs.freeValue(self.ctx, stack_val);
-            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
-                const smsg = qjs.toCString(self.ctx, stack_val);
-                if (smsg) |sm| {
-                    defer qjs.freeCString(self.ctx, sm);
-                    std.debug.print("{s}\n", .{sm});
-                }
-            }
+            reportAndFail(self, qjs.getException(self.ctx));
             return false;
         }
         microtasks.pumpMicrotasks(self.ctx);
@@ -527,23 +531,23 @@ pub const Runtime = struct {
         );
         defer qjs.freeValue(self.ctx, result);
         if (qjs.isException(result) != 0) {
-            const exc = qjs.getException(self.ctx);
-            defer qjs.freeValue(self.ctx, exc);
-            const msg = qjs.toCString(self.ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(self.ctx, m);
-                std.debug.print("Error: {s}\n", .{m});
-            }
-            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
-            defer qjs.freeValue(self.ctx, stack_val);
-            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
-                const smsg = qjs.toCString(self.ctx, stack_val);
-                if (smsg) |sm| {
-                    defer qjs.freeCString(self.ctx, sm);
-                    std.debug.print("{s}\n", .{sm});
-                }
-            }
+            reportAndFail(self, qjs.getException(self.ctx));
             return false;
+        }
+        // A module's top-level throw is routed into the module promise rather
+        // than into JS_EXCEPTION (js_evaluate_module resolves it via the
+        // rejecting func and returns the promise). The isException branch
+        // above therefore never sees it, which is why `ff bad.js` used to
+        // print nothing and exit 0. Inspect the promise directly.
+        if (is_module) {
+            const ps = qjs.promiseState(self.ctx, result);
+            if (ps == 2) { // JS_PROMISE_REJECTED
+                const pr = qjs.promiseResult(self.ctx, result);
+                // reportAndFail takes ownership, so hand it a fresh dup and
+                // keep `pr` owned by the defer above.
+                reportAndFail(self, qjs.dupValue(self.ctx, pr));
+                return false;
+            }
         }
         microtasks.pumpMicrotasks(self.ctx);
         return true;

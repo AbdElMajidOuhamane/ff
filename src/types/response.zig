@@ -252,9 +252,12 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         var i: c_uint = 0;
         while (i < @as(c_uint, @intCast(len))) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
+            defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;
             const name_val = c.getPropertyUint32(ctx, item, 0);
+            defer c.freeValue(ctx, name_val);
             const val_val = c.getPropertyUint32(ctx, item, 1);
+            defer c.freeValue(ctx, val_val);
             var nbuf: [128]u8 = undefined;
             var vbuf: [256]u8 = undefined;
             const n = extractStringAuto(ctx, name_val, &nbuf);
@@ -326,9 +329,12 @@ fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var result = zigStringToJS(ctx, body_text);
+    defer c.freeValue(ctx, result);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
     return promise;
 }
@@ -338,14 +344,18 @@ fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     if (body_text.len == 0) {
         var msg = zigStringToJS(ctx, "Unexpected end of JSON input");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    defer c.freeValue(ctx, parsed);
     if (c.isException(parsed) != 0) {
         var exc = c.getException(ctx);
         defer c.freeValue(ctx, exc);
@@ -361,9 +371,12 @@ fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
@@ -373,10 +386,13 @@ fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const blob = gpa.create(blob_mod.BlobData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -384,6 +400,7 @@ fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     blob.setBytes(body_bytes);
     if (data.headers.getFirst("content-type")) |ct| blob.setTypeNormalized(ct);
     var obj = blob_mod.buildBlobJSObject(ctx, blob);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
@@ -393,10 +410,13 @@ fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const fd = gpa.create(formdata_mod.FormData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -406,10 +426,12 @@ fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
         fd.deinit();
         gpa.destroy(fd);
         var msg = zigStringToJS(ctx, "FormData unsupported content-type");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var obj = formdata_mod.buildFormDataJSObject(ctx, fd);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
@@ -419,9 +441,12 @@ fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
@@ -510,7 +535,6 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
-// ===== THIS IS THE ONLY FUNCTION THAT CHANGED =====
 fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var body_buf: [512]u8 = undefined;

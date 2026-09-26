@@ -313,9 +313,12 @@ fn blobArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     _ = argv;
     const data = extractBlobData(ctx, this_val) orelse return c.JS_EXCEPTION;
     const b = data.bytes();
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = if (b.len > 0) c.newArrayBufferCopy(ctx, b.ptr, b.len) else c.newArrayBufferCopy(ctx, "", 0);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
@@ -325,9 +328,12 @@ fn blobText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
     _ = argv;
     const data = extractBlobData(ctx, this_val) orelse return c.JS_EXCEPTION;
     const b = data.bytes();
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var result = zigStringToJS(ctx, b);
+    defer c.freeValue(ctx, result);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
     return promise;
 }
@@ -337,19 +343,21 @@ fn blobBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value
     _ = argv;
     const data = extractBlobData(ctx, this_val) orelse return c.JS_EXCEPTION;
     const b = data.bytes();
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
-    // 3-arg TypedArray form — argv[1..2] (offset/len) are mandatory,
-    // same as http_native.zig:835-840.
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const ab = if (b.len > 0) c.newArrayBufferCopy(ctx, b.ptr, b.len) else c.newArrayBufferCopy(ctx, "", 0);
     if (c.getTag(ab) == c.TAG_EXCEPTION) {
         var exc = c.getException(ctx);
+        defer c.freeValue(ctx, exc);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &exc);
         return promise;
     }
     defer c.freeValue(ctx, ab);
     var targv = [_]c.Value{ ab, c.newInt32(ctx, 0), c.newInt32(ctx, @intCast(b.len)) };
     var u8arr = c.newTypedArray(ctx, 3, &targv, c.JS_TYPED_ARRAY_UINT8);
+    defer c.freeValue(ctx, u8arr);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &u8arr);
     return promise;
 }

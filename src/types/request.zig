@@ -230,11 +230,11 @@ pub const RequestData = struct {
         }
         return self._redirect.string();
     }
-    fn store(self: *RequestData, owned: []const u8, dst: *PoolSlice) void {
-        if (owned.len == 0) return;
+    fn store(self: *RequestData, s: []const u8, dst: *PoolSlice) void {
+        if (s.len == 0) return;
         const off = self.pool.items.len;
-        self.pool.appendSlice(gpa, owned) catch return;
-        dst.* = .{ .off = @intCast(off), .len = @intCast(owned.len) };
+        self.pool.appendSlice(gpa, s) catch return;
+        dst.* = .{ .off = @intCast(off), .len = @intCast(s.len) };
     }
     fn ensureCold(self: *RequestData) ?*RequestDataCold {
         if (self.cold) |cd| return cd;
@@ -249,57 +249,55 @@ pub const RequestData = struct {
         self.cold = cd;
         return cd;
     }
-    pub fn setUrl(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        self.store(owned, &self._url);
+    // Setters take a BORROWED slice: bytes are copied into the pool and the
+    // caller keeps ownership (requestConstructor frees via `defer x.deinit()`).
+    // FIX (bug G): these used to start with `defer gpa.free(owned)`, which
+    // pushed the caller's stack buffer (≤512B) — or a second free of the
+    // >512B heap buffer — onto smp_allocator's free list, poisoning it on
+    // every `new Request()`. Matches ResponseData's borrowed contract.
+    pub fn setUrl(self: *RequestData, s: []const u8) void {
+        self.store(s, &self._url);
     }
-    pub fn setBody(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        self.has_body = owned.len > 0;
-        self.store(owned, &self._body);
+    pub fn setBody(self: *RequestData, s: []const u8) void {
+        self.has_body = s.len > 0;
+        self.store(s, &self._body);
     }
-    pub fn setIntegrity(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        self.store(owned, &self._integrity);
+    pub fn setIntegrity(self: *RequestData, s: []const u8) void {
+        self.store(s, &self._integrity);
     }
-    pub fn setMethod(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        const m = Method.fromSlice(owned);
+    pub fn setMethod(self: *RequestData, s: []const u8) void {
+        const m = Method.fromSlice(s);
         self._method = m;
         if (m == .other) {
-            if (self.ensureCold()) |cd| self.store(owned, &cd._method_other);
+            if (self.ensureCold()) |cd| self.store(s, &cd._method_other);
         }
     }
-    pub fn setCache(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        const v = CacheMode.fromSlice(owned);
+    pub fn setCache(self: *RequestData, s: []const u8) void {
+        const v = CacheMode.fromSlice(s);
         self._cache = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(owned, &cd._cache_other);
+            if (self.ensureCold()) |cd| self.store(s, &cd._cache_other);
         }
     }
-    pub fn setCredentials(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        const v = CredMode.fromSlice(owned);
+    pub fn setCredentials(self: *RequestData, s: []const u8) void {
+        const v = CredMode.fromSlice(s);
         self._credentials = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(owned, &cd._credentials_other);
+            if (self.ensureCold()) |cd| self.store(s, &cd._credentials_other);
         }
     }
-    pub fn setMode(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        const v = Mode.fromSlice(owned);
+    pub fn setMode(self: *RequestData, s: []const u8) void {
+        const v = Mode.fromSlice(s);
         self._mode = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(owned, &cd._mode_other);
+            if (self.ensureCold()) |cd| self.store(s, &cd._mode_other);
         }
     }
-    pub fn setRedirect(self: *RequestData, owned: []const u8) void {
-        defer gpa.free(owned);
-        const v = RedirectMode.fromSlice(owned);
+    pub fn setRedirect(self: *RequestData, s: []const u8) void {
+        const v = RedirectMode.fromSlice(s);
         self._redirect = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(owned, &cd._redirect_other);
+            if (self.ensureCold()) |cd| self.store(s, &cd._redirect_other);
         }
     }
     pub fn cloneFrom(self: *RequestData, src: *const RequestData) void {
@@ -432,9 +430,12 @@ fn requestText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var result = zigStringToJS(ctx, body_text);
+    defer c.freeValue(ctx, result);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
     return promise;
 }
@@ -444,14 +445,18 @@ fn requestJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     if (body_text.len == 0) {
         var msg = zigStringToJS(ctx, "Unexpected end of JSON input");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    defer c.freeValue(ctx, parsed);
     if (c.isException(parsed) != 0) {
         var exc = c.getException(ctx);
         defer c.freeValue(ctx, exc);
@@ -467,9 +472,12 @@ fn requestArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
@@ -479,10 +487,13 @@ fn requestBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const blob = gpa.create(blob_mod.BlobData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -490,6 +501,7 @@ fn requestBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     blob.setBytes(body_bytes);
     if (data.headers.getFirst("content-type")) |ct| blob.setTypeNormalized(ct);
     var obj = blob_mod.buildBlobJSObject(ctx, blob);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
@@ -499,10 +511,13 @@ fn requestFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const fd = gpa.create(formdata_mod.FormData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -512,10 +527,12 @@ fn requestFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
         fd.deinit();
         gpa.destroy(fd);
         var msg = zigStringToJS(ctx, "FormData unsupported content-type");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var obj = formdata_mod.buildFormDataJSObject(ctx, fd);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
@@ -525,9 +542,12 @@ fn requestBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }

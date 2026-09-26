@@ -141,6 +141,23 @@ pub const HeadersData = struct {
             gpa.destroy(self);
         }
     }
+    // BUG-2 FIX: fetch adopts the REQUEST HeadersData into the Response
+    // (async_fetch.runJob:341) so its byte pools can be reused instead of
+    // allocating a throwaway per fetch. Without this reset the response
+    // still contains the request's headers — `res.headers.get("x-api-key")`
+    // returned the request value instead of null.
+    // clearRetainingCapacity keeps every reserved pool, so the response
+    // header append below is zero-alloc: one HeadersData + one growth per
+    // fetch (DOD / TigerBeetle §1: no allocator call added to the I/O path).
+    // Scratch (`merge_buf`/`view_buf`) is cleared too — those views are
+    // already documented as invalidated by the next getFirst/getAllValues.
+    pub fn clear(self: *HeadersData) void {
+        self.entries.clearRetainingCapacity();
+        self.names.clearRetainingCapacity();
+        self.values.clearRetainingCapacity();
+        self.merge_buf.clearRetainingCapacity();
+        self.view_buf.clearRetainingCapacity();
+    }
     // Batch reserve: one growth per bulk load instead of per-header realloc.
     // Call before any bulk append loop (fetch, async_fetch, constructor).
     pub fn reserve(self: *HeadersData, n_entries: usize, name_bytes: usize, val_bytes: usize) void {
@@ -464,12 +481,16 @@ pub fn headersForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     const callback = argv[0];
     for (0..data.len()) |i| {
         const p = data.getPair(i);
-        var args = [_]c.Value{
-            zigStringToJS(ctx, p.value),
-            zigStringToJS(ctx, p.name),
-            this_val,
-        };
+        // BUG-5 FIX: JS_Call borrows argv — it does not consume it. These
+        // two new values were never freed, so every forEach iteration leaked
+        // 2 JSValues on a hot path. Free after the call (the callback has
+        // already DupValue'd anything it kept); `this_val` is borrowed.
+        const v = zigStringToJS(ctx, p.value);
+        const n = zigStringToJS(ctx, p.name);
+        var args = [_]c.Value{ v, n, this_val };
         _ = c.call(ctx, callback, this_val, 3, &args);
+        c.freeValue(ctx, v);
+        c.freeValue(ctx, n);
     }
     return c.JS_UNDEFINED;
 }
