@@ -2,63 +2,60 @@
 
 # Fairyfly Runtime
 
-
 A lightweight, backend-focused JavaScript runtime built with Zig and powered by
 [QuickJS](https://bellard.org/quickjs/). Designed for fast startup, low memory,
 and a small readable codebase.
 
 > **138k req/sec · 0.66 ms p50 · 5 MB RSS** on Apple silicon (8-thread wrk, 100 conn).
 > Outperforms Node 23, Bun 1.4, and Deno 2 — and uses ~10× less memory.
+> Reproduce with [`bench/_bench/wrk.sh`](bench); see [Performance](#performance).
 
 ---
 
 ## Contents
 
-1. [Why Fairyfly](#why-fairyfly)
-2. [Quick start](#quick-start)
-3. [Core concepts](#core-concepts)
-4. [Tutorials](#tutorials)
-   - [Hello world](#hello-world)
-   - [Console](#console)
-   - [Timers and the event loop](#timers-and-the-event-loop)
-   - [HTTP server](#http-server)
-   - [Async handlers](#async-handlers)
-   - [Fetch client](#fetch-client)
-   - [WebSocket server](#websocket-server)
-   - [WebSocket client](#websocket-client)
-   - [TLS: HTTPS and WSS servers](#tls-https-and-wss-servers)
-   - [URL parsing](#url-parsing)
-   - [Headers](#headers)
-   - [File system](#file-system)
-   - [SQLite database](#sqlite-database)
-   - [Crypto](#crypto)
-   - [Text encoding](#text-encoding)
-   - [Performance timing](#performance-timing)
-   - [Workers](#workers)
-   - [Working with modules](#working-with-modules)
-5. [Built-in API reference](#built-in-api-reference)
-6. [Performance](#performance)
-7. [Architecture](#architecture)
-8. [Building from source](#building-from-source)
-9. [CLI reference](#cli-reference)
-10. [Limitations](#limitations-vs-node--browser)
-11. [License](#license)
+1. [Documentation](#documentation)
+2. [Why Fairyfly](#why-fairyfly)
+3. [Quick start](#quick-start)
+4. [Core concepts](#core-concepts)
+5. [Tutorials](#tutorials)
+6. [Built-in API reference](#built-in-api-reference)
+7. [Performance](#performance)
+8. [Architecture](#architecture)
+9. [Building from source](#building-from-source)
+10. [CLI reference](#cli-reference)
+11. [Limitations vs Node / browser](#limitations-vs-node--browser)
+12. [License](#license)
+
+---
+
+## Documentation
+
+The full guide set lives in [`docs/`](docs/index.md) — 28 pages covering
+everything this README summarizes.
+
+| Section | Contents |
+|---|---|
+| [Getting started](docs/getting-started/introduction.md) | Introduction, installation, quickstart |
+| [Guides](docs/index.md) | HTTP server, fetch, WebSocket, TLS, HTTP/2, Postgres packages, modules, workers, timers, testing, bytecode, environment, deploy |
+| [API reference](docs/api/overview.md) | Every global and module on one page |
+| [Reference](docs/reference/cli.md) | CLI, limitations, examples |
 
 ---
 
 ## Why Fairyfly
 
-Modern backend development doesn't need 50 MB of runtime to start. Fairyfly is
+Modern backend development doesn't need a 50 MB runtime to start. Fairyfly is
 built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — under 10k lines of Zig
+- **The whole codebase should fit in your head** — ~20k lines of Zig across 54 files
 
 It's *not* aimed at:
 
 - Browser parity (no DOM, no `window`)
-- npm ecosystem (no `node_modules` resolution)
+- Full npm ecosystem compatibility (pure-JS ESM packages only — see [Packages](docs/guides/packages.md))
 
 If you need either of those, use Node, Bun, or Deno. If you need a backend
 runtime that's small, fast, and auditable, Fairyfly fits.
@@ -68,15 +65,17 @@ runtime that's small, fast, and auditable, Fairyfly fits.
 ## Quick start
 
 ```sh
-# Build (one-time)
-make install
+# Build (one-time) — vendors are fetched automatically
+docker build -t fairyfly .
 
+# Or build locally after fetching vendors (see "Building from source")
+make install
 
 # Run inline code
 ff -e 'console.log("hello from fairyfly")'
 
 # Initialize a project (writes ff.json)
-f init
+ff init
 ff start
 ```
 
@@ -110,13 +109,20 @@ no JS state — they communicate by message passing.
 
 ### Modules are ES Modules only
 
-`require()` is not supported. Use `import` / `export`. File extensions are
-mandatory in import specifiers:
+`require()` is not supported. Use `import` / `export`.
+
+Include the file extension in relative specifiers:
 
 ```js
 import { add } from "./math.js";
 export const pi = 3.14159;
 ```
+
+If you omit the extension, the loader probes `X.js`, then `X/index.js`.
+
+Bare specifiers (`nanoid`) resolve through `node_modules/`, which
+[`ff imprint`](docs/guides/packages.md) populates — nothing is installed
+automatically.
 
 ---
 
@@ -144,27 +150,28 @@ Fairyfly provides a full `console` object with colored output and timers:
 
 ```js
 // Basic output methods
-console.log("standard output");         // plain text
-console.info("informational");          // same as log
-console.debug("debug details");         // same as log
-console.warn("warning message");        // yellow text
-console.error("error occurred");        // red text
+console.log("hello");             // plain text
+console.info("informational");    // same as log
+console.debug("debug details");   // same as log
+console.warn("warning message");  // yellow text
+console.error("error occurred");  // red text
 
 // Custom colored output
-console.detail("success message");      // green text
-console.slops("another warning");       // alias for warn (yellow)
-console.redbal("another error");        // alias for error (red)
+console.detail("success message");  // green text
+console.slops("another warning");   // alias for warn (yellow)
+console.redbal("another error");    // alias for error (red)
 
 // Performance timers
 console.time("db-query");
 // ... some operation ...
-console.timeLog("db-query");            // "db-query: 12.345ms"
+console.timeLog("db-query");        // "db-query: 12.345ms"
 // ... more work ...
-console.timeEnd("db-query");            // "db-query: 45.678ms" (timer removed)
-
-// All methods accept any number of arguments, any type
-console.log("count:", 42, "items:", ["a", "b"]);
+console.timeEnd("db-query");        // "db-query: 45.678ms" (timer removed)
 ```
+
+> **Note:** `console` writes to **stderr**, so `console.log > out.txt` captures
+> nothing. Each call prints the **first two arguments** (see
+> [Limitations](#limitations-vs-node--browser)).
 
 ### Timers and the event loop
 
@@ -228,12 +235,13 @@ console.log("main code");
 
 ```js
 const timer = setTimeout(() => console.log("done"), 5000);
-timer.unref();        // process can exit even if timer is still pending
+timer.unref();        // mark the timer as unreferenced
 timer.refresh();      // reset the countdown
-timer.hasRef();       // check if timer keeps process alive
+timer.hasRef();       // check the ref flag
 ```
 
-**Max timers**: 128 concurrent timers. After that, new timers queue and wait.
+**Max timers**: 128 concurrent timers. The 129th call throws
+`TypeError: too many timers (max 128)`.
 
 ### HTTP server
 
@@ -294,8 +302,8 @@ $ wrk -t 8 -c 100 -d 10s http://127.0.0.1:3000/
 Running 10s test @ http://127.0.0.1:3000/
   8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     0.66ms  143.62us   4.56ms   97.27%
-    Req/Sec    17.27k   1.30k    19.84k    70.85%
+    Latency     0.66ms  143.62us  4.56ms  97.27%
+    Req/Sec    17.27k    1.30k   19.84k   70.85%
   1381874 requests in 10.00s, 9.43MB read
 Requests/sec: 138187.47
 Transfer/sec:    964.39KB
@@ -365,9 +373,15 @@ const html = await fetch("https://example.com").then(r => r.text());
 
 **Caveats:**
 
-- HTTPS uses the system trust store
+- HTTPS uses the system trust store (or `FF_CA_FILE` / `--ca`)
 - Outbound fetch is HTTP/1.1 only (the server accepts HTTP/2 over TLS)
-- Redirects are not followed yet — 3xx responses are returned as-is
+- Redirects **are** followed, up to **5 hops**; `307`/`308` preserve method and
+  body, `303` and `301`/`302` on POST downgrade to `GET`. Beyond 5 hops the
+  promise rejects with `Too many redirects`. `res.redirected` reports whether
+  any hop occurred.
+- `AbortController` / `signal` are not supported
+
+See [Limitations](#limitations-vs-node--browser) for concurrency and body caps.
 
 ### WebSocket server
 
@@ -394,11 +408,10 @@ http.serve({
 }, (url, method, body) => new Response("ws endpoint", { status: 200 }));
 ```
 
-The `sock` object exposes:
+The server-side `sock` object exposes:
 
 - `sock.send(text)` — send a UTF-8 text frame
 - `sock.sendBinary(buffer)` — send a binary frame (`ArrayBuffer` or `Uint8Array`)
-- `sock.readyState` — `CONNECTING` / `OPEN` / `CLOSING` / `CLOSED`
 
 **Binary frames:**
 
@@ -423,7 +436,9 @@ ws.onclose = (e) => console.log("closed:", e.code, e.reason);
 ws.onerror = (e) => console.error("error:", e);
 ```
 
-Static constants: `WebSocket.CONNECTING`, `.OPEN`, `.CLOSING`, `.CLOSED`.
+The **client** `WebSocket` exposes `ws.readyState` — `CONNECTING` / `OPEN` /
+`CLOSING` / `CLOSED` — plus the static constants
+`WebSocket.CONNECTING`, `.OPEN`, `.CLOSING`, `.CLOSED`.
 
 ### TLS: HTTPS and WSS servers
 
@@ -491,7 +506,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 **Notes & limitations:**
 
 - TLS 1.2 (BearSSL does not implement TLS 1.3)
-- RSA or EC keys; RSA is recommended
+- RSA or EC keys; RSA is recommended. Ed25519 server certs are not supported yet.
 - Zero allocations on the TLS hot path
 - Builds can opt out entirely: `zig build -Dbearssl=false`
 
@@ -530,7 +545,7 @@ params.append("sort", "desc");
 console.log(params.toString());       // "page=1&limit=10&tag=zig&tag=fairyfly&sort=desc"
 
 params.delete("page");
-console.log([...params.entries()]);   // [["limit","10"],["tag","zig"],["tag","fairyfly"],["sort","desc"]]
+console.log(params.entries());        // [["limit","10"],["tag","zig"],["tag","fairyfly"],["sort","desc"]]
 ```
 
 **Non-throwing parse** with `URL.parse`:
@@ -543,7 +558,7 @@ const invalid = URL.parse("not a url");
 console.log(invalid); // null
 
 console.log(URL.canParse("https://example.com")); // true
-console.log(URL.canParse("not a url"));            // false
+console.log(URL.canParse("not a url"));           // false
 ```
 
 ### Headers
@@ -559,10 +574,10 @@ const h = new Headers({
 h.append("X-Custom", "world");
 console.log(h.get("x-custom"));       // "hello, world" (case-insensitive)
 console.log(h.has("content-type"));   // true
-console.log(h.size());                // 2
+console.log(h.size());                // 2  — note: a method, not a getter
 
 h.delete("x-custom");
-console.log([...h.keys()]);           // ["content-type"]
+console.log(h.keys());                // ["content-type"]
 ```
 
 **Iterate with forEach:**
@@ -669,32 +684,13 @@ console.log("Created user:", id);
 // row() — single row as an object, or null if no results
 const user = db.row("SELECT * FROM users WHERE id = ?", [1]);
 console.log(user.name);   // "Alice"
-console.log(user.email);  // "alice@example.com"
 
 // rows() — all matching rows as an array
 const all = db.rows("SELECT * FROM users ORDER BY name ASC");
-for (const u of all) {
-    console.log(`${u.name} <${u.email}>`);
-}
 
 // count rows affected by INSERT/UPDATE/DELETE
 db.exec("UPDATE users SET name = ? WHERE id = ?", ["Alicia", 1]);
 console.log(db.changes());  // 1
-```
-
-**Partial updates:**
-
-```js
-function updateUser(id, patch) {
-    const sets = [];
-    const params = [];
-    if (typeof patch.name === "string")  { sets.push("name = ?");  params.push(patch.name); }
-    if (typeof patch.email === "string") { sets.push("email = ?"); params.push(patch.email); }
-    if (sets.length === 0) return db.row("SELECT * FROM users WHERE id = ?", [id]);
-    params.push(id);
-    db.exec("UPDATE users SET " + sets.join(", ") + " WHERE id = ?", params);
-    return db.row("SELECT * FROM users WHERE id = ?", [id]);
-}
 ```
 
 **Transactions:**
@@ -718,11 +714,76 @@ db.transaction(() => {
 | `boolean` | `INTEGER` (1 or 0) |
 | `ArrayBuffer` / `Uint8Array` | `BLOB` |
 
+Full reference: [`Database` methods](#database-methods) and
+[docs/api/sqlite.md](docs/api/sqlite.md).
+
 **Closing the database:**
 
 ```js
 db.close();
 ```
+
+### PostgreSQL
+
+A native Postgres client ships with the runtime — `sql` and `SQL` are globals,
+no import and no package required.
+
+```js
+// todos.js
+const sql = new SQL("postgres://fairyfly:fairyfly@127.0.0.1:5432/fairyfly");
+
+await sql`CREATE TABLE IF NOT EXISTS todos (
+  id serial PRIMARY KEY,
+  title text NOT NULL,
+  done boolean NOT NULL DEFAULT false
+)`;
+
+await sql`INSERT INTO todos(title) VALUES (${"buy milk"})`;
+
+const rows = await sql`SELECT id, title, done FROM todos WHERE done = ${false}`;
+console.log(rows);
+// [ { id: 1, title: "buy milk", done: false } ]
+
+sql.close();
+```
+
+```sh
+ff todos.js
+```
+
+Interpolated values are always sent as **parameters**, never string-spliced —
+the tagged template turns `${x}` into `$1`, `$2`, … `sql.unsafe(sqlString, params)`
+stays parameterized too.
+
+**Connecting.** `new SQL(dsn)` builds a pool around that DSN. The global `sql`
+is preconfigured from the environment, checked in order: `PG_TEST_DSN`,
+`DATABASE_URL`, then `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` /
+`PGDATABASE`, then defaults (`127.0.0.1:5432`). Connections are lazy; the pool
+caps at 10.
+
+**Transactions:**
+
+```js
+const tx = await sql.begin();
+try {
+    await tx`UPDATE accounts SET balance = balance - ${100} WHERE id = ${1}`;
+    await tx`UPDATE accounts SET balance = balance + ${100} WHERE id = ${2}`;
+    await tx.commit();
+} catch (e) {
+    await tx.rollback();
+    throw e;
+}
+```
+
+**Type mapping:** `bool`, `int2/int4/int8` (int8 beyond ±2⁵³ becomes `BigInt`),
+`float4/float8`, `bytea` → `Uint8Array`, `json`/`jsonb` → parsed value, and
+Postgres arrays → JS arrays.
+
+Authentication: cleartext, MD5, and SCRAM-SHA-256. Full reference:
+[docs/api/postgres.md](docs/api/postgres.md).
+
+> Run `docker compose up -d` to start the bundled Postgres 16 fixture used by
+> `test/sql.test.js`, `test/sql3.test.js`, and `test/todo.test.js`.
 
 ### Crypto
 
@@ -737,17 +798,13 @@ console.log(id);  // "550e8400-e29b-41d4-a716-446655440000"
 // Fill a typed array with random bytes
 const bytes = new Uint8Array(16);
 crypto.getRandomValues(bytes);
-console.log(Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(""));
 
 // SHA-256 hash (returns a Promise)
 const data = new TextEncoder().encode("hello world");
 const hash = await crypto.subtle.digest("SHA-256", data);
 console.log(new Uint8Array(hash));  // Uint8Array of 32 bytes
 
-// SHA-512 hash
-const bigHash = await crypto.subtle.digest("SHA-512", data);
-
-// Other algorithms: "SHA-1", "SHA-384"
+// Other algorithms: "SHA-1", "SHA-384", "SHA-512"
 ```
 
 **Base64 encoding/decoding:**
@@ -839,9 +896,12 @@ onmessage = (e) => {
 
 **Rejected with `TypeError`:** functions, `WeakMap`/`WeakSet`, getters.
 
-**Limits:** max 8 workers, 32 MB heap + 1 MB stack each, 4 MB per message.
-Workers exit only via `terminate()`; the process exits once all workers
-are terminated. No nested workers yet.
+**Limits:** max 8 workers, 32 MB heap + 1 MB JS stack each (8 MB thread
+stack), 4 MB per message. Workers exit only via `terminate()`; the process
+exits once all workers are terminated. No nested workers yet.
+
+> Worker files are evaluated as **classic scripts**, not ES modules —
+> `import`/`export` inside a worker throws.
 
 ### Working with modules
 
@@ -862,12 +922,14 @@ console.log(PI);                // 3.14159
 
 Module paths:
 
-- Relative: `./foo.js`, `../bar.js`
+- Relative: `./foo.js`, `../bar.js` — include the extension. If omitted, the
+  loader probes `X.js`, then `X/index.js`.
 - Absolute: `/abs/path/to/file.js`
-- Bare specifiers (`foo`) are *not* resolved through `node_modules` —
-  Fairyfly has no package manager integration
+- Bare: `nanoid` resolves through `node_modules/`, populated by
+  [`ff imprint`](docs/guides/packages.md)
 
-The `import.meta.url` property contains the `file://` URL of the current module:
+The `import.meta.url` property contains the `file://` URL of the current
+module:
 
 ```js
 console.log(import.meta.url);  // "file:///path/to/module.js"
@@ -881,25 +943,27 @@ console.log(import.meta.url);  // "file:///path/to/module.js"
 
 | Name | Description |
 |---|---|
-| `console` | `log`, `info`, `debug`, `warn`, `error`, `detail`, `slops`, `redbal`, `time`, `timeLog`, `timeEnd` |
+| `console` | `log`, `info`, `debug`, `warn`, `error`, `detail`, `slops`, `redbal`, `time`, `timeLog`, `timeEnd` — first 2 args, stderr |
 | `setTimeout`, `clearTimeout` | One-shot timer scheduling (max 128 concurrent) |
 | `setInterval`, `clearInterval` | Repeating timer scheduling |
 | `queueMicrotask` | Queue a microtask (runs before next I/O/timer) |
 | `performance` | `performance.now()` — high-resolution monotonic timestamp |
-| `URL`, `URLSearchParams` | WHATWG URL parser and query string manipulation |
+| `URL`, `URLSearchParams` | WHATWG-style URL parser and query string manipulation |
 | `Headers`, `Request`, `Response` | Fetch API primitives |
 | `Blob` | Binary data container |
 | `FormData` | Multipart/form-data container |
 | `TextEncoder`, `TextDecoder` | UTF-8 string and byte array conversion |
-| `fetch` | HTTP client (Promise-based) |
-| `WebSocket` | WebSocket client |
+| `fetch` | HTTP client (Promise-based), HTTP/1.1, 16 concurrent |
+| `WebSocket` | WebSocket client (max 64 sockets) |
 | `Database` | SQLite database (via `Database.open(path)`) |
+| `sql`, `SQL`, `Tx` | Postgres — tagged templates, pools, transactions |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` |
 | `btoa`, `atob` | Base64 encode/decode |
 | `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (all sync) |
 | `process` | `exit`, `cwd`, `chdir`, `pid`, `platform`, `arch`, `env`, `argv` |
 | `http` | `http.serve(options, handler)` — start an HTTP/HTTPS server |
-| `Worker` | `new Worker(path, {data})`, `postMessage`, `onmessage`, `onerror`, `terminate` — threads with structured clone (max 8) |
+| `Worker` | `new Worker(path, {data})`, `postMessage`, `onmessage`, `onerror`, `terminate` (max 8) |
+| `import.meta.url` | `file://` URL of the current module (per-module, not a global) |
 
 ### Response static methods
 
@@ -924,12 +988,25 @@ console.log(import.meta.url);  // "file:///path/to/module.js"
 | `db.close()` | `() -> undefined` | Close the database |
 | `db.busyTimeout(ms)` | `(number) -> undefined` | Set busy timeout |
 
+### SQL (Postgres) methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `sql\`...\`` | `` (template) -> Promise<rows> `` | Parameterized query via tagged template |
+| `sql.unsafe(str, params?)` | `(string, Array?) -> Promise<rows>` | Query built from a string, still parameterized |
+| `sql.connect()` | `() -> Promise<undefined>` | Probe the pool (`SELECT 1`), rejects if unreachable |
+| `sql.begin()` | `() -> Promise<Tx>` | Start a transaction, pinning one connection |
+| `sql.close()` | `() -> undefined` | Close the default pool |
+| `tx\`...\`` | `` (template) -> Promise<rows> `` | Query inside the transaction |
+| `tx.commit()` / `tx.rollback()` | `() -> Promise<undefined>` | End the transaction |
+| `new SQL(dsn)` | `(string) -> SQL` | Pool bound to a specific DSN |
+
 ---
 
 ## Performance
 
-`wrk -t 8 -c 100 -d 10s`, Apple silicon, all runtimes serving the same hello-world
-handler:
+`wrk -t 8 -c 100 -d 10s`, Apple silicon, all runtimes serving the same
+hello-world handler:
 
 | Runtime       | Req/sec   | p50    | p99    | Peak RSS |
 |---------------|-----------|--------|--------|----------|
@@ -944,7 +1021,11 @@ Fairyfly is:
 - **-90% memory** vs Deno (~10x lower RSS)
 - **-24% p50 latency** vs Deno
 
-
+**Reproducing:** the harness is [`bench/_bench/wrk.sh`](bench) (wrk +
+RSS sampling). Server-side numbers use a `ReleaseFast` build
+(`make build`). Broader interpreter and I/O comparisons live in
+[`bench/run-bench.sh`](bench) (hyperfine across Node/Bun/Deno/Fairyfly) and
+[`bench/mem-bench.sh`](bench) (peak RSS).
 
 ---
 
@@ -962,11 +1043,13 @@ Fairyfly is:
 ┌──────────────────▼───────────────────────────────┐
 │ Zig API layer                                     │
 │   api/  - console, fs, process, crypto, url,      │
-│           fetch, websocket_client, sqlite          │
-│   net/  - http_native (SoA 512-slot server)       │
+│           fetch, websocket_client, sqlite, sql    │
+│   net/  - http_native (SoA 512-slot server),      │
+│           http2_server, pg_client, async_fetch    │
 │   event/- loop, timers, microtasks                │
 │   types/- Headers, Request, Response, Blob,       │
-│           FormData, PoolSlice                      │
+│           FormData, PoolSlice                     │
+│   worker/- worker, message_port, serialize        │
 └──────────────────┬───────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────┐
@@ -976,15 +1059,17 @@ Fairyfly is:
 
 **Hot-path design:**
 
-- Zero allocations per request (CountingAllocator asserts `balanced=true`)
-- SoA layout for connection slots (512x parallel arrays, packed 1-byte flags)
-- Static buffers reused across connections
-- HeadersData uses refcounting + lazy cold-struct split for hot/cold separation
-- URL objects: one refcounted allocation per URL (components pooled, zero-copy property reads)
-- Module interning: import/export strings interned into single arena
-- Boot arena owns runtime/event-loop/cache, no syscall-per-alloc at startup
-- Worker messaging: one small alloc + memcpy per message, zero
-  per-iteration cost when idle; parent drains per tick, exits at liveCount 0
+- SoA layout for connection slots (512× parallel arrays, packed 1-byte flags)
+- Static per-slot buffers reused across connections; heap spill is counted,
+  not hidden
+- `HeadersData` is a heap object with an atomic refcount, shared by
+  `Request`/`Response`/`Headers` and handed across the fetch threads
+- URL objects: one allocation per URL; components are pooled slices, so
+  property reads are zero-copy
+- Worker messaging: one small alloc + memcpy per message, zero per-iteration
+  cost when idle; the parent drains once per tick and exits at liveCount 0
+- Postgres: per-job arena (32 KB retain cap) + job freelist, so a warm query
+  path allocates nothing
 
 ---
 
@@ -992,28 +1077,87 @@ Fairyfly is:
 
 Requirements:
 
-- Zig 0.16 (uses 0.16.0 std APIs)
-- C compiler (clang on macOS, gcc on Linux) — QuickJS vendored as C source
+- **Zig 0.16** (uses 0.16.0 std APIs)
+- C compiler (clang on macOS, gcc on Linux)
 - A POSIX system (macOS or Linux)
 
-TLS is built in by default (BearSSL, fetched into `vendor/bearssl/`). Disable
-with: `zig build -Dbearssl=false`
+### The vendors are not committed
 
-```sh
-git clone <repo>
-cd fairyfly
-make install         # ReleaseFast build and install
-ff examples/hello.js
-```
+`vendor/quickjs`, `vendor/bearssl`, `vendor/sqlite`, and `vendor/nghttp2` are
+**gitignored** — a fresh clone has no C sources and `zig build` will fail
+until they are fetched.
 
+| Dependency | Version | Purpose |
+|---|---|---|
+| [quickjs-ng](https://github.com/quickjs-ng/quickjs) | 0.16.2 | The JS engine |
+| [BearSSL](https://www.bearssl.org) | 0.6 | TLS for HTTPS/WSS (optional, `-Dbearssl=false` to drop) |
+| [SQLite](https://sqlite.org) | 3.53.4 | The `Database` global |
+| [nghttp2](https://nghttp2.org) | 1.70.0 | HTTP/2 framing + HPACK |
 
+### Option A — Docker (recommended)
 
-**Docker:**
+The Dockerfile fetches all four at pinned versions, generates the Zig bridge
+headers, and cross-compiles a static musl binary:
 
 ```sh
 docker build -t fairyfly .
 ```
 
+### Option B — local build
+
+First fetch the vendors, then `make install`:
+
+```sh
+#!/bin/sh
+set -e
+
+# quickjs-ng 0.16.2
+curl -fL https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.16.2.tar.gz -o /tmp/qjs.tgz
+rm -rf /tmp/qjs vendor/quickjs && mkdir -p /tmp/qjs vendor/quickjs
+tar -xzf /tmp/qjs.tgz -C /tmp/qjs --strip-components=1
+cp /tmp/qjs/*.h /tmp/qjs/quickjs.c /tmp/qjs/libregexp.c /tmp/qjs/libunicode.c /tmp/qjs/dtoa.c vendor/quickjs/
+
+# BearSSL 0.6  (skip if you build with -Dbearssl=false)
+curl -fL https://www.bearssl.org/bearssl-0.6.tar.gz -o /tmp/bearssl.tgz
+rm -rf /tmp/bearssl vendor/bearssl && mkdir -p /tmp/bearssl vendor/bearssl
+tar -xzf /tmp/bearssl.tgz -C /tmp/bearssl --strip-components=1
+cp -r /tmp/bearssl/src /tmp/bearssl/inc vendor/bearssl/
+printf '#ifndef FF_BEARSSL_BRIDGE_H\n#define FF_BEARSSL_BRIDGE_H\n\n#include "bearssl.h"\n\n#endif\n' > vendor/bearssl/zig_bridge.h
+
+# SQLite 3.53.4
+curl -fL https://www.sqlite.org/2026/sqlite-amalgamation-30530400.zip -o /tmp/sqlite.zip
+rm -rf /tmp/sqlite vendor/sqlite && mkdir -p /tmp/sqlite vendor/sqlite
+unzip -q -o /tmp/sqlite.zip -d /tmp/sqlite
+cp /tmp/sqlite/sqlite-amalgamation-*/sqlite3.c /tmp/sqlite/sqlite-amalgamation-*/sqlite3.h vendor/sqlite/
+printf '#ifndef FF_SQLITE_BRIDGE_H\n#define FF_SQLITE_BRIDGE_H\n\n#include "sqlite3.h"\n\n#endif\n' > vendor/sqlite/zig_bridge.h
+
+# nghttp2 1.70.0
+curl -fL https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz -o /tmp/nghttp2.tgz
+rm -rf /tmp/nghttp2 vendor/nghttp2 && mkdir -p /tmp/nghttp2 vendor/nghttp2/lib vendor/nghttp2/includes
+tar -xzf /tmp/nghttp2.tgz -C /tmp/nghttp2 --strip-components=1
+cp /tmp/nghttp2/lib/*.c /tmp/nghttp2/lib/*.h vendor/nghttp2/lib/
+cp -r /tmp/nghttp2/lib/includes/nghttp2 vendor/nghttp2/includes/
+
+# build + install
+make install
+```
+
+Then:
+
+```sh
+ff -e 'console.log("hello")'
+```
+
+### Build options
+
+```sh
+zig build -Doptimize=ReleaseFast   # default for `make build`
+zig build -Dbearssl=false          # drop TLS support entirely
+zig build -Dversion=1.2.3          # version reported by `ff --version`
+zig build test                     # Zig unit tests
+make test                          # Zig unit tests + test/run.sh
+make ci                            # test/run.sh only
+```
 
 ---
 
@@ -1028,6 +1172,8 @@ ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
 ff start [--cert cert.pem --key key.pem]
                          Run ff.json's "main" (TLS enabled with cert+key)
+ff --watch <file|start> [args...]
+                         Restart the child when files change (200ms poll)
 
 ff test [filter]         Run test/*.test.js
 ff repl                  Interactive REPL
@@ -1036,33 +1182,105 @@ ff compile <f.js> [-o out.ffbc]
                          Compile to bytecode (run back with ff <file.ffbc>)
 ff fmt [--write|--check] <files...>
                          Format via prettier (needs npx/network)
+ff bench                 Run the bundled micro-benchmarks
 ff -e <code>             Run inline JavaScript code
 ff <file.js>             Run a JavaScript file
 ff --version             Print runtime version
 ```
+
+**`ff --watch`** never runs a runtime itself — it polls the project tree
+(mtime + size, 200 ms, 100 ms debounce), then SIGTERMs the child, waits up to
+500 ms, SIGKILLs, and respawns. `--watch` must be the **first** argument.
+Forward everything after the target (e.g. `ff --watch app.js --ca cert.pem`).
 
 Environment variables:
 
 - `FF_ECHO=1` — run the server in echo mode (returns canned response)
 - `FF_CERT` / `FF_KEY` — TLS cert/key paths (same as `--cert/--key`)
 - `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
+- `FF_WATCH_PARENT` — set internally by `--watch` (orphan watchdog)
+
+Database:
+
+- `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` —
+  configure the global `sql`
+- `PG_TEST_DSN` — used by the Postgres test files (they self-skip if unset)
 
 ---
 
 ## Limitations vs Node / browser
 
+**Modules & language**
+
 - No `require()`, no CommonJS
-- No `node_modules` resolution
+- ES Modules only; worker files are classic scripts (no `import`/`export`)
 - No `Buffer` (use `ArrayBuffer` / `Uint8Array`)
-- HTTP/2 accepted by the server (TLS + ALPN); outbound clients are HTTP/1.1 only
 - No browser DOM
-- TLS 1.2 only (BearSSL does not implement TLS 1.3)
-- Response bodies buffered (64 KB cap per response); request bodies <= ~4 KB
-- Max 128 concurrent timers
-- Max 512 concurrent HTTP connections
-- Max 64 concurrent outbound TLS connections
-- Workers: max 8, 32 MB heap each; worker scope is console + timers
-  (no fs/fetch/crypto yet); no nested workers; 4 MB message cap
+- TypeScript is not supported — compile to `.js` first
+
+**HTTP**
+
+- HTTP/2 accepted by the server (TLS + ALPN); outbound clients are HTTP/1.1 only
+- Max **512** concurrent HTTP connections
+- Request bodies: ~4 KB (headers + body share a 4 KB buffer; beyond → `413`)
+- Response bodies: buffered, hard cap **10 MB** (64 KB static stage buffer,
+  larger bodies spill to the heap; beyond 10 MB → `500`)
+- Response headers capped at 2048 bytes; server-computed
+  `Content-Length` / `Transfer-Encoding` / `Connection` are not overridable
+- No `Expect: 100-continue`, no chunked **request** bodies
+- No idle/keep-alive timeout — only hung handlers are reaped (504 after 30 s)
+
+**Outbound**
+
+- `fetch`: **16** concurrent slots, HTTP/1.1, 30 s I/O timeout, max 5 redirects
+- No `AbortController` / `signal` / `timeout` / `redirect` init keys
+- WebSocket client: **64** sockets, 16384-byte messages (larger sends truncate)
+- Outbound TLS connection pool: **64**
+
+**Timers & loop**
+
+- Max **128** concurrent timers; the 129th throws `TypeError`
+- Max **8** extra timer arguments
+- No `process.nextTick` — use `queueMicrotask`
+
+**Console**
+
+- Prints only the **first two arguments** of each call
+- Writes to **stderr**, not stdout
+
+**Workers**
+
+- Max **8**; 32 MB heap, 1 MB JS stack, 8 MB thread stack each
+- 4 MB per message; no `ArrayBuffer` transfer (always copied)
+- Worker scope is `console` + timers + `postMessage` — no `fs`, `fetch`, or `http.serve`
+- No nested workers; exit only via `terminate()`
+
+**SQLite**
+
+- `db.exec()` runs the **first** statement only — use `db.execNoArgs()` for
+  multi-statement SQL
+- Positional `?` parameters only (no named `:x` / `$x`)
+- Integer columns beyond 2⁵³ lose precision in JS
+
+**Postgres**
+
+- No TLS (`sslmode`), no connection/socket timeouts, no keepalive
+- Pool caps at 10 connections
+- `rowCount` reflects returned rows only (INSERT/UPDATE row counts are not reported)
+- No COPY support
+
+**Process**
+
+- `process.env` is a snapshot taken at boot — assigning to it does not affect
+  the OS environment
+- No `stdout`/`stdin` streams, no `hrtime`, no `kill`
+- No interrupt/watchdog for runaway JS — an infinite loop hangs the process
+
+**Packages**
+
+- `ff imprint` installs **pure-JS ESM** packages only; anything using
+  `require(`, `module.exports`, or `node:` imports is rejected
+- One flat `node_modules` — a conflicting transitive version is a hard error
 
 ---
 
@@ -1077,5 +1295,6 @@ MPL-2.0 (Mozilla Public License Version 2.0). See [LICENSE](LICENSE).
 - QuickJS — Fabrice Bellard
 - [BearSSL](https://www.bearssl.org) — Thomas Pornin
 - libxev — [mitchellh](https://github.com/mitchellh/libxev)
+- [nghttp2](https://nghttp2.org) — HTTP/2
 - Inspired by Node.js, Bun, and Deno — none of their code is included; this is
   a from-scratch implementation in Zig
