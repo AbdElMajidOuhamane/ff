@@ -29,6 +29,7 @@ const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const xev = @import("xev");
 const microtasks = @import("../event/microtasks.zig");
+const ffcfg = @import("ffcfg");
 
 const gpa = std.heap.smp_allocator;
 
@@ -1575,6 +1576,10 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
         _ = c.throwTypeError(ctx, "ffi.dlopen requires --allow-ffi");
         return c.JS_EXCEPTION;
     }
+    if (!ffcfg.ffi) {
+        _ = c.throwTypeError(ctx, "ffi.dlopen: FFI not compiled in (build with -Dffi=true)");
+        return c.JS_EXCEPTION;
+    }
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "ffi.dlopen: expected a library path");
         return c.JS_EXCEPTION;
@@ -1966,6 +1971,10 @@ fn callbackFactory(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     _ = this_val;
     if (!allow) {
         _ = c.throwTypeError(ctx, "ffi.callback requires --allow-ffi");
+        return c.JS_EXCEPTION;
+    }
+    if (!ffcfg.ffi) {
+        _ = c.throwTypeError(ctx, "ffi.callback: FFI not compiled in (build with -Dffi=true)");
         return c.JS_EXCEPTION;
     }
     if (argc < 2) {

@@ -54,7 +54,7 @@ RUN curl -fsSL -o /tmp/nghttp2.tar.gz "https://github.com/nghttp2/nghttp2/releas
 RUN case "${TARGETARCH}" in \
       arm64) ZT=aarch64-linux-musl ;; \
       *)     ZT=x86_64-linux-musl ;; \
-    esac && zig build -Doptimize=ReleaseFast -Dtarget=${ZT}
+    esac && zig build -Doptimize=ReleaseFast -Dtarget=${ZT} -Dffi=false
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 RUN adduser -D -u 1000 app

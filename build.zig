@@ -4,10 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const bearssl = b.option(bool, "bearssl", "Enable BearSSL TLS (https/wss)") orelse true;
+    const ffi = b.option(bool, "ffi", "Enable FFI (dlopen native libraries)") orelse true; // NEW
 
     // ── Build-options module (ffcfg) ──
     const ffcfg_opts = b.addOptions();
     ffcfg_opts.addOption(bool, "bearssl", bearssl);
+    ffcfg_opts.addOption(bool, "ffi", ffi); // NEW
     const ff_version = b.option([]const u8, "version", "Runtime version string") orelse "0.1.0-canary";
     ffcfg_opts.addOption([]const u8, "version", ff_version);
     const ffcfg_mod = ffcfg_opts.createModule();
@@ -223,7 +225,13 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("m", .{});
-    exe.root_module.linkSystemLibrary("ffi", .{});
+    // NEW: link system libffi only when FFI is enabled; otherwise compile
+    // symbol stubs so the extern declarations in src/api/ffi.zig resolve.
+    if (ffi) {
+        exe.root_module.linkSystemLibrary("ffi", .{});
+    } else {
+        exe.root_module.addCSourceFile(.{ .file = b.path("src/ffi_stubs.c"), .flags = &.{} });
+    }
 
     b.installArtifact(exe);
 
