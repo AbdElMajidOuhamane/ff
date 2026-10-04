@@ -30,6 +30,12 @@ ff server.js --ca ./ca.pem
 
 `--ca` trusts an extra CA bundle for that run's outbound `fetch` / `WSS`. It is accepted **only** by `ff <file>` and `ff -e` — not by `ff start` (use `FF_CA_FILE` there).
 
+```sh
+ff server.js --allow-ffi
+```
+
+`--allow-ffi` unlocks the `ffi` global (`ffi.dlopen`) for that run. Native code bypasses every sandbox guarantee, so without the flag `ffi.dlopen` throws and `ffi.allowed` is `false`. Accepted by `ff <file>`, `ff -e`, `ff test`, and `ff start`. See [FFI](/docs/api/ffi) for the full API and security contract.
+
 ## Evaluate inline code
 
 ```sh
@@ -127,9 +133,10 @@ Names are scope-aware: `ff sever @scope/pkg@1.0` strips to `@scope/pkg`.
 ff test
 ff test url
 ff test formdata
+ff test --allow-ffi
 ```
 
-Runs every `test/*.test.js` through the runtime (same convention as `test/run.sh` — see the Testing guide). The optional filter is a substring match on the filename. Each file evaluates to success with no `FAIL` lines; exits `1` if any test fails. Files larger than 10MB are not loaded.
+Runs every `test/*.test.js` through the runtime (same convention as `test/run.sh` — see the Testing guide). The optional filter is a substring match on the filename. Each file evaluates to success with no `FAIL` lines; exits `1` if any test fails. Files larger than 10MB are not loaded. Pass `--allow-ffi` to run the FFI contract (`test/ffi.test.js`); without it the FFI tests skip.
 
 ## Interactive REPL
 
@@ -177,21 +184,6 @@ ff fmt --check app.js
 
 Delegates to `npx --yes prettier` (needs network, or a global prettier). Without files it prints usage; exit code is non-zero when prettier fails.
 
-## Benchmarks
-
-```sh
-ff bench
-```
-
-Runs built-in microbenchmarks from the **current working directory** — it expects these paths relative to cwd:
-
-```text
-bench/fib.js  bench/sort.js  bench/string.js  bench/object.js
-bench/json.js bench/loop.js  bench/closure.js bench/array.js
-```
-
-Missing files print `read error` and are skipped. Prints per-file elapsed ms plus a total.
-
 ## Self-update
 
 ```sh
@@ -221,16 +213,15 @@ ff --version
 
 | Command | Purpose |
 |---------|---------|
-| `ff <file.js\|.ffbc>` | Run a file (`--ca` optional) |
-| `ff -e <code>` | Run inline JS (`--ca` optional) |
+| `ff <file.js\|.ffbc> [--allow-ffi]` | Run a file (`--ca`, `--allow-ffi` optional) |
+| `ff -e <code> [--allow-ffi]` | Run inline JS (`--ca`, `--allow-ffi` optional) |
 | `ff init [-y] [<dir>]` | Scaffold `ff.json` + entry file |
-| `ff start [--cert --key]` | Run `main` from `ff.json` |
+| `ff start [--cert --key] [--allow-ffi]` | Run `main` from `ff.json` |
 | `ff imprint [pkg[@ver] …]` | Install pure-JS ESM deps |
 | `ff sever [pkg …] [--force]` | Remove deps / wipe install |
-| `ff test [filter]` | Run `test/*.test.js` |
+| `ff test [filter] [--allow-ffi]` | Run `test/*.test.js` (FFI tests need the flag) |
 | `ff repl` | Interactive REPL |
 | `ff compile <f.js> [-o out.ffbc]` | Bytecode, source stripped |
 | `ff fmt [--write\|--check] <files …>` | Prettier via npx |
-| `ff bench` | Run `bench/*.js` microbenchmarks |
 | `ff upgrade [--check]` | Self-update from GitHub Releases |
 | `ff --version` | Print version |

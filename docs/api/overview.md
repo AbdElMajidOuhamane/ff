@@ -32,6 +32,7 @@ method: `http.serve`.
 | `TextEncoder`, `TextDecoder` | UTF-8 encode and decode | [Text](#text) |
 | `performance.now` | Milliseconds since start | [Utils](#utils) |
 | `btoa`, `atob` | Base64 encode and decode | [Utils](#utils) |
+| `ffi` | Load C-ABI shared libraries at runtime (`--allow-ffi`) | [FFI](/docs/api/ffi) |
 
 ## Console
 

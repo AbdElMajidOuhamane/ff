@@ -8,6 +8,7 @@ const ws_client = @import("../net/ws_client.zig");
 const timers_mod = @import("timers.zig");
 const worker_mod = @import("../worker/worker.zig");
 const pg_client = @import("../net/pg_client.zig");
+const ffi_api = @import("../api/ffi.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -79,6 +80,8 @@ pub const EventLoop = struct {
         if (async_fetch.pending.load(.acquire) > 0) return true;
         if (ws_client.pending.load(.acquire) > 0) return true;
         if (pg_client.pending.load(.acquire) > 0) return true;
+        if (ffi_api.pending.load(.acquire) > 0) return true;
+        if (ffi_api.bridge_pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         // Queue entries only count as blocking when nothing is unref'd:
         // with an unref'd timer pending, an entry in submissions may be that
@@ -127,6 +130,10 @@ pub const EventLoop = struct {
                 ws_client.arm(&self.loop);
             }
             ws_client.drainCompleted(ctx);
+            if (ffi_api.pending.load(.acquire) > 0 or ffi_api.bridge_pending.load(.acquire) > 0) {
+                ffi_api.ensureArmed();
+            }
+            ffi_api.drainCompleted(ctx);
             worker_mod.drainCompleted(ctx);
             microtasks.pumpMicrotasks(ctx);
             if (gc_ticks >= next_gc_check) {

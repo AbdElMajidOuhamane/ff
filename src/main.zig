@@ -4,13 +4,14 @@ const engine = @import("engine/engine.zig");
 const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
+const ffi_api = @import("api/ffi.zig");
 const loop_mod = @import("event/loop.zig");
 const microtasks = @import("event/microtasks.zig");
 const init_cmd = @import("commands/init.zig");
 const imprint_cmd = @import("commands/imprint.zig");
 const sever_cmd = @import("commands/sever.zig");
 const start_cmd = @import("commands/start.zig");
-const bench_cmd = @import("commands/bench.zig");
+
 const test_cmd = @import("commands/test.zig");
 const repl_cmd = @import("commands/repl.zig");
 const upgrade_cmd = @import("commands/upgrade.zig");
@@ -26,7 +27,6 @@ const Command = enum {
     imprint,
     sever,
     start,
-    bench,
     test_cmd,
     repl,
     upgrade,
@@ -43,7 +43,6 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "imprint")) return .imprint;
     if (std.mem.eql(u8, arg, "sever")) return .sever;
     if (std.mem.eql(u8, arg, "start")) return .start;
-    if (std.mem.eql(u8, arg, "bench")) return .bench;
     if (std.mem.eql(u8, arg, "test")) return .test_cmd;
     if (std.mem.eql(u8, arg, "repl")) return .repl;
     if (std.mem.eql(u8, arg, "upgrade")) return .upgrade;
@@ -67,6 +66,15 @@ fn parseCaFlag(init: std.process.Init) void {
                 std.debug.print("Error: --ca requires a path\n", .{});
                 std.process.exit(1);
             };
+            return;
+        }
+    }
+}
+fn parseAllowFfiFlag(init: std.process.Init) void {
+    var it = init.minimal.args.iterate();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--allow-ffi")) {
+            ffi_api.setAllow(true);
             return;
         }
     }
@@ -122,6 +130,7 @@ pub fn main(init: std.process.Init) !void {
         resetIgnoredInterrupt();
         maybeStartParentWatchdog();
     }
+    parseAllowFfiFlag(init);
     var args_iter = init.minimal.args.iterate();
     const exe = args_iter.next() orelse {
         printUsage();
@@ -161,7 +170,6 @@ pub fn main(init: std.process.Init) !void {
             try sever_cmd.run(init.io, rest.items);
         },
         .start => try start_cmd.run(init.io, init),
-        .bench => try bench_cmd.run(init.io, init),
         .test_cmd => try test_cmd.run(init.io, init),
         .repl => try repl_cmd.run(init.io, init),
         .upgrade => try upgrade_cmd.run(init.io, init),
@@ -270,7 +278,6 @@ fn printUsage() void {
     std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock", .{});
     std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s)", .{});
     std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project", .{});
-    std.debug.print("  ff bench             Run benchmarks", .{});
     std.debug.print("  ff test [filter]     Run test/*.test.js", .{});
     std.debug.print("  ff repl              Interactive REPL", .{});
     std.debug.print("  ff upgrade [--check] Self-update from GitHub Releases", .{});
@@ -279,5 +286,6 @@ fn printUsage() void {
     std.debug.print("  ff --watch <file|start>  Restart on file changes", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
     std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
+    std.debug.print("  --allow-ffi           Allow ffi.dlopen (native libraries)", .{});
     std.debug.print("  ff --version         Print runtime version", .{});
 }

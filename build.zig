@@ -223,6 +223,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.link_libc = true;
     exe.root_module.linkSystemLibrary("m", .{});
+    exe.root_module.linkSystemLibrary("ffi", .{});
 
     b.installArtifact(exe);
 

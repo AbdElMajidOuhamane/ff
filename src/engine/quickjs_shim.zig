@@ -300,6 +300,7 @@ pub const getUint8Array = qjs_c.JS_GetUint8Array;
 pub const newArrayBufferCopy = qjs_c.JS_NewArrayBufferCopy;
 pub const getArrayBuffer = qjs_c.JS_GetArrayBuffer;
 pub const detachArrayBuffer = qjs_c.JS_DetachArrayBuffer;
+pub const newUint8ArrayCopy = qjs_c.JS_NewUint8ArrayCopy;
 
 // ─── TypedArray ────────────────────────────────────────────────
 pub const newTypedArray = qjs_c.JS_NewTypedArray;

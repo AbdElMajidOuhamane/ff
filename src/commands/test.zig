@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine/engine.zig");
+const microtasks = @import("../event/microtasks.zig"); // NEW
 
 // ff test [filter] — run test/*.test.js through the runtime.
 // Same convention as test/run.sh: eval returns true = pass.
@@ -12,7 +13,12 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.next(); // ff
     _ = it.next(); // test
-    if (it.next()) |a| filter = a;
+    while (it.next()) |a| {
+        // --allow-ffi and other flags are consumed by main.zig, not filters.
+        if (std.mem.startsWith(u8, a, "--")) continue;
+        filter = a;
+        break;
+    }
 
     var test_dir = dir.openDir(io, "test", .{ .iterate = true }) catch {
         std.debug.print("No test/ directory found.\n", .{});
@@ -54,9 +60,11 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         path_buf[sub.len] = 0;
         const path_z: [:0]const u8 = path_buf[0..sub.len :0];
 
+        microtasks.had_error = false; // NEW: reset before each file
         const ok = runtime.evalModule(source, path_z);
         runtime.event_loop.runWithMicrotasks(runtime.ctx);
-        if (ok) {
+        const clean = ok and !microtasks.had_error; // NEW: catch async failures
+        if (clean) {
             std.debug.print("OK   {s}\n", .{sub});
             pass += 1;
         } else {

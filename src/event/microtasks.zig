@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 
 // Set whenever a top-level eval, a module's promise, a queued job, or a
-// timer callback throws. Consumed by main / start / bench to choose the
+// timer callback throws. Consumed by main / start  to choose the
 // process exit code — previously every script error exited 0.
 pub var had_error: bool = false;
 
