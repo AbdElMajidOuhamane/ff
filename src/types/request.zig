@@ -161,6 +161,11 @@ pub const RequestData = struct {
 
     comptime {
         std.debug.assert(@sizeOf(PoolSlice) == 8);
+        // A5 FIX: size ratchet, not just align (was: align-only, so layout
+        // drift went uncaught — cf. the stale "ArrayList = 16B" comment in
+        // headers.zig). 24 pool + 8 headers + 8 cold + 3×8 slices + 5 enums
+        // + 3 bools = 72B today; 8B headroom for deliberate growth.
+        std.debug.assert(@sizeOf(RequestData) <= 80);
         std.debug.assert(@alignOf(RequestData) >= 8);
     }
 

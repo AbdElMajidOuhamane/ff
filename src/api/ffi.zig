@@ -23,6 +23,11 @@
 //!   MAX_STRUCT_DEPTH nesting — bounded, no heap growth mid-call.
 //! - Async path: fixed MAX_JOBS slot pool, no per-call heap except
 //!   buffer/cstring/struct copies (inherent). Zero JS on worker threads.
+//! - A3 FIX: job scan keys (claimed/done) live in a 32-byte atomic state
+//!   column; the 2.6KB CallJob record is touched only after claiming a slot.
+//! - A2 FIX: foreign-thread bridge uses pooled BridgeCall slots with inline
+//!   arg buffers, and the per-tick drain skips the mutex unless a call is
+//!   actually queued (bridge_pending check).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -123,7 +128,7 @@ fn ffiTypeOf(k: FfiKind) *FfiType {
     return switch (k) {
         .i8_ => &ffi_type_sint8,
         .u8_ => &ffi_type_uint8,
-        .i16_ => &ffi_type_sint16,
+        .i16_ => &ffi_type_uint16,
         .u16_ => &ffi_type_uint16,
         .i32_ => &ffi_type_sint32,
         .u32_ => &ffi_type_uint32,
@@ -582,6 +587,8 @@ fn symCallAsync(ctx: ?*c.Context, sym: *SymbolDesc, argc: c_int, argv: [*c]c.Val
     if (!marshalJobArgs(ctx, job, argv)) {
         freeJobArgs(ctx, job);
         job.used = false;
+        // A3 FIX: release the claimed state column slot, not just `used`.
+        job_state[jobIndex(job)].store(ST_FREE, .release);
         c.freeValue(ctx, cap[0]);
         c.freeValue(ctx, cap[1]);
         c.freeValue(ctx, promise);
@@ -722,12 +729,27 @@ const CallJob = struct {
     back_len: [MAX_ARGS]usize = .{0} ** MAX_ARGS,
     rstore: [MAX_STRUCT]u8 align(16) = undefined,
     err: ?c.Value = null,
-    done: std.atomic.Value(bool) = .{ .raw = false },
+    // A3 FIX: `done` removed — cross-thread completion now lives in the
+    // job_state column below (ST_DONE), so drainJobs never touches the
+    // 2.6KB record until the slot is actually done.
     used: bool = false,
     cb: [MAX_ARGS]?*ClosureDesc = .{null} ** MAX_ARGS,
 };
 
 var jobs: [MAX_JOBS]CallJob = [_]CallJob{.{}} ** MAX_JOBS;
+
+// A3 FIX: hot scan keys live outside the 2.6KB CallJob record. drainJobs
+// scans this 32-byte atomic column per tick instead of 32 × ~2.6KB of
+// cold argument/result storage. Mirror: async_fetch.states + doneMask.
+const ST_FREE: u8 = 0;
+const ST_CLAIMED: u8 = 1;
+const ST_DONE: u8 = 2;
+var job_state: [MAX_JOBS]std.atomic.Value(u8) =
+    [_]std.atomic.Value(u8){.{ .raw = ST_FREE }} ** MAX_JOBS;
+
+fn jobIndex(job: *CallJob) usize {
+    return (@intFromPtr(job) - @intFromPtr(&jobs)) / @sizeOf(CallJob);
+}
 
 // Cross-thread wake: one xev.Async shared by job completion and bridge
 // calls. notify() is thread-safe; wait()/arm is JS-thread-only.
@@ -797,21 +819,34 @@ pub fn drainCompleted(ctx: ?*c.Context) void {
 // ── Job pool (JS-thread-owned bookkeeping; only `done` is cross-thread) ──
 
 fn acquireJob() ?*CallJob {
-    for (&jobs) |*j| {
-        if (j.used) continue;
-        j.* = .{};
+    // A3 FIX: claim via the state column; the 2.6KB record is touched only
+    // after the slot is ours. Targeted payload reset instead of `j.* = .{}`
+    // (2.6KB memset per async call): store/avals/rstore are write-before-read
+    // (marshalJobArgs/ffi_call), so reset only the fields settle/free paths read.
+    for (0..MAX_JOBS) |i| {
+        if (job_state[i].cmpxchgStrong(ST_FREE, ST_CLAIMED, .acq_rel, .acquire) != null) continue;
+        const j = &jobs[i];
+        j.task = .{ .callback = jobRun };
+        j.resolve = c.JS_UNDEFINED;
+        j.reject = c.JS_UNDEFINED;
+        j.owned = .{null} ** MAX_ARGS;
+        j.back = .{null} ** MAX_ARGS;
+        j.back_len = .{0} ** MAX_ARGS;
+        j.cb = .{null} ** MAX_ARGS;
+        j.err = null;
         j.used = true;
         return j;
     }
     return null;
 }
-
 fn jobRun(task: *xev.ThreadPool.Task) void {
     const job: *CallJob = @alignCast(@fieldParentPtr("task", task));
     tls_job = job;
     defer tls_job = null;
     ffi_call(&job.sym.cif, job.sym.fn_ptr.?, @ptrCast(&job.rstore), @ptrCast(&job.avals));
-    job.done.store(true, .release);
+    // A3 FIX: completion goes to the state column (cross-thread handoff),
+    // not to a bool buried in the 2.6KB record.
+    job_state[jobIndex(job)].store(ST_DONE, .release);
     notifyAsync();
 }
 
@@ -980,19 +1015,30 @@ fn settleJob(ctx: ?*c.Context, job: *CallJob) void {
         const dd = cbd orelse continue;
         _ = dd.bridge_job.cmpxchgStrong(@intFromPtr(job), 0, .acq_rel, .acquire);
     }
-    job.used = false;
+    // A3 FIX: `job.used = false` moved to drainJobs next to the state
+    // release (settleJob is only called from there); pending decrement stays.
     _ = pending.fetchSub(1, .release);
 }
 
 fn drainJobs(ctx: ?*c.Context) void {
-    for (&jobs) |*j| {
-        if (!j.used) continue;
-        if (!j.done.load(.acquire)) continue;
+    // A3 FIX: scan the 32-byte state column, not the 2.6KB records.
+    for (0..MAX_JOBS) |i| {
+        if (job_state[i].load(.acquire) != ST_DONE) continue;
+        const j = &jobs[i];
         settleJob(ctx, j);
+        j.used = false;
+        job_state[i].store(ST_FREE, .release);
     }
 }
 
 // ── Callback bridge: foreign thread → JS thread ──
+
+// A2 FIX: pooled BridgeCall slots with inline arg storage. The old shape
+// heap-allocated one BridgeCall + one argbuf per foreign-thread callback;
+// the pool makes the common path allocation-free (64 concurrent calls,
+// 1KB args each ≈ 80KB static).
+const BRIDGE_CAP: usize = 64;
+const BRIDGE_ARG_CAP: usize = 1024;
 
 const BridgeCall = struct {
     d: *ClosureDesc,
@@ -1000,12 +1046,43 @@ const BridgeCall = struct {
     argc: usize,
     arg_off: [MAX_ARGS]usize,
     arg_len: [MAX_ARGS]usize,
-    argbuf: []u8,
+    argbuf: [BRIDGE_ARG_CAP]u8 align(16) = undefined,
+    // Oversized args (> BRIDGE_ARG_CAP): heap spill, counted, cold.
+    argbuf_spill: ?[]u8 = null,
     rvalue: ?*anyopaque,
     err: ?c.Value = null,
     done: bool = false,
     next: ?*BridgeCall = null,
 };
+
+var bridge_pool: [BRIDGE_CAP]BridgeCall = undefined;
+var bridge_free: [BRIDGE_CAP]*BridgeCall = undefined;
+var bridge_free_n: std.atomic.Value(usize) = .{ .raw = 0 };
+var bridge_spill: std.atomic.Value(u64) = .{ .raw = 0 };
+
+fn acquireBridge() ?*BridgeCall {
+    const n = bridge_free_n.load(.acquire);
+    if (n == 0) return null;
+    if (bridge_free_n.cmpxchgStrong(n, n - 1, .acq_rel, .acquire) != null) return null;
+    return bridge_free[n - 1];
+}
+
+fn releaseBridge(bc: *BridgeCall) void {
+    if (bc.argbuf_spill) |b| {
+        gpa.free(b);
+        bc.argbuf_spill = null;
+    }
+    const n = bridge_free_n.load(.acquire);
+    if (n >= BRIDGE_CAP) return; // unreachable: pool never overflows
+    bridge_free[n] = bc;
+    bridge_free_n.store(n + 1, .release);
+}
+
+/// Arg storage currently backing a BridgeCall (inline or spill).
+fn bridgeArgBase(bc: *BridgeCall) [*]const u8 {
+    if (bc.argbuf_spill) |s| return s.ptr;
+    return @ptrCast(&bc.argbuf);
+}
 
 var bridge_mu: std.Io.Mutex = .init;
 var bridge_cv: std.Io.Condition = .init;
@@ -1059,6 +1136,9 @@ fn zeroResult(d: *ClosureDesc, rvalue: ?*anyopaque) void {
 }
 
 fn drainBridge(ctx: ?*c.Context) void {
+    // A2 FIX: skip the mutex entirely when no foreign call is queued
+    // (was: lock/unlock every event-loop tick unconditionally).
+    if (bridge_pending.load(.acquire) == 0) return;
     while (popBridge()) |bc| serviceBridge(ctx, bc);
 }
 
@@ -1068,7 +1148,8 @@ fn serviceBridge(ctx: ?*c.Context, bc: *BridgeCall) void {
     var argv: [MAX_ARGS]c.Value = undefined;
     var argc: usize = 0;
     for (0..bc.argc) |i| {
-        const v = argToJs(ctx, d.params[i], @intFromPtr(bc.argbuf.ptr) + bc.arg_off[i]);
+        // A2 FIX: args may live in the inline buffer or the heap spill.
+        const v = argToJs(ctx, d.params[i], @intFromPtr(bridgeArgBase(bc)) + bc.arg_off[i]);
         if (c.isException(v) != 0) break;
         argv[i] = v;
         argc = i + 1;
@@ -1311,6 +1392,34 @@ fn trampolineSameThread(d: *ClosureDesc, rvalue: ?*anyopaque, avalue: [*c]?*anyo
     if (callback_err != null) zeroResult(d, rvalue);
 }
 
+/// Copy raw arg bytes into `dst` (inline slot buffer or heap spill).
+/// Caller guarantees dst.len >= total.
+fn copyBridgeArgs(dst: []u8, d: *ClosureDesc, avalue: [*c]?*anyopaque, off: [MAX_ARGS]usize, len: [MAX_ARGS]usize) void {
+    for (d.params, 0..) |_, i| {
+        if (len[i] == 0) continue;
+        const raw = avalue[i];
+        const slot = if (raw) |r| @intFromPtr(r) else 0;
+        if (slot == 0) {
+            @memset(dst[off[i]..][0..len[i]], 0);
+            continue;
+        }
+        @memcpy(dst[off[i]..][0..len[i]], @as([*]const u8, @ptrFromInt(slot))[0..len[i]]);
+    }
+}
+
+/// Enqueue + wake + block until the JS thread services the call.
+fn submitBridge(bc: *BridgeCall) void {
+    _ = bc.d.in_flight.fetchAdd(1, .acq_rel);
+    _ = bridge_pending.fetchAdd(1, .acq_rel);
+    enqueueBridge(bc);
+    notifyAsync();
+    bridge_mu.lockUncancelable(thIo());
+    while (!bc.done) bridge_cv.waitUncancelable(thIo(), &bridge_mu);
+    bridge_mu.unlock(thIo());
+    _ = bc.d.in_flight.fetchSub(1, .acq_rel);
+    _ = bridge_pending.fetchSub(1, .release);
+}
+
 /// Foreign thread: never touches JS. Copies the raw arg bytes (still
 /// alive — the C caller is blocked in this trampoline), enqueues, wakes
 /// the loop, and blocks until the JS thread services the call.
@@ -1328,20 +1437,38 @@ fn trampolineForeign(d: *ClosureDesc, rvalue: ?*anyopaque, avalue: [*c]?*anyopaq
         len[i] = sz;
         total += sz;
     }
+    // A2 FIX: pooled slot + inline argbuf; heap only on pool exhaustion
+    // or oversized args. Both spill paths are counted, not hidden.
+    if (acquireBridge()) |bc| {
+        var spill: ?[]u8 = null;
+        if (total > BRIDGE_ARG_CAP) {
+            _ = bridge_spill.fetchAdd(1, .monotonic);
+            spill = gpa.alloc(u8, total) catch {
+                releaseBridge(bc);
+                zeroResult(d, rvalue);
+                return;
+            };
+        }
+        bc.* = .{
+            .d = d,
+            .job = tls_job orelse bridgeJobOf(d),
+            .argc = d.params.len,
+            .arg_off = off,
+            .arg_len = len,
+            .argbuf_spill = spill,
+            .rvalue = rvalue,
+        };
+        copyBridgeArgs(if (spill) |s| s else bc.argbuf[0..total], d, avalue, off, len);
+        submitBridge(bc);
+        releaseBridge(bc);
+        return;
+    }
+    _ = bridge_spill.fetchAdd(1, .monotonic);
     const argbuf = gpa.alloc(u8, if (total == 0) 1 else total) catch {
         zeroResult(d, rvalue);
         return;
     };
-    for (d.params, 0..) |_, i| {
-        if (len[i] == 0) continue;
-        const raw = avalue[i];
-        const slot = if (raw) |r| @intFromPtr(r) else 0;
-        if (slot == 0) {
-            @memset(argbuf[off[i]..][0..len[i]], 0);
-            continue;
-        }
-        @memcpy(argbuf[off[i]..][0..len[i]], @as([*]const u8, @ptrFromInt(slot))[0..len[i]]);
-    }
+    copyBridgeArgs(argbuf, d, avalue, off, len);
     const bc = gpa.create(BridgeCall) catch {
         gpa.free(argbuf);
         zeroResult(d, rvalue);
@@ -1353,18 +1480,10 @@ fn trampolineForeign(d: *ClosureDesc, rvalue: ?*anyopaque, avalue: [*c]?*anyopaq
         .argc = d.params.len,
         .arg_off = off,
         .arg_len = len,
-        .argbuf = argbuf,
+        .argbuf_spill = argbuf,
         .rvalue = rvalue,
     };
-    _ = d.in_flight.fetchAdd(1, .acq_rel);
-    _ = bridge_pending.fetchAdd(1, .acq_rel);
-    enqueueBridge(bc);
-    notifyAsync();
-    bridge_mu.lockUncancelable(thIo());
-    while (!bc.done) bridge_cv.waitUncancelable(thIo(), &bridge_mu);
-    bridge_mu.unlock(thIo());
-    _ = d.in_flight.fetchSub(1, .acq_rel);
-    _ = bridge_pending.fetchSub(1, .release);
+    submitBridge(bc);
     gpa.free(argbuf);
     gpa.destroy(bc);
 }
@@ -1597,7 +1716,6 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
         _ = c.throwTypeError(ctx, "ffi.dlopen: '%s': %s", path_c, msg);
         return c.JS_EXCEPTION;
     };
-
     const lib = gpa.create(Lib) catch {
         _ = dlclose(handle);
         return c.throwOutOfMemory(ctx);
@@ -2161,6 +2279,9 @@ pub fn setup(ctx: *c.Context) void {
     const rt = c.getRuntime(ctx);
     g_ctx = ctx;
     js_thread = std.Thread.getCurrentId();
+    // A2 FIX: bridge slot pool — foreign-thread calls allocate nothing.
+    for (0..BRIDGE_CAP) |i| bridge_free[i] = &bridge_pool[i];
+    bridge_free_n.store(BRIDGE_CAP, .release);
 
     var lib_def = c.ClassDef{ .class_name = "FfiLibrary", .finalizer = libFinalizer };
     _ = c.newClassID(rt, &lib_class_id);

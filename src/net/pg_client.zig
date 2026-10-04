@@ -302,6 +302,9 @@ const Conn = struct {
     rbuf: std.ArrayList(u8) = .empty,
     wqueue: std.ArrayList(u8) = .empty,
     woff: usize = 0,
+    // A1 FIX: parse cursor into rbuf — consumed prefix is no longer shifted
+    // per message with copyForwards (was O(n²) memmove per backend message).
+    rpos: usize = 0,
     flags: ConnFlags = .{},
     connect_comp: xev.Completion = .{},
     read_comp: xev.Completion = .{},
@@ -790,27 +793,43 @@ fn readCb(
     return .disarm;
 }
 
+/// A1 FIX: shift the unconsumed tail to the front ONCE per read batch.
+/// (Was: one copyForwards per protocol message → O(n²) memmove on bursts.)
+fn compactRbuf(conn: *Conn) void {
+    if (conn.rpos == 0) return;
+    const rem = conn.rbuf.items.len - conn.rpos;
+    if (rem == 0) {
+        conn.rbuf.items.len = 0;
+    } else {
+        std.mem.copyForwards(u8, conn.rbuf.items[0..rem], conn.rbuf.items[conn.rpos..]);
+        conn.rbuf.items.len = rem;
+    }
+    conn.rpos = 0;
+}
+
 fn processBuffer(conn: *Conn, l: *xev.Loop) void {
     while (conn.state != .dead) {
-        if (conn.rbuf.items.len < 5) break;
-        const typ = conn.rbuf.items[0];
-        const len = std.mem.readInt(u32, conn.rbuf.items[1..5], .big);
+        // A1 FIX: parse from the cursor; advance it instead of memmoving.
+        const avail = conn.rbuf.items.len - conn.rpos;
+        if (avail < 5) break;
+        const buf = conn.rbuf.items[conn.rpos..];
+        const typ = buf[0];
+        const len = std.mem.readInt(u32, buf[1..5], .big);
         if (len < 4) {
             failConn(conn, "invalid message length");
             return;
         }
         const total: usize = 1 + @as(usize, len);
-        if (conn.rbuf.items.len < total) break;
-        const payload = conn.rbuf.items[5..total];
+        if (avail < total) break;
+        const payload = buf[5..total];
         handleMessage(conn, l, typ, payload) catch {
             failConn(conn, "protocol error");
             return;
         };
-        const rem = conn.rbuf.items.len - total;
-        std.mem.copyForwards(u8, conn.rbuf.items[0..rem], conn.rbuf.items[total..]);
-        conn.rbuf.items.len = rem;
+        conn.rpos += total;
         if (conn.state == .dead) return;
     }
+    compactRbuf(conn);
     if (conn.state == .auth or conn.state == .busy) {
         if (!conn.flags.read_armed and conn.woff >= conn.wqueue.items.len) armRead(conn, l);
     }
@@ -848,7 +867,7 @@ fn handleAuth(conn: *Conn, l: *xev.Loop, payload: []const u8) !void {
             try queuePassword(conn, null);
             armWrite(conn, l);
         },
-        10, 11, 12 => {
+                10, 11, 12 => {
             if (code == 10) {
                 try beginScram(conn, payload[4..]);
                 armWrite(conn, l);

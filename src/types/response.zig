@@ -78,6 +78,37 @@ pub const ResponseDataCold = struct {
     response_type_other: PoolSlice,
 };
 
+// C1 FIX: ResponseData shell freelist — one `gpa.create` per fetch() result
+// (async_fetch.runJob) and per `new Response()` otherwise. The ~96B shell is
+// pooled; pools/bodies are freed by deinit, so idle RSS never grows. Safe:
+// every call site overwrites the shell with init()/initWithHeaders right
+// after acquiring, so no stale fields survive. JS-thread-only.
+const RESP_POOL_MAX: usize = 32;
+var resp_pool: [RESP_POOL_MAX]*ResponseData = undefined;
+var resp_pool_n: usize = 0;
+
+/// Pooled shell (uninitialized — caller must assign init()/initWithHeaders).
+/// Null only on OOM.
+pub fn acquire() ?*ResponseData {
+    if (resp_pool_n > 0) {
+        resp_pool_n -= 1;
+        return resp_pool[resp_pool_n];
+    }
+    return gpa.create(ResponseData) catch null;
+}
+
+/// deinit + return shell to the pool (destroy when full).
+/// Mirrors the old responseFinalizer body (response.zig:504).
+pub fn releaseData(d: *ResponseData) void {
+    d.deinit();
+    if (resp_pool_n < RESP_POOL_MAX) {
+        resp_pool[resp_pool_n] = d;
+        resp_pool_n += 1;
+    } else {
+        gpa.destroy(d);
+    }
+}
+
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
     headers: *headers_mod.HeadersData,
@@ -93,11 +124,17 @@ pub const ResponseData = struct {
     redirected: bool,
     comptime {
         std.debug.assert(@sizeOf(PoolSlice) == 8);
+        // A5 FIX: size ratchet, not just align (was: align-only, so layout
+        // drift went uncaught — cf. the stale "ArrayList = 16B" comment in
+        // headers.zig). 24 pool + 8 headers + 16 owned_body + 8 cold + 2
+        // status + 1 type + 3×8 slices + 3 bools = 88B today; 8B headroom.
+        std.debug.assert(@sizeOf(ResponseData) <= 96);
         std.debug.assert(@alignOf(ResponseData) >= 8);
     }
 
     pub fn init() ResponseData {
-        const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
+        // C1 FIX: pooled headers shell (headers.zig freelist).
+        const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
         h.* = headers_mod.HeadersData.init();
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
@@ -454,7 +491,8 @@ fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc; _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
-    const new_data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per clone).
+    const new_data = acquire() orelse return c.throwOutOfMemory(ctx);
     new_data.* = ResponseData.init();
     new_data.cloneFrom(data);
     return buildResponseJSObject(ctx, new_data);
@@ -462,12 +500,15 @@ fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 
 fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var scratch: [256]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     if (argc > 0) {
         const json_str = c.jsonStringify(ctx, argv[0], c.JS_UNDEFINED, c.JS_UNDEFINED);
         if (c.isException(json_str) != 0) {
-            gpa.destroy(data);
+            // C1 FIX: return the shell to the pool (was gpa.destroy —
+            // would corrupt the freelist by freeing a pooled shell).
+            releaseData(data);
             return c.JS_EXCEPTION;
         }
         defer c.freeValue(ctx, json_str);
@@ -501,7 +542,8 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
         return c.JS_EXCEPTION;
     }
     var url_buf: [512]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     if (extractStringAuto(ctx, argv[0], &url_buf)) |u| {
         defer u.deinit();
@@ -518,7 +560,8 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
 
 fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc; _ = argv;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     data.status = 0;
     data.setStatusText("");
@@ -530,8 +573,8 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, response_class_id)) |ptr| {
         const data: *ResponseData = @ptrCast(@alignCast(ptr));
-        data.deinit();
-        gpa.destroy(data);
+        // C1 FIX: return the shell to the pool (was deinit + destroy).
+        releaseData(data);
     }
 }
 
@@ -539,7 +582,8 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     _ = this_val;
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per `new Response()`).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
 
     if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {

@@ -26,11 +26,9 @@ const JOB_CLAIMED: u8 = 3;
 
 // Event-loop drain touches only `states` + `pending` + ring indices (hot).
 // Payload columns are cold per-job data, never scanned in drains.
-// Worker-thread allocs below are ONE per fetch (ResponseData wrapper + body
-// buffer), not per-chunk: common-case buffers are static/reused, heap is the
-// spill path for large bodies / >64 headers / zstd windows. Spill counters
-// (`stat_hdr_spill`, `stat_body_heap`, `stat_decompress_heap`) exist so the
-// batch-size decision can be measured with `bench/run-bench.sh`.
+// C1: the ResponseData wrapper comes from a freelist (zero alloc after
+// warmup); the per-fetch heap traffic that remains is the body copy into
+// ResponseData.pool + size-triggered spills below (measured via stat_*).
 // Scalar doneMask (not @Vector) is intentional: 16 slots fit one u64 mask
 // via inline unrolled scan; ws_client uses @Vector for 64 slots.
 
@@ -48,6 +46,10 @@ var methods: [MAX_FETCH]http.Method = undefined;
 var headers: [MAX_FETCH]?*headers_mod.HeadersData = [_]?*headers_mod.HeadersData{null} ** MAX_FETCH;
 var bodies: [MAX_FETCH]?[:0]const u8 = [_]?[:0]const u8{null} ** MAX_FETCH;
 var redirect_url_bufs: [MAX_FETCH][2048]u8 = undefined;
+// C1 FIX: per-slot static URL staging — replaces the per-fetch gpa.dupeZ
+// in fetch.zig. Heap spill only for >2048 URLs (flagged in url_owned).
+var url_stage_bufs: [MAX_FETCH][2048:0]u8 = undefined;
+var url_owned: [MAX_FETCH]bool = [_]bool{false} ** MAX_FETCH;
 // DOD-FIX TigerBeetle §3: reusable per-slot buffers — no per-fetch alloc
 // for the common case. Heap is spill only (measured via stat_* below).
 var body_stage_bufs: [MAX_FETCH][64 * 1024]u8 = undefined;
@@ -106,6 +108,7 @@ fn acquireSlot() ?usize {
 fn releaseSlot(s: usize) void {
     states[s].store(JOB_FREE, .release);
     url_bufs[s] = null;
+    url_owned[s] = false;
     uris[s] = undefined;
     methods[s] = undefined;
     headers[s] = null;
@@ -168,13 +171,15 @@ pub fn deinit() void {
     }
 }
 fn freeOwned(s: usize) void {
-    // BUG-7 FIX NOTE: these frees stay unconditional BY DESIGN. Every value
-    // that reaches url_bufs[]/bodies[] is heap-owned — fetch.extractStringFromVal
-    // no longer returns a static "" sentinel, and dupeSentinel allocates
-    // len+1 bytes even for empty input (Allocator.zig:472), so a `len > 0`
-    // guard here would leak those. Ownership is made uniform at the source
-    // instead of branched at the sink (DOD: explicit ownership & lifetime).
-    if (url_bufs[s]) |u| gpa.free(u);
+    // C1 FIX: url_bufs[s] is usually a view into url_stage_bufs[s] (no free);
+    // only the >2048 heap spill is owned (url_owned flag). Bodies stay
+    // unconditionally heap-owned: extractStringFromVal dupes and the JS
+    // string can be GC'd before the worker runs, so the copy is required.
+    // (Supersedes the BUG-7 "unconditional by design" note for URLs only.)
+    if (url_owned[s]) {
+        if (url_bufs[s]) |u| gpa.free(u);
+        url_owned[s] = false;
+    }
     url_bufs[s] = null;
     if (headers[s]) |h| h.release();
     headers[s] = null;
@@ -182,10 +187,10 @@ fn freeOwned(s: usize) void {
     bodies[s] = null;
 }
 fn freeResult(s: usize) void {
-    // Mirrors responseFinalizer (response.zig:504): deinit + destroy.
+    // C1 FIX: return the shell to the ResponseData freelist (was deinit +
+    // destroy per fetch). Mirrors responseFinalizer semantics.
     if (results[s]) |data| {
-        data.deinit();
-        gpa.destroy(data);
+        response_mod.releaseData(data);
         results[s] = null;
     }
 }
@@ -207,7 +212,7 @@ pub fn submit(
     ctx: ?*c.Context,
     resolve_func: c.Value,
     reject_func: c.Value,
-    url_buf: [:0]const u8,
+    url: []const u8,
     uri: std.Uri,
     method: http.Method,
     headers_ptr: *headers_mod.HeadersData,
@@ -216,12 +221,29 @@ pub fn submit(
     poolLock(); defer poolUnlock();
     const s = acquireSlot() orelse {
         if (builtin.mode==.Debug) std.debug.print("[submit] rejected: pool full\n", .{});
-        gpa.free(url_buf);
+        // C1 FIX: url is BORROWED now (staged below) — nothing to free.
+        // Bodies stay caller-owned heap (freed here on rejection as before).
         headers_ptr.release();
         if (body) |b| gpa.free(b);
         return error.NoConnectionAvailable;
     };
-    url_bufs[s]=url_buf; uris[s]=uri; methods[s]=method; headers[s]=headers_ptr; bodies[s]=body;
+    // C1 FIX: stage the borrowed URL into the per-slot static buffer.
+    // Heap spill only for >2048 URLs. Replaces fetch.zig's gpa.dupeZ.
+    if (url.len < url_stage_bufs[s].len) {
+        @memcpy(url_stage_bufs[s][0..url.len], url);
+        url_stage_bufs[s][url.len] = 0;
+        url_bufs[s] = url_stage_bufs[s][0..url.len :0];
+        url_owned[s] = false;
+    } else {
+        url_bufs[s] = gpa.dupeZ(u8, url) catch {
+            headers_ptr.release();
+            if (body) |b| gpa.free(b);
+            releaseSlot(s);
+            return error.NoConnectionAvailable;
+        };
+        url_owned[s] = true;
+    }
+    uris[s]=uri; methods[s]=method; headers[s]=headers_ptr; bodies[s]=body;
     results[s]=null; errs[s]=null;
     resolve_funcs[s]=c.dupValue(ctx, resolve_func);
     reject_funcs[s]=c.dupValue(ctx, reject_func);
@@ -350,9 +372,8 @@ fn runJob(slot_id: u16) void {
         const status_class=status_code/100;
         const has_body = switch(status_class){1=>false,2=>response.head.status!=.no_content and response.head.status!=.not_modified,3=>false,else=>true,};
         if (!has_body) { req.connection.?.closing=true; }
-        // One heap wrapper per fetch (cold submit path) — transferred to
-        // completeJob which builds the JS object. Not per-chunk.
-        const resp_data = gpa.create(response_mod.ResponseData) catch { failSlot(s,"Out of memory"); return; };
+        // C1 FIX: pooled ResponseData shell (was one gpa.create per fetch).
+        const resp_data = response_mod.acquire() orelse { failSlot(s,"Out of memory"); return; };
         // F1: take ownership of the slot's parsed headers directly — no
         // create+release of a throwaway HeadersData per fetch.
         resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
@@ -369,7 +390,11 @@ fn runJob(slot_id: u16) void {
         // the connection then does `r.* = undefined` — never extra_headers.
         resp_data.headers.clear();
         resp_data.status=status_code;
-        resp_data.setStatusText(response.head.status.phrase() orelse "OK");
+        // C1 FIX: single pool growth for status_text + url (was: one growth
+        // per storeString). Body reserves separately below (size known later).
+        const phrase = response.head.status.phrase() orelse "OK";
+        resp_data.pool.ensureTotalCapacity(gpa, phrase.len + current_url.len + 64) catch {};
+        resp_data.setStatusText(phrase);
         resp_data.redirected=redirected;
         resp_data.setUrl(current_url);
         // Batch reserve: single growth for response headers.
@@ -476,12 +501,21 @@ fn runJob(slot_id: u16) void {
         }
         if (owned_body) |b| {
             if (owned_heap) { resp_data.setBodyOwned(b); owned_body=null; owned_heap=false; }
-            else { resp_data.setBody(b); }
+            else {
+                // C1 FIX: single growth for the body bytes (was: appendSlice
+                // growth). Skipped for the owned_heap path above — that one
+                // transfers the buffer without touching the pool.
+                resp_data.pool.ensureTotalCapacity(gpa, resp_data.pool.items.len + b.len) catch {};
+                resp_data.setBody(b);
+            }
         }
         else if (response.head.content_length!=null and has_body) { resp_data.setBody(""); }
         if (builtin.mode==.Debug){
-            std.debug.print("[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B balanced={}\n", .{slot_id,job_counter.alloc_count,job_counter.free_count,job_counter.bytes_allocated,job_counter.bytes_freed,job_counter.balanced(),});
-            std.debug.assert(job_counter.balanced());
+            std.debug.print("[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B shells={d}\n", .{slot_id,job_counter.alloc_count,job_counter.free_count,job_counter.bytes_allocated,job_counter.bytes_freed,job_counter.alloc_count -| job_counter.free_count,});
+            // C1 FIX: pooled ResponseData shells are reused, not freed —
+            // per-job balance holds modulo ≤1 shell transfer (was: exact).
+            std.debug.assert(job_counter.alloc_count >= job_counter.free_count);
+            std.debug.assert(job_counter.alloc_count - job_counter.free_count <= 1);
         }
         okSlot(s, resp_data);
         break :hop;
@@ -511,8 +545,11 @@ fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!
     return .disarm;
 }
 fn doneMask() u64 {
+    // A5 FIX: acquire-load the atomics (was: non-atomic `.raw` read — a data
+    // race against the worker thread's `.release` store). Claim still goes
+    // through claimSlot's cmpxchgStrong below.
     var mask: u64=0;
-    inline for (0..MAX_FETCH) |i| { if (states[i].raw==JOB_DONE) mask|=@as(u64,1)<<@intCast(i); }
+    inline for (0..MAX_FETCH) |i| { if (states[i].load(.acquire)==JOB_DONE) mask|=@as(u64,1)<<@intCast(i); }
     return mask;
 }
 fn claimSlot(s: usize) bool { return states[s].cmpxchgStrong(JOB_DONE, JOB_CLAIMED, .acq_rel, .acquire)==null; }

@@ -536,15 +536,25 @@ fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
     tls_tm = &tm;
     defer tls_tm = null;
 
-    while (true) {
+        // A4 FIX: drain queued frames per wake (was 1 frame per poll — N queued
+    // frames cost N polls + N xev ticks), capped at 64 per wake so a message
+    // flood can't starve timers/microtasks. EOF still breaks out (parent
+    // closed its write end via terminate()).
+    outer: while (true) {
         if (port.pollReadable(POLL_QUANTUM_MS)) {
-            const fr = port.recvFrameBlocking() catch break; // EOF → shutdown
-            deliverToWorker(ctx, fr);
+            var budget: usize = 64;
+            while (budget > 0) {
+                const fr = port.recvFrameBlocking() catch break :outer; // EOF → shutdown
+                deliverToWorker(ctx, fr);
+                budget -= 1;
+                if (budget == 0) break;
+                if (!port.pollReadable(0)) break;
+            }
         }
         loop.run(.no_wait) catch {};
         microtasks.pumpMicrotasks(ctx);
-    }
-    tm.cancelAll();
+    }  
+           tm.cancelAll();
 }
 
 fn deliverToWorker(ctx: *qjs.Context, fr: port_mod.Frame) void {

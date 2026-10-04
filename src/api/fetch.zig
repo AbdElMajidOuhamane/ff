@@ -9,12 +9,14 @@ const http = std.http;
 
 // ── DOD note ──
 // This file is cold submit path (once per fetch() call), NOT the hot drain
-// path (async_fetch.runJob / event-loop pump). Heap ownership here is
-// intentional: url/method/body/headers are transferred to the worker thread
-// via async_fetch.submit and freed in freeOwned. Do not micro-opt this into
-// stack-only lifetimes — the worker outlives this call frame.
-// HeadersData built in-place, no per-header reallocation, cached RequestData
-// lookup (no repeated getOpaque2 pointer chase).
+// path (async_fetch.runJob / event-loop pump).
+// C1 FIX: URL/method are BORROWED here, not heap-duped — submit() stages the
+// URL into its per-slot static buffer synchronously (under poolLock) and the
+// method is parsed to an enum before submit, so stack lifetimes suffice.
+// Body stays heap-owned: the worker thread outlives this frame, and the JS
+// string can be GC'd after return. HeadersData comes from the freelist.
+// (Supersedes the old "heap ownership transferred to the worker" note for
+// URL/method; body/headers ownership is unchanged.)
 
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
@@ -44,6 +46,7 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 
 // Cold-submit owned-string helper: heap copy is REQUIRED because the
 // result outlives this frame (transferred to async_fetch worker).
+// Used ONLY for request bodies now (URL/method are borrowed — see note).
 //
 // BUG-7 FIX: the old `if (len == 0) return "";` handed back a STATIC
 // sentinel, so empty and non-empty inputs had two different owners.
@@ -171,30 +174,42 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     defer c.freeValue(ctx, cap[0]);
     defer c.freeValue(ctx, cap[1]);
     const arg0 = argv[0];
-    var url_str: ?[:0]const u8 = null;
+    // C1 FIX: URL + method are BORROWED (stack scratch, heap spill only for
+    // longer). submit() stages the URL synchronously under poolLock and the
+    // method is parsed to an enum before submit, so nothing outlives the
+    // frame. Body stays heap-owned: the worker outlives this frame and the
+    // JS string may be GC'd after return.
+    var url_stack: [2048]u8 = undefined;
+    var url_heap: ?[:0]const u8 = null;
+    defer if (url_heap) |u| gpa.free(u);
+    var url: ?[]const u8 = null;
+    var method_stack: [64]u8 = undefined;
+    var method_heap: ?[:0]const u8 = null;
+    defer if (method_heap) |m| gpa.free(m);
     var method_override: ?[]const u8 = null;
-    var owned_method: ?[:0]const u8 = null;
     var body_payload: ?[:0]const u8 = null;
-    defer {
-        // BUG-7: unconditional by design — every non-null value is heap-owned
-        // now that extractStringFromVal no longer returns a static "" .
-        if (url_str) |u| gpa.free(u);
-        if (owned_method) |m| gpa.free(m);
-        if (body_payload) |b| gpa.free(b);
-    }
+    defer if (body_payload) |b| gpa.free(b);
     // DOD-FIX: single getOpaque2 lookup, reused below (was looked up twice).
     const req_data = extractRequestData(ctx, arg0);
     if (c.isString(arg0) != 0) {
-        url_str = extractStringFromVal(ctx, arg0);
+        if (extractStringAuto(ctx, arg0, &url_stack)) |ex| {
+            url = ex.slice;
+            url_heap = ex.heap;
+        }
     } else if (c.isObject(arg0) != 0) {
         if (req_data) |rd| {
-            url_str = gpa.dupeZ(u8, rd.url()) catch null;
+            // Borrowed from the live Request object (arg0 is rooted for this
+            // call); submit() copies synchronously before return.
+            url = rd.url();
             method_override = rd.method();
             body_payload = if (rd.body()) |b| gpa.dupeZ(u8, b) catch null else null;
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
             defer c.freeValue(ctx, url_val);
-            url_str = extractStringFromVal(ctx, url_val);
+            if (extractStringAuto(ctx, url_val, &url_stack)) |ex| {
+                url = ex.slice;
+                url_heap = ex.heap;
+            }
         }
     } else {
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
@@ -223,9 +238,9 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         defer c.freeValue(ctx, method_val);
         // Guard undefined/null before alloc (was unconditional alloc).
         if (c.isUndefined(method_val) == 0 and c.isNull(method_val) == 0) {
-            if (extractStringFromVal(ctx, method_val)) |m| {
-                method_override = m;
-                owned_method = m;
+            if (extractStringAuto(ctx, method_val, &method_stack)) |m| {
+                method_override = m.slice;
+                method_heap = m.heap;
             }
         }
         const headers_val = c.getPropertyStr(ctx, init_val, "headers");
@@ -238,7 +253,7 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
     }
 
-    const url = url_str orelse {
+    const url_slice = url orelse {
         // BUG-5: the old `errdefer in_flight_headers.deinit()` never fired
         // (this function has no error returns) → the reserved name/value
         // pools leaked on every early return. Explicit cleanup instead.
@@ -253,7 +268,7 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         method_str = "POST";
     }
     const method = parseMethod(method_str);
-    const uri = std.Uri.parse(url) catch {
+    const uri = std.Uri.parse(url_slice) catch {
         in_flight_headers.deinit();
         var msg = zigStringToJS(ctx, "Invalid URL");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
@@ -262,32 +277,29 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     };
 
     // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
-    // heap-allocated HeadersData so async_fetch can hold a stable pointer.
-    // The wrapper is released by freeOwned once runJob has adopted its
-    // contents into the response's HeadersData.
-    const hdr_ptr = gpa.create(headers_mod.HeadersData) catch {
+    // pooled HeadersData shell so async_fetch can hold a stable pointer.
+    // The shell is returned to the freelist by freeOwned once runJob has
+    // adopted its contents into the response's HeadersData.
+    // C1 FIX: pooled shell (was gpa.create per fetch() call).
+    const hdr_ptr = headers_mod.acquire() orelse {
         in_flight_headers.deinit();
         var msg = zigStringToJS(ctx, "Out of memory");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         c.freeValue(ctx, msg);
-        // url_str / body_payload are still non-null here, so the deferred
-        // free above reclaims them — the null-outs below are deliberately
-        // placed AFTER this block to avoid leaking url_copy/body_copy.
         return promise;
     };
     hdr_ptr.* = in_flight_headers;
-    // Ownership of url/body moves to submit() from here on; null the
-    // deferred-free handles so this frame's defer stops tracking them.
-    const url_copy = url;
-    url_str = null;
+    // Ownership of body moves to submit() from here on; null the
+    // deferred-free handle so this frame's defer stops tracking it.
+    // URL needs no handoff — submit() staged a copy synchronously, and
+    // url_heap (spill only) is freed by the defer above on return.
     const body_copy = body_payload;
     body_payload = null;
-    async_fetch.submit(ctx, cap[0], cap[1], url_copy, uri, method, hdr_ptr, body_copy) catch {
+    async_fetch.submit(ctx, cap[0], cap[1], url_slice, uri, method, hdr_ptr, body_copy) catch {
         // BUG-6 FIX (double-release UAF): submit() takes ownership the moment
-        // it is called and has ALREADY freed url/body/headers on BOTH of its
-        // failure paths — pool-full at async_fetch:200-206 and shutdown at
-        // :213-218. Releasing hdr_ptr here drove the refcount 1→0→destroy
-        // then read gpa.destroy'd memory. Do not touch it again.
+        // it is called and has ALREADY released headers/body on BOTH of its
+        // failure paths — pool-full and shutdown. (URL is borrowed, nothing
+        // to release.) Do not touch hdr_ptr again here.
         var msg = zigStringToJS(ctx, "Failed to start fetch");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         c.freeValue(ctx, msg);

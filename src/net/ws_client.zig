@@ -462,7 +462,6 @@ fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) 
 fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8, r: *?http.Client.Request) void {
     const mlen = @min(msg.len, rx_err[s].len);
     @memcpy(rx_err[s][0..mlen], msg[0..mlen]);
-    rx_err_len[s] = @intCast(mlen);
     rx_code[s] = 1006;
     rx_reason_len[s] = 0;
     rx_event[s] = EV_CLOSE;
@@ -805,8 +804,11 @@ fn asyncCb( // CHANGED: drains events and pumps microtasks
 }
 
 fn doneMask() u64 {
+    // A5 FIX: acquire-load the atomics (was: non-atomic `.raw` read — a data
+    // race against the worker thread's `.release` store). The vector compare
+    // and the claimSlot cmpxchg below are unchanged.
     var raw: [MAX_WS]u8 = undefined;
-    for (0..MAX_WS) |i| raw[i] = states[i].raw;
+    for (0..MAX_WS) |i| raw[i] = states[i].load(.acquire);
     const v: @Vector(MAX_WS, u8) = @bitCast(raw);
     const eq = v == @as(@Vector(MAX_WS, u8), @splat(JOB_DONE));
     return @bitCast(eq);

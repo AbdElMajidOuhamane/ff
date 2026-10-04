@@ -598,6 +598,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
         buildResponse(id, 500, "Internal Server Error");
         return;
     };
+    
 
     var status: u16 = 200;
     var status_text: []const u8 = "";
@@ -1079,7 +1080,6 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 }
 
 fn wsConsume(id: usize, l: *xev.Loop) void {
-
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
         const hdr = ws.parseHeader(leftover) orelse break;
@@ -1195,10 +1195,10 @@ fn closeConn(id: usize) void {
             states[id] = .closing;
             cflags[id].tls_close_after_write = true;
             const l = g_loop orelse {
-                hardClose(id);
+hardClose(id);
                 return;
             };
-            fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+                        fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
             return;
         }
     }
@@ -1344,23 +1344,25 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
     // HTTP/2 path runs BEFORE the handler_parked early-return so multiplexed
     // streams keep flowing while one stream's promise is parked.
     if (cflags[id].h2_active) {
-        const used = http2_mod.onRecv(id, read_bufs[id][0..buf_lens[id]], l);
-        if (used == http2_mod.FATAL) {
-            closeConn(id);
-            return;
-        }
-        const rem = buf_lens[id] - used;
-        if (rem > 0) {
-            @memmove(read_bufs[id][0..rem], read_bufs[id][used..buf_lens[id]]);
-            buf_lens[id] = rem;
-            // Progress made: re-feed immediately. Otherwise (incomplete frame,
-            // nothing consumed) fall through and wait for more bytes.
-            if (used > 0) {
-                processPlaintext(id, l);
+        // B1 FIX: iterate instead of recursing (was: tail-call
+        // processPlaintext per consumed frame — stack grew ~16KB per
+        // frame in a burst; now bounded flat).
+        while (true) {
+            const used = http2_mod.onRecv(id, read_bufs[id][0..buf_lens[id]], l);
+            if (used == http2_mod.FATAL) {
+                closeConn(id);
                 return;
             }
-        } else {
-            buf_lens[id] = 0;
+            const rem = buf_lens[id] - used;
+            if (rem == 0) {
+                buf_lens[id] = 0;
+                break;
+            }
+            @memmove(read_bufs[id][0..rem], read_bufs[id][used..buf_lens[id]]);
+            buf_lens[id] = rem;
+            // Progress made: re-feed immediately. Otherwise (incomplete
+            // frame, nothing consumed) fall through and wait for more bytes.
+            if (used == 0) break;
         }
         states[id] = .reading;
         // NOTE: never tlsPump() here. pumpWrite (via onRecv's flushNow

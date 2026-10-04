@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const gpa = std.heap.smp_allocator;
 
 /// Frame types on the pipe. Payload for MESSAGE is a JSON string;
 /// payload for ERROR is a raw UTF-8 message (not JSON).
@@ -51,8 +50,14 @@ pub const MessagePort = struct {
         var hdr: [5]u8 = undefined;
         std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .little);
         hdr[4] = ftype;
-        try writeExact(self.send_fd, &hdr);
-        if (payload.len > 0) try writeExact(self.send_fd, payload);
+        if (payload.len == 0) return writeExact(self.send_fd, &hdr);
+        // A4 FIX: one writev per frame (was two writeExact syscalls).
+        // Single writer per fd, so partial-write retry is safe.
+        const iov = [_]std.posix.iovec_const{
+            .{ .base = &hdr, .len = hdr.len },
+            .{ .base = payload.ptr, .len = payload.len },
+        };
+        try writevExact(self.send_fd, &iov);
     }
 
     pub fn sendMessage(self: *const MessagePort, json: []const u8) !void {
@@ -128,6 +133,29 @@ fn writeExact(fd: std.posix.fd_t, buf: []const u8) !void {
     }
 }
 
+
+// A4 FIX: vectored-write twin of writeExact. iovec_const elements are
+// immutable, so advance (base, len) across partial writes on a mutable
+// stack copy. Bounded: all in-tree callers pass ≤ 2 entries (sendFrame).
+fn writevExact(fd: std.posix.fd_t, iov: []const std.posix.iovec_const) !void {
+    std.debug.assert(iov.len <= 8);
+    var buf: [8]std.posix.iovec_const = undefined;
+    @memcpy(buf[0..iov.len], iov);
+    var cur = buf[0..iov.len];
+    while (cur.len > 0) {
+        const n = std.c.writev(fd, cur.ptr, @intCast(cur.len));
+        if (n <= 0) return error.WriteFailed;
+        var left: usize = @intCast(n);
+        while (cur.len > 0 and left >= cur[0].len) {
+            left -= cur[0].len;
+            cur = cur[1..];
+        }
+        if (cur.len > 0 and left > 0) {
+            cur[0].base += left;
+            cur[0].len -= left;
+        }
+    }
+}
 fn readExact(fd: std.posix.fd_t, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {

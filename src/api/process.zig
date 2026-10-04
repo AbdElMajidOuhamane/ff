@@ -1,6 +1,11 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const builtin = @import("builtin");
+// C3: stat counters live in the net modules (verified: nothing in their
+// import closures references api/process, so no cycle).
+const async_fetch = @import("../net/async_fetch.zig");
+const http_native = @import("../net/http_native.zig");
+const pg_client = @import("../net/pg_client.zig");
 
 const Io = std.Io;
 
@@ -16,7 +21,7 @@ fn throwErr(ctx: ?*c.Context, msg: []const u8) void {
 }
 
 fn zigStringToVal(ctx: ?*c.Context, str: []const u8) c.Value {
-    return c.newStringLen(ctx, str.ptr, str.len);
+    return c.newStringLen(ctx, str.ptr, @intCast(str.len));
 }
 
 fn extractString(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_int) ?[:0]const u8 {
@@ -72,6 +77,61 @@ fn chdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     return c.JS_UNDEFINED;
 }
 
+// C3 FIX: expose the TB §5 spill/reuse counters to JS (works in Release
+// too — the Debug stderr dumps don't). Key names match what
+// bench/fetch_spill.js expects: fetch.bodyHeap, fetch.hdrSpill,
+// fetch.decompressHeap, http.bodySpill, pg.*.
+// JS_NewInt64 takes i64: the u64 counters need @intCast (same-width
+// signed/unsigned does not coerce); pg's u32 counters widen implicitly.
+fn statsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    const root = c.newObject(ctx);
+
+    const fetch_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, fetch_obj, "bodyHeap", c.newInt64(ctx, @intCast(async_fetch.stat_body_heap.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, fetch_obj, "hdrSpill", c.newInt64(ctx, @intCast(async_fetch.stat_hdr_spill.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, fetch_obj, "decompressHeap", c.newInt64(ctx, @intCast(async_fetch.stat_decompress_heap.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, root, "fetch", fetch_obj, c.PROP_C_W_E);
+
+    const http_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, http_obj, "bodySpill", c.newInt64(ctx, @intCast(http_native.stat_body_spill.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, root, "http", http_obj, c.PROP_C_W_E);
+
+    const pg_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "submit", c.newInt64(ctx, pg_client.stat_submit.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "jobReuse", c.newInt64(ctx, pg_client.stat_job_reuse.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "jobFresh", c.newInt64(ctx, pg_client.stat_job_fresh.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "wqueueGrow", c.newInt64(ctx, pg_client.stat_wqueue_grow.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "wqueueShrink", c.newInt64(ctx, pg_client.stat_wqueue_shrink.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "waitEnqueue", c.newInt64(ctx, pg_client.stat_wait_enqueue.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "arenaResetFail", c.newInt64(ctx, pg_client.stat_arena_reset_fail.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, pg_obj, "freelistDestroy", c.newInt64(ctx, pg_client.stat_freelist_destroy.load(.monotonic)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, root, "pg", pg_obj, c.PROP_C_W_E);
+
+    return root;
+}
+
+// C3 FIX: docs/guides/process.md claimed "nothing for RSS" —
+// bench/streams/streams_bench.js already calls process.memoryUsage().rss.
+// getrusage(0): who=0 is RUSAGE_SELF/SELF on every POSIX target.
+fn memoryUsageCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    _ = argc;
+    _ = argv;
+    const ru = std.posix.getrusage(0);
+    const raw: i64 = @max(ru.maxrss, 0);
+    // Linux reports KiB, Darwin reports bytes — normalize to bytes.
+    const rss: u64 = switch (builtin.os.tag) {
+        .linux => @as(u64, @intCast(raw)) * 1024,
+        else => @intCast(raw),
+    };
+    const obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, obj, "rss", c.newInt64(ctx, @intCast(rss)), c.PROP_C_W_E);
+    return obj;
+}
+
 pub fn setup(ctx: *c.Context, args: std.process.Args) void {
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
@@ -85,6 +145,13 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
 
     const chdir_fn = c.newCFunction(ctx, chdirCallback, "chdir", 1);
     _ = c.definePropertyValueStr(ctx, process_obj, "chdir", chdir_fn, c.PROP_C_W_E);
+
+    // C3: allocation/spill introspection for bench/fetch_spill.js.
+    const stats_fn = c.newCFunction(ctx, statsCallback, "stats", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "stats", stats_fn, c.PROP_C_W_E);
+
+    const memory_usage_fn = c.newCFunction(ctx, memoryUsageCallback, "memoryUsage", 0);
+    _ = c.definePropertyValueStr(ctx, process_obj, "memoryUsage", memory_usage_fn, c.PROP_C_W_E);
 
     const pid_val = c.newInt64(ctx, @intCast(@as(i64, std.c.getpid())));
     _ = c.definePropertyValueStr(ctx, process_obj, "pid", pid_val, c.PROP_C_W_E);

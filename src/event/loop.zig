@@ -9,6 +9,8 @@ const timers_mod = @import("timers.zig");
 const worker_mod = @import("../worker/worker.zig");
 const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
+// C2: async FS completions drain here (Promise settlements on the JS thread).
+const fs_mod = @import("../api/fs.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -73,7 +75,7 @@ pub const EventLoop = struct {
     // the old break condition — `!work_left and ... and !timersAlive()` —
     // could never be satisfied: `!work_left` was already false whenever
     // any timer existed, so `timersAlive()` never got to decide anything.
-    inline fn hasRelevantWork(loop: *const xev.Loop) bool {
+    inline fn hasRelevantWork(loop: *xev.Loop) bool {
         if ((loop.active -| unrefArmed()) > 0) return true;
         if (timersAlive()) return true;
         if (http_api.server_running.load(.acquire)) return true;
@@ -82,6 +84,9 @@ pub const EventLoop = struct {
         if (pg_client.pending.load(.acquire) > 0) return true;
         if (ffi_api.pending.load(.acquire) > 0) return true;
         if (ffi_api.bridge_pending.load(.acquire) > 0) return true;
+        // C2: in-flight async FS jobs keep the process alive (else
+        // `await fs.readFileAsync()` would exit before settling).
+        if (fs_mod.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         // Queue entries only count as blocking when nothing is unref'd:
         // with an unref'd timer pending, an entry in submissions may be that
@@ -134,6 +139,11 @@ pub const EventLoop = struct {
                 ffi_api.ensureArmed();
             }
             ffi_api.drainCompleted(ctx);
+            // C2: async FS settlements (Promise resolve/reject on JS thread).
+            if (fs_mod.pending.load(.acquire) > 0) {
+                fs_mod.ensureArmed();
+            }
+            fs_mod.drainCompleted(ctx);
             worker_mod.drainCompleted(ctx);
             microtasks.pumpMicrotasks(ctx);
             if (gc_ticks >= next_gc_check) {

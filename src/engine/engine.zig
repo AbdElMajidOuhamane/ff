@@ -288,6 +288,7 @@ pub const Runtime = struct {
         ws_client.setLoop(&loop_ptr.loop);
         pg_client.setLoop(&loop_ptr.loop);
         ffi_api.setLoop(&loop_ptr.loop);
+        fs_api.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{

@@ -96,6 +96,38 @@ comptime {
     std.debug.assert(@alignOf(Entry) == 4);
 }
 
+// C1 FIX: HeadersData shell freelist — one `gpa.create` per fetch() call
+// (api/fetch.zig) and per `new Headers()` otherwise. The 128B shell is
+// pooled; the byte pools themselves are NOT retained (deinit frees them),
+// so idle RSS never grows — only the create/destroy churn disappears.
+// Pooling happens ONLY on the refcount-0 path below, never while a JS
+// object references the container. JS-thread-only (no atomics needed).
+const HDR_POOL_MAX: usize = 32;
+var hdr_pool: [HDR_POOL_MAX]*HeadersData = undefined;
+var hdr_pool_n: usize = 0;
+
+/// Pooled HeadersData shell, freshly init()'d (refcount = 1).
+/// Null only on OOM — callers use `orelse` like the old gpa.create path.
+pub fn acquire() ?*HeadersData {
+    if (hdr_pool_n > 0) {
+        hdr_pool_n -= 1;
+        const h = hdr_pool[hdr_pool_n];
+        h.* = HeadersData.init();
+        return h;
+    }
+    return gpa.create(HeadersData) catch null;
+}
+
+fn releaseToPool(h: *HeadersData) void {
+    h.deinit();
+    if (hdr_pool_n < HDR_POOL_MAX) {
+        hdr_pool[hdr_pool_n] = h;
+        hdr_pool_n += 1;
+    } else {
+        gpa.destroy(h);
+    }
+}
+
 // Hot data: `entries` (16B stride, scanned by every get/has/forEach).
 // Cold data: `names`/`values` bytes, `merge_buf`/`view_buf` scratch.
 // Hot loops touch entries + the referenced name bytes only; merge/view
@@ -110,8 +142,11 @@ pub const HeadersData = struct {
     pub const PairView = struct { name: []const u8, value: []const u8 };
 
     comptime {
-        // 3 pointers+len (ArrayList = 16B on 64-bit) x5 + atomic = small GC object,
-        // not a hot array element — size guard documents cold-bridge intent.
+        // A5 FIX: unmanaged ArrayList = 24B (ptr+len+capacity), not 16B —
+        // the old comment was stale since Zig 0.15 (5×24 + atomic = 128B).
+        // Small GC object, not a hot array element — size guard documents
+        // cold-bridge intent and catches future std layout drift.
+        std.debug.assert(@sizeOf(HeadersData) <= 128);
         std.debug.assert(@alignOf(HeadersData) >= @alignOf(usize));
     }
 
@@ -137,8 +172,9 @@ pub const HeadersData = struct {
     }
     pub fn release(self: *HeadersData) void {
         if (self.refcount.fetchSub(1, .acq_rel) == 1) {
-            self.deinit();
-            gpa.destroy(self);
+            // C1 FIX: return the shell to the freelist instead of
+            // destroying it (pools are freed by deinit inside releaseToPool).
+            releaseToPool(self);
         }
     }
     // BUG-2 FIX: fetch adopts the REQUEST HeadersData into the Response
@@ -325,7 +361,7 @@ pub const HeadersData = struct {
         return result.toOwnedSlice(gpa) catch &.{};
     }
     // Cold JS-bridge helper: allocates per call, never used in I/O hot loop.
-    pub fn serialize(self: *const HeadersData) ![]const u8 {
+    pub fn serialize(self: *HeadersData) ![]const u8 {
         var total: usize = 0;
         for (self.entries.items) |e| {
             total += self.nameOf(e).len + self.valueOf(e).len + 4;
@@ -517,7 +553,8 @@ fn headersFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 
 fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
-    const data = gpa.create(HeadersData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell instead of gpa.create per `new Headers()`.
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = HeadersData.init();
 
     if (argc > 0) {
