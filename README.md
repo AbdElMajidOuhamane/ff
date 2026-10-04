@@ -355,7 +355,7 @@ const result = await res2.json();
 console.log(result);
 
 // Check status
-const res3 = await fetch("https://httpbin.org/status/404");
+const res3 = await fetch("https://example.com/status/404");
 console.log(res3.status);   // 404
 console.log(res3.ok);       // false
 
@@ -743,8 +743,6 @@ await sql`INSERT INTO todos(title) VALUES (${"buy milk"})`;
 const rows = await sql`SELECT id, title, done FROM todos WHERE done = ${false}`;
 console.log(rows);
 // [ { id: 1, title: "buy milk", done: false } ]
-
-sql.close();
 ```
 
 ```sh
@@ -962,6 +960,7 @@ console.log(import.meta.url);  // "file:///path/to/module.js"
 | `fs` | `readFile`, `writeFile`, `exists`, `mkdir`, `rm`, `readdir` (all sync) |
 | `process` | `exit`, `cwd`, `chdir`, `pid`, `platform`, `arch`, `env`, `argv` |
 | `http` | `http.serve(options, handler)` — start an HTTP/HTTPS server |
+| `ffi` | `dlopen`, `struct`, `union`, `callback` — C-ABI shared libraries (needs `--allow-ffi`) |
 | `Worker` | `new Worker(path, {data})`, `postMessage`, `onmessage`, `onerror`, `terminate` (max 8) |
 | `import.meta.url` | `file://` URL of the current module (per-module, not a global) |
 
@@ -1182,7 +1181,6 @@ ff compile <f.js> [-o out.ffbc]
                          Compile to bytecode (run back with ff <file.ffbc>)
 ff fmt [--write|--check] <files...>
                          Format via prettier (needs npx/network)
-ff bench                 Run the bundled micro-benchmarks
 ff -e <code>             Run inline JavaScript code
 ff <file.js>             Run a JavaScript file
 ff --version             Print runtime version
