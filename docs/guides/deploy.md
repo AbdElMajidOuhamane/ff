@@ -43,6 +43,10 @@ make install        # copy to ~/.local/bin/ff
 
 There is no `make build-native` target.
 
+On Linux the I/O backend is io_uring by default; build with
+`zig build -Dio_uring=false` for an epoll binary that runs anywhere. See the
+README's "I/O backend on Linux" for the kernel and seccomp requirements.
+
 ## Run with `ff start`
 
 `ff start` reads `main` from `ff.json` and runs it — this is the production entrypoint:
@@ -93,6 +97,12 @@ curl http://127.0.0.1:3000/
 ```
 
 The `-p` mapping must match the port in `http.serve({ port })` — the container binds `0.0.0.0` already, so only the mapping can be wrong.
+
+> **io_uring images need a permissive seccomp profile.** The published image
+> is built with io_uring; Docker's default profile blocks it and the process
+> exits at startup with `ff: I/O backend unavailable…`. Run with
+> `--security-opt seccomp=unconfined`, or build your image with
+> `zig build -Dio_uring=false` for a run-anywhere epoll binary.
 
 ## Smoke-test before traffic
 
@@ -152,3 +162,9 @@ Point your platform's health check at `/health` and assert on `ok: true`.
 **TLS didn't start** — both cert and key required, within size caps (cert ≤ 512KB, key ≤ 256KB), paths readable by the process user.
 
 **App boots but handlers 504** — the 30s watchdog is firing under load. Move heavy work to `Worker` threads (max 8) and reply early.
+
+**`ff: I/O backend unavailable`** — this binary uses io_uring (Linux 5.1+,
+seccomp must allow `io_uring_setup`/`io_uring_enter`/`io_uring_register`).
+On Docker and most managed platforms the default seccomp profile blocks it:
+run with `--security-opt seccomp=unconfined`, or rebuild with
+`-Dio_uring=false` (epoll). The published image is an io_uring image.

@@ -98,8 +98,8 @@ no JS state — they communicate by message passing.
 │                 │ →  │                         │
 └─────────────────┘    └─ microtask pump ────────┘
                                  ↓
-                     ┌─ I/O completion (kqueue/epoll) ─┐
-                     └─ back to JS code ───────────────┘
+                     ┌─ I/O completion (kqueue/io_uring) ─┐
+                     └─ back to JS code ───────────────────┘
 ```
 
 ### No `process.nextTick`; use `queueMicrotask`
@@ -308,7 +308,6 @@ Running 10s test @ http://127.0.0.1:3000/
 Requests/sec: 138187.47
 Transfer/sec:    964.39KB
 ```
-
 ### Async handlers
 
 Handlers can be `async` — the runtime parks the connection and resumes it
@@ -1004,8 +1003,9 @@ console.log(import.meta.url);  // "file:///path/to/module.js"
 
 ## Performance
 
-`wrk -t 8 -c 100 -d 10s`, Apple silicon, all runtimes serving the same
-hello-world handler:
+### macOS (Apple silicon, kqueue)
+
+`wrk -t 8 -c 100 -d 10s`, all runtimes serving the same hello-world handler:
 
 | Runtime       | Req/sec   | p50    | p99    | Peak RSS |
 |---------------|-----------|--------|--------|----------|
@@ -1014,20 +1014,33 @@ hello-world handler:
 | Bun 1.4       | 107k      | 0.87 ms | 1.71 ms | 34 MB    |
 | Node 23       | 69k       | 1.36 ms | 1.69 ms | 82 MB    |
 
-Fairyfly is:
+### Linux (io_uring vs epoll)
 
-- **+25% throughput** vs the next-fastest runtime
-- **-90% memory** vs Deno (~10x lower RSS)
-- **-24% p50 latency** vs Deno
+hyperfine × wrk `-t4 -c100 -d 10s`, 3-run medians across two campaigns,
+Linux aarch64 VM, musl `ReleaseFast` builds, same hello-world handler:
 
-**Reproducing:** the harness is [`bench/_bench/wrk.sh`](bench) (wrk +
-RSS sampling). Server-side numbers use a `ReleaseFast` build
-(`make build`). Broader interpreter and I/O comparisons live in
-[`bench/run-bench.sh`](bench) (hyperfine across Node/Bun/Deno/Fairyfly) and
-[`bench/mem-bench.sh`](bench) (peak RSS).
+| Runtime | req/s (io_uring) | req/s (epoll) | Peak RSS (io_uring / epoll) |
+|---|---|---|---|
+| **Fairyfly** | **309k** | 171k | **10 MB / 16 MB** |
+| Deno 2.9.7 | 248k | 247k | 44 MB / 44 MB |
+| Bun 1.4.2 | 187k | 184k | 34 MB / 35 MB |
+| Node 18 | 55k | 57k | 88 MB / 88 MB |
+
+Fairyfly with io_uring is **~1.8× its own epoll backend** (≈2× on the
+`wrk.sh` harness), **+25% throughput over Deno** with **~4× lower peak
+RSS** on this workload.
+
+> These are VM-relative numbers: compare rows within a table, not across
+> tables or against other machines. Hello-JSON keep-alive is one workload;
+> TLS/WebSocket/Postgres paths are not represented here.
+
+**Reproducing:** [`bench/_bench/wrk.sh`](bench) (wrk + RSS sampling),
+[`bench/_bench/hyperfine-http.sh`](bench) (3-run medians per runtime).
+Server-side numbers use `ReleaseFast` builds (`make build`). Broader
+interpreter and I/O comparisons live in [`bench/run-bench.sh`](bench) and
+[`bench/mem-bench.sh`](bench).
 
 ---
-
 ## Architecture
 
 ```
@@ -1052,7 +1065,7 @@ RSS sampling). Server-side numbers use a `ReleaseFast` build
 └──────────────────┬───────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────┐
-│ libxev event loop (epoll on Linux, kqueue on mac) │
+│ libxev event loop (io_uring/epoll, kqueue on mac) │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -1152,14 +1165,52 @@ ff -e 'console.log("hello")'
 ```sh
 zig build -Doptimize=ReleaseFast   # default for `make build`
 zig build -Dbearssl=false          # drop TLS support entirely
+zig build -Dio_uring=false         # Linux: epoll backend instead of io_uring
 zig build -Dversion=1.2.3          # version reported by `ff --version`
 zig build test                     # Zig unit tests
 make test                          # Zig unit tests + test/run.sh
 make ci                            # test/run.sh only
 ```
 
----
+### I/O backend on Linux (io_uring)
 
+The Linux backend is **io_uring** by default; **epoll** stays available as a
+build-time fallback. Other platforms are unchanged (kqueue on macOS).
+
+| Build | Linux backend |
+|---|---|
+| `zig build` | io_uring (default) |
+| `zig build -Dio_uring=false` | epoll (runs anywhere) |
+
+io_uring needs **Linux 5.1+** and a seccomp profile that allows
+`io_uring_setup` / `io_uring_enter` / `io_uring_register`. Docker's default
+profile blocks them: run containers with `--security-opt seccomp=unconfined`
+or ship an epoll build. If the binary prints
+
+```
+ff: I/O backend unavailable (io_uring requires Linux 5.1+ and must not be blocked by seccomp; rebuild with -Dio_uring=false for epoll)
+```
+
+it detected a blocked or absent io_uring and exited deliberately — rebuild
+with `-Dio_uring=false`.
+
+**Testing io_uring (rc1) — help wanted.** Under sustained load, please
+exercise: the HTTP server (plain + TLS), WebSockets, `fetch`, and
+PostgreSQL/SQLite query paths. Run `make test` and `ff bench/fetch_spill.js`.
+File an issue including `uname -r`, `cat /proc/sys/kernel/io_uring_disabled`,
+your seccomp/container setup, `ff --version`, the workload, and throughput /
+latency / RSS numbers — plus the same build with `-Dio_uring=false` for
+comparison when possible.
+
+Known issues in rc1:
+
+- A failed `db.execNoArgs` leaks SQLite's error message (error paths only).
+- A multi-statement query that re-describes columns can leak cached name
+  atoms (currently unreachable through the extended query protocol).
+- On some custom kernels glibc thread creation fails and `fetch` worker
+  threads panic at startup; musl static builds are unaffected.
+
+---
 ## CLI reference
 
 ```
