@@ -119,6 +119,10 @@ pub var slot_ids: [MAX_CONN]u16 = undefined;
 var slot_gen: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
 var parked_since_ms: [MAX_CONN]u64 = [_]u64{0} ** MAX_CONN;
 var promise_class_id: c.ClassID = 0;
+// Cached "then" atom for parkHandler: one JS_NewAtomLen per process instead
+// of one intern+release per parked async request. Process-lifetime, like
+// promise_class_id — never freed. // ◀ FIX-3
+var then_atom: c.Atom = 0; // ◀ FIX-3
 
 const HDR_MAX = 2048;
 const HANDLER_TIMEOUT_MS: u64 = 30_000;
@@ -806,8 +810,10 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
         c.freeValue(ctx, exc);
         return false;
     }
-    const then_atom = c.newAtomLen(ctx, "then", 4);
-    defer c.freeAtom(ctx, then_atom);
+    // Cached process-lifetime "then" atom (setupStrings); lazy fallback if
+    // the server started without it. Atom 0 (newAtomLen OOM) → invoke throws,
+    // same failure mode as before. No per-park intern/release. // ◀ FIX-3
+    if (then_atom == 0) then_atom = c.newAtomLen(ctx, "then", 4); // ◀ FIX-3
     var then_argv = [_]c.Value{ ok_fn, err_fn };
     const then_result = c.invoke(ctx, promise, then_atom, 2, &then_argv);
     defer c.freeValue(ctx, then_result);
@@ -1782,6 +1788,9 @@ pub fn setupStrings(ctx: ?*c.Context) void {
     defer c.freeValue(ctx, cap[0]);
     defer c.freeValue(ctx, cap[1]);
     if (c.isObject(p) != 0) promise_class_id = c.getClassID(p);
+    // Cache the "then" atom once (parkHandler reuses it; never freed,
+    // like promise_class_id). Guarded so a retried probe can't leak. // ◀ FIX-3
+    if (then_atom == 0) then_atom = c.newAtomLen(ctx, "then", 4); // ◀ FIX-3
 }
 
 // ── Regression test: classifyMethod must never read past the slice ──

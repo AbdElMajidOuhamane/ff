@@ -16,6 +16,7 @@
 //!   for GC'd Tx (in-flight jobs root the Tx object, so only idle conns seen).
 //! §Hot/cold: Job.err.* cold (only ErrorResponse); query fields hot.
 //! §Layout: ConnFlags packed u8 (incl. in_tx); state/auth/op enum(u8); FieldDesc dense [];
+//!   FieldDesc carries a RowDesc-time JS atom (no per-cell re-atomize); // ◀ FIX-1
 //!   AoS Conn/Job justified: N ≤ max(10), whole-object access per op — no MultiArrayList/SoA.
 //! §SIMD: N/A (text wire protocol, no numeric hot loop).
 //! Cold (exempt): SCRAM/DNS/Config/pool create; QuickJS heap for promises/rows/errors.
@@ -97,9 +98,14 @@ pub const Config = struct {
 pub const FieldDesc = struct {
     name: [:0]u8,
     oid: u32,
+    /// RowDesc-time JS atom for `name`. handleDataRow writes cells with
+    /// setProperty(atom) instead of setPropertyStr (no per-cell re-atomize).
+    /// Defaults to 0 (JS_ATOM_NULL); freed in Job.release/destroy. // ◀ FIX-1
+    atom: c.Atom = 0, // ◀ FIX-1
 };
 
 comptime {
+    // name(16) + oid(4) + atom(4) = 24: the atom must not grow the stride. // ◀ FIX-1
     std.debug.assert(@sizeOf(FieldDesc) == 24);
 }
 
@@ -190,6 +196,9 @@ pub const Job = struct {
             if (c.isUndefined(self.reject) == 0) c.freeValue(ctx, self.reject);
             if (c.isUndefined(self.rows_val) == 0) c.freeValue(ctx, self.rows_val);
             if (c.isUndefined(self.tx_obj) == 0) c.freeValue(ctx, self.tx_obj);
+            // RowDesc-time column atoms. Unparsed slots are atom 0 → skipped.
+            // Must run before arena.reset (fields are arena-backed). // ◀ FIX-1
+            for (self.fields) |f| if (f.atom != 0) c.freeAtom(ctx, f.atom); // ◀ FIX-1
         }
         self.resolve = c.JS_UNDEFINED;
         self.reject = c.JS_UNDEFINED;
@@ -229,6 +238,8 @@ pub const Job = struct {
             if (c.isUndefined(self.reject) == 0) c.freeValue(ctx, self.reject);
             if (c.isUndefined(self.rows_val) == 0) c.freeValue(ctx, self.rows_val);
             if (c.isUndefined(self.tx_obj) == 0) c.freeValue(ctx, self.tx_obj);
+            // Same atom cleanup as release (no-op for released jobs: fields is empty). // ◀ FIX-1
+            for (self.fields) |f| if (f.atom != 0) c.freeAtom(ctx, f.atom); // ◀ FIX-1
         }
         self.arena.deinit();
         gpa.destroy(self);
@@ -883,10 +894,14 @@ fn handleAuth(conn: *Conn, l: *xev.Loop, payload: []const u8) !void {
 
 fn handleRowDesc(conn: *Conn, payload: []const u8) !void {
     const job = conn.job orelse return;
+    const ctx = g_ctx orelse return; // ◀ FIX-1 (hoisted: atoms need ctx during parse)
     if (payload.len < 2) return error.BadRowDesc;
     const n = std.mem.readInt(u16, payload[0..2], .big);
     if (n > 0) {
         job.fields = try job.alloc(FieldDesc, n);
+        // Zero atoms up front: a mid-parse error leaves unparsed slots at
+        // atom 0 (JS_ATOM_NULL), which Job.release skips — no garbage frees. // ◀ FIX-1
+        for (job.fields) |*f| f.atom = 0; // ◀ FIX-1
     } else {
         job.fields = &.{};
     }
@@ -901,9 +916,13 @@ fn handleRowDesc(conn: *Conn, payload: []const u8) !void {
         if (off + 18 > payload.len) return error.BadRowDesc;
         const oid = std.mem.readInt(u32, payload[off + 6 ..][0..4], .big);
         off += 18;
-        job.fields[i] = .{ .name = try job.dupeZ(name), .oid = oid };
+        // One atom per column per result set — handleDataRow reuses it. // ◀ FIX-1
+        job.fields[i] = .{ // ◀ FIX-1
+            .name = try job.dupeZ(name), // ◀ FIX-1
+            .oid = oid, // ◀ FIX-1
+            .atom = c.newAtomLen(ctx, name.ptr, name.len), // ◀ FIX-1
+        }; // ◀ FIX-1
     }
-    const ctx = g_ctx orelse return;
     if (c.isUndefined(job.rows_val) != 0) {
         job.rows_val = c.newArray(ctx);
     }
@@ -932,7 +951,12 @@ fn handleDataRow(conn: *Conn, payload: []const u8) !void {
         if (idx >= job.fields.len) continue;
         const field = job.fields[idx];
         const val = textToJs(ctx, text, field.oid, job.allocator());
-        _ = c.setPropertyStr(ctx, obj, field.name.ptr, val);
+        // Atom fast path (atom 0 = newAtomLen OOM at RowDesc → name fallback). // ◀ FIX-1
+        if (field.atom != 0) { // ◀ FIX-1
+            _ = c.setProperty(ctx, obj, field.atom, val); // ◀ FIX-1
+        } else { // ◀ FIX-1
+            _ = c.setPropertyStr(ctx, obj, field.name.ptr, val); // ◀ FIX-1
+        } // ◀ FIX-1
     }
     if (c.isUndefined(job.rows_val) != 0) job.rows_val = c.newArray(ctx);
     // Dense index write — setPropertyUint32 consumes obj.

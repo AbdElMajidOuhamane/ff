@@ -173,7 +173,7 @@ pub const RequestData = struct {
         // Gap-5 fix: headers live in a heap refcounted HeadersData like
         // ResponseData (see response.zig), so createEmbeddedHeaders' retain
         // and deinit's release always pair on a real heap object.
-        const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
+        const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
         h.* = headers_mod.HeadersData.init();
         return .{
             .pool = std.ArrayList(u8).empty,

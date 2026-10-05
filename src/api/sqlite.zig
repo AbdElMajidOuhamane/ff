@@ -257,27 +257,50 @@ fn sqliteColumnToJs(
     }
 }
 
-// B2b FIX: resolve column names ONCE per result set (was:
-// sqlite3_column_name per cell per row — O(rows×cols) C calls). One small
-// heap alloc per query; freed by the caller before return.
-fn columnNamesAlloc(stmt: *sqlite_c.sqlite3_stmt) ?[]?[*:0]const u8 {
+// B2b FIX (+ atom precompute): resolve column names AND their JS atoms ONCE
+// per result set (was: sqlite3_column_name per cell per row — O(rows×cols)
+// C calls — then setPropertyStr re-atomized per cell — O(rows×cols) atoms).
+// sqlite3_column_name returns NUL-terminated (or NULL), so JS_NewAtom needs
+// no strlen. One small heap alloc per query; caller frees atoms + slice via
+// freeColumnNames before return. // ◀ FIX-2
+const ColName = struct { // ◀ FIX-2
+    name: ?[*:0]const u8, // ◀ FIX-2
+    atom: c.Atom = 0, // ◀ FIX-2 (0 = JS_ATOM_NULL: null name or newAtom OOM)
+}; // ◀ FIX-2
+
+fn columnNamesAlloc(ctx: ?*c.Context, stmt: *sqlite_c.sqlite3_stmt) ?[]ColName { // ◀ FIX-2
     const n = sqlite_c.sqlite3_column_count(stmt);
     const count: usize = @intCast(@max(n, 0));
-    const out = gpa.alloc(?[*:0]const u8, count) catch return null;
-    for (0..count) |i| out[i] = sqlite_c.sqlite3_column_name(stmt, @intCast(i));
+    const out = gpa.alloc(ColName, count) catch return null;
+    for (0..count) |i| {
+        const name_ptr = sqlite_c.sqlite3_column_name(stmt, @intCast(i));
+        var atom: c.Atom = 0;
+        if (name_ptr) |np| atom = c.newAtom(ctx, np);
+        out[i] = .{ .name = name_ptr, .atom = atom };
+    }
     return out;
 }
+
+fn freeColumnNames(ctx: ?*c.Context, cols: []ColName) void { // ◀ FIX-2
+    for (cols) |col| if (col.atom != 0) c.freeAtom(ctx, col.atom); // ◀ FIX-2
+    gpa.free(cols); // ◀ FIX-2
+} // ◀ FIX-2
 
 fn buildRowObject(
     ctx: ?*c.Context,
     stmt: *sqlite_c.sqlite3_stmt,
-    names: []const ?[*:0]const u8,
+    cols: []const ColName, // ◀ FIX-2 (was: names: []const ?[*:0]const u8)
 ) !c.Value {
     const obj = c.newObject(ctx);
-    for (names, 0..) |name_ptr, i| {
-        if (name_ptr == null) continue;
+    for (cols, 0..) |col, i| {
+        if (col.name == null) continue;
         const val = sqliteColumnToJs(ctx, stmt, @intCast(i));
-        _ = c.setPropertyStr(ctx, obj, name_ptr, val);
+        // Atom fast path (atom 0 = newAtom OOM → name fallback). // ◀ FIX-2
+        if (col.atom != 0) { // ◀ FIX-2
+            _ = c.setProperty(ctx, obj, col.atom, val); // ◀ FIX-2
+        } else { // ◀ FIX-2
+            _ = c.setPropertyStr(ctx, obj, col.name.?, val); // ◀ FIX-2
+        } // ◀ FIX-2
     }
     return obj;
 }
@@ -354,12 +377,12 @@ fn jsRow(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) ca
         };
     }
 
-    const names = columnNamesAlloc(stmt) orelse return c.throwOutOfMemory(ctx);
-    defer gpa.free(names);
+    const cols = columnNamesAlloc(ctx, stmt) orelse return c.throwOutOfMemory(ctx); // ◀ FIX-2
+    defer freeColumnNames(ctx, cols); // ◀ FIX-2 (was: defer gpa.free(names))
 
     const rc = sqlite_c.sqlite3_step(stmt);
     if (rc == sqlite_c.SQLITE_ROW) {
-        return buildRowObject(ctx, stmt, names) catch {
+        return buildRowObject(ctx, stmt, cols) catch { // ◀ FIX-2
             throwSqliteErr(ctx, db.handle);
             return c.JS_EXCEPTION;
         };
@@ -402,8 +425,8 @@ fn jsRows(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
         };
     }
 
-    const names = columnNamesAlloc(stmt) orelse return c.throwOutOfMemory(ctx);
-    defer gpa.free(names);
+    const cols = columnNamesAlloc(ctx, stmt) orelse return c.throwOutOfMemory(ctx); // ◀ FIX-2
+    defer freeColumnNames(ctx, cols); // ◀ FIX-2 (was: defer gpa.free(names))
 
     const arr = c.newArray(ctx);
     var idx: u32 = 0;
@@ -416,7 +439,7 @@ fn jsRows(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
             throwSqliteErr(ctx, db.handle);
             return c.JS_EXCEPTION;
         }
-        const row_obj = buildRowObject(ctx, stmt, names) catch {
+        const row_obj = buildRowObject(ctx, stmt, cols) catch { // ◀ FIX-2
             throwSqliteErr(ctx, db.handle);
             return c.JS_EXCEPTION;
         };
@@ -557,7 +580,6 @@ fn jsExecNoArgs(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
         if (err != null) {
             const len = std.mem.span(err).len;
             throwErr(ctx, err[0..len]);
-            sqlite_c.sqlite3_free(@ptrCast(err));
         } else {
             throwSqliteErr(ctx, db.handle);
         }

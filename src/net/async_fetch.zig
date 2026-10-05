@@ -1,3 +1,4 @@
+
 const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
@@ -26,11 +27,12 @@ const JOB_CLAIMED: u8 = 3;
 
 // Event-loop drain touches only `states` + `pending` + ring indices (hot).
 // Payload columns are cold per-job data, never scanned in drains.
-// C1: the ResponseData wrapper comes from a freelist (zero alloc after
-// warmup); the per-fetch heap traffic that remains is the body copy into
-// ResponseData.pool + size-triggered spills below (measured via stat_*).
+// C1 (+ FIX-4): the ResponseData wrapper comes from a freelist and request
+// URL/body submit is zero-alloc (static staging, spills only, measured via
+// stat_*); the per-fetch heap traffic that remains is the body copy into
+// ResponseData.pool + size-triggered spills below.
 // Scalar doneMask (not @Vector) is intentional: 16 slots fit one u64 mask
-// via inline unrolled scan; ws_client uses @Vector for 64 slots.
+// via inline unrolled scan; ws_client uses @Vector for 64 slots. // ◀ FIX-4 (comment only)
 
 // Hot path touches only `states` + `pending` + ring indices.
 // Payload columns below are cold per-job data, never scanned in drains.
@@ -50,6 +52,13 @@ var redirect_url_bufs: [MAX_FETCH][2048]u8 = undefined;
 // in fetch.zig. Heap spill only for >2048 URLs (flagged in url_owned).
 var url_stage_bufs: [MAX_FETCH][2048:0]u8 = undefined;
 var url_owned: [MAX_FETCH]bool = [_]bool{false} ** MAX_FETCH;
+// FIX-4: request bodies are staged exactly like URLs (borrowed at submit,
+// NUL-terminated into body_stage_bufs; heap spill only for >64K, flagged
+// in body_owned). Sharing body_stage_bufs with the RESPONSE path is safe:
+// runJob writes the request body to the socket before any response bytes
+// land in the buffer, and redirect hops re-send before accumulating — the
+// staged request is never live when response staging starts. // ◀ FIX-4
+var body_owned: [MAX_FETCH]bool = [_]bool{false} ** MAX_FETCH; // ◀ FIX-4
 // DOD-FIX TigerBeetle §3: reusable per-slot buffers — no per-fetch alloc
 // for the common case. Heap is spill only (measured via stat_* below).
 var body_stage_bufs: [MAX_FETCH][64 * 1024]u8 = undefined;
@@ -113,6 +122,7 @@ fn releaseSlot(s: usize) void {
     methods[s] = undefined;
     headers[s] = null;
     bodies[s] = null;
+    body_owned[s] = false; // ◀ FIX-4
     freeResolvers(s);
     results[s] = null;
     errs[s] = null;
@@ -172,10 +182,11 @@ pub fn deinit() void {
 }
 fn freeOwned(s: usize) void {
     // C1 FIX: url_bufs[s] is usually a view into url_stage_bufs[s] (no free);
-    // only the >2048 heap spill is owned (url_owned flag). Bodies stay
-    // unconditionally heap-owned: extractStringFromVal dupes and the JS
-    // string can be GC'd before the worker runs, so the copy is required.
-    // (Supersedes the BUG-7 "unconditional by design" note for URLs only.)
+    // only the >2048 heap spill is owned (url_owned flag).
+    // FIX-4: bodies work the same — usually a view into body_stage_bufs[s]
+    // (staged synchronously at submit); only the >64K heap spill is owned
+    // (body_owned flag). (Supersedes the BUG-7 "unconditional by design"
+    // note for URLs and bodies.) // ◀ FIX-4
     if (url_owned[s]) {
         if (url_bufs[s]) |u| gpa.free(u);
         url_owned[s] = false;
@@ -183,7 +194,10 @@ fn freeOwned(s: usize) void {
     url_bufs[s] = null;
     if (headers[s]) |h| h.release();
     headers[s] = null;
-    if (bodies[s]) |b| gpa.free(b);
+    if (body_owned[s]) { // ◀ FIX-4
+        if (bodies[s]) |b| gpa.free(b); // ◀ FIX-4
+        body_owned[s] = false; // ◀ FIX-4
+    } // ◀ FIX-4
     bodies[s] = null;
 }
 fn freeResult(s: usize) void {
@@ -216,15 +230,14 @@ pub fn submit(
     uri: std.Uri,
     method: http.Method,
     headers_ptr: *headers_mod.HeadersData,
-    body: ?[:0]const u8,
+    body: ?[]const u8, // ◀ FIX-4: BORROWED (was caller-owned heap [:0])
 ) !void {
     poolLock(); defer poolUnlock();
     const s = acquireSlot() orelse {
         if (builtin.mode==.Debug) std.debug.print("[submit] rejected: pool full\n", .{});
-        // C1 FIX: url is BORROWED now (staged below) — nothing to free.
-        // Bodies stay caller-owned heap (freed here on rejection as before).
+        // C1 FIX (+ FIX-4): url and body are BORROWED now (staged below) —
+        // nothing to free. // ◀ FIX-4
         headers_ptr.release();
-        if (body) |b| gpa.free(b);
         return error.NoConnectionAvailable;
     };
     // C1 FIX: stage the borrowed URL into the per-slot static buffer.
@@ -237,13 +250,36 @@ pub fn submit(
     } else {
         url_bufs[s] = gpa.dupeZ(u8, url) catch {
             headers_ptr.release();
-            if (body) |b| gpa.free(b);
             releaseSlot(s);
             return error.NoConnectionAvailable;
         };
         url_owned[s] = true;
     }
-    uris[s]=uri; methods[s]=method; headers[s]=headers_ptr; bodies[s]=body;
+    // FIX-4: stage the borrowed body the same way. NUL-terminate so
+    // bodies[s] keeps its [:0] type; strict < leaves room for the sentinel.
+    // Replaces fetch.zig's per-fetch gpa.dupeZ. Heap spill only for >64K
+    // bodies (measured via stat_body_heap, freed in freeOwned). // ◀ FIX-4
+    if (body) |bb| { // ◀ FIX-4
+        if (bb.len < body_stage_bufs[s].len) { // ◀ FIX-4
+            @memcpy(body_stage_bufs[s][0..bb.len], bb); // ◀ FIX-4
+            body_stage_bufs[s][bb.len] = 0; // ◀ FIX-4
+            bodies[s] = body_stage_bufs[s][0..bb.len :0]; // ◀ FIX-4
+            body_owned[s] = false; // ◀ FIX-4
+        } else { // ◀ FIX-4
+            _ = stat_body_heap.fetchAdd(1, .release); // ◀ FIX-4
+            bodies[s] = gpa.dupeZ(u8, bb) catch { // ◀ FIX-4
+                headers_ptr.release(); // ◀ FIX-4
+                freeOwned(s); // frees a staged URL spill; headers[s] still null // ◀ FIX-4
+                releaseSlot(s); // ◀ FIX-4
+                return error.NoConnectionAvailable; // ◀ FIX-4
+            }; // ◀ FIX-4
+            body_owned[s] = true; // ◀ FIX-4
+        } // ◀ FIX-4
+    } else { // ◀ FIX-4
+        bodies[s] = null; // ◀ FIX-4
+        body_owned[s] = false; // ◀ FIX-4
+    } // ◀ FIX-4
+    uris[s]=uri; methods[s]=method; headers[s]=headers_ptr;
     results[s]=null; errs[s]=null;
     resolve_funcs[s]=c.dupValue(ctx, resolve_func);
     reject_funcs[s]=c.dupValue(ctx, reject_func);
@@ -583,6 +619,6 @@ fn completeJob(ctx: ?*c.Context, s: usize) void {
     // (ownership was documented as freeOwned but only deinit/shutdown called it).
     freeOwned(s);
     results[s]=null;
-    errs[s]=null;
+errs[s]=null;
     releaseSlot(s);
 }

@@ -10,13 +10,12 @@ const http = std.http;
 // ── DOD note ──
 // This file is cold submit path (once per fetch() call), NOT the hot drain
 // path (async_fetch.runJob / event-loop pump).
-// C1 FIX: URL/method are BORROWED here, not heap-duped — submit() stages the
-// URL into its per-slot static buffer synchronously (under poolLock) and the
-// method is parsed to an enum before submit, so stack lifetimes suffice.
-// Body stays heap-owned: the worker thread outlives this frame, and the JS
-// string can be GC'd after return. HeadersData comes from the freelist.
-// (Supersedes the old "heap ownership transferred to the worker" note for
-// URL/method; body/headers ownership is unchanged.)
+// C1 FIX (+ FIX-4): URL/method/body are BORROWED here, not heap-duped —
+// submit() stages URL and body into its per-slot static buffers
+// synchronously (under poolLock) and the method is parsed to an enum
+// before submit, so stack lifetimes suffice. HeadersData comes from the
+// freelist. (Supersedes the old "heap ownership transferred to the worker"
+// note for URL/method/body; headers ownership is unchanged.) // ◀ FIX-4
 
 fn zigStringToJS(ctx: ?*c.Context, str: []const u8) c.Value {
     return c.newStringLen(ctx, str.ptr, @intCast(str.len));
@@ -42,34 +41,6 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
     const heap_buf = gpa.allocSentinel(u8, len, 0) catch return null;
     @memcpy(heap_buf[0..len], cstr[0..len]);
     return .{ .slice = heap_buf, .heap = heap_buf };
-}
-
-// Cold-submit owned-string helper: heap copy is REQUIRED because the
-// result outlives this frame (transferred to async_fetch worker).
-// Used ONLY for request bodies now (URL/method are borrowed — see note).
-//
-// BUG-7 FIX: the old `if (len == 0) return "";` handed back a STATIC
-// sentinel, so empty and non-empty inputs had two different owners.
-// gpa.free on that sentinel is NOT a no-op: mem.absorbSentinel
-// (std/mem.zig:4733) does `ptr[0..len + 1]`, giving bytes.len == 1, which
-// sails past Allocator.free's `if (bytes.len == 0) return` (Allocator.zig:447)
-// and @memsets + rawFree's a .rodata pointer → heap corruption / crash.
-// The old `len > 0` guard at the free sites could not fix this either:
-// dupeSentinel allocates len+1 (Allocator.zig:472), so a heap "" MUST be
-// freed unconditionally or it leaks.
-// Fix by construction — one owner for every value: allocSentinel already
-// allocates n+1 even for n == 0 (Allocator.zig:222), so letting the general
-// path handle the empty case yields a real heap block every time. All free
-// sites then stay unconditional, with no branch.
-fn extractStringFromVal(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
-    if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return null;
-    var stack_buf: [256]u8 = undefined;
-    const ex = extractStringAuto(ctx, val, &stack_buf) orelse return null;
-    if (ex.heap) |h| return h; // heap case: return directly, no second copy
-    const buf = gpa.allocSentinel(u8, ex.slice.len, 0) catch return null;
-    @memcpy(buf[0..ex.slice.len], ex.slice);
-    buf[ex.slice.len] = 0; // sentinel slot at index len — legal on [:0]T
-    return buf;
 }
 
 fn extractRequestData(ctx: ?*c.Context, obj: c.Value) ?*request_mod.RequestData {
@@ -174,11 +145,12 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     defer c.freeValue(ctx, cap[0]);
     defer c.freeValue(ctx, cap[1]);
     const arg0 = argv[0];
-    // C1 FIX: URL + method are BORROWED (stack scratch, heap spill only for
-    // longer). submit() stages the URL synchronously under poolLock and the
-    // method is parsed to an enum before submit, so nothing outlives the
-    // frame. Body stays heap-owned: the worker outlives this frame and the
-    // JS string may be GC'd after return.
+    // C1 FIX (+ FIX-4): URL + method + body are BORROWED (stack scratch,
+    // heap spill only for longer). submit() stages URL and body
+    // synchronously under poolLock and the method is parsed to an enum
+    // before submit, so nothing outlives the frame. The JS values and the
+    // Request pool behind these borrows stay alive for the whole call
+    // (arg0/body_val rooted; defers below run after submit returns). // ◀ FIX-4
     var url_stack: [2048]u8 = undefined;
     var url_heap: ?[:0]const u8 = null;
     defer if (url_heap) |u| gpa.free(u);
@@ -187,8 +159,13 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     var method_heap: ?[:0]const u8 = null;
     defer if (method_heap) |m| gpa.free(m);
     var method_override: ?[]const u8 = null;
-    var body_payload: ?[:0]const u8 = null;
-    defer if (body_payload) |b| gpa.free(b);
+    // FIX-4: borrowed body (Request pool / stack / transient spill).
+    // submit() stages it before return; the heap half (if any) is freed
+    // by the defer below — after submit has copied. // ◀ FIX-4
+    var body_stack: [2048]u8 = undefined; // ◀ FIX-4
+    var body_ex: ?ExtractedStr = null; // ◀ FIX-4
+    defer if (body_ex) |ex| ex.deinit(); // ◀ FIX-4
+    var body_borrowed: ?[]const u8 = null; // ◀ FIX-4
     // DOD-FIX: single getOpaque2 lookup, reused below (was looked up twice).
     const req_data = extractRequestData(ctx, arg0);
     if (c.isString(arg0) != 0) {
@@ -202,7 +179,10 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
             // call); submit() copies synchronously before return.
             url = rd.url();
             method_override = rd.method();
-            body_payload = if (rd.body()) |b| gpa.dupeZ(u8, b) catch null else null;
+            // FIX-4: borrow (was gpa.dupeZ per fetch). Also fixes a leak:
+            // the old dupe was overwritten — and lost — by the init-body
+            // path below when both were present. // ◀ FIX-4
+            if (rd.body()) |b| body_ex = .{ .slice = b }; // ◀ FIX-4
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
             defer c.freeValue(ctx, url_val);
@@ -249,9 +229,16 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
-            body_payload = extractStringFromVal(ctx, body_val);
+            // FIX-4: borrow via stack scratch (heap spill only for >2K),
+            // staged by submit(). body_val is freed by the defer above —
+            // after submit returns. (Was: unconditional heap dupe.) // ◀ FIX-4
+            if (extractStringAuto(ctx, body_val, &body_stack)) |ex| body_ex = ex; // ◀ FIX-4
         }
     }
+
+    // FIX-4: materialize the borrow before use (GET→POST check and submit
+    // handoff below both read body_borrowed). // ◀ FIX-4
+    if (body_ex) |ex| body_borrowed = ex.slice; // ◀ FIX-4
 
     const url_slice = url orelse {
         // BUG-5: the old `errdefer in_flight_headers.deinit()` never fired
@@ -264,7 +251,7 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return promise;
     };
     var method_str = method_override orelse "GET";
-    if (body_payload != null and std.mem.eql(u8, method_str, "GET")) {
+    if (body_borrowed != null and std.mem.eql(u8, method_str, "GET")) { // ◀ FIX-4 (was: body_payload)
         method_str = "POST";
     }
     const method = parseMethod(method_str);
@@ -289,17 +276,15 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return promise;
     };
     hdr_ptr.* = in_flight_headers;
-    // Ownership of body moves to submit() from here on; null the
-    // deferred-free handle so this frame's defer stops tracking it.
-    // URL needs no handoff — submit() staged a copy synchronously, and
-    // url_heap (spill only) is freed by the defer above on return.
-    const body_copy = body_payload;
-    body_payload = null;
-    async_fetch.submit(ctx, cap[0], cap[1], url_slice, uri, method, hdr_ptr, body_copy) catch {
+    // FIX-4: body_borrowed is staged synchronously by submit(); the body_ex
+    // defer above frees any transient spill after submit returns. URL needs
+    // no handoff — submit() staged a copy synchronously, and url_heap
+    // (spill only) is freed by the defer above on return. // ◀ FIX-4
+    async_fetch.submit(ctx, cap[0], cap[1], url_slice, uri, method, hdr_ptr, body_borrowed) catch {
         // BUG-6 FIX (double-release UAF): submit() takes ownership the moment
-        // it is called and has ALREADY released headers/body on BOTH of its
-        // failure paths — pool-full and shutdown. (URL is borrowed, nothing
-        // to release.) Do not touch hdr_ptr again here.
+        // it is called and has ALREADY released headers on BOTH of its
+        // failure paths — pool-full and shutdown. (URL and body are borrowed,
+        // nothing to release.) Do not touch hdr_ptr again here. // ◀ FIX-4
         var msg = zigStringToJS(ctx, "Failed to start fetch");
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         c.freeValue(ctx, msg);
