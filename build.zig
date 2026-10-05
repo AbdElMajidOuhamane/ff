@@ -5,11 +5,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const bearssl = b.option(bool, "bearssl", "Enable BearSSL TLS (https/wss)") orelse true;
     const ffi = b.option(bool, "ffi", "Enable FFI (dlopen native libraries)") orelse true; // NEW
+    const io_uring = b.option(bool, "io_uring", "Use io_uring backend on Linux (default: true; -Dio_uring=false selects epoll)") orelse true;
 
     // ── Build-options module (ffcfg) ──
     const ffcfg_opts = b.addOptions();
     ffcfg_opts.addOption(bool, "bearssl", bearssl);
     ffcfg_opts.addOption(bool, "ffi", ffi); // NEW
+    ffcfg_opts.addOption(bool, "io_uring", io_uring);
     const ff_version = b.option([]const u8, "version", "Runtime version string") orelse "0.1.0-canary";
     ffcfg_opts.addOption([]const u8, "version", ff_version);
     const ffcfg_mod = ffcfg_opts.createModule();
@@ -186,9 +188,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "xev", .module = b.addModule("xev-shim", .{
                     .root_source_file = b.path("src/xev.zig"),
-                    .imports = &.{.{ .name = "xev-inner",
-                        .module = b.dependency("libxev", .{}).module("xev"),
-                    } },
+                    .imports = &.{
+                        .{ .name = "xev-inner",
+                            .module = b.dependency("libxev", .{}).module("xev"),
+                        },
+                        .{ .name = "ffcfg", .module = ffcfg_mod },
+                    },
                 }) },
                 .{ .name = "quickjs_c", .module = c_mod },
                 .{ .name = "sqlite_c", .module = sql_mod },

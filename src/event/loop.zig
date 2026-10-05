@@ -39,6 +39,15 @@ pub const EventLoop = struct {
         return .{ .loop = try xev.Loop.init(.{ .thread_pool = &g_thread_pool }) };
     }
     pub fn initInto(self: *EventLoop) void {
+        // Fail loud when the selected backend is unavailable (io_uring needs
+        // Linux 5.1+ and must not be blocked by seccomp) instead of hitting
+        // `catch unreachable` below with no message. Skipped unless io_uring
+        // was selected: inner.available is always the io_uring probe on Linux
+        // and must not gate the epoll path.
+        if (xev.is_io_uring and !xev.available()) {
+            std.debug.print("ff: I/O backend unavailable (io_uring requires Linux 5.1+ and must not be blocked by seccomp; rebuild with -Dio_uring=false for epoll)\n", .{});
+            std.process.exit(1);
+        }
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
         self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch unreachable };
     }
@@ -106,6 +115,25 @@ pub const EventLoop = struct {
     const IDLE_MIN_NS: u64 = 100_000;
     const IDLE_MAX_NS: u64 = 8_000_000;
 
+    // A failing run() must never be swallowed: `catch {}` on the tick turns
+    // submit errors and nested-run bugs into a silent stall that looks
+    // exactly like a backend hang. Fail loud with the error name instead.
+    // Plain catch-all (no named errors): Loop.run's error set differs per
+    // backend, and naming a non-member error is a compile error.
+    inline fn runOnce(self: *EventLoop) void {
+        self.loop.run(.once) catch |err| {
+            std.debug.print("ff: event loop error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+
+    inline fn runNoWait(self: *EventLoop) void {
+        self.loop.run(.no_wait) catch |err| {
+            std.debug.print("ff: event loop error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    }
+
     pub fn runWithMicrotasks(self: *EventLoop, ctx: *c.Context) void {
         var gc_ticks: usize = 0;
         var next_gc_check: usize = GC_POLICE;
@@ -116,13 +144,13 @@ pub const EventLoop = struct {
             if ((self.loop.active -| unrefArmed()) > 0) {
                 // Real work armed (referenced timers, sockets, fetch…):
                 // block until at least one completion arrives.
-                self.loop.run(.once) catch {};
+                self.runOnce();
                 did_work = true;
             } else if (!self.loop.submissions.empty() or hasPendingCompletions(&self.loop)) {
                 // Only queued entries remain — possibly an unref'd timer's
                 // own submission. Drain them without blocking, then decide;
                 // blocking here is what made `t.unref()` wait out the timer.
-                self.loop.run(.no_wait) catch {};
+                self.runNoWait();
                 did_work = true;
             }
             // Batched completion drains: contiguous, reusable slot storage,

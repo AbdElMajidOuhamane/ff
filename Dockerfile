@@ -33,7 +33,7 @@ RUN curl -fsSL -o /tmp/bearssl.tar.gz "https://www.bearssl.org/bearssl-${BEARSSL
   && cp -r /tmp/bearssl-src/src /tmp/bearssl-src/inc vendor/bearssl/ \
   && printf '#ifndef FF_BEARSSL_BRIDGE_H\n#define FF_BEARSSL_BRIDGE_H\n\n#include "bearssl.h"\n\n#endif\n' > vendor/bearssl/zig_bridge.h \
   && rm -rf /tmp/bearssl-src /tmp/bearssl.tar.gz
-RUN SQLITE_ENC=$(echo ${SQLITE_VERSION} | awk -F. '{if (NF==4) printf "%d%02d%02d%02d",$1,$2,$3,$4; else printf "%d%02d%02d00",$1,$2,$3}') \
+RUN SQLITE_ENC=$(echo ${SQLITE_VERSION} | awk -F. '{if (NF==4) printf "%d%02d%02d",$1,$2,$3,$4; else printf "%d%02d%02d00",$1,$2,$3}') \
   && curl -fsSL -o /tmp/sqlite.zip \
     "https://www.sqlite.org/${SQLITE_YEAR}/sqlite-amalgamation-${SQLITE_ENC}.zip" \
   && rm -rf vendor/sqlite \
@@ -51,10 +51,13 @@ RUN curl -fsSL -o /tmp/nghttp2.tar.gz "https://github.com/nghttp2/nghttp2/releas
   && cp /tmp/nghttp2-src/lib/*.c /tmp/nghttp2-src/lib/*.h vendor/nghttp2/lib/ \
   && cp -r /tmp/nghttp2-src/lib/includes/nghttp2 vendor/nghttp2/includes/ \
   && rm -rf /tmp/nghttp2-src /tmp/nghttp2.tar.gz
+# Published image stays epoll: io_uring needs a permissive seccomp profile
+# and this image must boot under Docker defaults. For io_uring, build with
+# -Dio_uring=true and run with --security-opt seccomp=unconfined.
 RUN case "${TARGETARCH}" in \
       arm64) ZT=aarch64-linux-musl ;; \
       *)     ZT=x86_64-linux-musl ;; \
-    esac && zig build -Doptimize=ReleaseFast -Dtarget=${ZT} -Dffi=false
+    esac && zig build -Doptimize=ReleaseFast -Dtarget=${ZT} -Dffi=false -Dio_uring=true
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 RUN adduser -D -u 1000 app
