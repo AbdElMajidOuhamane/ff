@@ -53,7 +53,13 @@ pub fn dataFromJS(ctx: ?*c.Context, val: c.Value) ?*ResponseData {
 }
 
 pub const ResponseType = enum(u8) {
-    basic, cors, default, err, opaque_type, opaqueredirect, other,
+    basic,
+    cors,
+    default,
+    err,
+    opaque_type,
+    opaqueredirect,
+    other,
     pub fn fromSlice(s: []const u8) ResponseType {
         if (std.mem.eql(u8, s, "basic")) return .basic;
         if (std.mem.eql(u8, s, "cors")) return .cors;
@@ -65,9 +71,13 @@ pub const ResponseType = enum(u8) {
     }
     pub fn string(self: ResponseType) []const u8 {
         return switch (self) {
-            .basic => "basic", .cors => "cors", .default => "default",
-            .err => "error", .opaque_type => "opaque",
-            .opaqueredirect => "opaqueredirect", .other => unreachable,
+            .basic => "basic",
+            .cors => "cors",
+            .default => "default",
+            .err => "error",
+            .opaque_type => "opaque",
+            .opaqueredirect => "opaqueredirect",
+            .other => unreachable,
         };
     }
 };
@@ -77,6 +87,37 @@ const PoolSlice = pool_slice_mod.PoolSlice;
 pub const ResponseDataCold = struct {
     response_type_other: PoolSlice,
 };
+
+// C1 FIX: ResponseData shell freelist — one `gpa.create` per fetch() result
+// (async_fetch.runJob) and per `new Response()` otherwise. The ~96B shell is
+// pooled; pools/bodies are freed by deinit, so idle RSS never grows. Safe:
+// every call site overwrites the shell with init()/initWithHeaders right
+// after acquiring, so no stale fields survive. JS-thread-only.
+const RESP_POOL_MAX: usize = 32;
+var resp_pool: [RESP_POOL_MAX]*ResponseData = undefined;
+var resp_pool_n: usize = 0;
+
+/// Pooled shell (uninitialized — caller must assign init()/initWithHeaders).
+/// Null only on OOM.
+pub fn acquire() ?*ResponseData {
+    if (resp_pool_n > 0) {
+        resp_pool_n -= 1;
+        return resp_pool[resp_pool_n];
+    }
+    return gpa.create(ResponseData) catch null;
+}
+
+/// deinit + return shell to the pool (destroy when full).
+/// Mirrors the old responseFinalizer body (response.zig:504).
+pub fn releaseData(d: *ResponseData) void {
+    d.deinit();
+    if (resp_pool_n < RESP_POOL_MAX) {
+        resp_pool[resp_pool_n] = d;
+        resp_pool_n += 1;
+    } else {
+        gpa.destroy(d);
+    }
+}
 
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
@@ -93,11 +134,17 @@ pub const ResponseData = struct {
     redirected: bool,
     comptime {
         std.debug.assert(@sizeOf(PoolSlice) == 8);
+        // A5 FIX: size ratchet, not just align (was: align-only, so layout
+        // drift went uncaught — cf. the stale "ArrayList = 16B" comment in
+        // headers.zig). 24 pool + 8 headers + 16 owned_body + 8 cold + 2
+        // status + 1 type + 3×8 slices + 3 bools = 88B today; 8B headroom.
+        std.debug.assert(@sizeOf(ResponseData) <= 96);
         std.debug.assert(@alignOf(ResponseData) >= 8);
     }
 
     pub fn init() ResponseData {
-        const h = gpa.create(headers_mod.HeadersData) catch @panic("OOM HeadersData");
+        // C1 FIX: pooled headers shell (headers.zig freelist).
+        const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
         h.* = headers_mod.HeadersData.init();
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
@@ -204,6 +251,9 @@ pub const ResponseData = struct {
         }
     }
     pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) void {
+        // FIX: reserve the pool BEFORE appendSlice (was after → no-op warm).
+        // Single growth for the whole copy instead of per-chunk growth.
+        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
         self.pool.appendSlice(gpa, src.pool.items) catch {};
         self.status = src.status;
         self.status_text = src.status_text;
@@ -213,7 +263,6 @@ pub const ResponseData = struct {
         self._url = src._url;
         self.redirected = src.redirected;
         self.response_type = src.response_type;
-        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
         self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
         self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
         if (src.cold) |sc| {
@@ -245,12 +294,17 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
+        // FIX: batch reserve — one growth for the whole array load.
+        if (len > 0) target.reserveEntries(@intCast(len));
         var i: c_uint = 0;
         while (i < @as(c_uint, @intCast(len))) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
+            defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;
             const name_val = c.getPropertyUint32(ctx, item, 0);
+            defer c.freeValue(ctx, name_val);
             const val_val = c.getPropertyUint32(ctx, item, 1);
+            defer c.freeValue(ctx, val_val);
             var nbuf: [128]u8 = undefined;
             var vbuf: [256]u8 = undefined;
             const n = extractStringAuto(ctx, name_val, &nbuf);
@@ -268,6 +322,8 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     var p: [*c]c.PropertyEnum = null;
     var count: c_uint = 0;
     if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        // FIX: batch reserve — one growth for the whole object load.
+        if (count > 0) target.reserveEntries(count);
         for (0..count) |idx| {
             const name_atom = p[idx].atom;
             const name_val = c.atomToString(ctx, name_atom);
@@ -316,30 +372,39 @@ fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
 }
 
 fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var result = zigStringToJS(ctx, body_text);
+    defer c.freeValue(ctx, result);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
     return promise;
 }
 
 fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     if (body_text.len == 0) {
         var msg = zigStringToJS(ctx, "Unexpected end of JSON input");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    defer c.freeValue(ctx, parsed);
     if (c.isException(parsed) != 0) {
         var exc = c.getException(ctx);
         defer c.freeValue(ctx, exc);
@@ -351,26 +416,34 @@ fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
 
 fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const blob = gpa.create(blob_mod.BlobData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -378,19 +451,24 @@ fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     blob.setBytes(body_bytes);
     if (data.headers.getFirst("content-type")) |ct| blob.setTypeNormalized(ct);
     var obj = blob_mod.buildBlobJSObject(ctx, blob);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
 
 fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     const fd = gpa.create(formdata_mod.FormData) catch {
         var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     };
@@ -400,30 +478,38 @@ fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
         fd.deinit();
         gpa.destroy(fd);
         var msg = zigStringToJS(ctx, "FormData unsupported content-type");
+        defer c.freeValue(ctx, msg);
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
     var obj = formdata_mod.buildFormDataJSObject(ctx, fd);
+    defer c.freeValue(ctx, obj);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &obj);
     return promise;
 }
 
 fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
-    var cap: [2]c.Value = undefined;
+    var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
     var ab = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    defer c.freeValue(ctx, ab);
     _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &ab);
     return promise;
 }
 
 fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
-    const new_data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per clone).
+    const new_data = acquire() orelse return c.throwOutOfMemory(ctx);
     new_data.* = ResponseData.init();
     new_data.cloneFrom(data);
     return buildResponseJSObject(ctx, new_data);
@@ -431,12 +517,15 @@ fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 
 fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var scratch: [256]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     if (argc > 0) {
         const json_str = c.jsonStringify(ctx, argv[0], c.JS_UNDEFINED, c.JS_UNDEFINED);
         if (c.isException(json_str) != 0) {
-            gpa.destroy(data);
+            // C1 FIX: return the shell to the pool (was gpa.destroy —
+            // would corrupt the freelist by freeing a pooled shell).
+            releaseData(data);
             return c.JS_EXCEPTION;
         }
         defer c.freeValue(ctx, json_str);
@@ -470,7 +559,8 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
         return c.JS_EXCEPTION;
     }
     var url_buf: [512]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     if (extractStringAuto(ctx, argv[0], &url_buf)) |u| {
         defer u.deinit();
@@ -486,8 +576,10 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
 }
 
 fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    _ = argc;
+    _ = argv;
+    // C1 FIX: pooled shell (was gpa.create per call).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
     data.status = 0;
     data.setStatusText("");
@@ -499,17 +591,17 @@ fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, response_class_id)) |ptr| {
         const data: *ResponseData = @ptrCast(@alignCast(ptr));
-        data.deinit();
-        gpa.destroy(data);
+        // C1 FIX: return the shell to the pool (was deinit + destroy).
+        releaseData(data);
     }
 }
 
-// ===== THIS IS THE ONLY FUNCTION THAT CHANGED =====
 fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
-    const data = gpa.create(ResponseData) catch return c.throwOutOfMemory(ctx);
+    // C1 FIX: pooled shell (was gpa.create per `new Response()`).
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
 
     if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {
@@ -521,14 +613,20 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
                 const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
                 data.setBodyOwned(owned);
             } else {
-                if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                if (c.hasException(ctx)) {
+                    const exc = c.getException(ctx);
+                    c.freeValue(ctx, exc);
+                }
                 var u8_size: usize = 0;
                 if (c.getUint8Array(ctx, &u8_size, body_val)) |u8_ptr| {
                     const bytes: []const u8 = if (u8_size == 0) "" else u8_ptr[0..u8_size];
                     const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
                     data.setBodyOwned(owned);
                 } else {
-                    if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                    if (c.hasException(ctx)) {
+                        const exc = c.getException(ctx);
+                        c.freeValue(ctx, exc);
+                    }
                     if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
                         defer owned.deinit();
                         data.setBody(owned.slice);

@@ -46,7 +46,7 @@ const TX_TEXT: u8 = 1;
 const TX_BINARY: u8 = 2;
 const TX_CLOSE: u8 = 3;
 
-var states:       [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_WS;
+var states: [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_WS;
 // Gap-2 fix: single-thread-owned flags packed to 1 byte/slot (cf.
 // http_native ConnFlags). `want_connect`/`tx_pending` stay separate plain
 // columns: they are cross-thread hints written by main while the worker
@@ -69,44 +69,44 @@ comptime {
     std.debug.assert(@sizeOf(WsFlags) == 1);
 }
 var wflags: [MAX_WS]WsFlags = [_]WsFlags{.{}} ** MAX_WS;
-var sock_fds:     [MAX_WS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** MAX_WS;
-var hosts:        [MAX_WS][:0]const u8 = [_][:0]const u8{""} ** MAX_WS;
-var paths:        [MAX_WS][]const u8 = [_][]const u8{""} ** MAX_WS;
-var ports:        [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
-var keys:         [MAX_WS][28]u8 = undefined;
+var sock_fds: [MAX_WS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** MAX_WS;
+var hosts: [MAX_WS][:0]const u8 = [_][:0]const u8{""} ** MAX_WS;
+var paths: [MAX_WS][]const u8 = [_][]const u8{""} ** MAX_WS;
+var ports: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
+var keys: [MAX_WS][28]u8 = undefined;
 var close_deadline: [MAX_WS]i64 = [_]i64{0} ** MAX_WS;
-var tx_pending:   [MAX_WS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_WS;
-var tx_job:       [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
-var tx_len:       [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var tx_code:      [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
-var tx_reason_len:[MAX_WS]u8 = [_]u8{0} ** MAX_WS;
-var tx_reason:    [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
-var tx_msg:       [MAX_WS][WS_MSG_SIZE]u8 = undefined;
-var rx_event:     [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
-var rx_len:       [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var rx_code:      [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
-var rx_reason_len:[MAX_WS]u8 = [_]u8{0} ** MAX_WS;
-var rx_reason:    [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
-var rx_err_len:   [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
-var rx_err:       [MAX_WS][64]u8 = undefined;
-var rx_msg:       [MAX_WS][WS_MSG_SIZE]u8 = undefined;
-var rd_len:       [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var partial_len:  [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var wb:           [MAX_WS][WS_MSG_SIZE + ws.MAX_HDR]u8 = undefined;
-var rd_buf:       [MAX_WS][RDBUF]u8 = undefined;
-var partial:      [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+var tx_pending: [MAX_WS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_WS;
+var tx_job: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var tx_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
+var tx_code: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
+var tx_reason_len: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var tx_reason: [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
+var tx_msg: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+var rx_event: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var rx_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
+var rx_code: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
+var rx_reason_len: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var rx_reason: [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
+var rx_err_len: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var rx_err: [MAX_WS][64]u8 = undefined;
+var rx_msg: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+var rd_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
+var partial_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
+var wb: [MAX_WS][WS_MSG_SIZE + ws.MAX_HDR]u8 = undefined;
+var rd_buf: [MAX_WS][RDBUF]u8 = undefined;
+var partial: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
 // F7-B: static per-slot URL storage — no per-connection dupe/free.
 // `hosts`/`paths` stay slice views so all downstream uses are untouched.
-var host_bufs:    [MAX_WS][256:0]u8 = undefined;
-var path_bufs:    [MAX_WS][2048]u8 = undefined;
+var host_bufs: [MAX_WS][256:0]u8 = undefined;
+var path_bufs: [MAX_WS][2048]u8 = undefined;
 // F7-B: shared-worker coordination. The main thread is the sole producer of
 // want_connect/tx flags; `states` (atomic) is the guard and flags are
 // level-triggered hints re-verified against it. conn_live/w_conns/w_reqs are
 // worker-owned (releaseSlot only clears want_connect once the slot is DONE).
 var want_connect: [MAX_WS]bool = [_]bool{false} ** MAX_WS;
-var w_conns:      [MAX_WS]?*http.Client.Connection = [_]?*http.Client.Connection{null} ** MAX_WS;
-var w_reqs:       [MAX_WS]?http.Client.Request = [_]?http.Client.Request{null} ** MAX_WS;
-var cmd_pipe:     [2]std.posix.fd_t = .{ -1, -1 };
+var w_conns: [MAX_WS]?*http.Client.Connection = [_]?*http.Client.Connection{null} ** MAX_WS;
+var w_reqs: [MAX_WS]?http.Client.Request = [_]?http.Client.Request{null} ** MAX_WS;
+var cmd_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var worker_started: bool = false; // guarded by poolLock (submit path only)
 var free_list: [MAX_WS]u16 = undefined;
 var free_count: usize = MAX_WS;
@@ -462,7 +462,6 @@ fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) 
 fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8, r: *?http.Client.Request) void {
     const mlen = @min(msg.len, rx_err[s].len);
     @memcpy(rx_err[s][0..mlen], msg[0..mlen]);
-    rx_err_len[s] = @intCast(mlen);
     rx_code[s] = 1006;
     rx_reason_len[s] = 0;
     rx_event[s] = EV_CLOSE;
@@ -500,7 +499,8 @@ fn signalEvent(s: usize) void {
 const UPGRADE_TIMEOUT_MS: i64 = 5000;
 
 fn buildUpgradeRequest(s: usize, buf: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buf,
+    return std.fmt.bufPrint(
+        buf,
         "GET {s} HTTP/1.1\r\n" ++
             "Host: {s}:{d}\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -805,8 +805,11 @@ fn asyncCb( // CHANGED: drains events and pumps microtasks
 }
 
 fn doneMask() u64 {
+    // A5 FIX: acquire-load the atomics (was: non-atomic `.raw` read — a data
+    // race against the worker thread's `.release` store). The vector compare
+    // and the claimSlot cmpxchg below are unchanged.
     var raw: [MAX_WS]u8 = undefined;
-    for (0..MAX_WS) |i| raw[i] = states[i].raw;
+    for (0..MAX_WS) |i| raw[i] = states[i].load(.acquire);
     const v: @Vector(MAX_WS, u8) = @bitCast(raw);
     const eq = v == @as(@Vector(MAX_WS, u8), @splat(JOB_DONE));
     return @bitCast(eq);
@@ -841,12 +844,20 @@ fn dispatchEvent(
     event_val: ?c.Value,
 ) void {
     const prop = c.getPropertyStr(ctx, sock_val, event_name);
+    // FIX: JS_GetPropertyStr returns a new ref — previously dropped on both
+    // the non-function early return and the normal path.
+    defer c.freeValue(ctx, prop);
     if (c.isFunction(ctx, prop) == 0) return;
     if (event_val) |ev| {
+        // FIX: every caller passes a freshly built event (make*Event) — we own
+        // it. JS_Call copies argv, so the ref stays ours after the dispatch.
+        defer c.freeValue(ctx, ev);
         var argv = [_]c.Value{ev};
-        _ = c.call(ctx, prop, sock_val, 1, &argv);
+        const ret = c.call(ctx, prop, sock_val, 1, &argv);
+        defer c.freeValue(ctx, ret);
     } else {
-        _ = c.call(ctx, prop, sock_val, 0, null);
+        const ret = c.call(ctx, prop, sock_val, 0, null);
+        defer c.freeValue(ctx, ret);
     }
 }
 

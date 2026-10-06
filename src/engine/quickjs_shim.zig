@@ -300,6 +300,7 @@ pub const getUint8Array = qjs_c.JS_GetUint8Array;
 pub const newArrayBufferCopy = qjs_c.JS_NewArrayBufferCopy;
 pub const getArrayBuffer = qjs_c.JS_GetArrayBuffer;
 pub const detachArrayBuffer = qjs_c.JS_DetachArrayBuffer;
+pub const newUint8ArrayCopy = qjs_c.JS_NewUint8ArrayCopy;
 
 // ─── TypedArray ────────────────────────────────────────────────
 pub const newTypedArray = qjs_c.JS_NewTypedArray;
@@ -368,6 +369,10 @@ pub const writeObject = qjs_c.JS_WriteObject;
 pub const readObject = qjs_c.JS_ReadObject;
 pub const evalFunction = qjs_c.JS_EvalFunction;
 
+pub const WRITE_OBJ_BYTECODE: c_int = qjs_c.JS_WRITE_OBJ_BYTECODE;
+pub const WRITE_OBJ_STRIP_SOURCE: c_int = qjs_c.JS_WRITE_OBJ_STRIP_SOURCE;
+pub const WRITE_OBJ_STRIP_DEBUG: c_int = qjs_c.JS_WRITE_OBJ_STRIP_DEBUG;
+pub const READ_OBJ_BYTECODE: c_int = qjs_c.JS_READ_OBJ_BYTECODE;
 // ─── Object write/read flags (structured clone) ─────────────────
 // NOTE: BYTECODE deliberately not exposed — JS_READ_OBJ_BYTECODE on
 // untrusted input allows hostile bytecode execution (see quickjs.h).

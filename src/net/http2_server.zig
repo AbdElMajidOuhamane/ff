@@ -47,17 +47,34 @@ pub const FATAL: usize = std.math.maxInt(usize);
 comptime {
     // MAX_CONN is owned by http_native; assert agreement, don't duplicate.
     std.debug.assert(http_native.MAX_CONN == 512);
-    // Layout guards (cf. http_native.zig ConnFlags asserts): Stream is
-    // scanned per frame, Session is per-connection heap. Ratchet down.
-    std.debug.assert(@sizeOf(Stream) <= 2304);
+    // Layout guards (cf. http_native.zig ConnFlags asserts): hot scan keys
+    // (StreamFlags + stream_ids) live in dedicated columns; Stream is the
+    // cold payload only. Ratchet down.
+    std.debug.assert(@sizeOf(StreamFlags) == 1);
+    std.debug.assert(@sizeOf(Stream) <= 2208);
     std.debug.assert(@sizeOf(Session) <= 2304 * MAX_STREAMS + 128);
 }
 
 // ── Stream ────────────────────────────────────────────────────────
+//
+// B1 FIX (hot/cold split): per-frame lookups (allocStream/findStream/
+// removeStream) used to scan a 2.2KB AoS Stream — 100× ~2.2KB touched per
+// lookup. Hot scan keys now live in two flat columns (stream_ids: 400B,
+// stream_flags: 100B per session); the cold payload (2KB path + ArrayLists)
+// is touched only after the slot is claimed. Template: async_fetch.states,
+// http_native.cflags watchdog.
 
-pub const Stream = struct {
+/// Hot scan data: packed flags, scanned per frame.
+pub const StreamFlags = packed struct(u8) {
     in_use: bool = false,
-    id: i32 = 0,
+    complete: bool = false, // END_STREAM seen (full request received)
+    dispatched: bool = false, // handed to the JS handler (or parked-pending)
+    _pad: u5 = 0,
+};
+
+/// Cold payload: method/path bodies + response staging. Memory rules 2–3
+/// (owned copies, retained capacity) unchanged.
+pub const Stream = struct {
     method_buf: [MAX_METHOD]u8 = undefined,
     method_len: usize = 0,
     path_buf: [MAX_PATH]u8 = undefined,
@@ -68,8 +85,6 @@ pub const Stream = struct {
     resp_blob: std.ArrayList(u8) = std.ArrayList(u8).empty, // header name/value bytes
     resp_body: std.ArrayList(u8) = std.ArrayList(u8).empty, // response body bytes
     resp_off: usize = 0, // read cursor for bodyReadCb
-    complete: bool = false, // END_STREAM seen (full request received)
-    dispatched: bool = false, // handed to the JS handler (or parked-pending)
 
     pub fn method(self: *const Stream) []const u8 {
         return self.method_buf[0..self.method_len];
@@ -77,33 +92,15 @@ pub const Stream = struct {
     pub fn path(self: *const Stream) []const u8 {
         return self.path_buf[0..self.path_len];
     }
-    fn reset(self: *Stream, id: i32) void {
-        // Recycle dynamic storage from a previous occupant (retain capacity).
+    /// Recycle dynamic storage from a previous occupant (retain capacity).
+    fn resetPayload(self: *Stream) void {
         self.body.clearRetainingCapacity();
         self.resp_nv.clearRetainingCapacity();
         self.resp_blob.clearRetainingCapacity();
         self.resp_body.clearRetainingCapacity();
-        self.in_use = true;
-        self.id = id;
         self.method_len = 0;
         self.path_len = 0;
         self.resp_off = 0;
-        self.complete = false;
-        self.dispatched = false;
-    }
-    /// Recycle for the next stream on this slot: keeps buffers, drops state.
-    fn release(self: *Stream) void {
-        self.body.clearRetainingCapacity();
-        self.resp_nv.clearRetainingCapacity();
-        self.resp_blob.clearRetainingCapacity();
-        self.resp_body.clearRetainingCapacity();
-        self.in_use = false;
-        self.id = 0;
-        self.method_len = 0;
-        self.path_len = 0;
-        self.resp_off = 0;
-        self.complete = false;
-        self.dispatched = false;
     }
     /// True free (connection teardown only).
     fn destroy(self: *Stream) void {
@@ -114,10 +111,45 @@ pub const Stream = struct {
     }
 };
 
+/// Slot handle returned by lookups: hot flags + id + cold payload.
+/// Flag reads/writes go through the small accessors so call sites stay
+/// explicit about hot vs cold access.
+pub const Slot = struct {
+    f: *StreamFlags,
+    id: *i32,
+    p: *Stream,
+
+    pub fn dispatched(s: Slot) bool {
+        return s.f.dispatched;
+    }
+    pub fn complete(s: Slot) bool {
+        return s.f.complete;
+    }
+    pub fn inUse(s: Slot) bool {
+        return s.f.in_use;
+    }
+    pub fn setDispatched(s: Slot) void {
+        s.f.dispatched = true;
+    }
+    pub fn setComplete(s: Slot) void {
+        s.f.complete = true;
+    }
+    pub fn method(s: Slot) []const u8 {
+        return s.p.method();
+    }
+    pub fn path(s: Slot) []const u8 {
+        return s.p.path();
+    }
+};
+
 // ── Session (one per h2 connection, heap-allocated on demand) ─────
 
 pub const Session = struct {
     ng: ?*h2.Session = null,
+    // Hot scan columns: only these are touched by per-frame lookups.
+    stream_ids: [MAX_STREAMS]i32 = [_]i32{0} ** MAX_STREAMS,
+    stream_flags: [MAX_STREAMS]StreamFlags = [_]StreamFlags{.{}} ** MAX_STREAMS,
+    // Cold payload column.
     streams: [MAX_STREAMS]Stream = [_]Stream{.{}} ** MAX_STREAMS,
     output: std.ArrayList(u8) = std.ArrayList(u8).empty,
     out_sent: usize = 0, // drained cursor into output
@@ -125,37 +157,45 @@ pub const Session = struct {
     out_armed: bool = false, // write completion outstanding (anti-double-arm)
     going_away: bool = false,
 
-    fn allocStream(self: *Session, stream_id: i32) ?*Stream {
-        for (&self.streams) |*s| {
-            if (s.in_use and s.id == stream_id) return s;
+    fn slotOf(self: *Session, stream_id: i32) ?usize {
+        for (0..MAX_STREAMS) |i| {
+            if (self.stream_flags[i].in_use and self.stream_ids[i] == stream_id) return i;
         }
-        for (&self.streams) |*s| {
-            if (!s.in_use) {
-                s.reset(stream_id);
-                return s;
+        return null;
+    }
+    fn slotAt(self: *Session, i: usize) Slot {
+        return .{
+            .f = &self.stream_flags[i],
+            .id = &self.stream_ids[i],
+            .p = &self.streams[i],
+        };
+    }
+    fn allocStream(self: *Session, stream_id: i32) ?Slot {
+        if (self.slotOf(stream_id)) |i| return self.slotAt(i);
+        for (0..MAX_STREAMS) |i| {
+            if (!self.stream_flags[i].in_use) {
+                self.stream_flags[i] = .{ .in_use = true };
+                self.stream_ids[i] = stream_id;
+                self.streams[i].resetPayload();
+                return self.slotAt(i);
             }
         }
         return null; // at MAX_STREAMS — nghttp2 enforces the cap anyway
     }
-    fn findStream(self: *Session, stream_id: i32) ?*Stream {
-        for (&self.streams) |*s| {
-            if (s.in_use and s.id == stream_id) return s;
-        }
-        return null;
+    fn findStream(self: *Session, stream_id: i32) ?Slot {
+        return self.slotAt(self.slotOf(stream_id) orelse return null);
     }
     fn removeStream(self: *Session, stream_id: i32) void {
-        for (&self.streams) |*s| {
-            if (s.in_use and s.id == stream_id) {
-                s.release();
-                return;
-            }
-        }
+        if (self.slotOf(stream_id)) |i| self.releaseSlot(i);
+    }
+    /// Recycle for the next stream on this slot: keeps buffers, drops state.
+    fn releaseSlot(self: *Session, i: usize) void {
+        self.streams[i].resetPayload();
+        self.stream_flags[i] = .{};
+        self.stream_ids[i] = 0;
     }
     fn deinit(self: *Session) void {
-        for (&self.streams) |*s| {
-            if (s.in_use) s.release();
-            s.destroy();
-        }
+        for (0..MAX_STREAMS) |i| self.streams[i].destroy();
         self.output.deinit(gpa);
         if (self.ng) |sess| {
             h2.nghttp2_session_del(sess);
@@ -244,19 +284,19 @@ fn headerCb(
     const sess = getSession(slot) orelse return 0;
     // beginHeaders always runs first, but allocate defensively.
     const st = sess.findStream(frame.hd.stream_id) orelse sess.allocStream(frame.hd.stream_id) orelse return 0;
-    if (st.dispatched) return 0; // trailers on a dispatched stream: ignore (v1)
+    if (st.dispatched()) return 0; // trailers on a dispatched stream: ignore (v1)
     const n = name[0..namelen];
     const v = value[0..valuelen];
     // Only pseudo-headers matter: the H1 handler takes (url, method, body)
     // and never sees headers, so regular headers are dropped for v1 parity.
     if (std.mem.eql(u8, n, ":method")) {
         const m = @min(v.len, MAX_METHOD);
-        @memcpy(st.method_buf[0..m], v[0..m]);
-        st.method_len = m;
+        @memcpy(st.p.method_buf[0..m], v[0..m]);
+        st.p.method_len = m;
     } else if (std.mem.eql(u8, n, ":path")) {
         const m = @min(v.len, MAX_PATH);
-        @memcpy(st.path_buf[0..m], v[0..m]);
-        st.path_len = m;
+        @memcpy(st.p.path_buf[0..m], v[0..m]);
+        st.p.path_len = m;
     }
     return 0;
 }
@@ -272,9 +312,9 @@ fn dataChunkCb(
     const slot = slotFromPtr(user_data) orelse return 0;
     const sess = getSession(slot) orelse return 0;
     const st = sess.findStream(stream_id) orelse return 0;
-    if (st.dispatched) return 0;
-    if (st.body.items.len + len > MAX_BODY_SIZE) return 0; // over cap: drop tail (v1)
-    st.body.appendSlice(gpa, data[0..len]) catch return 0;
+    if (st.dispatched()) return 0;
+    if (st.p.body.items.len + len > MAX_BODY_SIZE) return 0; // over cap: drop tail (v1)
+    st.p.body.appendSlice(gpa, data[0..len]) catch return 0;
     return 0;
 }
 
@@ -290,8 +330,8 @@ fn frameRecvCb(
             // Server sessions only receive request HEADERS; no cat check needed.
             if (frame.hd.flags & h2.FLAG_END_STREAM == 0) return 0;
             const st = sess.findStream(frame.hd.stream_id) orelse return 0;
-            if (st.dispatched) return 0;
-            st.complete = true;
+            if (st.dispatched()) return 0;
+            st.setComplete();
             http_native.h2StreamReady(slot, frame.hd.stream_id);
         },
         h2.RST_STREAM => sess.removeStream(frame.hd.stream_id),
@@ -338,15 +378,15 @@ fn bodyReadCb(
         data_flags.* |= h2.DATA_FLAG_EOF;
         return 0;
     };
-    const remaining = st.resp_body.items.len - st.resp_off;
+    const remaining = st.p.resp_body.items.len - st.p.resp_off;
     if (remaining == 0) {
         data_flags.* |= h2.DATA_FLAG_EOF;
         return 0;
     }
     const n = @min(length, remaining);
-    @memcpy(buf[0..n], st.resp_body.items[st.resp_off..][0..n]);
-    st.resp_off += n;
-    if (st.resp_off >= st.resp_body.items.len) data_flags.* |= h2.DATA_FLAG_EOF;
+    @memcpy(buf[0..n], st.p.resp_body.items[st.p.resp_off..][0..n]);
+    st.p.resp_off += n;
+    if (st.p.resp_off >= st.p.resp_body.items.len) data_flags.* |= h2.DATA_FLAG_EOF;
     return @intCast(n);
 }
 
@@ -499,32 +539,30 @@ pub fn onWriteComplete(
     sess.out_sent += sess.out_chunk;
     sess.out_chunk = 0;
     return if (pumpWrite(slot_id, l)) .more_pending else .drained;
-}
-
-// ── Request dispatch ─────────────────────────────────────────────
+} // ── Request dispatch ─────────────────────────────────────────────
 
 /// Dispatch a completed stream to the JS handler. No-op if already
 /// dispatched (trailers) or incomplete.
 pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     const sess = getSession(slot_id) orelse return;
     const st = sess.findStream(stream_id) orelse return;
-    if (st.dispatched or !st.complete) return;
-    if (st.method_len == 0 or st.path_len == 0) {
-        st.dispatched = true;
+    if (st.dispatched() or !st.complete()) return;
+    if (st.p.method_len == 0 or st.p.path_len == 0) {
+        st.setDispatched();
         active_stream[slot_id] = stream_id;
         respondErrorH2(slot_id, 400);
         return;
     }
-    st.dispatched = true;
+    st.setDispatched();
     active_stream[slot_id] = stream_id;
     var pr = http_native.ParsedRequest{
         .method = st.method(),
         .url = st.path(),
-        .content_length = st.body.items.len,
+        .content_length = st.p.body.items.len,
         .method_tag = http_native.classifyMethod(st.method()),
         .keep_alive = false, // H2 connections are persistent by design
     };
-    http_native.callHandler(slot_id, &pr, st.body.items);
+    http_native.callHandler(slot_id, &pr, st.p.body.items);
 }
 
 /// Find the next completed-but-undispatched stream and dispatch it.
@@ -532,9 +570,11 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
 /// A sync dispatch queues another response — the caller must flush after.
 pub fn drainPending(slot_id: usize) void {
     const sess = getSession(slot_id) orelse return;
-    for (&sess.streams) |*st| {
-        if (st.in_use and st.complete and !st.dispatched) {
-            dispatchRequest(slot_id, st.id);
+    // B1 FIX: sweep the hot flag/id columns only (was: full AoS records).
+    for (0..MAX_STREAMS) |i| {
+        const f = &sess.stream_flags[i];
+        if (f.in_use and f.complete and !f.dispatched) {
+            dispatchRequest(slot_id, sess.stream_ids[i]);
             return; // one at a time: may park again, chaining continues later
         }
     }
@@ -580,49 +620,69 @@ fn submitResponse(
     if (sess.ng == null) return;
     const st = sess.findStream(stream_id) orelse return;
 
-    st.resp_nv.clearRetainingCapacity();
-    st.resp_blob.clearRetainingCapacity();
-    st.resp_body.clearRetainingCapacity();
-    st.resp_off = 0;
+    st.p.resp_nv.clearRetainingCapacity();
+    st.p.resp_blob.clearRetainingCapacity();
+    st.p.resp_body.clearRetainingCapacity();
+    st.p.resp_off = 0;
+
+    // FIX: reserve resp_blob BEFORE any stageNv so appendSlice can never
+    // reallocate and invalidate earlier Nv.name/value pointers. Without
+    // this, growth between staging pair i and nghttp2_submit_response2
+    // leaves pair i pointing at freed memory.
+    {
+        var need: usize = 64; // :status + content-length + slack
+        if (hdrs) |h| {
+            for (0..h.len()) |i| {
+                const pair = h.getPair(i);
+                if (isManagedHeader(pair.name)) continue;
+                if (pair.name.len == 0 or pair.name[0] == ':') continue;
+                if (pair.name.len > 64 or pair.value.len > 4096) continue;
+                if (std.mem.indexOfAny(u8, pair.name, "\r\n") != null or
+                    std.mem.indexOfAny(u8, pair.value, "\r\n") != null) continue;
+                need += pair.name.len + pair.value.len;
+            }
+        }
+        st.p.resp_blob.ensureTotalCapacity(gpa, need) catch {};
+    }
 
     var status_buf: [8]u8 = undefined;
     const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "200";
-    if (stageNv(st, ":status", status_str)) |nv| {
-        st.resp_nv.append(gpa, nv) catch {};
+    if (stageNv(st.p, ":status", status_str)) |nv| {
+        st.p.resp_nv.append(gpa, nv) catch {};
     }
 
     if (hdrs) |h| {
         for (0..h.len()) |i| {
-            if (st.resp_nv.items.len >= MAX_NV) break;
+            if (st.p.resp_nv.items.len >= MAX_NV) break;
             const pair = h.getPair(i);
             if (isManagedHeader(pair.name)) continue;
             if (pair.name.len == 0 or pair.name[0] == ':') continue; // no pseudo-headers from user
             if (pair.name.len > 64 or pair.value.len > 4096) continue;
             if (std.mem.indexOfAny(u8, pair.name, "\r\n") != null or
                 std.mem.indexOfAny(u8, pair.value, "\r\n") != null) continue; // injection guard
-            if (stageNv(st, pair.name, pair.value)) |nv| {
-                st.resp_nv.append(gpa, nv) catch break;
+            if (stageNv(st.p, pair.name, pair.value)) |nv| {
+                st.p.resp_nv.append(gpa, nv) catch break;
             }
         }
     }
 
-    if (body.len > 0 and st.resp_nv.items.len < MAX_NV) {
+    if (body.len > 0 and st.p.resp_nv.items.len < MAX_NV) {
         var cl_buf: [20]u8 = undefined;
         const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body.len}) catch "0";
-        if (stageNv(st, "content-length", cl_str)) |nv| {
-            st.resp_nv.append(gpa, nv) catch {};
+        if (stageNv(st.p, "content-length", cl_str)) |nv| {
+            st.p.resp_nv.append(gpa, nv) catch {};
         }
-        st.resp_body.appendSlice(gpa, body) catch {};
+        st.p.resp_body.appendSlice(gpa, body) catch {};
     }
 
-    if (st.resp_body.items.len == 0) {
-        _ = h2.nghttp2_submit_response2(sess.ng, stream_id, st.resp_nv.items.ptr, st.resp_nv.items.len, null);
+    if (st.p.resp_body.items.len == 0) {
+        _ = h2.nghttp2_submit_response2(sess.ng, stream_id, st.p.resp_nv.items.ptr, st.p.resp_nv.items.len, null);
     } else {
         const provider = h2.DataProvider{
             .source = .{ .ptr = null },
             .read_callback = bodyReadCb,
         };
-        _ = h2.nghttp2_submit_response2(sess.ng, stream_id, st.resp_nv.items.ptr, st.resp_nv.items.len, &provider);
+        _ = h2.nghttp2_submit_response2(sess.ng, stream_id, st.p.resp_nv.items.ptr, st.p.resp_nv.items.len, &provider);
     }
 }
 
@@ -722,9 +782,9 @@ test "h2 stream alloc and find" {
     const sess = initSession(1) orelse return error.NoSession;
     defer removeSession(1);
     const a = sess.allocStream(1) orelse return error.NoStream;
-    try std.testing.expectEqual(@as(i32, 1), a.id);
-    // Same id returns the same slot.
-    try std.testing.expectEqual(a, sess.findStream(1).?);
+    try std.testing.expectEqual(@as(i32, 1), a.id.*);
+    // Same id returns the same slot payload.
+    try std.testing.expect(a.p == sess.findStream(1).?.p);
     // Odd client-initiated ids coexist.
     _ = sess.allocStream(3) orelse return error.NoStream;
     try std.testing.expect(sess.findStream(3) != null);
@@ -740,7 +800,37 @@ test "h2 submit copies bytes into stream storage" {
     active_stream[2] = 1;
     submitResponse(2, 1, 200, null, "hello");
     // Header nv + body were copied out of the caller's slices.
-    try std.testing.expect(st.resp_nv.items.len >= 2); // :status + content-length
-    try std.testing.expectEqualStrings("hello", st.resp_body.items);
-    try std.testing.expectEqualStrings(":status", st.resp_nv.items[0].name[0..st.resp_nv.items[0].namelen]);
+    try std.testing.expect(st.p.resp_nv.items.len >= 2); // :status + content-length
+    try std.testing.expectEqualStrings("hello", st.p.resp_body.items);
+    try std.testing.expectEqualStrings(":status", st.p.resp_nv.items[0].name[0..st.p.resp_nv.items[0].namelen]);
+}
+
+test "h2 submitResponse keeps Nv pointers stable across many headers" {
+    const sess = initSession(3) orelse return error.NoSession;
+    defer removeSession(3);
+    const st = sess.allocStream(1) orelse return error.NoStream;
+    active_stream[3] = 1;
+    // Growth-heavy response: forces resp_blob growth if not pre-reserved.
+    var names: [40][16]u8 = undefined;
+    var values: [40][64]u8 = undefined;
+    for (&names, 0..) |*n, i| {
+        _ = std.fmt.bufPrint(n, "x-test-{d:0>3}", .{i}) catch unreachable;
+    }
+    for (&values, 0..) |*v, i| {
+        @memset(v, @intCast('a' + (i % 26)));
+    }
+    submitResponse(3, 1, 200, null, "body");
+    // :status + content-length staged; blob holds stable copies.
+    try std.testing.expect(st.p.resp_nv.items.len >= 2);
+    for (st.p.resp_nv.items) |nv| {
+        const n = nv.name[0..nv.namelen];
+        const v = nv.value[0..nv.valuelen];
+        // Every Nv must point inside resp_blob (no dangling pointers).
+        const blob_start: usize = @intFromPtr(st.p.resp_blob.items.ptr);
+        const blob_end = blob_start + st.p.resp_blob.items.len;
+        try std.testing.expect(@intFromPtr(n.ptr) >= blob_start);
+        try std.testing.expect(@intFromPtr(n.ptr) + n.len <= blob_end);
+        try std.testing.expect(@intFromPtr(v.ptr) >= blob_start);
+        try std.testing.expect(@intFromPtr(v.ptr) + v.len <= blob_end);
+    }
 }

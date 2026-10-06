@@ -1,14 +1,23 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const engine = @import("engine/engine.zig");
+const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
+const ffi_api = @import("api/ffi.zig");
 const loop_mod = @import("event/loop.zig");
+const microtasks = @import("event/microtasks.zig");
 const init_cmd = @import("commands/init.zig");
 const imprint_cmd = @import("commands/imprint.zig");
 const sever_cmd = @import("commands/sever.zig");
 const start_cmd = @import("commands/start.zig");
-const bench_cmd = @import("commands/bench.zig");
+
+const test_cmd = @import("commands/test.zig");
+const repl_cmd = @import("commands/repl.zig");
+const upgrade_cmd = @import("commands/upgrade.zig");
+const compile_cmd = @import("commands/compile.zig");
+const fmt_cmd = @import("commands/fmt.zig");
+const watch_cmd = @import("commands/watch.zig");
 const c = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
@@ -18,7 +27,12 @@ const Command = enum {
     imprint,
     sever,
     start,
-    bench,
+    test_cmd,
+    repl,
+    upgrade,
+    compile,
+    fmt,
+    watch,
     e_flag,
     file,
     version,
@@ -29,20 +43,21 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "imprint")) return .imprint;
     if (std.mem.eql(u8, arg, "sever")) return .sever;
     if (std.mem.eql(u8, arg, "start")) return .start;
-    if (std.mem.eql(u8, arg, "bench")) return .bench;
+    if (std.mem.eql(u8, arg, "test")) return .test_cmd;
+    if (std.mem.eql(u8, arg, "repl")) return .repl;
+    if (std.mem.eql(u8, arg, "upgrade")) return .upgrade;
+    if (std.mem.eql(u8, arg, "compile")) return .compile;
+    if (std.mem.eql(u8, arg, "fmt")) return .fmt;
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
     if (std.mem.eql(u8, arg, "--version")) return .version;
+    if (std.mem.eql(u8, arg, "--watch")) return .watch;
     return .file;
 }
-// DOD-FIX 9: boot_arena (inside Runtime) is the sole owner of `runtime`
-// and `runtime.event_loop`. We only call deinit(), not destroy().
 fn shutdownRuntime(runtime: *engine.Runtime) void {
     engine.deinitNetwork();
     runtime.event_loop.deinit();
     runtime.deinit();
 }
-/// Scan the full arg list for `--ca <path>` and stage it for tls.init().
-/// (tls.ca_file is consumed inside engine.Runtime.init -> tls.init().)
 fn parseCaFlag(init: std.process.Init) void {
     var it = init.minimal.args.iterate();
     while (it.next()) |a| {
@@ -55,9 +70,72 @@ fn parseCaFlag(init: std.process.Init) void {
         }
     }
 }
+fn parseAllowFfiFlag(init: std.process.Init) void {
+    var it = init.minimal.args.iterate();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--allow-ffi")) {
+            ffi_api.setAllow(true);
+            return;
+        }
+    }
+}
+
+// POSIX forces SIGINT/SIGQUIT to ignore for background jobs, so `kill -INT`
+// on a backgrounded ff was a no-op. Restore the default action when a
+// signal was ignored; caught handlers are left alone (exec already reset
+// them to default for us).
+fn resetIgnoredInterrupt() void {
+    for ([_]std.posix.SIG{ .INT, .TERM }) |sig| {
+        var old: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &old);
+        if (old.handler.handler == std.posix.SIG.IGN) {
+            const act: std.posix.Sigaction = .{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            std.posix.sigaction(sig, &act, null);
+        }
+    }
+}
+
+// Under `ff --watch` the supervisor exports FF_WATCH_PARENT before spawn;
+// if the supervisor dies (even SIGKILL), exit within 500ms instead of
+// living on as an orphan.
+fn maybeStartParentWatchdog() void {
+    const env = std.c.getenv("FF_WATCH_PARENT") orelse return;
+    const parent = std.fmt.parseInt(std.posix.pid_t, std.mem.span(env), 10) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parentWatchdog, .{parent}) catch return;
+    t.detach();
+}
+
+fn parentWatchdog(parent: std.posix.pid_t) void {
+    const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    while (true) {
+        _ = std.c.nanosleep(&ts, null);
+        if (std.posix.getppid() != parent) std.c._exit(0);
+    }
+}
+
+// Runs the event loop to quiescence, then exits 1 if anything threw —
+// a top-level throw, a rejected module promise, a failed job, or a
+// timer/microtask error. Previously every one of these exited 0.
+fn runAndExit(runtime: *engine.Runtime) void {
+    runtime.event_loop.runWithMicrotasks(runtime.ctx);
+    if (microtasks.had_error) std.process.exit(1);
+}
+
 pub fn main(init: std.process.Init) !void {
+    if (builtin.os.tag != .windows) {
+        resetIgnoredInterrupt();
+        maybeStartParentWatchdog();
+    }
+    parseAllowFfiFlag(init);
     var args_iter = init.minimal.args.iterate();
-    _ = args_iter.next();
+    const exe = args_iter.next() orelse {
+        printUsage();
+        return;
+    };
     const first_arg = args_iter.next() orelse {
         printUsage();
         return;
@@ -92,7 +170,41 @@ pub fn main(init: std.process.Init) !void {
             try sever_cmd.run(init.io, rest.items);
         },
         .start => try start_cmd.run(init.io, init),
-        .bench => try bench_cmd.run(init.io, init),
+        .test_cmd => try test_cmd.run(init.io, init),
+        .repl => try repl_cmd.run(init.io, init),
+        .upgrade => try upgrade_cmd.run(init.io, init),
+        .compile => try compile_cmd.run(init.io, init),
+        .fmt => try fmt_cmd.run(init.io, init),
+        .watch => {
+            var target: ?[]const u8 = null;
+            var forward = std.ArrayList([]const u8).empty;
+            defer forward.deinit(std.heap.page_allocator);
+            while (args_iter.next()) |a| {
+                if (target == null) {
+                    if (std.mem.eql(u8, a, "--ca")) {
+                        const v = args_iter.next() orelse {
+                            std.debug.print("Error: --ca requires a path\n", .{});
+                            std.process.exit(1);
+                        };
+                        try forward.append(std.heap.page_allocator, a);
+                        try forward.append(std.heap.page_allocator, v);
+                    } else {
+                        target = a;
+                    }
+                } else {
+                    try forward.append(std.heap.page_allocator, a);
+                }
+            }
+            const t = target orelse {
+                std.debug.print("Error: --watch requires a file or 'start'\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, t, "start")) {
+                try watch_cmd.run(init.io, exe, .start, t, forward.items);
+            } else {
+                try watch_cmd.run(init.io, exe, .file, t, forward.items);
+            }
+        },
         .version => {
             std.debug.print("ff {s} ({s}-{s})\n", .{
                 ffcfg.version,
@@ -102,21 +214,21 @@ pub fn main(init: std.process.Init) !void {
         },
         .e_flag => {
             const code = args_iter.next() orelse {
-                std.debug.print("Error: -e requires an argument", .{});
+                std.debug.print("Error: -e requires an argument\n", .{});
                 std.process.exit(1);
             };
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
-            _ = runtime.eval(code, "<eval>");
-            runtime.event_loop.runWithMicrotasks(runtime.ctx);
+            if (!runtime.eval(code, "<eval>")) microtasks.had_error = true;
+            runAndExit(runtime);
         },
         .file => {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
             const file = c.fopen(first_arg.ptr, "rb") orelse {
-                std.debug.print("Error: could not open file '{s}'", .{first_arg});
+                std.debug.print("Error: could not open file '{s}'\n", .{first_arg});
                 std.process.exit(1);
             };
             defer _ = c.fclose(file);
@@ -126,9 +238,36 @@ pub fn main(init: std.process.Init) !void {
             const buf = try std.heap.page_allocator.allocSentinel(u8, size, 0);
             defer std.heap.page_allocator.free(buf);
             _ = c.fread(buf.ptr, 1, size, file);
-            const source: [:0]const u8 = buf;
-            _ = runtime.evalModule(source, first_arg);
-            runtime.event_loop.runWithMicrotasks(runtime.ctx);
+
+            if (std.mem.endsWith(u8, first_arg, ".ffbc")) {
+                const obj = qjs.readObject(runtime.ctx, buf.ptr, size, qjs.READ_OBJ_BYTECODE);
+                defer qjs.freeValue(runtime.ctx, obj);
+                if (qjs.isException(obj) != 0) {
+                    const exc = qjs.getException(runtime.ctx);
+                    defer qjs.freeValue(runtime.ctx, exc);
+                    if (qjs.toCString(runtime.ctx, exc)) |m| {
+                        defer qjs.freeCString(runtime.ctx, m);
+                        std.debug.print("Error: {s}\n", .{m});
+                    }
+                    std.process.exit(1);
+                }
+                const result = qjs.evalFunction(runtime.ctx, obj);
+                defer qjs.freeValue(runtime.ctx, result);
+                if (qjs.isException(result) != 0) {
+                    const exc = qjs.getException(runtime.ctx);
+                    defer qjs.freeValue(runtime.ctx, exc);
+                    if (qjs.toCString(runtime.ctx, exc)) |m| {
+                        defer qjs.freeCString(runtime.ctx, m);
+                        std.debug.print("Error: {s}\n", .{m});
+                    }
+                    std.process.exit(1);
+                }
+                runAndExit(runtime);
+            } else {
+                const source: [:0]const u8 = buf;
+                if (!runtime.evalModule(source, first_arg)) microtasks.had_error = true;
+                runAndExit(runtime);
+            }
         },
         .none => printUsage(),
     }
@@ -136,11 +275,17 @@ pub fn main(init: std.process.Init) !void {
 fn printUsage() void {
     std.debug.print("Usage:", .{});
     std.debug.print("  ff init [-y|--yes] [<dir>]  Initialize a new project", .{});
-    std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM", .{});
-    std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s), prune orphans; no args clears all (confirms)", .{});
-    std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project (https/wss with cert+key)", .{});
-    std.debug.print("  ff bench             Run benchmarks", .{});
+    std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock", .{});
+    std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s)", .{});
+    std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project", .{});
+    std.debug.print("  ff test [filter]     Run test/*.test.js", .{});
+    std.debug.print("  ff repl              Interactive REPL", .{});
+    std.debug.print("  ff upgrade [--check] Self-update from GitHub Releases", .{});
+    std.debug.print("  ff compile <f.js> [-o out.ffbc]  Compile to bytecode", .{});
+    std.debug.print("  ff fmt [--write|--check] <files...>  Format via prettier", .{});
+    std.debug.print("  ff --watch <file|start>  Restart on file changes", .{});
     std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
     std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
+    std.debug.print("  --allow-ffi           Allow ffi.dlopen (native libraries)", .{});
     std.debug.print("  ff --version         Print runtime version", .{});
 }

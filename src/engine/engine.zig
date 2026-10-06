@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const qjs = @import("quickjs_shim.zig");
 const mod = @import("../modules/mod.zig");
 const EventLoop = @import("../event/loop.zig").EventLoop;
@@ -24,6 +25,9 @@ const formdata = @import("../types/formdata.zig");
 const blob = @import("../types/blob.zig");
 const sqlite_api = @import("../api/sqlite.zig");
 const worker_mod = @import("../worker/worker.zig");
+const sql_api = @import("../api/sql.zig");
+const pg_client = @import("../net/pg_client.zig");
+const ffi_api = @import("../api/ffi.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -35,6 +39,7 @@ pub fn getEventLoop() ?*EventLoop {
 
 pub fn deinitNetwork() void {
     http_native.deinit();
+    sql_api.deinit();
 }
 
 var g_runtime: ?*Runtime = null;
@@ -154,12 +159,16 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
         return null;
     };
     defer gpa.free(src_z);
-    std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
-        name,
-        src.len,
-        if (src.len >= 16) src[0..16] else src,
-        if (src.len >= 16) src[src.len - 16 ..] else src,
-    });
+    // FIX: blocking stdout write on every module load is Debug-only.
+    // In release it stalls the loader path for zero user benefit.
+    if (builtin.mode == .Debug) {
+        std.debug.print("load {s} ({d} bytes) head=[{s}] tail=[{s}]\n", .{
+            name,
+            src.len,
+            if (src.len >= 16) src[0..16] else src,
+            if (src.len >= 16) src[src.len - 16 ..] else src,
+        });
+    }
     const func_val = qjs.eval(ctx, src_z.ptr, src.len, name.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     if (qjs.isException(func_val) != 0) return null;
     const m: *qjs.ModuleDef = @ptrCast(@alignCast(func_val.u.ptr));
@@ -178,6 +187,28 @@ fn moduleLoader(ctx: ?*qjs.Context, module_name: [*c]const u8, opaque_: ?*anyopa
     qjs.freeValue(ctx, meta);
     qjs.freeValue(ctx, func_val);
     return m;
+}
+
+// Print an exception value (message, then stack if present) and mark the
+// run as failed. Takes ownership of `exc` — the caller must not free it.
+// Shared by eval() and evalModule().
+fn reportAndFail(self: *Runtime, exc: qjs.Value) void {
+    defer qjs.freeValue(self.ctx, exc);
+    microtasks.had_error = true;
+    const msg = qjs.toCString(self.ctx, exc);
+    if (msg) |m| {
+        defer qjs.freeCString(self.ctx, m);
+        std.debug.print("Error: {s}\n", .{m});
+    }
+    const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
+    defer qjs.freeValue(self.ctx, stack_val);
+    if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
+        const smsg = qjs.toCString(self.ctx, stack_val);
+        if (smsg) |sm| {
+            defer qjs.freeCString(self.ctx, sm);
+            std.debug.print("{s}\n", .{sm});
+        }
+    }
 }
 
 pub const Runtime = struct {
@@ -208,7 +239,9 @@ pub const Runtime = struct {
         websocket_client.setup(ctx);
         text_encoding.setup(ctx);
         sqlite_api.setup(ctx);
+        sql_api.setup(ctx);
         worker_mod.setup(ctx);
+        ffi_api.setup(ctx);
         {
             var timeout_def = qjs.ClassDef{
                 .class_name = "Timeout",
@@ -253,6 +286,9 @@ pub const Runtime = struct {
         EventLoop.initInto(loop_ptr);
         async_fetch.setLoop(&loop_ptr.loop);
         ws_client.setLoop(&loop_ptr.loop);
+        pg_client.setLoop(&loop_ptr.loop);
+        ffi_api.setLoop(&loop_ptr.loop);
+        fs_api.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{
@@ -373,7 +409,7 @@ pub const Runtime = struct {
         const rt = g_runtime orelse return qjs.JS_UNDEFINED;
         const id = timeoutSlotFromThis(ctx, this_val) orelse return qjs.JS_UNDEFINED;
         rt.timer_manager.unrefSlot(id);
-    return qjs.dupValue(ctx, this_val);
+        return qjs.dupValue(ctx, this_val);
     }
 
     fn timeoutRef(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
@@ -431,13 +467,10 @@ pub const Runtime = struct {
         _ = argc;
         const ret = qjs.call(ctx, argv[0], qjs.JS_UNDEFINED, 0, null);
         if (qjs.isException(ret) != 0) {
-            const exc = qjs.getException(ctx);
-            defer qjs.freeValue(ctx, exc);
-            const msg = qjs.toCString(ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(ctx, m);
-                std.debug.print("queueMicrotask error: {s}\n", .{m});
-            }
+            // ctx is optional at the ABI boundary; reportUncaught needs a
+            // non-null one. QuickJS never hands us null here, but guard so a
+            // null can never panic the runtime.
+            if (ctx) |jc| microtasks.reportUncaught(jc, "queueMicrotask error");
             return qjs.JS_UNDEFINED;
         }
         return ret;
@@ -476,22 +509,7 @@ pub const Runtime = struct {
         );
         defer qjs.freeValue(self.ctx, result);
         if (qjs.isException(result) != 0) {
-            const exc = qjs.getException(self.ctx);
-            defer qjs.freeValue(self.ctx, exc);
-            const msg = qjs.toCString(self.ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(self.ctx, m);
-                std.debug.print("Error: {s}\n", .{m});
-            }
-            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
-            defer qjs.freeValue(self.ctx, stack_val);
-            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
-                const smsg = qjs.toCString(self.ctx, stack_val);
-                if (smsg) |sm| {
-                    defer qjs.freeCString(self.ctx, sm);
-                    std.debug.print("{s}\n", .{sm});
-                }
-            }
+            reportAndFail(self, qjs.getException(self.ctx));
             return false;
         }
         microtasks.pumpMicrotasks(self.ctx);
@@ -517,23 +535,23 @@ pub const Runtime = struct {
         );
         defer qjs.freeValue(self.ctx, result);
         if (qjs.isException(result) != 0) {
-            const exc = qjs.getException(self.ctx);
-            defer qjs.freeValue(self.ctx, exc);
-            const msg = qjs.toCString(self.ctx, exc);
-            if (msg) |m| {
-                defer qjs.freeCString(self.ctx, m);
-                std.debug.print("Error: {s}\n", .{m});
-            }
-            const stack_val = qjs.getPropertyStr(self.ctx, exc, "stack");
-            defer qjs.freeValue(self.ctx, stack_val);
-            if (qjs.isException(stack_val) == 0 and qjs.isUndefined(stack_val) == 0) {
-                const smsg = qjs.toCString(self.ctx, stack_val);
-                if (smsg) |sm| {
-                    defer qjs.freeCString(self.ctx, sm);
-                    std.debug.print("{s}\n", .{sm});
-                }
-            }
+            reportAndFail(self, qjs.getException(self.ctx));
             return false;
+        }
+        // A module's top-level throw is routed into the module promise rather
+        // than into JS_EXCEPTION (js_evaluate_module resolves it via the
+        // rejecting func and returns the promise). The isException branch
+        // above therefore never sees it, which is why `ff bad.js` used to
+        // print nothing and exit 0. Inspect the promise directly.
+        if (is_module) {
+            const ps = qjs.promiseState(self.ctx, result);
+            if (ps == 2) { // JS_PROMISE_REJECTED
+                const pr = qjs.promiseResult(self.ctx, result);
+                // reportAndFail takes ownership, so hand it a fresh dup and
+                // keep `pr` owned by the defer above.
+                reportAndFail(self, qjs.dupValue(self.ctx, pr));
+                return false;
+            }
         }
         microtasks.pumpMicrotasks(self.ctx);
         return true;

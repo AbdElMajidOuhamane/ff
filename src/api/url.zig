@@ -163,7 +163,7 @@ const URLSearchParamsData = struct {
         }
         return self.view_buf.items;
     }
-    fn hasEntry(self: *const URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
+    fn hasEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, self.nameOf(e), name)) {
                 if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) return true;
@@ -365,12 +365,14 @@ fn spForEach(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value
     const callback = argv[0];
     if (c.isFunction(ctx, callback) == 0) return c.JS_UNDEFINED;
     for (data.entries.items) |e| {
-        var args = [_]c.Value{
-            zigStringToJS(ctx, data.valueOf(e)),
-            zigStringToJS(ctx, data.nameOf(e)),
-            this_val,
-        };
+        // BUG-5: JS_Call borrows argv, it does not consume it — both new
+        // values were leaked every iteration.
+        const v = zigStringToJS(ctx, data.valueOf(e));
+        const n = zigStringToJS(ctx, data.nameOf(e));
+        var args = [_]c.Value{ v, n, this_val };
         _ = c.call(ctx, callback, c.JS_UNDEFINED, 3, &args);
+        c.freeValue(ctx, v);
+        c.freeValue(ctx, n);
     }
     return c.JS_UNDEFINED;
 }
@@ -409,6 +411,20 @@ fn spConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 // ============================================================
 // UrlData + UrlBlock — single allocation per URL
 // ============================================================
+// BUG A — pool sizing. deriveStrings re-emits scheme 3x, host 4x and
+// path/query/fragment up to 3x each (raw copy → normalized copy → origin →
+// href), so the old `input.len + 256` under-allocated by ~3x: a ~100-char
+// path was already enough to walk PoolWriter off the end of the block
+// (heap corruption under ReleaseFast, OOB panic under Debug). Summing every
+// length term of parseUrlAbsolute + deriveStrings against L gives an
+// algebraic worst case of 4L + 27; the +64 keeps margin for port/origin
+// formatting. Overflow is reported as error.OutOfPool → "Invalid URL".
+fn poolBound(len_a: usize, len_b: usize) !usize {
+    const sum = std.math.add(usize, len_a, len_b) catch return error.OutOfPool;
+    const four = std.math.mul(usize, sum, 4) catch return error.OutOfPool;
+    return std.math.add(usize, four, 64) catch error.OutOfPool;
+}
+
 const UrlData = struct {
     block: *UrlBlock, // ownership handle — released by urlFinalizer, never freed here
     pool: [*]u8,
@@ -440,7 +456,9 @@ const UrlBlock = struct {
 
     fn create(pool_len: usize) !*UrlBlock {
         const hdr = std.mem.alignForward(usize, @sizeOf(UrlBlock), 8);
-        const total = hdr + pool_len;
+        const total = std.math.add(usize, hdr, pool_len) catch return error.OutOfPool;
+        // mem_len is u32 — refuse anything the header could not address.
+        if (total > std.math.maxInt(u32)) return error.OutOfPool;
         const mem = try gpa.alignedAlloc(u8, .of(UrlBlock), total);
         const block: *UrlBlock = @ptrCast(@alignCast(mem.ptr));
         block.* = .{
@@ -474,6 +492,13 @@ comptime {
 const PoolWriter = struct {
     pool: []u8,
     used: usize = 0,
+    // BUG A safety net: every write clamps to the end of the pool and raises
+    // this instead of running off the block. parseUrlAbsolute/Relative check
+    // it once before returning, so an over-long URL degrades to a clean
+    // `Invalid URL` rather than heap corruption. One predictable branch on a
+    // cold path (URL construction) — no cost on the I/O hot path.
+    overflowed: bool = false,
+
     fn rest(self: *PoolWriter) []u8 {
         return self.pool[self.used..];
     }
@@ -483,30 +508,44 @@ const PoolWriter = struct {
     fn sliceFrom(self: *PoolWriter, off: usize) []const u8 {
         return self.pool[off..][0 .. self.used - off];
     }
+    // Reserve up to `n` writable bytes and advance past them. May return
+    // fewer than `n`; callers decide whether that is fatal — a decoder can
+    // legitimately consume less than its upper bound without overflowing.
+    fn reserve(self: *PoolWriter, n: usize) []u8 {
+        const avail = self.pool.len - self.used;
+        const k = @min(n, avail);
+        const off = self.used;
+        self.used += k;
+        return self.pool[off..][0..k];
+    }
     fn put(self: *PoolWriter, bytes: []const u8) []const u8 {
         if (bytes.len == 0) return "";
         const off = self.used;
-        @memcpy(self.pool[off..][0..bytes.len], bytes);
-        self.used += bytes.len;
-        return self.pool[off..][0..bytes.len];
+        const dst = self.reserve(bytes.len);
+        if (dst.len < bytes.len) self.overflowed = true;
+        @memcpy(dst, bytes[0..dst.len]);
+        return self.pool[off..][0..dst.len];
     }
     fn putUint(self: *PoolWriter, v: u16) void {
         var buf: [5]u8 = undefined;
         var n: usize = 0;
         var x = v;
         if (x == 0) {
-            self.pool[self.used] = '0';
-            self.used += 1;
-            return;
+            buf[0] = '0';
+            n = 1;
+        } else {
+            while (x > 0) : (x /= 10) {
+                buf[n] = @intCast('0' + x % 10);
+                n += 1;
+            }
         }
-        while (x > 0) : (x /= 10) {
-            buf[n] = @intCast('0' + x % 10);
-            n += 1;
-        }
-        while (n > 0) {
-            n -= 1;
-            self.pool[self.used] = buf[n];
-            self.used += 1;
+        if (self.pool.len - self.used < n) self.overflowed = true;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            const dst = self.reserve(1);
+            if (dst.len == 0) return;
+            dst[0] = buf[i];
         }
     }
     fn putComponent(self: *PoolWriter, comp: std.Uri.Component) []const u8 {
@@ -514,23 +553,43 @@ const PoolWriter = struct {
             .raw => |raw| return self.put(raw),
             .percent_encoded => |pe| {
                 const off = self.used;
+                // Decoding never grows the payload (%XX → 1 byte), so pe.len
+                // is an exact upper bound — one reserve, no per-byte branch.
+                const dst = self.reserve(pe.len);
+                var o: usize = 0;
                 var i: usize = 0;
-                while (i < pe.len) {
+                while (i < pe.len and o < dst.len) {
                     if (pe[i] == '%' and i + 2 < pe.len) {
                         if (std.fmt.parseInt(u8, pe[i + 1 .. i + 3], 16)) |byte| {
-                            self.pool[self.used] = byte;
-                            self.used += 1;
+                            dst[o] = byte;
+                            o += 1;
                             i += 3;
                             continue;
                         } else |_| {}
                     }
-                    self.pool[self.used] = pe[i];
-                    self.used += 1;
+                    dst[o] = pe[i];
+                    o += 1;
                     i += 1;
                 }
-                return self.pool[off..][0 .. self.used - off];
+                // Fatal only if input is left over — a tight pool that still
+                // swallowed every byte did not actually overflow.
+                if (i < pe.len) self.overflowed = true;
+                self.used = off + o; // hand back the unused reservation
+                return self.pool[off..][0..o];
             },
         }
+    }
+    // Append the dot-segment-normalized copy of `input`. One bounds check up
+    // front covers every write inside removeDotSegmentsInto.
+    fn putNormalizedPath(self: *PoolWriter, input: []const u8) error{OutOfPool}![]const u8 {
+        if (self.pool.len - self.used < input.len + 1) {
+            self.overflowed = true;
+            return error.OutOfPool;
+        }
+        const off = self.used;
+        const n = try removeDotSegmentsInto(self.rest(), input);
+        self.used += n;
+        return self.pool[off..][0..n];
     }
 };
 
@@ -644,12 +703,20 @@ fn setUrlField(ctx: ?*c.Context, this_val: c.Value, field: UrlField, raw: []cons
             const after_scheme = old.href[sep + 3 ..];
             const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
             const rest = after_scheme[auth_end..];
-            if (sep + 3 + host_part.len + 1 + port_part.len + rest.len > buf.len) return;
+            // BUG A FIX: the old guard omitted the userinfo this branch
+            // re-emits below. With a long username/password the check passed
+            // while the writes that followed ran past buf.len — OOB slice
+            // panic in Debug, silent 8 KiB-stack corruption in ReleaseFast.
+            const userinfo_len: usize = if (old.username.len > 0 or old.password.len > 0)
+                old.username.len + 1 + old.password.len + 1
+            else
+                0;
+            if (sep + 3 + userinfo_len + host_part.len + 1 + port_part.len + rest.len > buf.len) return;
             @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
             n = sep + 3;
-            if (old.username.len > 0 or old.password.len > 0) {
+            if (userinfo_len > 0) {
                 _ = std.fmt.bufPrint(buf[n..], "{s}:{s}@", .{ old.username, old.password }) catch return;
-                n += old.username.len + 1 + old.password.len + 1;
+                n += userinfo_len;
             }
             @memcpy(buf[n..][0..host_part.len], host_part);
             n += host_part.len;
@@ -703,24 +770,30 @@ fn setUrlField(ctx: ?*c.Context, this_val: c.Value, field: UrlField, raw: []cons
             n += rest.len;
         },
         .pathname => {
-            var p: []const u8 = raw;
-            if (p.len == 0 or p[0] != '/') {
-                if (p.len + 1 > buf.len) return;
-                buf[0] = '/';
-                @memcpy(buf[1..][0..p.len], p);
-                p = buf[0 .. p.len + 1];
-            }
+            // BUG A FIX: the old code prepended '/' at buf[0..] and then set
+            // `p = buf[0..len+1]`, so `p` ALIASED this very buffer. The next
+            // statement copied old.href over buf[0..sep+3] (destroying p), and
+            // the p copy that followed had overlapping src/dst — undefined
+            // behaviour, and a wrong pathname. `raw` comes from the caller's
+            // own 512 B stack buffer, so it never aliases buf: emit the
+            // leading '/' at the write cursor instead of pre-building.
+            const need_slash = raw.len == 0 or raw[0] != '/';
             const sep = std.mem.indexOf(u8, old.href, "://") orelse return;
             const after_scheme = old.href[sep + 3 ..];
             const auth_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
             const keep = after_scheme[0..auth_end];
-            if (sep + 3 + keep.len + p.len + old.search.len + old.hash.len > buf.len) return;
+            const extra: usize = if (need_slash) 1 else 0;
+            if (sep + 3 + keep.len + extra + raw.len + old.search.len + old.hash.len > buf.len) return;
             @memcpy(buf[0 .. sep + 3], old.href[0 .. sep + 3]);
             n = sep + 3;
             @memcpy(buf[n..][0..keep.len], keep);
             n += keep.len;
-            @memcpy(buf[n..][0..p.len], p);
-            n += p.len;
+            if (need_slash) {
+                buf[n] = '/';
+                n += 1;
+            }
+            @memcpy(buf[n..][0..raw.len], raw);
+            n += raw.len;
             @memcpy(buf[n..][0..old.search.len], old.search);
             n += old.search.len;
             @memcpy(buf[n..][0..old.hash.len], old.hash);
@@ -789,7 +862,7 @@ fn setUrlField(ctx: ?*c.Context, this_val: c.Value, field: UrlField, raw: []cons
     }
     const new_full = buf[0..n];
     const block = parseUrlAbsolute(new_full) catch return;
-    // repoint the existing searchParams JS object to the new block 
+    // repoint the existing searchParams JS object to the new block
     const sp_obj = c.getPropertyStr(ctx, this_val, "searchParams");
     defer c.freeValue(ctx, sp_obj);
     if (c.getOpaque2(ctx, sp_obj, sp_class_id) != null) {
@@ -923,31 +996,30 @@ fn setPassword(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c
 
 fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     const uri = try std.Uri.parse(input);
-    const block = try UrlBlock.create(input.len + 256);
+    const block = try UrlBlock.create(try poolBound(input.len, 0));
     errdefer block.release();
     var w = PoolWriter{ .pool = block.poolSlice() };
     const url = &block.url;
     url.port = uri.port;
     url.scheme = w.put(uri.scheme);
     url.host = if (uri.host) |h| w.putComponent(h) else "";
-    url.path = blk: {
-        if (uri.path.isEmpty()) break :blk w.put("/");
-        const raw = w.putComponent(uri.path);
-        const off = w.used;
-        w.used += try removeDotSegmentsInto(w.rest(), raw);
-        break :blk w.pool[off..][0 .. w.used - off];
-    };
+    url.path = if (uri.path.isEmpty())
+        w.put("/")
+    else
+        try w.putNormalizedPath(w.putComponent(uri.path));
     url.query = if (uri.query) |q| w.putComponent(q) else "";
     url.fragment = if (uri.fragment) |f| w.putComponent(f) else "";
     url.username = if (uri.user) |u| w.putComponent(u) else "";
     url.password = if (uri.password) |p| w.putComponent(p) else "";
     block.sp.parseFromString(url.query);
     deriveStrings(url, &w);
+    // BUG A: a single place to turn a clamped write into a clean error.
+    if (w.overflowed) return error.OutOfPool;
     return block;
 }
 fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
     const base = try std.Uri.parse(base_url);
-    const block = try UrlBlock.create(input.len + base_url.len + 256);
+    const block = try UrlBlock.create(try poolBound(input.len, base_url.len));
     errdefer block.release();
     var w = PoolWriter{ .pool = block.poolSlice() };
     const url = &block.url;
@@ -956,34 +1028,32 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
             url.port = rel.port;
             url.scheme = w.put(rel.scheme);
             url.host = if (rel.host) |h| w.putComponent(h) else "";
-            url.path = if (rel.path.isEmpty()) w.put("/") else blk: {
-                const raw = w.putComponent(rel.path);
-                const off = w.used;
-                w.used += try removeDotSegmentsInto(w.rest(), raw);
-                break :blk w.pool[off..][0 .. w.used - off];
-            };
+            url.path = if (rel.path.isEmpty())
+                w.put("/")
+            else
+                try w.putNormalizedPath(w.putComponent(rel.path));
             url.query = if (rel.query) |q| w.putComponent(q) else "";
             url.fragment = if (rel.fragment) |f| w.putComponent(f) else "";
             url.username = if (rel.user) |u| w.putComponent(u) else "";
             url.password = if (rel.password) |p| w.putComponent(p) else "";
             block.sp.parseFromString(url.query);
             deriveStrings(url, &w);
+            if (w.overflowed) return error.OutOfPool;
             return block;
         }
         if (rel.host) |h| {
             url.port = rel.port;
             url.scheme = w.put(base.scheme);
             url.host = w.putComponent(h);
-            url.path = if (rel.path.isEmpty()) w.put("/") else blk: {
-                const raw = w.putComponent(rel.path);
-                const off = w.used;
-                w.used += try removeDotSegmentsInto(w.rest(), raw);
-                break :blk w.pool[off..][0 .. w.used - off];
-            };
+            url.path = if (rel.path.isEmpty())
+                w.put("/")
+            else
+                try w.putNormalizedPath(w.putComponent(rel.path));
             url.query = if (rel.query) |q| w.putComponent(q) else "";
             url.fragment = if (rel.fragment) |f| w.putComponent(f) else "";
             block.sp.parseFromString(url.query);
             deriveStrings(url, &w);
+            if (w.overflowed) return error.OutOfPool;
             return block;
         }
     } else |_| {}
@@ -1019,9 +1089,7 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
             query = path_part[qi + 1 ..];
             path_part = path_part[0..qi];
         }
-        const off = w.used;
-        w.used += try removeDotSegmentsInto(w.rest(), path_part);
-        url.path = w.pool[off..][0 .. w.used - off];
+        url.path = try w.putNormalizedPath(path_part);
         url.query = if (query.len > 0) w.put(query) else "";
         url.fragment = if (frag.len > 0) w.put(frag) else "";
     } else {
@@ -1037,20 +1105,35 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
             query = path_part[qi + 1 ..];
             path_part = path_part[0..qi];
         }
-        var tmp: [4096]u8 = undefined;
-        const n = mergePathsInto(&tmp, base_path, path_part);
-        const off = w.used;
-        w.used += try removeDotSegmentsInto(w.rest(), tmp[0..n]);
-        url.path = w.pool[off..][0 .. w.used - off];
+        // BUG A FIX: this used a fixed `var tmp: [4096]u8` plus
+        // mergePathsInto, which @memcpy'd base_path + rel_path with no check
+        // — a longer pair smashed the stack. Merge straight into the pool
+        // instead: dir(base_path) is a sub-slice already behind `used` and
+        // path_part lives in the caller's buffer, so the raw copy overlaps
+        // nothing; the normalized pass then writes after it, the same
+        // double-write pattern parseUrlAbsolute already uses.
+        const dir_end = if (std.mem.lastIndexOfScalar(u8, base_path, '/')) |idx| idx + 1 else 0;
+        const raw_off = w.mark();
+        _ = w.put(base_path[0..dir_end]);
+        _ = w.put(path_part);
+        const raw = w.sliceFrom(raw_off);
+        url.path = try w.putNormalizedPath(raw);
         url.query = if (query.len > 0) w.put(query) else "";
         url.fragment = if (frag.len > 0) w.put(frag) else "";
     }
     block.sp.parseFromString(url.query);
     deriveStrings(url, &w);
+    if (w.overflowed) return error.OutOfPool;
     return block;
 }
 
-fn removeDotSegmentsInto(out: []u8, input: []const u8) !usize {
+// Output never exceeds input.len (dot segments only shrink it), except the
+// one-byte "/" fallback when nothing survives — hence the `+ 1`. The entry
+// check below makes that bound explicit so every write in the body is
+// provably in range; it is redundant with PoolWriter.putNormalizedPath but
+// keeps this function safe for any future caller.
+fn removeDotSegmentsInto(out: []u8, input: []const u8) error{OutOfPool}!usize {
+    if (input.len >= out.len) return error.OutOfPool;
     var n: usize = 0;
     var rest = input;
     while (rest.len > 0) {
@@ -1105,20 +1188,6 @@ fn removeDotSegmentsInto(out: []u8, input: []const u8) !usize {
         out[n] = '/';
         n += 1;
     }
-    return n;
-}
-
-fn mergePathsInto(out: []u8, base_path: []const u8, rel_path: []const u8) usize {
-    var n: usize = 0;
-    @memcpy(out[n..][0..base_path.len], base_path);
-    n += base_path.len;
-    if (std.mem.lastIndexOfScalar(u8, out[0..n], '/')) |idx| {
-        n = idx + 1;
-    } else {
-        n = 0;
-    }
-    @memcpy(out[n..][0..rel_path.len], rel_path);
-    n += rel_path.len;
     return n;
 }
 
@@ -1309,7 +1378,6 @@ pub fn setup(ctx: *c.Context) void {
             else
                 c.JS_UNDEFINED;
             _ = c.definePropertyGetSet(ctx, url_proto, c.newAtomLen(ctx, gs.name, std.mem.len(gs.name)), get_val, set_val, c.PROP_CONFIGURABLE | c.PROP_WRITABLE);
-           
         }
     }
 

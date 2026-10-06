@@ -1,0 +1,146 @@
+# CI — build + test on every push to main and every pull request.
+#
+# this file is a thin bootstrap. All real logic lives in
+# scripts/ and the Makefile, so `make ci` on a laptop runs the same steps.
+#
+# Linux jobs build musl static (-Dffi=false), matching the release assets
+# and the Docker image. Native glibc builds are dropped from CI: fetch
+# hangs on the ubuntu-latest/Azure kernel (see README "Known issues").
+name: CI
+
+permissions: {}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One CI run per ref; a new push cancels the stale run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tidy:
+    name: zig fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - run: zig fmt --check build.zig src/
+
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux default backend is io_uring; epoll stays as fallback.
+          # musl static: glibc fetch hangs on ubuntu-latest (Azure kernel),
+          # so glibc is out of CI until that is root-caused. FFI is off on
+          # musl (no system libffi); test/ffi.test.js self-skips, and macOS
+          # still covers FFI fully.
+          - name: linux-musl-io_uring
+            os: ubuntu-latest
+            flags: "-Dtarget=x86_64-linux-musl -Dffi=false"
+          - name: linux-musl-epoll
+            os: ubuntu-latest
+            flags: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+          # macOS backend is kqueue (native build, FFI enabled).
+          - name: macos
+            os: macos-latest
+            flags: ""
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.name }}-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.name }}-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast ${{ matrix.flags }}
+
+      - name: Zig unit tests
+        run: zig build test ${{ matrix.flags }}
+
+      - name: JS smoke tests
+        run: sh test/fixtures/build.sh && sh test/run.sh
+
+  postgres:
+    name: postgres integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fairyfly
+          POSTGRES_PASSWORD: fairyfly
+          POSTGRES_DB: fairyfly
+        ports:
+          - 5432:5432
+        # Same readiness gate as docker-compose.yml.
+        options: >-
+          --health-cmd="pg_isready -U fairyfly"
+          --health-interval=2s
+          --health-timeout=3s
+          --health-retries=20
+    env:
+      PG_TEST_DSN: postgres://fairyfly:fairyfly@localhost:5432/fairyfly
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-musl-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-musl-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - run: sh scripts/fetch-vendors.sh
+      - run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false
+      - run: sh test/fixtures/build.sh && sh test/run.sh
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: docker build -t fairyfly:ci .

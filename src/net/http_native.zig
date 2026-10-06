@@ -9,16 +9,17 @@ const builtin = @import("builtin");
 const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
 const http2_mod = @import("http2_server.zig");
-const response_mod = @import("../types/response.zig"); 
-const headers_mod = @import("../types/headers.zig"); 
-const gpa = std.heap.smp_allocator; 
+const response_mod = @import("../types/response.zig");
+const headers_mod = @import("../types/headers.zig");
+const gpa = std.heap.smp_allocator;
 
 // F3: the Debug req_counter (CountingAllocator) that used to wrap this
-// file's allocator is deleted. Nothing in this file allocates through it
-// (zero `gpa.` call sites) and the real per-request heap traffic — QuickJS
-// values plus types/response.zig via raw smp_allocator — bypasses it, so
-// `balanced=true` was vacuous false assurance. The meaningful per-job
-// counter lives in net/async_fetch.zig.
+// file's allocator was deleted: a process-wide counter only proved "allocs
+// matched frees", not "zero allocs per request" — vacuous false assurance.
+// The meaningful per-job counter lives in net/async_fetch.zig. Exception:
+// response bodies above BODY_BUF_SIZE still take a documented gpa spill in
+// stageLargeResponse (measured via stat_body_spill / stat_body_spill_reuse;
+// spills ≤ BODY_SPILL_RETAIN_MAX are retained on the slot across responses).
 
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 4096;
@@ -95,10 +96,16 @@ var body_source_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // get a 500 (JS body pointers are freed when callHandler returns, so the
 // whole body must be staged before the write pipeline starts).
 const BODY_BUF_SIZE = 64 * 1024;
+const BODY_SPILL_RETAIN_MAX = 256 * 1024; // retained-spill cap: bounds 512-slot worst case
 const MAX_BODY_SIZE = 10 * 1024 * 1024; //10 MB gate — matches fs.zig MAX_READ
 var body_bufs: [MAX_CONN][BODY_BUF_SIZE]u8 = undefined;
+// Retained across responses on the same slot; freed at closeConn/setupSlot
+// or at drain end when a spill exceeds BODY_SPILL_RETAIN_MAX.
 var body_heap: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN; // heap spill for >64KB
 var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+// Spill telemetry for the >64KB response path (mirrors async_fetch stat_*).
+pub var stat_body_spill: std.atomic.Value(u64) = .{ .raw = 0 };
+pub var stat_body_spill_reuse: std.atomic.Value(u64) = .{ .raw = 0 };
 // ── TLS (https/wss): per-slot BearSSL engine + bidirectional iobuf ──
 var tls_ctxs: [MAX_CONN]tls_mod.Ctx = undefined;
 var tls_iobufs: [MAX_CONN][tls_mod.IOBUF_LEN]u8 = undefined;
@@ -112,6 +119,10 @@ pub var slot_ids: [MAX_CONN]u16 = undefined;
 var slot_gen: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
 var parked_since_ms: [MAX_CONN]u64 = [_]u64{0} ** MAX_CONN;
 var promise_class_id: c.ClassID = 0;
+// Cached "then" atom for parkHandler: one JS_NewAtomLen per process instead
+// of one intern+release per parked async request. Process-lifetime, like
+// promise_class_id — never freed. // ◀ FIX-3
+var then_atom: c.Atom = 0; // ◀ FIX-3
 
 const HDR_MAX = 2048;
 const HANDLER_TIMEOUT_MS: u64 = 30_000;
@@ -341,7 +352,7 @@ fn appendUInt(w: []u8, pos: *usize, value: usize) void {
         }
         std.mem.reverse(u8, buf[0..n]);
     }
-    @memcpy(w[pos.* ..][0..n], buf[0..n]);
+    @memcpy(w[pos.*..][0..n], buf[0..n]);
     pos.* += n;
 }
 fn wantsBodyBytes(id: usize, status: u16) bool {
@@ -421,7 +432,6 @@ pub fn armWrite(id: usize, l: *xev.Loop) void {
         write_offsets[id] = 0;
         tls_mod.flush(&tls_ctxs[id]);
         const out = tls_mod.sendRecReady(&tls_ctxs[id]);
-
         if (out.len == 0) return;
         states[id] = .writing;
         fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
@@ -430,7 +440,6 @@ pub fn armWrite(id: usize, l: *xev.Loop) void {
     states[id] = .writing;
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
 }
-
 /// Drive the BearSSL engine. br_ssl_engine_current_state() returns a
 /// COMBINATION of bitmask flags (bearssl_ssl.h: BR_SSL_CLOSED=0x0001,
 /// SENDREC=0x0002, RECVREC=0x0004, SENDAPP=0x0008, RECVAPP=0x0010), so
@@ -524,9 +533,6 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     return @intCast(out);
 }
 
-
-
-
 fn nowMs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -546,18 +552,47 @@ fn printException(ctx: ?*c.Context, exc: c.Value) void {
     std.debug.print("[http] handler error: {s}\n", .{msg});
 }
 
+// Retained-spill gate: spills ≤ BODY_SPILL_RETAIN_MAX stay on the slot after
+// the drain so the next large response reuses them (free+dupe avoided);
+// larger spills are freed at drain end to bound memory.
+fn releaseSpillIfOversized(id: usize) void {
+    if (body_heap[id]) |old| {
+        if (old.len > BODY_SPILL_RETAIN_MAX) {
+            gpa.free(old);
+            body_heap[id] = null;
+        }
+    }
+}
+
 // DOD-FIX 3: chunked large-body write helper. The caller has already
 // formatted the header block into write_bufs[id] (write_lens[id] = header
 // length); writeCb drains WRITE_BUF_SIZE chunks from the staged body afterwards.
 // ≤64KB stages into static body_bufs (unchanged fast path);
-// >64KB spills to a per-slot heap buffer (cold path only).
+// >64KB spills to a per-slot heap buffer (measured via stat_body_spill /
+// stat_body_spill_reuse; retained while ≤ BODY_SPILL_RETAIN_MAX instead of
+// free+dupe per response).
 fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen: usize) void {
     write_lens[id] = header_len;
     write_offsets[id] = 0;
     if (blen <= BODY_BUF_SIZE) {
         @memcpy(body_bufs[id][0..blen], body_ptr[0..blen]);
     } else {
-        if (body_heap[id]) |old| gpa.free(old);
+        _ = stat_body_spill.fetchAdd(1, .release);
+        // Reuse capacity when the previous spill still fits: avoids a
+        // free+dupe cycle on every large response (body_lens tracks the
+        // logical length; the drain reads [body_source_off..][0..n]).
+        if (body_heap[id]) |old| {
+            if (old.len >= blen) {
+                _ = stat_body_spill_reuse.fetchAdd(1, .release);
+                @memcpy(old[0..blen], body_ptr[0..blen]);
+                body_lens[id] = blen;
+                body_remaining[id] = blen;
+                body_source_off[id] = 0;
+                return;
+            }
+            gpa.free(old);
+            body_heap[id] = null;
+        }
         body_heap[id] = gpa.dupe(u8, body_ptr[0..blen]) catch {
             buildResponse(id, 500, "Internal Server Error");
             return;
@@ -617,10 +652,11 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                 var size: usize = 0;
                 const p = c.getArrayBuffer(ctx, &size, body_out_val);
                 if (p != null and size > 0) {
-                    body_bytes = p[0..size];   
+                    body_bytes = p[0..size];
                     has_body = true;
                 }
-            }        }
+            }
+        }
     }
 
     const suppress = !wantsBodyBytes(id, status);
@@ -653,7 +689,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
             if (std.mem.indexOfAny(u8, p.name, "\r\n") != null or
                 std.mem.indexOfAny(u8, p.value, "\r\n") != null) continue;
             if (std.ascii.eqlIgnoreCase(p.name, "content-type")) seen_ct = true;
-            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break; 
+            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break;
             pushStr(w, &pos, p.name);
             pushStr(w, &pos, ": ");
             pushStr(w, &pos, p.value);
@@ -687,7 +723,6 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
         stageLargeResponse(id, pos, body_bytes.ptr, body_bytes.len);
     }
 }
-
 
 /// Claim a parked slot from a reaction's packed magic. Returns null when the
 /// connection was closed or the slot was reused (generation mismatch).
@@ -771,8 +806,10 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
         c.freeValue(ctx, exc);
         return false;
     }
-    const then_atom = c.newAtomLen(ctx, "then", 4);
-    defer c.freeAtom(ctx, then_atom);
+    // Cached process-lifetime "then" atom (setupStrings); lazy fallback if
+    // the server started without it. Atom 0 (newAtomLen OOM) → invoke throws,
+    // same failure mode as before. No per-park intern/release. // ◀ FIX-3
+    if (then_atom == 0) then_atom = c.newAtomLen(ctx, "then", 4); // ◀ FIX-3
     var then_argv = [_]c.Value{ ok_fn, err_fn };
     const then_result = c.invoke(ctx, promise, then_atom, 2, &then_argv);
     defer c.freeValue(ctx, then_result);
@@ -863,7 +900,6 @@ pub fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) vo
 
     stageHandlerResponse(id, result);
 }
-
 pub const ws_class_id_val: c.ClassID = 0;
 
 fn wsSocket(id: usize, ctx: ?*c.Context) ?c.Value {
@@ -959,7 +995,8 @@ pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     const buf = write_bufs[id][tail..];
     @memcpy(buf[ws.MAX_HDR..][0..bytes.len], bytes);
     const hlen = ws.buildHeader(buf, ws.OP_BINARY, true, bytes.len);
-    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..hlen], buf[ws.MAX_HDR..][0..hlen]);
+    // FIX: move bytes.len payload bytes (was hlen — corrupts non-10B headers).
+    if (hlen != ws.MAX_HDR) @memmove(buf[hlen..][0..bytes.len], buf[ws.MAX_HDR..][0..bytes.len]);
     write_lens[id] = tail + hlen + bytes.len;
     if (!cflags[id].ws_writing) wsKick(id);
 }
@@ -1038,7 +1075,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
             wsSendClose(id, 1009);
             return false;
         }
-    wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
+        wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
         @memcpy(ws_partial[id][0..payload.len], payload);
         ws_partial_len[id] = payload.len;
         return true;
@@ -1061,7 +1098,6 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 }
 
 fn wsConsume(id: usize, l: *xev.Loop) void {
-
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
         const hdr = ws.parseHeader(leftover) orelse break;
@@ -1161,7 +1197,10 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
 
 fn closeConn(id: usize) void {
     http2_mod.removeSession(id);
-    if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+    if (body_heap[id]) |old| {
+        gpa.free(old);
+        body_heap[id] = null;
+    } // ← FIX
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1255,7 +1294,10 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
-    if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+    if (body_heap[id]) |old| {
+        gpa.free(old);
+        body_heap[id] = null;
+    } // ← FIX
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1274,17 +1316,31 @@ fn acceptCb(
     _: *xev.Completion,
     r: xev.AcceptError!xev.TCP,
 ) xev.CallbackAction {
-    const first = r catch {
+    const first = r catch |err| {
+        // Never silently re-arm: a persistent accept failure with no log
+        // looks exactly like a backend stall (see io_uring accept-drain bug).
+        if (builtin.mode == .Debug)
+            std.debug.print("[http] accept error: {s} — re-arming\n", .{@errorName(err)});
         listener_tcp.accept(l, &accept_comp, void, null, acceptCb);
         return .disarm;
     };
-    var budget: usize = ACCEPT_BATCH;
-    if (setupSlot(l, first)) budget -= 1;
-    while (budget > 0) : (budget -= 1) {
-        const rc = std.c.accept(listener_tcp.fd, null, null);
-        if (std.posix.errno(rc) != .SUCCESS) break;
-        const fd: std.posix.socket_t = @intCast(rc);
-        if (!setupSlot(l, xev.TCP.initFd(fd))) break;
+    // DOD-FIX (io_uring stall): libxev creates io_uring sockets BLOCKING
+    // (watcher/tcp.zig: "On io_uring we don't use non-blocking sockets…"),
+    // so the raw batch drain below would block the event loop inside this
+    // callback when the backlog empties. On io_uring the accept SQE re-arm
+    // below is cheap (batched SQ submission) — one connection per completion.
+    // comptime gate: epoll/kqueue paths are byte-identical to before.
+    if (xev.backend != .io_uring) {
+        var budget: usize = ACCEPT_BATCH;
+        if (setupSlot(l, first)) budget -= 1;
+        while (budget > 0) : (budget -= 1) {
+            const rc = std.c.accept(listener_tcp.fd, null, null);
+            if (std.posix.errno(rc) != .SUCCESS) break;
+            const fd: std.posix.socket_t = @intCast(rc);
+            if (!setupSlot(l, xev.TCP.initFd(fd))) break;
+        }
+    } else {
+        _ = setupSlot(l, first);
     }
     listener_tcp.accept(l, &accept_comp, void, null, acceptCb);
     return .disarm;
@@ -1319,30 +1375,31 @@ fn readCb(
     processPlaintext(id, l);
     return .disarm;
 }
-
 /// HTTP/WS state machine over bytes in read_bufs[0..buf_lens]
 /// (plaintext for plain HTTP, decrypted app-data when TLS is active).
 fn processPlaintext(id: usize, l: *xev.Loop) void {
     // HTTP/2 path runs BEFORE the handler_parked early-return so multiplexed
     // streams keep flowing while one stream's promise is parked.
     if (cflags[id].h2_active) {
-        const used = http2_mod.onRecv(id, read_bufs[id][0..buf_lens[id]], l);
-        if (used == http2_mod.FATAL) {
-            closeConn(id);
-            return;
-        }
-        const rem = buf_lens[id] - used;
-        if (rem > 0) {
-            @memmove(read_bufs[id][0..rem], read_bufs[id][used..buf_lens[id]]);
-            buf_lens[id] = rem;
-            // Progress made: re-feed immediately. Otherwise (incomplete frame,
-            // nothing consumed) fall through and wait for more bytes.
-            if (used > 0) {
-                processPlaintext(id, l);
+        // B1 FIX: iterate instead of recursing (was: tail-call
+        // processPlaintext per consumed frame — stack grew ~16KB per
+        // frame in a burst; now bounded flat).
+        while (true) {
+            const used = http2_mod.onRecv(id, read_bufs[id][0..buf_lens[id]], l);
+            if (used == http2_mod.FATAL) {
+                closeConn(id);
                 return;
             }
-        } else {
-            buf_lens[id] = 0;
+            const rem = buf_lens[id] - used;
+            if (rem == 0) {
+                buf_lens[id] = 0;
+                break;
+            }
+            @memmove(read_bufs[id][0..rem], read_bufs[id][used..buf_lens[id]]);
+            buf_lens[id] = rem;
+            // Progress made: re-feed immediately. Otherwise (incomplete
+            // frame, nothing consumed) fall through and wait for more bytes.
+            if (used == 0) break;
         }
         states[id] = .reading;
         // NOTE: never tlsPump() here. pumpWrite (via onRecv's flushNow
@@ -1504,7 +1561,10 @@ pub fn writeCb(
             if (write_lens[id] == 0) {
                 const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
                 if (n > 0) {
-                    if (body_heap[id]) |hp| { // ← FIX
+                    // Source follows the staging predicate, NOT body_heap[id]:
+                    // retained spills outlive their response.
+                    if (body_lens[id] > BODY_BUF_SIZE) {
+                        const hp = body_heap[id].?;
                         @memcpy(write_bufs[id][0..n], hp[body_source_off[id]..][0..n]);
                     } else {
                         @memcpy(write_bufs[id][0..n], body_bufs[id][body_source_off[id]..][0..n]);
@@ -1514,7 +1574,7 @@ pub fn writeCb(
                     body_source_off[id] += n;
                     body_remaining[id] -= n;
                 } else {
-                    if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+                    releaseSpillIfOversized(id); // ← FIX: retain ≤ cap for reuse
                     body_lens[id] = 0;
                     body_remaining[id] = 0;
                     body_source_off[id] = 0;
@@ -1526,7 +1586,7 @@ pub fn writeCb(
             }
             if (cflags[id].keep_alive) {
                 states[id] = .reading;
-                keepAlivePreserve(id); 
+                keepAlivePreserve(id);
                 tlsPump(id, l);
             } else {
                 closeConn(id);
@@ -1543,7 +1603,7 @@ pub fn writeCb(
         }
         if (cflags[id].keep_alive) {
             states[id] = .reading;
-            keepAlivePreserve(id); 
+            keepAlivePreserve(id);
             tlsPump(id, l);
         } else {
             closeConn(id);
@@ -1588,13 +1648,11 @@ pub fn writeCb(
 
     write_offsets[id] += written;
 
-    
     if (body_lens[id] > 0) {
         if (write_offsets[id] >= write_lens[id]) {
-           
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
-                if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+                releaseSpillIfOversized(id); // ← FIX: retain ≤ cap for reuse
                 body_lens[id] = 0;
                 body_remaining[id] = 0;
                 body_source_off[id] = 0;
@@ -1607,7 +1665,9 @@ pub fn writeCb(
                 }
                 return .disarm;
             }
-            if (body_heap[id]) |hp| {
+            // Same rule as the TLS path above: staging predicate decides.
+            if (body_lens[id] > BODY_BUF_SIZE) {
+                const hp = body_heap[id].?;
                 @memcpy(write_bufs[id][0..n], hp[body_source_off[id]..][0..n]);
             } else {
                 @memcpy(write_bufs[id][0..n], body_bufs[id][body_source_off[id]..][0..n]);
@@ -1617,7 +1677,7 @@ pub fn writeCb(
             body_source_off[id] += n;
             body_remaining[id] -= n;
         }
-         if (write_offsets[id] < write_lens[id]) {
+        if (write_offsets[id] < write_lens[id]) {
             tcp.write(
                 l,
                 &write_comps[id],
@@ -1639,7 +1699,7 @@ pub fn writeCb(
     write_offsets[id] = 0;
     if (cflags[id].keep_alive) {
         write_lens[id] = 0;
-        keepAliveRearm(id, l); 
+        keepAliveRearm(id, l);
     } else {
         closeConn(id);
     }
@@ -1728,6 +1788,9 @@ pub fn setupStrings(ctx: ?*c.Context) void {
     defer c.freeValue(ctx, cap[0]);
     defer c.freeValue(ctx, cap[1]);
     if (c.isObject(p) != 0) promise_class_id = c.getClassID(p);
+    // Cache the "then" atom once (parkHandler reuses it; never freed,
+    // like promise_class_id). Guarded so a retried probe can't leak. // ◀ FIX-3
+    if (then_atom == 0) then_atom = c.newAtomLen(ctx, "then", 4); // ◀ FIX-3
 }
 
 // ── Regression test: classifyMethod must never read past the slice ──
@@ -1751,4 +1814,57 @@ test "classifyMethod covers all methods with exact-length slices" {
         const s: []const u8 = case[0];
         try std.testing.expectEqual(case[1], classifyMethod(s));
     }
+}
+
+// ── Regression test: spill reuse must not corrupt small-body sourcing ──
+// stageLargeResponse retains ≤256KB spills on the slot; the drain must pick
+// its source by staged length (body_lens > BODY_BUF_SIZE), never by
+// body_heap[id] != null (a retained spill outlives its response).
+test "stageLargeResponse retains spill for reuse and routes by length" {
+    const id: usize = 0;
+    const big_len = 100 * 1024;
+    const big1 = try gpa.alloc(u8, big_len);
+    defer gpa.free(big1);
+    @memset(big1, 'A');
+    const big2 = try gpa.alloc(u8, big_len);
+    defer gpa.free(big2);
+    @memset(big2, 'B');
+
+    const spill0 = stat_body_spill.load(.monotonic);
+    const reuse0 = stat_body_spill_reuse.load(.monotonic);
+
+    // 1. First large stage allocates a spill.
+    stageLargeResponse(id, 0, big1.ptr, big_len);
+    try std.testing.expect(body_heap[id] != null);
+    try std.testing.expectEqual(big_len, body_lens[id]);
+    try std.testing.expectEqual(spill0 + 1, stat_body_spill.load(.monotonic));
+
+    // 2. Same-slot large stage reuses — no second free+dupe.
+    stageLargeResponse(id, 0, big2.ptr, big_len);
+    try std.testing.expectEqual(reuse0 + 1, stat_body_spill_reuse.load(.monotonic));
+    try std.testing.expectEqualSlices(u8, big2, body_heap[id].?[0..big_len]);
+
+    // 3. Small body stages into body_bufs even though a spill is retained —
+    // body_lens proves the drain must read body_bufs, not the stale heap.
+    const small = "hello";
+    stageLargeResponse(id, 0, small.ptr, small.len);
+    try std.testing.expect(body_lens[id] <= BODY_BUF_SIZE);
+    try std.testing.expectEqualSlices(u8, small, body_bufs[id][0..small.len]);
+    try std.testing.expect(body_heap[id] != null); // still retained
+
+    // 4. Oversize gate: ≤ cap retained, > cap freed.
+    stageLargeResponse(id, 0, big1.ptr, big_len);
+    releaseSpillIfOversized(id);
+    try std.testing.expect(body_heap[id] != null);
+    const huge_len = BODY_SPILL_RETAIN_MAX + 1;
+    const huge = try gpa.alloc(u8, huge_len);
+    defer gpa.free(huge);
+    stageLargeResponse(id, 0, huge.ptr, huge_len);
+    releaseSpillIfOversized(id);
+    try std.testing.expect(body_heap[id] == null);
+
+    // Leave the slot clean for other tests.
+    body_lens[id] = 0;
+    body_remaining[id] = 0;
+    body_source_off[id] = 0;
 }

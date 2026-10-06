@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("../engine/engine.zig");
+const microtasks = @import("../event/microtasks.zig");
 const tls_server = @import("../net/tls_server.zig");
 const http_native = @import("../net/http_native.zig");
 const tls = @import("../net/tls.zig");
@@ -99,6 +100,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.event_loop.deinit();
         runtime.deinit();
     }
-    _ = runtime.evalModule(source, main_name_z);
+    if (!runtime.evalModule(source, main_name_z)) microtasks.had_error = true;
     runtime.event_loop.runWithMicrotasks(runtime.ctx);
+    if (microtasks.had_error) std.process.exit(1);
 }

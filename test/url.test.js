@@ -29,7 +29,10 @@ const s = new URL("https://example.com/x/y?q=1");
 s.pathname = "/z";
 check("set pathname", s.href === "https://example.com/z?q=1");
 s.search = "a=1&b=2";
-check("set search", s.searchParams.get("b") === "2" && s.href === "https://example.com/z?a=1&b=2");
+check(
+  "set search",
+  s.searchParams.get("b") === "2" && s.href === "https://example.com/z?a=1&b=2",
+);
 s.search = "";
 check("clear search", s.search === "" && s.href === "https://example.com/z");
 s.hash = "frag";

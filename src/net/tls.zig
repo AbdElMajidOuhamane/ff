@@ -12,7 +12,7 @@ const http = std.http;
 // (types/headers.zig: lowerAsciiSimd, net/http_native.zig: findHeaderEnd);
 // this module previously carried unused copies that have been removed.
 // ============================================================
-const Io =std.Io;
+const Io = std.Io;
 pub const MAX_CONN = 64;
 
 /// Hard bound on any single socket read/write on pooled connections: a
