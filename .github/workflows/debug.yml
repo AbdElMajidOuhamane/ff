@@ -86,3 +86,5 @@ jobs:
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false
       - name: Run http.test.js (60s cap)
         run: timeout 60 ./zig-out/bin/ff test/http.test.js --allow-ffi || echo "exit=$?"
+      - name: Run full smoke suite (musl verification)
+        run: timeout 300 sh test/fixtures/build.sh && timeout 300 sh test/run.sh || echo "exit=$?"
