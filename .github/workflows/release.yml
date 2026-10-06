@@ -50,8 +50,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Static musl binaries (same flags as the Dockerfile: no FFI,
-          # musl has no system libffi to link).
+          # Release binaries ship WITHOUT FFI on every platform:
+          # - Linux musl has no system libffi to link (same as Dockerfile).
+          # - Explicit-target macOS builds can't find system libffi
+          #   (native CI builds can; -Dtarget switches Zig off host SDK
+          #   paths). FFI stays tested via the CI macos job + source builds.
           - asset: ff-linux-x86_64
             runner: ubuntu-latest
             target: x86_64-linux-musl
@@ -69,12 +72,12 @@ jobs:
           - asset: ff-macos-aarch64
             runner: macos-latest
             target: aarch64-macos
-            extra: ""
+            extra: -Dffi=false
             smoke: true
           - asset: ff-macos-x86_64
             runner: macos-latest
             target: x86_64-macos
-            extra: ""
+            extra: -Dffi=false
             smoke: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -83,10 +86,6 @@ jobs:
         with:
           version: 0.16.0
           use-cache: false
-
-      - name: Install libffi (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libffi-dev
 
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
