@@ -1,0 +1,44 @@
+
+name: Debug hang
+permissions: {}
+on:
+  workflow_dispatch:
+concurrency:
+  group: debug-hang
+  cancel-in-progress: true
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev strace
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ hashFiles('build.zig.zon') }}
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+      - run: sh scripts/fetch-vendors.sh
+      - run: zig build -Doptimize=ReleaseFast
+      - name: Environment
+        run: |
+          uname -r
+          cat /proc/sys/kernel/io_uring_disabled || true
+          nproc; free -m | head -2; ulimit -a | head -20
+          env | grep -i -E "proxy|github|runner|ci" | sort || true
+      - name: External fetch probe (60s cap)
+        run: timeout 60 ./zig-out/bin/ff -e '(async () => { const r = await fetch("http://neverssl.com/"); console.log("EXT", r.status); process.exit(0); })()' || echo "exit=$?"
+      - name: Self fetch probe (60s cap)
+        run: timeout 60 ./zig-out/bin/ff -e '(async () => { http.serve({ port: 39991 }, () => ({ status: 200, body: "ok" })); const r = await fetch("http://127.0.0.1:39991/health"); console.log("SELF", r.status, await r.text()); process.exit(0); })()' || echo "exit=$?"
+      - name: strace the hanging smoke test (90s cap)
+        run: timeout 90 strace -f -e trace=%network -o /tmp/strace.log ./zig-out/bin/ff test/http.test.js --allow-ffi || echo "exit=$?"; tail -60 /tmp/strace.log
