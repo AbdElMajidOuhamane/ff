@@ -1,4 +1,4 @@
-.PHONY: build install uninstall
+.PHONY: build install uninstall fixtures test ci
 
 build:
 	zig build -Doptimize=ReleaseFast
@@ -14,10 +14,17 @@ install: build
 
 uninstall:
 	rm -f $(HOME)/.local/bin/ff
-	
-test: build
+
+# Builds the C fixture for test/ffi.test.js
+# (libaddon_probe.dylib on macOS, .so on Linux).
+fixtures:
+	sh test/fixtures/build.sh
+
+test: build fixtures
 	zig build test
 	sh test/run.sh
 
-ci: build
+# CI entrypoint: same steps the GitHub Actions CI jobs run.
+ci: build fixtures
+	zig build test
 	sh test/run.sh

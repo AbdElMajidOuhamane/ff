@@ -189,7 +189,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "xev", .module = b.addModule("xev-shim", .{
                     .root_source_file = b.path("src/xev.zig"),
                     .imports = &.{
-                        .{ .name = "xev-inner",
+                        .{
+                            .name = "xev-inner",
                             .module = b.dependency("libxev", .{}).module("xev"),
                         },
                         .{ .name = "ffcfg", .module = ffcfg_mod },

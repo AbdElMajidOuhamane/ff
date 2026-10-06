@@ -539,7 +539,7 @@ pub fn onWriteComplete(
     sess.out_sent += sess.out_chunk;
     sess.out_chunk = 0;
     return if (pumpWrite(slot_id, l)) .more_pending else .drained;
-}// ── Request dispatch ─────────────────────────────────────────────
+} // ── Request dispatch ─────────────────────────────────────────────
 
 /// Dispatch a completed stream to the JS handler. No-op if already
 /// dispatched (trailers) or incomplete.

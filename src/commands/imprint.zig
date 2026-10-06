@@ -63,7 +63,9 @@ const PkgArg = struct { name: []u8, ver: ?[]u8 };
 fn splitPkgArg(gpa: Alloc, arg: []const u8) !PkgArg {
     var at: ?usize = null;
     var i: usize = 1;
-    while (i < arg.len) : (i += 1) { if (arg[i] == '@') at = i; }
+    while (i < arg.len) : (i += 1) {
+        if (arg[i] == '@') at = i;
+    }
     if (at) |idx| {
         return .{ .name = try gpa.dupe(u8, arg[0..idx]), .ver = try gpa.dupe(u8, arg[idx + 1 ..]) };
     }
@@ -220,9 +222,7 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
     defer gpa.free(dest);
     const stage = try std.fmt.allocPrint(gpa, "/tmp/ff-stage-{s}", .{safe});
     defer gpa.free(stage);
-    const sh = try std.fmt.allocPrint(gpa,
-        "rm -rf {s} {s} && mkdir -p {s} {s} && tar -xzf {s} -C {s} --strip-components=1 && cp {s}/package.json {s}/",
-        .{ stage, dest, stage, dest, tmp, stage, stage, dest });
+    const sh = try std.fmt.allocPrint(gpa, "rm -rf {s} {s} && mkdir -p {s} {s} && tar -xzf {s} -C {s} --strip-components=1 && cp {s}/package.json {s}/", .{ stage, dest, stage, dest, tmp, stage, stage, dest });
     defer gpa.free(sh);
     try runCmd(io, &.{ "sh", "-c", sh });
     // Route 1: root ESM closure (fail loud), then each subpath entry
@@ -610,11 +610,12 @@ fn isJsFile(name: []const u8) bool {
 
 fn gateSource(path: []const u8, src: []const u8) !void {
     for ([_][]const u8{
-        "from \"node:", "from 'node:",
-        "from\"node:", "from'node:",
+        "from \"node:",    "from 'node:",
+        "from\"node:",     "from'node:",
         "from \"buffer\"", "from 'buffer'",
-        "from\"buffer\"", "from'buffer\"",
-        "require(", "module.exports", "exports.",
+        "from\"buffer\"",  "from'buffer\"",
+        "require(",        "module.exports",
+        "exports.",
     }) |needle| {
         if (std.mem.indexOf(u8, src, needle) != null) {
             std.debug.print("  REJECT {s}: needs {s} (pure-JS ESM only)\n", .{ path, needle });

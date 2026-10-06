@@ -352,7 +352,7 @@ fn appendUInt(w: []u8, pos: *usize, value: usize) void {
         }
         std.mem.reverse(u8, buf[0..n]);
     }
-    @memcpy(w[pos.* ..][0..n], buf[0..n]);
+    @memcpy(w[pos.*..][0..n], buf[0..n]);
     pos.* += n;
 }
 fn wantsBodyBytes(id: usize, status: u16) bool {
@@ -533,9 +533,6 @@ fn extractInt(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     return @intCast(out);
 }
 
-
-
-
 fn nowMs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
@@ -620,7 +617,6 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
         return;
     };
 
-
     var status: u16 = 200;
     var status_text: []const u8 = "";
     var body_bytes: []const u8 = "";
@@ -659,7 +655,8 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                     body_bytes = p[0..size];
                     has_body = true;
                 }
-            }        }
+            }
+        }
     }
 
     const suppress = !wantsBodyBytes(id, status);
@@ -726,7 +723,6 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
         stageLargeResponse(id, pos, body_bytes.ptr, body_bytes.len);
     }
 }
-
 
 /// Claim a parked slot from a reaction's packed magic. Returns null when the
 /// connection was closed or the slot was reused (generation mismatch).
@@ -1079,7 +1075,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
             wsSendClose(id, 1009);
             return false;
         }
-    wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
+        wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
         @memcpy(ws_partial[id][0..payload.len], payload);
         ws_partial_len[id] = payload.len;
         return true;
@@ -1201,7 +1197,10 @@ fn tryUpgrade(id: usize, l: *xev.Loop, kpos: usize, headers_end: usize, pr: *con
 
 fn closeConn(id: usize) void {
     http2_mod.removeSession(id);
-    if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+    if (body_heap[id]) |old| {
+        gpa.free(old);
+        body_heap[id] = null;
+    } // ← FIX
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1217,10 +1216,10 @@ fn closeConn(id: usize) void {
             states[id] = .closing;
             cflags[id].tls_close_after_write = true;
             const l = g_loop orelse {
-hardClose(id);
+                hardClose(id);
                 return;
             };
-                        fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
+            fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
             return;
         }
     }
@@ -1295,7 +1294,10 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
-    if (body_heap[id]) |old| { gpa.free(old); body_heap[id] = null; } // ← FIX
+    if (body_heap[id]) |old| {
+        gpa.free(old);
+        body_heap[id] = null;
+    } // ← FIX
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1646,10 +1648,8 @@ pub fn writeCb(
 
     write_offsets[id] += written;
 
-
     if (body_lens[id] > 0) {
         if (write_offsets[id] >= write_lens[id]) {
-
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
                 releaseSpillIfOversized(id); // ← FIX: retain ≤ cap for reuse
@@ -1677,34 +1677,34 @@ pub fn writeCb(
             body_source_off[id] += n;
             body_remaining[id] -= n;
         }
-          if (write_offsets[id] < write_lens[id]) {
-             tcp.write(
-                 l,
-                 &write_comps[id],
-                 .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] },
-                 u16,
-                 &slot_ids[id],
-                 writeCb,
-             );
-             return .disarm;
-         }
-         return .disarm;
-     }
+        if (write_offsets[id] < write_lens[id]) {
+            tcp.write(
+                l,
+                &write_comps[id],
+                .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] },
+                u16,
+                &slot_ids[id],
+                writeCb,
+            );
+            return .disarm;
+        }
+        return .disarm;
+    }
 
-     if (write_offsets[id] < write_lens[id]) {
-         tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
-         return .disarm;
-     }
+    if (write_offsets[id] < write_lens[id]) {
+        tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+        return .disarm;
+    }
 
-     write_offsets[id] = 0;
-     if (cflags[id].keep_alive) {
-         write_lens[id] = 0;
-         keepAliveRearm(id, l);
-     } else {
-         closeConn(id);
-     }
-     return .disarm;
- }
+    write_offsets[id] = 0;
+    if (cflags[id].keep_alive) {
+        write_lens[id] = 0;
+        keepAliveRearm(id, l);
+    } else {
+        closeConn(id);
+    }
+    return .disarm;
+}
 
 fn wsKick(id: usize) void {
     const l = g_loop orelse return;

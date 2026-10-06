@@ -559,8 +559,7 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
 
     if (argc > 0) {
         const init_val = argv[0];
-        if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) {
-        } else if (c.isObject(init_val) != 0) {
+        if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) {} else if (c.isObject(init_val) != 0) {
             if (c.getOpaque2(ctx, init_val, headers_class_id)) |ptr| {
                 const src: *HeadersData = @ptrCast(@alignCast(ptr));
                 data.reserve(src.len(), src.names.items.len, src.values.items.len);

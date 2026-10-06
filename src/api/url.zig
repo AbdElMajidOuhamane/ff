@@ -862,7 +862,7 @@ fn setUrlField(ctx: ?*c.Context, this_val: c.Value, field: UrlField, raw: []cons
     }
     const new_full = buf[0..n];
     const block = parseUrlAbsolute(new_full) catch return;
-    // repoint the existing searchParams JS object to the new block 
+    // repoint the existing searchParams JS object to the new block
     const sp_obj = c.getPropertyStr(ctx, this_val, "searchParams");
     defer c.freeValue(ctx, sp_obj);
     if (c.getOpaque2(ctx, sp_obj, sp_class_id) != null) {
@@ -1378,7 +1378,6 @@ pub fn setup(ctx: *c.Context) void {
             else
                 c.JS_UNDEFINED;
             _ = c.definePropertyGetSet(ctx, url_proto, c.newAtomLen(ctx, gs.name, std.mem.len(gs.name)), get_val, set_val, c.PROP_CONFIGURABLE | c.PROP_WRITABLE);
-           
         }
     }
 

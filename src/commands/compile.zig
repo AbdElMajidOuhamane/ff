@@ -47,16 +47,14 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
 
     const in_z = try allocator.dupeZ(u8, in_path);
     defer allocator.free(in_z);
-    const fn_obj = qjs.eval(runtime.ctx, src.ptr, src.len, in_z.ptr,
-        qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
+    const fn_obj = qjs.eval(runtime.ctx, src.ptr, src.len, in_z.ptr, qjs.EVAL_TYPE_MODULE | qjs.EVAL_FLAG_COMPILE_ONLY);
     defer qjs.freeValue(runtime.ctx, fn_obj);
     if (qjs.isException(fn_obj) != 0) {
         std.debug.print("compile error in '{s}'\n", .{in_path});
         return;
     }
     var size: usize = 0;
-    const buf = qjs.writeObject(runtime.ctx, &size, fn_obj,
-        qjs.WRITE_OBJ_BYTECODE | qjs.WRITE_OBJ_STRIP_SOURCE | qjs.WRITE_OBJ_STRIP_DEBUG);
+    const buf = qjs.writeObject(runtime.ctx, &size, fn_obj, qjs.WRITE_OBJ_BYTECODE | qjs.WRITE_OBJ_STRIP_SOURCE | qjs.WRITE_OBJ_STRIP_DEBUG);
     if (buf == null) {
         std.debug.print("compile: JS_WriteObject failed\n", .{});
         return;

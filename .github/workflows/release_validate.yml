@@ -1,0 +1,47 @@
+# Release (validate) — confirm published artifacts stay healthy.
+#
+# Runs after every Release, on a 6h schedule (catches bitrot from systems we
+# don't control), and manually. Requires at least one published release.
+name: "Release (validate)"
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+  schedule:
+    # Every six hours.
+    - cron: "0 */6 * * *"
+
+# Never validate while a release is publishing.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # Skip when triggered by a failed release run.
+    if: ${{ !(github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure') }}
+    steps:
+      - name: Check release assets
+        run: |
+          TAG="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)"
+          echo "latest release: $TAG"
+          for asset in ff-linux-x86_64 ff-linux-aarch64 ff-macos-x86_64 ff-macos-aarch64; do
+            url="https://github.com/${{ github.repository }}/releases/download/$TAG/$asset"
+            curl -fSL -o /dev/null "$url" && echo "OK $asset"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check published image
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ff"
+          docker run --rm "$IMAGE:latest" ff --version

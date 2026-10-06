@@ -53,7 +53,13 @@ pub fn dataFromJS(ctx: ?*c.Context, val: c.Value) ?*ResponseData {
 }
 
 pub const ResponseType = enum(u8) {
-    basic, cors, default, err, opaque_type, opaqueredirect, other,
+    basic,
+    cors,
+    default,
+    err,
+    opaque_type,
+    opaqueredirect,
+    other,
     pub fn fromSlice(s: []const u8) ResponseType {
         if (std.mem.eql(u8, s, "basic")) return .basic;
         if (std.mem.eql(u8, s, "cors")) return .cors;
@@ -65,9 +71,13 @@ pub const ResponseType = enum(u8) {
     }
     pub fn string(self: ResponseType) []const u8 {
         return switch (self) {
-            .basic => "basic", .cors => "cors", .default => "default",
-            .err => "error", .opaque_type => "opaque",
-            .opaqueredirect => "opaqueredirect", .other => unreachable,
+            .basic => "basic",
+            .cors => "cors",
+            .default => "default",
+            .err => "error",
+            .opaque_type => "opaque",
+            .opaqueredirect => "opaqueredirect",
+            .other => unreachable,
         };
     }
 };
@@ -362,7 +372,8 @@ fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
 }
 
 fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -377,7 +388,8 @@ fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_text = data.body() orelse "";
@@ -404,7 +416,8 @@ fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -419,7 +432,8 @@ fn responseArrayBuffer(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
 }
 
 fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -443,7 +457,8 @@ fn responseBlob(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 }
 
 fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -474,7 +489,8 @@ fn responseFormData(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
 }
 
 fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
     const body_bytes = data.body() orelse "";
@@ -489,7 +505,8 @@ fn responseBytes(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 }
 
 fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     // C1 FIX: pooled shell (was gpa.create per clone).
     const new_data = acquire() orelse return c.throwOutOfMemory(ctx);
@@ -559,7 +576,8 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
 }
 
 fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = argc; _ = argv;
+    _ = argc;
+    _ = argv;
     // C1 FIX: pooled shell (was gpa.create per call).
     const data = acquire() orelse return c.throwOutOfMemory(ctx);
     data.* = ResponseData.init();
@@ -595,14 +613,20 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
                 const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
                 data.setBodyOwned(owned);
             } else {
-                if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                if (c.hasException(ctx)) {
+                    const exc = c.getException(ctx);
+                    c.freeValue(ctx, exc);
+                }
                 var u8_size: usize = 0;
                 if (c.getUint8Array(ctx, &u8_size, body_val)) |u8_ptr| {
                     const bytes: []const u8 = if (u8_size == 0) "" else u8_ptr[0..u8_size];
                     const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
                     data.setBodyOwned(owned);
                 } else {
-                    if (c.hasException(ctx)) { const exc = c.getException(ctx); c.freeValue(ctx, exc); }
+                    if (c.hasException(ctx)) {
+                        const exc = c.getException(ctx);
+                        c.freeValue(ctx, exc);
+                    }
                     if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
                         defer owned.deinit();
                         data.setBody(owned.slice);

@@ -148,7 +148,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return c.JS_EXCEPTION;
     };
 
-        http_native.init(&loop_ptr.loop, port) catch |err| {
+    http_native.init(&loop_ptr.loop, port) catch |err| {
         std.debug.print("[http] FAILED: {}\n", .{err});
         throwTypeError(ctx, "failed to start server (is the port in use?)");
         return c.JS_EXCEPTION;

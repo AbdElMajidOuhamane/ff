@@ -1,0 +1,206 @@
+# Release — build versioned artifacts and publish them.
+#
+# Trigger: manually (workflow_dispatch with a `tag` input like v0.2.0) or by
+# pushing a v* tag.
+name: Release
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0). Binaries are built with -Dversion=<tag>."
+        required: true
+  push:
+    tags:
+      - "v*"
+
+# Never run two releases at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        run: |
+          TAG='${{ inputs.tag }}'
+          [ -n "$TAG" ] || TAG='${{ github.ref_name }}'
+          case "$TAG" in
+            v*) echo "tag=$TAG" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::tag must look like vX.Y.Z (got '$TAG')"; exit 1 ;;
+          esac
+
+  build:
+    needs: [check-tag]
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl binaries (same flags as the Dockerfile: no FFI,
+          # musl has no system libffi to link).
+          - asset: ff-linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-linux-musl
+            extra: -Dffi=false
+            smoke: true
+          - asset: ff-linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-musl
+            extra: -Dffi=false
+            smoke: true
+          # macOS: native arm64 + cross-compiled x86_64 (no Rosetta on the
+          # runner, so the x86_64 binary only gets a `file` check).
+          - asset: ff-macos-aarch64
+            runner: macos-latest
+            target: aarch64-macos
+            extra: ""
+            smoke: true
+          - asset: ff-macos-x86_64
+            runner: macos-latest
+            target: x86_64-macos
+            extra: ""
+            smoke: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Install libffi (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - run: sh scripts/fetch-vendors.sh
+
+      - name: Build release binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Dversion="$TAG"
+          cp zig-out/bin/ff "${{ matrix.asset }}"
+          if [ "${{ matrix.smoke }}" = "true" ]; then
+            ./"${{ matrix.asset }}" --version
+          else
+            file "${{ matrix.asset }}"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [check-tag, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        run: |
+          cd dist
+          sha256sum ff-* > sha256sums.txt
+          gh release create "$TAG" ff-* sha256sums.txt \
+            --title "$TAG" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    needs: [check-tag]
+    name: docker ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ff"
+          docker build -t "$IMAGE:$TAG-${{ matrix.arch }}" .
+          docker push "$IMAGE:$TAG-${{ matrix.arch }}"
+
+  docker-manifest:
+    needs: [check-tag, release, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish multi-arch tags
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ff"
+          docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+
+  # TigerBeetle-style failure alert. No-op unless you add a
+  # SLACK_RELEASE_WEBHOOK secret.
+  alert_failure:
+    needs: [check-tag, build, release, docker, docker-manifest]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TAG: ${{ needs.check-tag.outputs.tag }}
+    steps:
+      - name: Alert on release failure
+        run: |
+          [ -n "${{ secrets.SLACK_RELEASE_WEBHOOK }}" ] || { echo "no webhook configured, skipping"; exit 0; }
+          curl -fsSL -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Release $TAG failed: $URL\"}" \
+            "${{ secrets.SLACK_RELEASE_WEBHOOK }}"
+        env:
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

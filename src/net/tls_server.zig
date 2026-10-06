@@ -139,8 +139,14 @@ pub fn initServer(cert_pem: []const u8, key_pem: []const u8) InitError!void {
     var key_cursor: usize = 0;
     var key_der_buf: [8 * 1024]u8 = undefined;
     const kder = pemNextBlock(key_pem, "PRIVATE KEY", &key_cursor, &key_der_buf) orelse
-        blk: { key_cursor = 0; break :blk pemNextBlock(key_pem, "EC PRIVATE KEY", &key_cursor, &key_der_buf); } orelse
-        blk: { key_cursor = 0; break :blk pemNextBlock(key_pem, "RSA PRIVATE KEY", &key_cursor, &key_der_buf); } orelse
+        blk: {
+            key_cursor = 0;
+            break :blk pemNextBlock(key_pem, "EC PRIVATE KEY", &key_cursor, &key_der_buf);
+        } orelse
+        blk: {
+            key_cursor = 0;
+            break :blk pemNextBlock(key_pem, "RSA PRIVATE KEY", &key_cursor, &key_der_buf);
+        } orelse
         return error.BadPem;
 
     bssl.br_skey_decoder_init(&g_skey);

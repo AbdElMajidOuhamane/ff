@@ -878,7 +878,7 @@ fn handleAuth(conn: *Conn, l: *xev.Loop, payload: []const u8) !void {
             try queuePassword(conn, null);
             armWrite(conn, l);
         },
-                10, 11, 12 => {
+        10, 11, 12 => {
             if (code == 10) {
                 try beginScram(conn, payload[4..]);
                 armWrite(conn, l);

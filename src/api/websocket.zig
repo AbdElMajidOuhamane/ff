@@ -1,7 +1,7 @@
 const c = @import("../c.zig").c;
 const http_native = @import("../net/http_native.zig");
 const ws = @import("../net/ws_native.zig");
-const std =@import("std");
+const std = @import("std");
 
 pub var ws_class_id: c.ClassID = 0;
 

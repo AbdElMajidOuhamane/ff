@@ -1,6 +1,5 @@
 const std = @import("std");
 
-
 /// Frame types on the pipe. Payload for MESSAGE is a JSON string;
 /// payload for ERROR is a raw UTF-8 message (not JSON).
 pub const FRAME_MESSAGE: u8 = 1;
@@ -132,7 +131,6 @@ fn writeExact(fd: std.posix.fd_t, buf: []const u8) !void {
         off += @intCast(n);
     }
 }
-
 
 // A4 FIX: vectored-write twin of writeExact. iovec_const elements are
 // immutable, so advance (base, len) across partial writes on a mutable

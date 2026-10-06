@@ -1,6 +1,3 @@
-
-
-
 const std = @import("std");
 const c = @import("../c.zig").c;
 const ws_client = @import("../net/ws_client.zig");
@@ -177,7 +174,7 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
     var size: usize = 0;
     const p = c.getArrayBuffer(ctx, &size, arg);
     if (p != null and size > 0) {
-    ws_client.sendBytes(s, p[0..@min(size, ws.WS_MSG_SIZE)], true);
+        ws_client.sendBytes(s, p[0..@min(size, ws.WS_MSG_SIZE)], true);
         return c.JS_UNDEFINED;
     }
     // ArrayBufferView — try buffer property
@@ -195,7 +192,7 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
             defer c.freeValue(ctx, len_val);
             var view_len: i32 = 0;
             _ = c.toInt32(ctx, &view_len, len_val);
-           const start = @as(usize, @intCast(@max(offset, 0)));
+            const start = @as(usize, @intCast(@max(offset, 0)));
             const end = @min(start + @as(usize, @intCast(@max(view_len, 0))), size);
             if (end > start) ws_client.sendBytes(s, p2[start..end], true);
         }
@@ -217,15 +214,15 @@ fn wsClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) 
     var reason_buf: [123]u8 = undefined;
     if (argc >= 2) {
         if (c.isString(argv[1]) != 0) {
-    const cstr = c.toCString(ctx, argv[1]) orelse return c.JS_UNDEFINED;
-    defer c.freeCString(ctx, cstr);
-    const len = std.mem.len(cstr);
-    if (len > 0) {
-        const cap = @min(len, reason_buf.len);
-        @memcpy(reason_buf[0..cap], cstr[0..cap]);
-        reason = reason_buf[0..cap];
-    }
-}
+            const cstr = c.toCString(ctx, argv[1]) orelse return c.JS_UNDEFINED;
+            defer c.freeCString(ctx, cstr);
+            const len = std.mem.len(cstr);
+            if (len > 0) {
+                const cap = @min(len, reason_buf.len);
+                @memcpy(reason_buf[0..cap], cstr[0..cap]);
+                reason = reason_buf[0..cap];
+            }
+        }
     }
 
     // readyState -> CLOSING (2) immediately

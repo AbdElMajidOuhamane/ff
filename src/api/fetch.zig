@@ -50,13 +50,13 @@ fn extractRequestData(ctx: ?*c.Context, obj: c.Value) ?*request_mod.RequestData 
 }
 
 fn methodToken(comptime s: []const u8) u64 {
-    var buf = [_]u8{ 0 } ** 8;
+    var buf = [_]u8{0} ** 8;
     @memcpy(buf[0..s.len], s);
     return std.mem.readInt(u64, &buf, .little);
 }
 
 fn parseMethod(method_str: []const u8) http.Method {
-    var buf = [_]u8{ 0 } ** 8;
+    var buf = [_]u8{0} ** 8;
     const n = @min(method_str.len, 8);
     @memcpy(buf[0..n], method_str[0..n]);
     const w = std.mem.readInt(u64, &buf, .little);

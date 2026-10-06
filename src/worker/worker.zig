@@ -536,7 +536,7 @@ fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
     tls_tm = &tm;
     defer tls_tm = null;
 
-        // A4 FIX: drain queued frames per wake (was 1 frame per poll — N queued
+    // A4 FIX: drain queued frames per wake (was 1 frame per poll — N queued
     // frames cost N polls + N xev ticks), capped at 64 per wake so a message
     // flood can't starve timers/microtasks. EOF still breaks out (parent
     // closed its write end via terminate()).
@@ -553,8 +553,8 @@ fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
         }
         loop.run(.no_wait) catch {};
         microtasks.pumpMicrotasks(ctx);
-    }  
-           tm.cancelAll();
+    }
+    tm.cancelAll();
 }
 
 fn deliverToWorker(ctx: *qjs.Context, fr: port_mod.Frame) void {

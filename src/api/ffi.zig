@@ -101,21 +101,36 @@ const RTLD_NOW: c_int = 2;
 // ── Native type registry ──
 
 const FfiKind = enum {
-    i8_, u8_, i16_, u16_, i32_, u32_, i64_, u64_,
-    isize_, usize_, f32_, f64_, void_, pointer, buffer, cstring,
-    struct_, function_,
+    i8_,
+    u8_,
+    i16_,
+    u16_,
+    i32_,
+    u32_,
+    i64_,
+    u64_,
+    isize_,
+    usize_,
+    f32_,
+    f64_,
+    void_,
+    pointer,
+    buffer,
+    cstring,
+    struct_,
+    function_,
 };
 
 fn parseType(name: []const u8) ?FfiKind {
     const pairs = [_]struct { []const u8, FfiKind }{
-        .{ "i8", .i8_ },        .{ "u8", .u8_ },
-        .{ "i16", .i16_ },      .{ "u16", .u16_ },
-        .{ "i32", .i32_ },      .{ "u32", .u32_ },
-        .{ "i64", .i64_ },      .{ "u64", .u64_ },
-        .{ "isize", .isize_ },  .{ "usize", .usize_ },
-        .{ "f32", .f32_ },      .{ "f64", .f64_ },
-        .{ "void", .void_ },    .{ "pointer", .pointer },
-        .{ "buffer", .buffer }, .{ "cstring", .cstring },
+        .{ "i8", .i8_ },             .{ "u8", .u8_ },
+        .{ "i16", .i16_ },           .{ "u16", .u16_ },
+        .{ "i32", .i32_ },           .{ "u32", .u32_ },
+        .{ "i64", .i64_ },           .{ "u64", .u64_ },
+        .{ "isize", .isize_ },       .{ "usize", .usize_ },
+        .{ "f32", .f32_ },           .{ "f64", .f64_ },
+        .{ "void", .void_ },         .{ "pointer", .pointer },
+        .{ "buffer", .buffer },      .{ "cstring", .cstring },
         .{ "function", .function_ },
     };
     for (pairs) |p| {
@@ -227,8 +242,12 @@ fn makeStructDesc(names: []const []const u8, specs: []ArgSpec, is_union: bool) !
     };
     d.* = .{
         .fields = specs,
-        .offsets = &.{}, .names = &.{}, .elems = &.{},
-        .size = 0, .alignment = 1, .ffi_type = undefined,
+        .offsets = &.{},
+        .names = &.{},
+        .elems = &.{},
+        .size = 0,
+        .alignment = 1,
+        .ffi_type = undefined,
         .is_union = is_union,
     };
     errdefer freeStructDesc(d);
