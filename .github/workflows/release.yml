@@ -57,11 +57,13 @@ jobs:
             target: x86_64-linux-musl
             extra: -Dffi=false
             smoke: true
+          # linux-aarch64 is cross-compiled on x86_64 (no qemu on the
+          # runner, so it only gets a `file` check too).
           - asset: ff-linux-aarch64
             runner: ubuntu-latest
             target: aarch64-linux-musl
             extra: -Dffi=false
-            smoke: true
+            smoke: false
           # macOS: native arm64 + cross-compiled x86_64 (no Rosetta on the
           # runner, so the x86_64 binary only gets a `file` check).
           - asset: ff-macos-aarch64
@@ -100,7 +102,7 @@ jobs:
 
       - name: Build release binary
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Dversion="$TAG"
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Dversion="${TAG#v}"
           cp zig-out/bin/ff "${{ matrix.asset }}"
           if [ "${{ matrix.smoke }}" = "true" ]; then
             ./"${{ matrix.asset }}" --version
