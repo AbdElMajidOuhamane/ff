@@ -20,14 +20,16 @@ FF_CERT=cert.pem FF_KEY=key.pem ff start  # serve TLS without flags
 
 | Variable | Used by | Effect |
 |----------|---------|--------|
-| `FF_ECHO` | `ff <file>`, `ff start` | Any value (even empty string counts as set? no — must be non-empty… see below) enables canned `200 {"message":"ok"}` for every request |
+| `FF_ECHO` | `ff <file>`, `ff start` | Presence enables canned `200 {"message":"ok"}` for every request — any value, **including empty** |
 | `FF_CERT` | `ff start` | Fallback for `--cert`: PEM certificate path |
 | `FF_KEY` | `ff start` | Fallback for `--key`: PEM private key path |
 | `FF_CA_FILE` | runtime `fetch` / `WebSocket` client | Extra CA bundle trusted for outbound HTTPS/WSS |
 
 ### `FF_ECHO` — smoke mode
 
-Any non-empty value enables it. Every request gets `200 {"message":"ok"}` without running your handler:
+Any value enables it — the check is *"is the variable set?"*, so even
+`FF_ECHO=` (empty) counts. Every request gets `200 {"message":"ok"}`
+without running your handler:
 
 ```sh
 FF_ECHO=1 ff server.js
@@ -42,7 +44,9 @@ unset FF_ECHO
 ff server.js
 ```
 
-> **Note:** `FF_ECHO` is checked with "is set and non-empty". `FF_ECHO= ff server.js` (empty) does **not** enable it.
+> **Note:** Only *unsetting* disables echo mode. `FF_ECHO= ff server.js`
+> (empty value) **does** enable it; `FF_ECHO=0` also enables it (the
+> value is never inspected).
 
 ### `FF_CERT` / `FF_KEY` — TLS without flags
 
@@ -107,3 +111,5 @@ FF_CA_FILE=/etc/ssl/upstream-ca.pem ff start
 **`--ca` rejected by `ff start`** — expected. Use `FF_CA_FILE` with `ff start`; `--ca` works only with `ff <file>` and `ff -e`.
 
 **TLS didn't start with env set** — both `FF_CERT` and `FF_KEY` must be set, files must exist and be within size caps, and explicit `--cert`/`--key` flags override env.
+
+**Echo mode won't turn off** — `FF_ECHO=` (empty) and `FF_ECHO=0` both keep it on. `unset FF_ECHO` is the only way off.

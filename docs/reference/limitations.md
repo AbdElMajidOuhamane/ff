@@ -20,7 +20,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Bind address | Always `0.0.0.0` | No host option, no `FF_PORT` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
 | HTTP/2 | TLS + ALPN only (nghttp2) | Plain sockets stay HTTP/1.1 |
-| `FF_ECHO` | Any non-empty value set | Every request gets canned `200 {"message":"ok"}` |
+| `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
 
 ## Fetch (client)
 
@@ -64,13 +64,13 @@ queueMicrotask(fn);
 |------|-------|----------|
 | Path length | 4096 bytes | Longer paths fail |
 | Read per call | 10MB, sync | Larger reads fail |
-| API style | Sync only | No `fs.watch` — poll with timers |
+| API style | Sync + six `*Async` Promise variants (`readFileAsync`, `writeFileAsync`, `existsAsync`, `mkdirAsync`, `rmAsync`, `readdirAsync`) | No `fs.watch` — poll with timers |
 
 ## Console
 
-| Area | Limit | When hit |
-|------|-------|----------|
-| Arguments printed | First 2 per call | Extra arguments are dropped |
+| Area | Type | Description |
+|------|------|-------------|
+| Arguments printed | All per call | Every argument prints, joined with spaces |
 | Destination | stderr | `console.log > out.txt` captures nothing |
 
 ## Modules and language
@@ -78,7 +78,7 @@ queueMicrotask(fn);
 | Area | Limit | When hit |
 |------|-------|----------|
 | Module system | ESM only | No `require()`, no CommonJS |
-| Relative extensions | Use `"./x.js"` | Extensionless relative imports may fail |
+| Relative extensions | Optional for `.js` | `./x` probes `./x.js`, then `./x/index.js`; other extensions must be written out |
 | Bare specifiers | Resolved via `node_modules` | Needs `ff imprint` install first |
 | `Buffer` | Missing | Use `Uint8Array` |
 | DOM / `window` | Missing | Backend only |

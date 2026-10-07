@@ -43,10 +43,13 @@ ff -e 'console.log("hello from fairyfly")'
 # hello from fairyfly
 ```
 
-Runs the string as a script. Accepts `--ca` like `ff <file>`. Handy for smoke tests:
+Runs the string as a **classic script** — no top-level `await` (it's a
+`SyntaxError`; wrap in an async IIFE when you need `await`). Accepts
+`--ca` like `ff <file>`. Handy for smoke tests:
 
 ```sh
-ff -e 'const r = await fetch("https://example.com/"); console.log(r.status)'
+ff -e 'fetch("https://example.com/").then((r) => console.log(r.status))'
+ff -e '(async () => { const r = await fetch("https://example.com/"); console.log(r.status); })()'
 ```
 
 ## Scaffold a project
@@ -214,7 +217,7 @@ ff --version
 | Command | Purpose |
 |---------|---------|
 | `ff <file.js\|.ffbc> [--allow-ffi]` | Run a file (`--ca`, `--allow-ffi` optional) |
-| `ff -e <code> [--allow-ffi]` | Run inline JS (`--ca`, `--allow-ffi` optional) |
+| `ff -e <code> [--allow-ffi]` | Run inline JS as a classic script (`--ca`, `--allow-ffi` optional) |
 | `ff init [-y] [<dir>]` | Scaffold `ff.json` + entry file |
 | `ff start [--cert --key] [--allow-ffi]` | Run `main` from `ff.json` |
 | `ff imprint [pkg[@ver] …]` | Install pure-JS ESM deps |

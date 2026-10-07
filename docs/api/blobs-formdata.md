@@ -1,12 +1,12 @@
 ---
 title: Blob and FormData
 description: Binary payloads and HTML forms — construct, inspect, send, and parse them.
-order: 4
+order: 17
 ---
 
 # Blob and FormData
 
-`Blob` carries typed binary data; `FormData` carries multipart-style key/value fields (text or `Blob`s). Both are globals, both ride `fetch` bodies, and both come back out of `res.blob()` / `res.formData()`.
+`Blob` carries typed binary data; `FormData` carries multipart-style key/value fields (text or `Blob`s). Both are globals, and both come back out of `res.blob()` / `res.formData()`. Sending is a different story: `fetch` stringifies non-string bodies (see Known issue below), so only `string` (and `URLSearchParams`) payloads reach the wire intact.
 
 ## Quick look
 
@@ -26,6 +26,8 @@ console.log(res.status);
 ```sh
 ff upload.js
 ```
+
+> **Known issue:** that `body: form` does **not** send multipart data — `fetch` coerces the `FormData` with `String()`, so the server receives the literal text `"[object Object]"`. Build the payload as an explicit string (JSON, urlencoded, or a hand-built multipart body with a `content-type` header) until form/binary bodies are serialized natively.
 
 ## `Blob` reference
 
@@ -54,12 +56,14 @@ console.log((await b.bytes()).length); // 11
 
 > **Note:** There is no `blob.stream()`. Read with `text()` / `arrayBuffer()` / `bytes()`.
 
-Send one directly — `fetch` sets the content type from `blob.type`:
+> **Known issue:** a `Blob` body is stringified to `"[object Object]"`, not sent as bytes — and no `content-type` is inferred. Send the text yourself:
 
 ```js
+const blob = new Blob([json], { type: "application/json" });
 await fetch("https://api.example.com/raw", {
   method: "POST",
-  body: new Blob([json], { type: "application/json" }),
+  headers: { "content-type": blob.type },
+  body: await blob.text(),
 });
 ```
 
@@ -82,14 +86,14 @@ form.append("avatar", blob, "avatar.png");
 | `has(name)` | Presence check |
 | `delete(name)` | Remove the field |
 | `entries()` / `keys()` / `values()` / `forEach()` | Iterate |
-| `size` | Field count |
+| `size()` | Field count — a **method**, not a property (unlike `Blob.size`); call it |
 
 ```js
 form.get("name"); // "ada"
 form.getAll("tag"); // ["x", "y"]
 form.has("avatar"); // true
 form.delete("tag");
-form.size;
+form.size(); // 2
 form.forEach((value, key) => console.log(key, value));
 ```
 
@@ -113,16 +117,28 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 });
 ```
 
-Hmm — one wrinkle: the handler receives `body` as a string, and re-wrapping it in a `Request` re-parses it. That works for text fields but binary parts may not survive the string round-trip. Prefer parsing uploads from real `fetch`-delivered requests (proxies, tests) rather than the `(url, method, body)` string form:
+One wrinkle: the handler receives `body` as a string, and re-wrapping it in a `Request` re-parses it. Since `fetch` also sends strings as-is, build multipart (or urlencoded) payloads as explicit strings with a matching `content-type` header — `FormData` objects stringify to `"[object Object]"` instead:
 
 ```js
-// client side of the same server — binary-safe
-const form = new FormData();
-form.append("name", "ada");
-form.append("avatar", new Blob([new Uint8Array([1, 2, 3])], { type: "application/octet-stream" }), "a.bin");
-const res = await fetch("http://127.0.0.1:3000/upload", { method: "POST", body: form });
+// client side of the same server — multipart as an explicit string
+const boundary = "ff-boundary";
+const CRLF = "\r\n";
+const body =
+  `--${boundary}${CRLF}` +
+  `content-disposition: form-data; name="name"${CRLF}${CRLF}ada${CRLF}` +
+  `--${boundary}${CRLF}` +
+  `content-disposition: form-data; name="avatar"; filename="a.txt"${CRLF}` +
+  `content-type: text/plain${CRLF}${CRLF}abc${CRLF}` +
+  `--${boundary}--${CRLF}`;
+const res = await fetch("http://127.0.0.1:3000/upload", {
+  method: "POST",
+  headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+  body,
+});
 console.log(await res.json()); // { name: "ada", avatarBytes: 3 }
 ```
+
+Binary parts may not survive the handler's string round-trip — prefer base64 text for binary uploads.
 
 ## Practical example: file drop endpoint
 
@@ -149,10 +165,10 @@ curl -X POST http://127.0.0.1:3000/drop --data-binary @photo.png
 
 ## Troubleshooting
 
-**`get("field")` returns null** — the field name is misspelled (names are exact, case-sensitive) or the request wasn't multipart/urlencoded at all. Check `form.has(name)` and `form.size` first.
+**`get("field")` returns null** — the field name is misspelled (names are exact, case-sensitive) or the request wasn't multipart/urlencoded at all. Check `form.has(name)` and `form.size()` first.
 
 **Binary corrupted through the handler** — the `(url, method, body)` handler form stringifies bodies. Keep binary uploads on paths served to real `fetch` clients, or accept base64 text and decode server-side.
 
 **`X is not a function` on `blob.stream()`** — doesn't exist. Use `text()` / `arrayBuffer()` / `bytes()`.
 
-**Server rejects a 5MB upload** — the 64KB response/request staging caps still apply. Chunk large uploads across requests.
+**Server rejects an upload over ~4KB with `413`** — the whole request (headers + body) must fit in a single 4 KB read buffer. Responses are the roomy side: bodies up to 10 MB (a 64 KB stage buffer spills to the heap past that). Chunk large uploads across requests.

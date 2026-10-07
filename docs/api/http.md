@@ -1,7 +1,7 @@
 ---
 title: http API
 description: http.serve reference — signatures, options, handler contract, and helpers.
-order: 1
+order: 16
 ---
 
 # `http` API
@@ -66,7 +66,11 @@ http.serve(
 | `websocket.message` | `(socket, data) => void` | none | Fires per frame; `data` is a string (text) or `Uint8Array` (binary) |
 | `websocket.close` | `(socket) => void` | none | Fires when a client disconnects |
 
-When the `websocket` block is present, upgrade is triggered by the `Sec-WebSocket-Key` header. On the WebSocket path your handler must return `{ status: 101 }`:
+When the `websocket` block is present, any request carrying
+`Connection: Upgrade`, `Upgrade: websocket`, and `Sec-WebSocket-Key` is
+upgraded **before your handler runs** — the handler never sees that
+request, and no `{ status: 101 }` branch is needed (a handler that would
+return 404 still gets the `101`). The handler serves plain HTTP only:
 
 ```js
 // server.js
@@ -79,10 +83,7 @@ http.serve(
       close: (socket) => console.log("bye"),
     },
   },
-  (url, method, body) => {
-    if (url === "/ws") return { status: 101 };
-    return new Response("http here, ws on /ws");
-  },
+  (url, method, body) => new Response("http here, ws upgrades on this port"),
 );
 ```
 
@@ -95,7 +96,7 @@ The handler is called as `(url, method, body)` — all three are strings:
 | Argument | Type | Example |
 |----------|------|---------|
 | `url` | `string` | `"/greet?name=ada"` (path + query) |
-| `method` | `string` | `"GET"`, `"POST"` |
+| `method` | `string` | `"GET"`, `"POST"` — exactly as the client sent it (`curl -X post` yields `"post"`); normalize case before comparing |
 | `body` | `string` | Request text, `""` when none |
 
 Return one of:
@@ -125,15 +126,15 @@ return new Response("text");                          // 200 text/plain by defau
 return new Response("missing", { status: 404 });      // custom status
 return Response.json({ hello: "world" });             // JSON + content-type, optional init
 return Response.json({ id: 1 }, { status: 201 });     // with status
-return Response.redirect("/new-path");                // 302 redirect
-return Response.redirect("/moved", 301);              // redirect with status
+return Response.redirect("/new-path");                // 302 status only — no Location header
+return Response.redirect("/moved", 301);              // 301 status only — no Location header
 ```
 
 | Helper | Signature | Notes |
 |--------|-----------|-------|
 | `new Response(body, init?)` | `body`: `string \| ArrayBuffer \| null`; `init`: `{ status?, headers? }` | Default `content-type` is `text/plain` when the body has none |
 | `Response.json(data, init?)` | any JSON-serializable `data` | Sets `content-type: application/json` |
-| `Response.redirect(url, status?)` | redirect target + status (default 302) | Follows the standard redirect semantics |
+| `Response.redirect(url, status?)` | redirect target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | — | Status `0`, type `"error"` (fetch-network-error shape) |
 
 Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Each body reads once (`bodyUsed` goes `true`).
@@ -146,8 +147,10 @@ h.get("content-type"); // "text/html"
 h.set("x-id", "1");
 h.append("x-id", "2");
 h.getAll("x-id");      // ["1", "2"]
-h.has("x-id"); h.delete("x-id");
-h.entries(); h.keys(); h.values(); h.forEach((v, k) => {});
+h.has("x-id");         // true
+h.delete("x-id");
+h.entries(); h.keys(); h.values();
+h.forEach((value, key) => console.log(key, value));
 ```
 
 ## Full example
@@ -171,17 +174,17 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```sh
 ff server.js
 curl http://127.0.0.1:3000/json        # {"ok":true}
-curl -i http://127.0.0.1:3000/old      # 301 to /json
+curl -i http://127.0.0.1:3000/old      # 301 without Location (clients won't follow)
 curl -X POST http://127.0.0.1:3000/echo -d hi  # hi
 ```
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 64KB max response body, 30s handler watchdog (→ `504`), plain listeners speak HTTP/1.1 (HTTP/2 needs TLS).
+Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s handler watchdog (→ `504`), plain listeners speak HTTP/1.1 (HTTP/2 needs TLS).
 
 ## See also
 
-- [HTTP Server guide](/guides/http-server) — tutorial version of this page
-- [WebSocket guide](/guides/websocket) — `send` / `sendBinary` patterns
-- [TLS guide](/guides/tls) — `tls: { cert, key }` in depth
-- [Limitations](/reference/limitations) — every hard cap
+- [HTTP Server guide](/docs/guides/http-server) — tutorial version of this page
+- [WebSocket guide](/docs/guides/websocket) — `send` / `sendBinary` patterns
+- [TLS guide](/docs/guides/tls) — `tls: { cert, key }` in depth
+- [Limitations](/docs/reference/limitations) — every hard cap

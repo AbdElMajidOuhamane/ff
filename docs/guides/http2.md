@@ -64,7 +64,7 @@ Unchanged — write handlers exactly like the HTTP Server guide:
 
 - Handler signature `(url, method, body)` → `Response | { status, body } | Promise<…>`.
 - `Response.json` / `redirect` / statics, `Headers`, status codes — all identical.
-- Limits still apply: 512 connections, 64KB response body, 30s watchdog.
+- Limits still apply: 512 connections, 10 MB response body (64 KB stage buffer spills to the heap), 30s watchdog.
 - WebSocket upgrades ride the HTTP/1.1 connections on the same port; `h2` connections serve normal requests.
 
 What you get from the protocol (handled by nghttp2, not your code):
@@ -122,4 +122,4 @@ Behind a platform load balancer that terminates TLS, skip `tls` entirely and ser
 
 **Outbound fetch to an h2-only host fails** — expected: no HTTP/2 client. Proxy through an HTTP/1.1 endpoint or pick a host that still negotiates 1.1.
 
-**WebSocket over the TLS port broke after enabling `tls`** — nothing about WS changed; upgrades still happen on HTTP/1.1 connections to the same port. Check the handler still returns `{ status: 101 }` on the WS path and the client uses `wss://`.
+**WebSocket over the TLS port broke after enabling `tls`** — nothing about WS changed; upgrades still happen on HTTP/1.1 connections to the same port. Check the `websocket` block is present (the upgrade is automatic — no handler branch) and the client uses `wss://`.

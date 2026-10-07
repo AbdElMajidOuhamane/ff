@@ -6,7 +6,7 @@ order: 12
 
 # Modules
 
-Every file runs as an ES module. `import` is the only loader — there is no `require()`, no CommonJS, and no URL imports. Three specifier shapes resolve: relative (`./`, `../`), absolute (`/`), and bare (`lodash`).
+A file containing `import`/`export` runs as an ES module; a plain file runs as a classic script (and `ff -e` code is a classic script too — no top-level `await` there). `import` is the only loader — there is no `require()`, no CommonJS, and no URL imports. Three specifier shapes resolve: relative (`./`, `../`), absolute (`/`), and bare (`lodash`).
 
 ## Quick look
 
@@ -33,7 +33,7 @@ ff main.js
 # <h1>hi</h1>
 ```
 
-Top-level `await` works in every module — no async wrapper needed:
+Top-level `await` works in every **module** — no async wrapper needed:
 
 ```js
 const res = await fetch("https://example.com/");
@@ -42,15 +42,20 @@ console.log(res.status);
 
 ## Relative imports: `./` and `../`
 
-Joined onto the importer's directory and loaded **literally** — no extension probing, no directory index:
+Joined onto the importer's directory. An extensionless specifier probes
+`X.js`, then `X/index.js`; anything written with an extension loads
+literally:
 
 ```js
 import { router } from "./router.js";     // ./router.js
+import { legacy } from "./legacy";        // probes ./legacy.js, then ./legacy/index.js
 import { check } from "./lib.mjs";        // .mjs works too — any literal name
 import { db } from "../shared/db.js";     // up one, then down
 ```
 
-> **Caution:** Always write the extension. `import "./router"` looks for a file literally named `router` — it will not try `router.js`. This is the single most common import failure.
+> **Note:** The probe only tries `X.js` and `X/index.js` — other
+> extensions (`.mjs`, `.json`, …) must be written out. If neither probe
+> hits, the loader error names `X.js`.
 
 `..` segments normalize against the importer dir (`./a/../b.js` → `./b.js`); escaping past the filesystem root resolves to the joined remainder and fails to load.
 
@@ -148,7 +153,8 @@ curl http://127.0.0.1:3000/api/products  # JSON
 
 | Specifier | Resolves to |
 |-----------|-------------|
-| `./x.js`, `../x.js` | Literal join onto importer dir — extension mandatory |
+| `./x.js`, `../x.js` | Literal join onto importer dir |
+| `./x` (extensionless) | Probes `./x.js`, then `./x/index.js` |
 | `pkg`, `pkg/sub` | `node_modules` walk-up via exports → module → main → passthrough → index.js |
 | `@scope/pkg` (+ `/sub`) | Same, with scoped directory handling |
 | `/abs/path.js` | Literal filesystem path |
@@ -158,7 +164,7 @@ curl http://127.0.0.1:3000/api/products  # JSON
 
 **`could not load module filename '…'`** — the specifier resolved to a path with no file. For relative imports: check the spelling and the extension. For bare imports: run `ff imprint <pkg>` and confirm `node_modules/<pkg>` exists from the importer's directory upward.
 
-**Extensionless relative import fails** — by design, no probing. Add `.js` (or `.mjs`).
+**Extensionless relative import fails** — the probe only tries `X.js` and `X/index.js`. For `.mjs` (or any other extension), write it out.
 
 **`require is not defined`** — ESM only. Convert to `import`, or pick an ESM package.
 

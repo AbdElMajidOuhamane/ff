@@ -36,15 +36,16 @@ Everything ships in a single binary. No `npm install` needed for core features.
 | Workers | Up to 8 threads, cooperative concurrency |
 | Fetch | Outbound HTTP client with async support |
 | Crypto | randomUUID, getRandomValues, subtle.digest |
-| File System | Sync read, write, mkdir, rm, readdir |
+| File System | Sync read, write, mkdir, rm, readdir (+ `*Async` variants) |
 | Timers | setTimeout, setInterval, queueMicrotask |
 | URL | Full WHATWG URL API |
 
 ## Three rules
 
-### Rule 1: ESM only, extensions mandatory
+### Rule 1: ESM only, extensions optional
 
-Every import must include the `.js` extension.
+Imports are ESM (there is no `require`). A relative specifier may omit
+the `.js` extension — the loader then probes `X.js`, then `X/index.js`:
 
 ```js
 // math.js
@@ -53,9 +54,11 @@ export function add(a, b) {
 }
 
 // main.js
-import { add } from "./math.js";
+import { add } from "./math.js";   // "./math" works too
 console.log(add(2, 3)); // 5
 ```
+
+Non-`.js` extensions (`.mjs`, …) are **not** probed — write those out.
 
 Bare specifiers like `import "lodash"` resolve by walking up `node_modules/` directories, but only pure-JS ESM packages work.
 
