@@ -6,6 +6,16 @@ order: 3
 
 # Quickstart
 
+## Install (once)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.sh | sh
+```
+
+Prebuilt for macOS (Apple silicon / Intel) and Linux (x86_64 / ARM64),
+SHA-256 verified, installs to `~/.local/bin/ff`. Docker and source builds:
+[Installation](/docs/getting-started/installation).
+
 ## Run a file
 
 Create `hello.js`:

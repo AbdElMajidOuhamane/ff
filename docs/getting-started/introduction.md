@@ -6,7 +6,7 @@ description: What Fairyfly is, when to use it, and the three rules every develop
 
 # Introduction
 
-Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS. It runs on a single OS thread with an event loop powered by xev (epoll on Linux, kqueue on macOS).
+Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS. It runs on a single OS thread with an event loop powered by libxev (io_uring on Linux by default, epoll fallback, kqueue on macOS).
 
 > 138k req/sec · 0.66ms p50 · 5MB RSS on Apple silicon
 
@@ -14,7 +14,7 @@ Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS.
 
 - Cold start matters (CLI tools, edge functions, short-lived jobs)
 - Memory is capped (strict container limits)
-- You want the whole runtime to fit in your head (under 10k lines of Zig)
+- You want the whole runtime to fit in your head (~24k lines of Zig across 54 files)
 
 ## When NOT to use Fairyfly
 

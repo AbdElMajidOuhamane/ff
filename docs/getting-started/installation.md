@@ -1,21 +1,49 @@
 ---
 title: Installation
-description: Build Fairyfly from source with Zig, install it on PATH, or use Docker.
+description: Install the prebuilt binary with curl, build from source with Zig, or use Docker.
 order: 2
 ---
 
 # Installation
 
-Build from source with Zig, or run the prebuilt binary in Docker.
+Install the prebuilt binary in one line, build from source with Zig, or run it in Docker.
+
+## Quick install
+
+macOS (Apple silicon / Intel) and Linux (x86_64 / ARM64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.sh | sh
+```
+
+The installer detects your OS and architecture, downloads the matching binary
+from the latest GitHub release, verifies its SHA-256 checksum, and installs to
+`~/.local/bin/ff`. If `~/.local/bin` isn't on your `PATH`, it prints the
+`export` line to add. Update anytime with:
+
+```sh
+ff upgrade
+```
+
+| Platform | Asset |
+|---|---|
+| macOS (Apple silicon) | `ff-macos-aarch64` |
+| macOS (Intel) | `ff-macos-x86_64` |
+| Linux (x86_64) | `ff-linux-x86_64` |
+| Linux (ARM64) | `ff-linux-aarch64` |
+
+Prefer containers? `docker pull ghcr.io/abdelmjidouhamane/ff:latest`.
+
+The rest of this page covers Docker and building from source.
 
 ## Prerequisites
 
 | Tool | Why | Where |
 |------|-----|-------|
-| **Zig 0.16** | Compiler — the only hard requirement | [ziglang.org/download](https://ziglang.org/download/) |
+| **Zig 0.16** | Compiler — the only hard requirement for source builds | [ziglang.org/download](https://ziglang.org/download/) |
 | **Make** | `build` / `install` / `test` shortcuts | macOS: Xcode CLT (`xcode-select --install`); Linux: `build-essential` |
 | **Git** | Clone the repo | any package manager |
-| **curl** | Only for `ff upgrade` | any package manager |
+| **curl** | Quick install and `ff upgrade` | any package manager |
 
 Check Zig first — Fairyfly requires 0.16:
 
@@ -26,9 +54,13 @@ zig version
 
 ## Build from source
 
+The vendors (QuickJS, BearSSL, SQLite, nghttp2) are gitignored — fetch them
+first (pinned versions, SHA-256 verified), then build:
+
 ```sh
 git clone <repo-url>
 cd fairyfly
+./scripts/fetch-vendors.sh
 make build
 ```
 
@@ -114,8 +146,9 @@ The listen port is set in code via `http.serve({ port })` (default `3000`), not 
 | `make build` | `zig build -Doptimize=ReleaseFast` |
 | `make install` | Build + copy to `~/.local/bin/ff` |
 | `make uninstall` | Delete `~/.local/bin/ff` |
-| `make test` | Build + `zig build test` + `test/run.sh` |
-| `make ci` | Build + `test/run.sh` |
+| `make fixtures` | Build the C fixture for `test/ffi.test.js` |
+| `make test` | Build + fixtures + `zig build test` + `test/run.sh` |
+| `make ci` | Same steps as `make test` (the CI entrypoint) |
 
 ## Troubleshooting
 
@@ -125,6 +158,6 @@ The listen port is set in code via `http.serve({ port })` (default `3000`), not 
 
 **`ff: command not found` after `make install`** — `~/.local/bin` isn't on `PATH`. Add the export shown by Make, then open a new shell.
 
-**Permission denied** — prefer `make install` (user-local). Don't `sudo` anything; this project doesn't ship a system-install path.
+**Permission denied** — prefer `make install` (user-local). Don't `sudo` anything; this project has no system-install path.
 
 **Docker: connection refused** — confirm `http.serve({ port })` matches the `-p` mapping and the handler is actually registered (try `FF_ECHO=1` smoke mode first).

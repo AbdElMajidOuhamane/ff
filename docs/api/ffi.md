@@ -22,6 +22,11 @@ ff test --allow-ffi
 
 Without the flag, `ffi.dlopen` throws and `ffi.allowed` is `false`.
 
+> **Prebuilt binaries ship without FFI.** Release binaries and the GHCR image
+> are built with `-Dffi=false`, so `ffi.dlopen` throws
+> `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` even with
+> `--allow-ffi`. FFI works out of the box in source builds (the default).
+
 ## Quick look
 
 ```js

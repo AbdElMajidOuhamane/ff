@@ -225,7 +225,7 @@ await fetch("https://api.example.com/submit", { method: "POST", body: form });
 ## Deploy checklist
 
 ```sh
-make build && make install
+./scripts/fetch-vendors.sh && make build && make install
 FF_ECHO=1 ff start & curl -i http://127.0.0.1:3000/health; kill %1
 ff start
 ```

@@ -6,11 +6,16 @@ order: 7
 
 # Deploy
 
-A deploy is: build the binary, get your code on the box, start it with `ff start` (or `ff server.js`), and verify with `FF_ECHO` before opening traffic.
+A deploy is: get the binary — prebuilt with `curl -fsSL …/install.sh | sh`
+(see [Installation](/docs/getting-started/installation)), pull
+`ghcr.io/abdelmjidouhamane/ff:latest`, or build from source (below) — get your
+code on the box, start it with `ff start` (or `ff server.js`), and verify with
+`FF_ECHO` before opening traffic.
 
 ## Quick look
 
 ```sh
+./scripts/fetch-vendors.sh   # first run only — vendors are gitignored
 make build
 ./zig-out/bin/ff start
 ```
@@ -24,6 +29,7 @@ curl http://127.0.0.1:3000/
 ```sh
 git clone <repo-url>
 cd fairyfly
+./scripts/fetch-vendors.sh   # pinned vendors, SHA-256 verified
 make build          # zig build -Doptimize=ReleaseFast -> ./zig-out/bin/ff
 make install        # copy to ~/.local/bin/ff
 ```

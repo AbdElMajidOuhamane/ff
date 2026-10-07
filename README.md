@@ -2,6 +2,10 @@
 
 # Fairyfly Runtime
 
+[![CI](https://github.com/AbdElMajidOuhamane/ff/actions/workflows/ci.yml/badge.svg)](https://github.com/AbdElMajidOuhamane/ff/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AbdElMajidOuhamane/ff)](https://github.com/AbdElMajidOuhamane/ff/releases/latest)
+[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
+
 A lightweight, backend-focused JavaScript runtime built with Zig and powered by
 [QuickJS](https://bellard.org/quickjs/). Designed for fast startup, low memory,
 and a small readable codebase.
@@ -15,23 +19,24 @@ and a small readable codebase.
 ## Contents
 
 1. [Documentation](#documentation)
-2. [Why Fairyfly](#why-fairyfly)
-3. [Quick start](#quick-start)
-4. [Core concepts](#core-concepts)
-5. [Tutorials](#tutorials)
-6. [Built-in API reference](#built-in-api-reference)
-7. [Performance](#performance)
-8. [Architecture](#architecture)
-9. [Building from source](#building-from-source)
-10. [CLI reference](#cli-reference)
-11. [Limitations vs Node / browser](#limitations-vs-node--browser)
-12. [License](#license)
+2. [Installation](#installation)
+3. [Why Fairyfly](#why-fairyfly)
+4. [Quick start](#quick-start)
+5. [Core concepts](#core-concepts)
+6. [Tutorials](#tutorials)
+7. [Built-in API reference](#built-in-api-reference)
+8. [Performance](#performance)
+9. [Architecture](#architecture)
+10. [Building from source](#building-from-source)
+11. [CLI reference](#cli-reference)
+12. [Limitations vs Node / browser](#limitations-vs-node--browser)
+13. [License](#license)
 
 ---
 
 ## Documentation
 
-The full guide set lives in [`docs/`](docs/index.md) — 28 pages covering
+The full guide set lives in [`docs/`](docs/index.md) — 29 pages covering
 everything this README summarizes.
 
 | Section | Contents |
@@ -43,6 +48,45 @@ everything this README summarizes.
 
 ---
 
+## Installation
+
+### Prebuilt binary (macOS and Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.sh | sh
+```
+
+One command works on every supported platform — it detects your OS and
+architecture, downloads the matching binary from the latest GitHub release,
+verifies its SHA-256 checksum, and installs to `~/.local/bin/ff`:
+
+| Platform | Asset |
+|---|---|
+| macOS (Apple silicon) | `ff-macos-aarch64` |
+| macOS (Intel) | `ff-macos-x86_64` |
+| Linux (x86_64) | `ff-linux-x86_64` |
+| Linux (ARM64) | `ff-linux-aarch64` |
+
+If `~/.local/bin` isn't on your `PATH`, the installer prints the `export` line
+to add to your shell profile. Update anytime with:
+
+```sh
+ff upgrade
+```
+
+### Docker
+
+```sh
+docker pull ghcr.io/abdelmjidouhamane/ff:latest
+docker run --rm ghcr.io/abdelmjidouhamane/ff:latest ff --version
+```
+
+### From source
+
+See [Building from source](#building-from-source).
+
+---
+
 ## Why Fairyfly
 
 Modern backend development doesn't need a 50 MB runtime to start. Fairyfly is
@@ -50,7 +94,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~20k lines of Zig across 54 files
+- **The whole codebase should fit in your head** — ~24k lines of Zig across 54 files
 
 It's *not* aimed at:
 
@@ -65,17 +109,15 @@ runtime that's small, fast, and auditable, Fairyfly fits.
 ## Quick start
 
 ```sh
-# Build (one-time) — vendors are fetched automatically
-docker build -t fairyfly .
-
-# Or build locally after fetching vendors (see "Building from source")
-make install
+# Install (see Installation)
+curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.sh | sh
 
 # Run inline code
 ff -e 'console.log("hello from fairyfly")'
 
 # Initialize a project (writes ff.json)
-ff init
+ff init -y demo
+cd demo
 ff start
 ```
 
@@ -1117,40 +1159,11 @@ docker build -t fairyfly .
 
 ### Option B — local build
 
-First fetch the vendors, then `make install`:
+Fetch the vendors (pinned versions, SHA-256 verified — the same script CI
+and the Dockerfile use), then build and install:
 
 ```sh
-#!/bin/sh
-set -e
-
-# quickjs-ng 0.16.2
-curl -fL https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.16.2.tar.gz -o /tmp/qjs.tgz
-rm -rf /tmp/qjs vendor/quickjs && mkdir -p /tmp/qjs vendor/quickjs
-tar -xzf /tmp/qjs.tgz -C /tmp/qjs --strip-components=1
-cp /tmp/qjs/*.h /tmp/qjs/quickjs.c /tmp/qjs/libregexp.c /tmp/qjs/libunicode.c /tmp/qjs/dtoa.c vendor/quickjs/
-
-# BearSSL 0.6  (skip if you build with -Dbearssl=false)
-curl -fL https://www.bearssl.org/bearssl-0.6.tar.gz -o /tmp/bearssl.tgz
-rm -rf /tmp/bearssl vendor/bearssl && mkdir -p /tmp/bearssl vendor/bearssl
-tar -xzf /tmp/bearssl.tgz -C /tmp/bearssl --strip-components=1
-cp -r /tmp/bearssl/src /tmp/bearssl/inc vendor/bearssl/
-printf '#ifndef FF_BEARSSL_BRIDGE_H\n#define FF_BEARSSL_BRIDGE_H\n\n#include "bearssl.h"\n\n#endif\n' > vendor/bearssl/zig_bridge.h
-
-# SQLite 3.53.4
-curl -fL https://www.sqlite.org/2026/sqlite-amalgamation-30530400.zip -o /tmp/sqlite.zip
-rm -rf /tmp/sqlite vendor/sqlite && mkdir -p /tmp/sqlite vendor/sqlite
-unzip -q -o /tmp/sqlite.zip -d /tmp/sqlite
-cp /tmp/sqlite/sqlite-amalgamation-*/sqlite3.c /tmp/sqlite/sqlite-amalgamation-*/sqlite3.h vendor/sqlite/
-printf '#ifndef FF_SQLITE_BRIDGE_H\n#define FF_SQLITE_BRIDGE_H\n\n#include "sqlite3.h"\n\n#endif\n' > vendor/sqlite/zig_bridge.h
-
-# nghttp2 1.70.0
-curl -fL https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.gz -o /tmp/nghttp2.tgz
-rm -rf /tmp/nghttp2 vendor/nghttp2 && mkdir -p /tmp/nghttp2 vendor/nghttp2/lib vendor/nghttp2/includes
-tar -xzf /tmp/nghttp2.tgz -C /tmp/nghttp2 --strip-components=1
-cp /tmp/nghttp2/lib/*.c /tmp/nghttp2/lib/*.h vendor/nghttp2/lib/
-cp -r /tmp/nghttp2/lib/includes/nghttp2 vendor/nghttp2/includes/
-
-# build + install
+./scripts/fetch-vendors.sh
 make install
 ```
 
@@ -1166,6 +1179,7 @@ ff -e 'console.log("hello")'
 zig build -Doptimize=ReleaseFast   # default for `make build`
 zig build -Dbearssl=false          # drop TLS support entirely
 zig build -Dio_uring=false         # Linux: epoll backend instead of io_uring
+zig build -Dffi=false              # drop the ffi global (no dlopen)
 zig build -Dversion=1.2.3          # version reported by `ff --version`
 zig build test                     # Zig unit tests
 make test                          # Zig unit tests + test/run.sh
@@ -1207,8 +1221,9 @@ Known issues in rc1:
 - A failed `db.execNoArgs` leaks SQLite's error message (error paths only).
 - A multi-statement query that re-describes columns can leak cached name
   atoms (currently unreachable through the extended query protocol).
-- On some custom kernels glibc thread creation fails and `fetch` worker
-  threads panic at startup; musl static builds are unaffected.
+- On some kernels (e.g. Azure) a glibc build fails to spawn `fetch` worker
+  threads; the failure is swallowed and queued requests hang indefinitely.
+  Release binaries are static musl builds and are unaffected.
 
 ---
 ## CLI reference
@@ -1234,6 +1249,7 @@ ff fmt [--write|--check] <files...>
                          Format via prettier (needs npx/network)
 ff -e <code>             Run inline JavaScript code
 ff <file.js>             Run a JavaScript file
+ff <file.js> --allow-ffi Allow ffi.dlopen (native libraries)
 ff --version             Print runtime version
 ```
 

@@ -200,13 +200,13 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 | `--check` | Prints the newer version, exits without downloading |
 | Update available | Downloads `ff-<os>-<arch>`, `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
 
-> **Note:** The repository currently publishes no releases, so today `ff upgrade` always takes the failure row: `upgrade: no releases published for AbdElMajidOuhamane/ff` with exit code `1`. Release a version (or wait for the first one) for the other rows to apply.
+> **Note:** Releases are published at [github.com/AbdElMajidOuhamane/ff/releases](https://github.com/AbdElMajidOuhamane/ff/releases) — `v0.1.0-canary` is the first. With a release available, `ff upgrade` reports up-to-date for current builds, downloads when you're behind, and only takes the failure row on network errors or a missing release asset.
 
 ## Print the version
 
 ```sh
 ff --version
-# ff 0.1.0 (macos-aarch64)
+# ff 0.1.0-canary (macos-aarch64)
 ```
 
 ## Summary

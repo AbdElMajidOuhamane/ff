@@ -13,7 +13,9 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Response body | 64KB per response | Larger bodies are rejected |
+| Request body | ~4 KB (shares the 4 KB read buffer) | Beyond → `413 Payload Too Large` |
+| Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
+| Response headers | 2048 bytes | Headers beyond the cap are dropped |
 | Hung handler | 30s | Connection fails with `504` |
 | Bind address | Always `0.0.0.0` | No host option, no `FF_PORT` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
@@ -47,7 +49,8 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Live timers | 128 | `TypeError: too many timers (max 128)` |
 | Extra timer args | 8 after `ms` | Extras ignored |
 | Workers | 8 | `too many workers (max 8)` |
-| Worker stack | 8MB | — |
+| Worker heap | 32 MB + 1 MB JS stack (8 MB thread stack) | — |
+| Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
 | `process.nextTick` | Missing | Use `queueMicrotask` |
 
 ```js
@@ -63,6 +66,13 @@ queueMicrotask(fn);
 | Read per call | 10MB, sync | Larger reads fail |
 | API style | Sync only | No `fs.watch` — poll with timers |
 
+## Console
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Arguments printed | First 2 per call | Extra arguments are dropped |
+| Destination | stderr | `console.log > out.txt` captures nothing |
+
 ## Modules and language
 
 | Area | Limit | When hit |
@@ -74,6 +84,33 @@ queueMicrotask(fn);
 | DOM / `window` | Missing | Backend only |
 | `process.spawn` / `exec` | Missing | `process` has exit/cwd/chdir/pid/platform/arch/env/argv only |
 
+## SQLite
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| `db.exec` | First statement only | Multi-statement SQL needs `db.execNoArgs` |
+| Parameters | Positional `?` only | Named `:x` / `$x` are not supported |
+| Integer precision | ±2⁵³ | Beyond → precision loss in JS |
+
+## Postgres
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Pool | 10 connections | Extra queries queue |
+| TLS (`sslmode`) | Not supported | — |
+| Connection/socket timeouts | None | Slow queries wait indefinitely |
+| `rowCount` | Returned rows only | INSERT/UPDATE row counts are not reported |
+| COPY | Not supported | — |
+
+## Process
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| `process.env` | Snapshot at boot | Assigning to it does not affect the OS environment |
+| stdout/stdin streams | Missing | No `process.stdout.write` or stdin reads |
+| `hrtime`, `kill` | Missing | — |
+| Runaway JS watchdog | None | An infinite loop hangs the process |
+
 ## TLS and bytecode
 
 | Area | Limit | When hit |
@@ -83,6 +120,13 @@ queueMicrotask(fn);
 | `ff test` file | 10MB | Larger test files are not loaded |
 | REPL line | 8192 bytes | Longer lines truncate |
 | `ff init` | Always overwrites | Back up `ff.json` if you customized it |
+
+## Packages
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Package type | Pure-JS ESM only | `require(`, `module.exports`, or `node:` imports are rejected |
+| Version graph | One flat `node_modules` | A conflicting transitive version is a hard error |
 
 ## What is *not* limited (common misconceptions)
 

@@ -12,7 +12,7 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, bat
 | Page | What it covers |
 |------|----------------|
 | [Introduction](/docs/getting-started/introduction) | What Fairyfly is and how it compares |
-| [Installation](/docs/getting-started/installation) | Build with Zig 0.16, install to `~/.local/bin`, or Docker |
+| [Installation](/docs/getting-started/installation) | Prebuilt install (curl), build with Zig 0.16, or Docker |
 | [Quickstart](/docs/getting-started/quickstart) | First server in five minutes |
 
 ## Guides
@@ -30,6 +30,9 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, bat
 | [Packages](/docs/guides/packages) | `ff imprint` / `ff sever` for ESM dependencies |
 | [Workers](/docs/guides/workers) | CPU-bound work on up to 8 threads |
 | [Timers](/docs/guides/timers) | `setTimeout`, `setInterval`, and friends |
+| [Modules](/docs/guides/modules) | ESM imports that resolve — relative paths, bare packages, and the lookup rules |
+| [Process](/docs/guides/process) | argv, env, cwd, exit, pid — what process gives you, and what's missing on purpose |
+| [HTTP/2](/docs/guides/http2) | Serve HTTP/2 over TLS with ALPN — same handler, same port, no code changes |
 
 ## API reference
 
@@ -39,8 +42,10 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, bat
 | [`http`](/docs/api/http) | `http.serve` signatures, options, handler contract |
 | [`fetch`](/docs/api/fetch) | `fetch`, `Request`, `Response`, `Headers` |
 | [`fs`](/docs/api/fs) | Sync filesystem calls |
+| [Blob and FormData](/docs/api/blobs-formdata) | Binary payloads and HTML forms — construct, inspect, send, and parse them |
 | [SQLite](/docs/api/sqlite) | `Database` — open, query, write, transactions |
 | [`SQL`](/docs/api/postgres) | Postgres — queries, types, errors, transactions |
+| [FFI](/docs/api/ffi) | Load C-ABI shared libraries at runtime and call them from JS |
 
 ## Reference
 
@@ -48,3 +53,4 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, ESM only, bat
 |------|----------------|
 | [CLI](/docs/reference/cli) | Every `ff` subcommand with flags and examples |
 | [Limitations](/docs/reference/limitations) | Every hard cap in one place |
+| [Examples](/docs/reference/examples) | Every runnable example, indexed by task — file, run command, expected result |

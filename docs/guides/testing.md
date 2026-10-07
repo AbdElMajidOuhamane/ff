@@ -98,7 +98,7 @@ Same job, one process per file:
 # all tests passed
 ```
 
-Green means every file exited `0` **and** printed no `FAIL` lines. `make test` runs `zig build test` plus `test/run.sh`; `make ci` runs the build plus `test/run.sh`.
+Green means every file exited `0` **and** printed no `FAIL` lines. `make test` and `make ci` run the same steps: build + C fixtures, `zig build test`, then `test/run.sh`.
 
 > **Caution:** `run.sh` greps for the word `FAIL`, so any `console.log("FAIL…")` of your own marks the file failed. Only `check()` should ever print it.
 
