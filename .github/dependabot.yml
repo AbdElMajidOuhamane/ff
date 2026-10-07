@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # SHA-pinned workflow actions — grouped into one PR per week
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Dockerfile base images: debian:bookworm (build), alpine:3.20 (runtime)
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # docker-compose.yml: postgres:16 fixture image
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
