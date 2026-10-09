@@ -12,7 +12,9 @@ and a small readable codebase.
 
 > **138k req/sec · 0.66 ms p50 · 5 MB RSS** on Apple silicon (8-thread wrk, 100 conn).
 > Outperforms Node 23, Bun 1.4, and Deno 2 — and uses ~10× less memory.
-> Reproduce with [`bench/_bench/wrk.sh`](bench); see [Performance](#performance).
+> Reproduce: `make build`, serve the hello-world handler, then
+> `wrk -t8 -c100 -d10s http://127.0.0.1:3000/` (RSS sampled via `ps -o rss=`);
+> see [Performance](#performance).
 
 ---
 
@@ -76,8 +78,8 @@ ff upgrade
 ### Docker
 
 ```sh
-docker pull ghcr.io/abdelmajidouhamane/ff:latest
-docker run --rm ghcr.io/abdelmajidouhamane/ff:latest ff --version
+docker pull ghcr.io/abdelmjidouhamane/ff:latest
+docker run --rm ghcr.io/abdelmjidouhamane/ff:latest ff --version
 ```
 
 ### From source
@@ -236,11 +238,12 @@ RSS** on this workload.
 > tables or against other machines. Hello-JSON keep-alive is one workload;
 > TLS/WebSocket/Postgres paths are not represented here.
 
-**Reproducing:** [`bench/_bench/wrk.sh`](bench) (wrk + RSS sampling),
-[`bench/_bench/hyperfine-http.sh`](bench) (3-run medians per runtime).
-Server-side numbers use `ReleaseFast` builds (`make build`). Broader
-interpreter and I/O comparisons live in [`bench/run-bench.sh`](bench) and
-[`bench/mem-bench.sh`](bench).
+**Reproducing:** `wrk -t8 -c100 -d10s` against the hello-world handler
+(8 threads, 100 keep-alive connections, RSS sampled via `ps`), 3-run
+medians per runtime. Server-side numbers use `ReleaseFast` builds
+(`make build`). Broader interpreter and I/O comparisons live in
+[`bench/run-bench.sh`](bench); memory comparisons use `bench/mem-bench.sh`
+(maintainer-local, not in the repo).
 
 ---
 
