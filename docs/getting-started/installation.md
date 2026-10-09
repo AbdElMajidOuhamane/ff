@@ -32,7 +32,7 @@ ff upgrade
 | Linux (x86_64) | `ff-linux-x86_64` |
 | Linux (ARM64) | `ff-linux-aarch64` |
 
-Prefer containers? `docker pull ghcr.io/abdelmjidouhamane/ff:latest`.
+Prefer containers? `docker pull ghcr.io/abdelmajidouhamane/ff:latest`.
 
 The rest of this page covers Docker and building from source.
 
