@@ -78,8 +78,8 @@ ff upgrade
 ### Docker
 
 ```sh
-docker pull ghcr.io/abdelmjidouhamane/ff:latest
-docker run --rm ghcr.io/abdelmjidouhamane/ff:latest ff --version
+docker pull ghcr.io/abdelmajidouhamane/ff:latest
+docker run --rm ghcr.io/abdelmajidouhamane/ff:latest ff --version
 ```
 
 ### From source
