@@ -1,7 +1,7 @@
 ---
 title: Bytecode
 description: Ship without source — compile JS to .ffbc with ff compile and run it back.
-order: 9
+order: 15
 ---
 
 # Bytecode

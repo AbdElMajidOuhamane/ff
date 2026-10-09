@@ -68,16 +68,17 @@ db.execNoArgs("CREATE INDEX IF NOT EXISTS idx_notes_id ON notes (id)");
 
 | Method | Signature | Returns |
 |--------|-----------|---------|
-| `exec` | `exec(sql, params?)` | `undefined` — throws with the SQLite error message on failure |
+| `exec` | `exec(sql, params?)` | `undefined` — throws the SQLite error message **as a plain string** on failure (not an `Error`) |
 | `execNoArgs` | `execNoArgs(sql)` | Same, for statements without parameters (schema, pragmas, indexes) |
 
-SQL errors throw — a bad statement never fails silently:
+SQL errors throw — a bad statement never fails silently. The thrown value is a **plain string**, not an `Error` object:
 
 ```js
 try {
   db.exec("INSERT INTO missing_table VALUES (?)", [1]);
 } catch (e) {
-  console.error("write failed:", e.message); // no such table: missing_table
+  console.error("write failed:", String(e)); // no such table: missing_table
+  console.error(typeof e, e instanceof Error); // "string" false — e.message is undefined
 }
 ```
 
@@ -128,7 +129,7 @@ try {
     throw new Error("insufficient funds"); // -> ROLLBACK
   });
 } catch (e) {
-  console.log("aborted:", e.message, "| a still has:", db.row("SELECT bal FROM accounts WHERE name = ?", ["a"]).bal);
+  console.log("aborted:", String(e), "| a still has:", db.row("SELECT bal FROM accounts WHERE name = ?", ["a"]).bal);
 }
 ```
 
@@ -182,6 +183,8 @@ curl http://127.0.0.1:3000/notes
 ## Troubleshooting
 
 **`no such table: x`** — the `execNoArgs(CREATE TABLE …)` never ran (fresh cwd? different `open` path?). Paths are cwd-relative — log `process.cwd()` when in doubt.
+
+**Caught error has no `.message`** — SQL failures throw plain strings (`typeof e === "string"`), so `e.message` is `undefined` and `e instanceof Error` is `false`. Log `String(e)`. (Pure argument mistakes, e.g. calling `exec()` with no SQL, throw real `TypeError`s.)
 
 **`database is locked`** — contention beat the busy timeout. Raise `db.busyTimeout(ms)`, shorten write transactions, or serialize writers through one handle.
 

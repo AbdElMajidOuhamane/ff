@@ -51,7 +51,7 @@ ff client.js
 
 ## Server: upgrading connections
 
-Add a `websocket` block to the options. Its presence enables upgrades; the upgrade itself fires when a request arrives with a `Sec-WebSocket-Key` header — on any path, before your handler runs. The handler only ever sees plain HTTP, so it returns normal responses for every path:
+Add a `websocket` block to the options. Any request carrying the handshake headers (`Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key`) is upgraded **before your handler runs** — the handler never sees that request, and no `{ status: 101 }` branch is needed (a handler that would return 404 still gets the `101`). The handler serves plain HTTP only:
 
 ```js
 http.serve(

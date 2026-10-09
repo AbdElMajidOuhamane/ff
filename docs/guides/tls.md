@@ -64,7 +64,7 @@ Rules:
 
 ## WebSocket over TLS
 
-Nothing extra — same port, `wss://` scheme. The upgrade path still returns `{ status: 101 }`:
+Nothing extra — same port, `wss://` scheme, and the upgrade happens automatically exactly like plain WS (no `{ status: 101 }` branch in the handler):
 
 ```js
 // wss-server.js
@@ -78,10 +78,7 @@ http.serve(
       close: (socket) => console.log("bye"),
     },
   },
-  (url, method, body) => {
-    if (url === "/ws") return { status: 101 };
-    return new Response("http here, wss on /ws");
-  },
+  (url, method, body) => new Response("http here, wss upgrades on this port"),
 );
 ```
 

@@ -36,9 +36,9 @@ await fetch("https://example.com/items", {
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `url` | `string` | Request target. `http://` and `https://` only |
-| `init.method` | `string` | Default `"GET"` |
+| `init.method` | `string` | Default `"GET"` — exact-case token only (see Gotchas) |
 | `init.headers` | object / `Headers` | Header pairs, case-insensitive |
-| `init.body` | `string \| ArrayBuffer \| Uint8Array \| Blob \| FormData \| URLSearchParams` | Default none |
+| `init.body` | `string \| ArrayBuffer \| Uint8Array \| Blob \| FormData \| URLSearchParams` | Default none — only strings (and `URLSearchParams`) survive intact (see Gotchas) |
 
 Only `method` / `headers` / `body` are read. These init keys are **ignored**: `signal`, `timeout`, `redirect`, `credentials`, `cache`, `mode`.
 
@@ -76,7 +76,7 @@ Construction + statics (for handlers and tests):
 |--------|-----------|-------|
 | `new Response(body, init?)` | body: `string \| ArrayBuffer \| null`; init: `{ status?, headers? }` | Defaults to `200`, `content-type: text/plain` when the body has none |
 | `Response.json(data, init?)` | any JSON-serializable data | Sets JSON content-type |
-| `Response.redirect(url, status?)` | target + status (default 302) | Standard redirect response |
+| `Response.redirect(url, status?)` | target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it (see Gotchas) |
 | `Response.error()` | — | Status `0`, type `"error"` |
 
 ## `Request` reference
@@ -134,6 +134,8 @@ CR/LF characters in header values are dropped.
 
 Followed automatically up to 5 hops. `res.redirected` and `res.url` tell you where the response actually came from. Past 5 hops, `fetch` throws `Too many redirects`. There is no manual-redirect mode.
 
+Note: redirects your own `http.serve` handler returns via `Response.redirect()` carry no `Location` header, so nothing follows them — see Gotchas.
+
 ## Full example
 
 ```js
@@ -165,8 +167,22 @@ ff client.js
 
 Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, no abort/`signal`, HTTP/1.1 only.
 
+## Gotchas
+
+**Method names are exact-case.** `fetch` matches `init.method` against the standard tokens verbatim — `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"`. Anything else, including lowercase (`"post"`), is sent as `GET` (a body is still attached). Your `http.serve` handler likewise sees the method exactly as the client sent it, so normalize before comparing (`method.toUpperCase() === "POST"`).
+
+**Only string bodies reach the wire intact.** Every other body value is coerced with JS `String()` semantics: a `FormData` or `Blob` arrives as `"[object Object]"`, an `ArrayBuffer` as `"[object ArrayBuffer]"`, and a `Uint8Array([104, 105])` as `"104,105"`. `URLSearchParams` survives only because its `toString()` is the query string. There is no multipart encoding and no binary-body path — serialize yourself (`JSON.stringify`, `params.toString()`, base64, or a hand-built multipart string with an explicit `content-type` header).
+
+**`Response.redirect()` sends no `Location` header.** It sets the status (default 302) and flags the object as redirected, but clients never follow it. Build the response yourself when clients must follow:
+
+```js
+return new Response(null, { status: 302, headers: { Location: "/new-path" } });
+```
+
+**Rejections are plain strings.** Network failures reject with `"Network error"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"` — `e.message` is `undefined`, so log `String(e)`.
+
 ## See also
 
-- [Fetch Client guide](/guides/fetch-client) — tutorial version of this page
-- [HTTP Server guide](/guides/http-server) — serving instead of calling
-- [Limitations](/reference/limitations) — every hard cap
+- [Fetch Client guide](/docs/guides/fetch-client) — tutorial version of this page
+- [HTTP Server guide](/docs/guides/http-server) — serving instead of calling
+- [Limitations](/docs/reference/limitations) — every hard cap

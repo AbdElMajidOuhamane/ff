@@ -159,22 +159,13 @@ For larger route trees, put the matching in a small router function or reach for
 
 ## Practical example: JSON REST API
 
-A tiny notes API backed by SQLite, zero dependencies:
+A tiny notes API backed by SQLite, zero dependencies. Schema statements
+belong in `db.execNoArgs` (multi-statement, no params); single statements
+with bound params use `db.exec`:
 
 ```js
 // server.js
-const db = new Database("notes.db");
-db.exec(`CREATE TABLE IF NOT EXISTS notes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  text TEXT NOT NULL
-)`);
-```
-
-Wait — `db.exec` with a single argument and a multi-line schema string works (no params to bind), but schema statements belong in `execNoArgs`. Corrected:
-
-```js
-// server.js
-const db = new Database("notes.db");
+const db = Database.open("notes.db");
 db.execNoArgs(`CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   text TEXT NOT NULL
@@ -185,7 +176,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 
   // List notes
   if (path === "/notes" && method === "GET") {
-    return Response.json(db.rows("SELECT id, text FROM notes"));
+    return Response.json(db.rows("SELECT id, text FROM notes ORDER BY id"));
   }
 
   // Create a note
@@ -232,7 +223,8 @@ curl http://127.0.0.1:3000/anything
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Response body | 64KB per response | Larger bodies are rejected |
+| Request body | ~4 KB total (headers + body share one read buffer) | Beyond → `413 Payload Too Large` |
+| Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
 | Hung handler | 30s | Connection fails with `504` |
 | Bind address | Always `0.0.0.0` | No host option exists |
 | Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |

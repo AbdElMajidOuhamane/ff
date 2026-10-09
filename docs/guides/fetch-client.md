@@ -6,7 +6,7 @@ order: 2
 
 # Fetch Client
 
-`fetch` is global. It reads `method` / `headers` / `body` from the init object and returns a `Promise<Response>`. Everything else in init (`signal`, `timeout`, `redirect`) is ignored.
+`fetch` is global. It reads `method` / `headers` / `body` from the init object and returns a `Promise<Response>`. Everything else in init (`signal`, `timeout`, `redirect`) is ignored. Method names are exact-case standard tokens — lowercase `"post"` is sent as `GET` (see Troubleshooting).
 
 ## Quick look
 
@@ -62,12 +62,17 @@ console.log(data); // e.g. { id: 1, text: "buy milk" }
 ff client.js
 ```
 
-Other body shapes work too — `string`, `ArrayBuffer`, `Uint8Array`, `Blob`, `FormData`, `URLSearchParams`:
+`string` bodies — and `URLSearchParams`, which coerces to its query string — reach the wire intact. Everything else is coerced with JS `String()` semantics: a `FormData` or `Blob` arrives as `"[object Object]"`, an `ArrayBuffer` as `"[object ArrayBuffer]"`, a `Uint8Array([104, 105])` as `"104,105"`.
+
+> **Known issue:** `fetch` does not multipart-encode `FormData` or send binary bodies as bytes. Build the payload yourself:
 
 ```js
-const form = new FormData();
-form.append("name", "ada");
-await fetch("https://api.example.com/submit", { method: "POST", body: form });
+const params = new URLSearchParams({ name: "ada" });
+await fetch("https://api.example.com/submit", {
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded" },
+  body: params, // "name=ada" — URLSearchParams stringifies to its query
+});
 ```
 
 ## Reading the response
@@ -156,6 +161,12 @@ ff mirror.js
 ## Troubleshooting
 
 **404 resolves instead of throwing** — by design. Check `res.ok` / `res.status` after every call.
+
+**Lowercase `method: "post"` arrives as `GET`** — method tokens match exactly; anything unrecognized goes out as `GET` (the body is still attached). Use `"POST"`.
+
+**`FormData` / `Blob` / `Uint8Array` body arrives mangled** — bodies are string-coerced, not serialized (`"[object Object]"`, `"104,105"`). Send `string`, `URLSearchParams`, or a hand-built multipart string instead.
+
+**Caught fetch error has no `.message`** — network failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`). Log `String(e)`.
 
 **`Too many redirects`** — the chain exceeded 5 hops. Inspect `res.url` on the last good hop or fix the redirect loop server-side.
 

@@ -63,18 +63,21 @@ import { marked } from "marked";
 import lodash from "lodash";
 ```
 
-Your own files use relative imports — **with the extension**:
+Your own files use relative imports — extensions are optional (omitting
+one probes `X.js`, then `X/index.js`):
 
 ```js
 import { router } from "./router.js";
 import { check, done } from "./lib.mjs";
+import { helper } from "./helper";       // probes ./helper.js
 ```
 
 ```sh
 ff main.js
 ```
 
-> **Caution:** `import "./router"` (no extension) may fail. Always write `./router.js`.
+> **Note:** The probe only tries `X.js` and `X/index.js`. Non-`.js`
+> targets (`./lib.mjs`) must be written out.
 
 ## Removing: `ff sever`
 

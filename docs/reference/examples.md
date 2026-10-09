@@ -71,10 +71,7 @@ http.serve(
       close: (socket) => peers.delete(socket),
     },
   },
-  (url, method, body) => {
-    if (url === "/room") return { status: 101 };
-    return new Response(`online: ${peers.size}`);
-  },
+  (url, method, body) => new Response(`online: ${peers.size}`),
 );
 ```
 
@@ -82,7 +79,7 @@ http.serve(
 ff room.js
 ```
 
-Presence counter, binary frames, client API: [WebSocket guide](/docs/guides/websocket).
+Upgrades are automatic when the `websocket` block is present — no handler branch. Presence counter, binary frames, client API: [WebSocket guide](/docs/guides/websocket).
 
 ## TLS + WSS
 
@@ -105,7 +102,7 @@ db.execNoArgs("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TE
 db.exec("INSERT INTO notes (text) VALUES (?)", ["buy milk"]);
 console.log(db.rows("SELECT * FROM notes"));
 db.close();
-# [ { id: 1, text: "buy milk" } ]
+// [ { id: 1, text: "buy milk" } ]
 ```
 
 Transactions, `lastInsertRowId()`, busy timeout: [SQLite API](/docs/api/sqlite).

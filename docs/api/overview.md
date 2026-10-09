@@ -1,284 +1,129 @@
 ---
-title: API Overview
-description: All globals at a glance.
+title: API overview
+description: Every global Fairyfly injects, one row each, linking to its full reference.
 order: 1
 ---
 
-# API Overview
+# API overview
 
-Fairyfly exposes its API as globals and namespaces. No imports
-needed — `fetch`, `console`, `fs`, `process`, `URL`, and the rest
-are available in every script. `http` is a namespace with one
-method: `http.serve`.
+Everything below is available with **no imports** — Fairyfly injects these
+globals into every script. Bare specifiers still resolve through
+`node_modules` for packages (see [Packages](/docs/guides/packages)).
 
-## Globals table
+## Globals
 
-| Name | What it does | Details |
+| Global | What it is | Reference |
 |---|---|---|
-| `console` | `log`, `info`, `debug`, `warn`, `error`, `time`, `timeEnd` | [Console](#console) |
-| `setTimeout`, `clearTimeout` | Run once after a delay | [Timers](#timers) |
-| `setInterval`, `clearInterval` | Run on repeat | [Timers](#timers) |
-| `queueMicrotask` | Run before next timer or I/O | [Microtasks](#microtasks) |
-| `URL`, `URLSearchParams` | Parse and build URLs | [URL](#url) |
-| `Headers`, `Request`, `Response` | Fetch primitives | [Fetch](#fetch) |
-| `fetch` | Outbound HTTP client | [Fetch](#fetch) |
-| `WebSocket` | Outbound WS client | [WebSocket](#websocket) |
-| `Worker` | Multi-threaded JS, up to 8 threads | [Workers](#workers) |
-| `Database` | Open SQLite files, run queries, transactions | Built-in, no packages |
-| `SQL`, `sql` | Connect to Postgres — queries, types, transactions | [Postgres API](/docs/api/postgres) |
-| `fs` | Sync files: read, write, mkdir, rm, readdir | [FS](#fs) |
-| `process` | argv, env, cwd, exit, pid | [Process](#process) |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [Crypto](#crypto) |
-| `TextEncoder`, `TextDecoder` | UTF-8 encode and decode | [Text](#text) |
-| `performance.now` | Milliseconds since start | [Utils](#utils) |
-| `btoa`, `atob` | Base64 encode and decode | [Utils](#utils) |
-| `ffi` | Load C-ABI shared libraries at runtime (`--allow-ffi`) | [FFI](/docs/api/ffi) |
+| `console` | Output, colored aliases, `time`/`timeLog`/`timeEnd` | [console](/docs/api/console) |
+| `setTimeout`, `clearTimeout` | One-shot timer (max 128 live) | [Timers](/docs/guides/timers) |
+| `setInterval`, `clearInterval` | Repeating timer | [Timers](/docs/guides/timers) |
+| `queueMicrotask` | Run before the next timer or I/O callback | [Event loop](/docs/concepts/event-loop) |
+| `performance` | `performance.now()` — monotonic ms | [performance](/docs/api/performance) |
+| `URL`, `URLSearchParams` | WHATWG URL parser, query strings | [URL](/docs/api/url) |
+| `Headers` | Case-insensitive header collection | [Request/Response](/docs/api/request-response) |
+| `Request` | Fetch request object | [Request/Response](/docs/api/request-response) |
+| `Response` | Fetch response object + `json`/`redirect`/`error` | [Request/Response](/docs/api/request-response) |
+| `Blob` | Immutable binary blob | [Blob/FormData](/docs/api/blobs-formdata) |
+| `FormData` | `multipart/form-data` container | [Blob/FormData](/docs/api/blobs-formdata) |
+| `TextEncoder`, `TextDecoder` | UTF-8 string ↔ bytes | [Text encoding](/docs/api/text-encoding) |
+| `fetch` | HTTP client (16 slots, HTTP/1.1) | [fetch](/docs/api/fetch) |
+| `WebSocket` | WebSocket client (max 64 sockets) | [WebSocket](/docs/api/websocket) |
+| `Worker` | OS-thread worker (max 8) | [Worker](/docs/api/worker) |
+| `http` | `http.serve(options, handler)` | [http](/docs/api/http) |
+| `fs` | Sync + Promise filesystem calls | [fs](/docs/api/fs) |
+| `process` | `argv`, `env`, `exit`, `pid`, `memoryUsage`… | [process](/docs/api/process) |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [crypto](/docs/api/crypto) |
+| `btoa`, `atob` | Base64 encode / decode | [crypto](/docs/api/crypto) |
+| `Database` | SQLite (`Database.open(path)`) | [SQLite](/docs/api/sqlite) |
+| `sql`, `SQL` | Postgres tagged templates + pool | [Postgres](/docs/api/postgres) |
+| `ffi` | C-ABI shared libraries (`--allow-ffi`) | [FFI](/docs/api/ffi) |
+| `import.meta.url` | `file://` URL of the current module | [Modules](/docs/guides/modules) |
 
-## Console
+### Timer handles
 
-```js
-console.log("plain", 1, true, null);
-console.info("info line");
-console.debug("debug line");
-console.warn("warned here");
-console.error("errored", 42);
-```
-
-Methods: log, info, debug, warn, error, plus slops, redbal, detail aliases. All return undefined. All accept multiple args, joined with spaces.
-
-Timing:
+`setTimeout` / `setInterval` return a `Timeout` **object** (pass it to
+`clearTimeout` / `clearInterval`, or call its methods):
 
 ```js
-console.time("t");
-// ... work
-console.timeEnd("t");
+const t = setTimeout(() => console.log("later"), 5000);
+t.unref();      // don't hold the process open
+t.refresh();    // restart the countdown
+t.hasRef();     // boolean
+t.ref();        // hold the process again
 ```
 
-Prints elapsed milliseconds for label "t".
-
-## Timers
+### Static helpers you'll use constantly
 
 ```js
-const id = setTimeout(() => console.log("once"), 30);
-clearTimeout(id);
-
-const iv = setInterval(() => console.log("tick"), 20);
-clearInterval(iv);
+Response.json({ ok: true });              // Response with JSON content-type
+Response.redirect("/login");              // 302 status only — no Location header
+URL.parse("not a url");                   // null instead of throwing
+new URL("/a/b", "https://x.example");     // base resolution
+crypto.randomUUID();                      // v4 UUID
+Database.open("app.db");                  // SQLite
 ```
 
-setTimeout returns a numeric id. clearTimeout cancels it. Same pair for intervals. Max 128 live timers. Max 8 extra args after ms. Negative delay becomes 0. Full guide: Timers.
+Full tables: [Response statics and Database methods](#quick-reference).
 
-## Microtasks
+## Quick reference
 
-```js
-queueMicrotask(() => console.log("microtask"));
-console.log("sync");
-```
+### `Response` statics
 
-Output:
+| Method | Signature | Description |
+|---|---|---|
+| `Response.json(value, init?)` | `(any, { status?, headers? }) → Response` | JSON response shortcut |
+| `Response.redirect(url, status?)` | `(string, number?) → Response` | Redirect status (default 302) — Known issue: no `Location` header emitted |
+| `Response.error()` | `() → Response` | Error response, status `0` |
 
-```text
-sync
-microtask
-```
+### `Database` methods
 
-There is no process.nextTick. Use queueMicrotask.
+| Method | Signature | Description |
+|---|---|---|
+| `Database.open(path)` | `(string) → Database` | Open or create a database |
+| `db.exec(sql, params?)` | `(string, Array?) → undefined` | One statement, bound params |
+| `db.execNoArgs(sql)` | `(string) → undefined` | Multi-statement SQL, no params |
+| `db.row(sql, params?)` | `(string, Array?) → object \| null` | First row |
+| `db.rows(sql, params?)` | `(string, Array?) → object[]` | All rows |
+| `db.changes()` | `() → number` | Rows affected by the last write |
+| `db.lastInsertRowId()` | `() → number` | Rowid of the last insert |
+| `db.transaction(fn)` | `(Function) → any` | Auto-commit / rollback |
+| `db.busyTimeout(ms)` | `(number) → undefined` | Busy timeout (default 5000) |
+| `db.close()` | `() → undefined` | Close the handle |
 
-## URL
+### `sql` / `SQL` methods
 
-```js
-const u = new URL("https://user:pass@example.com:8080/path?q=1#hash");
-console.log(u.protocol);
-console.log(u.hostname);
-console.log(u.port);
-console.log(u.pathname);
-console.log(u.search);
-console.log(u.hash);
-```
+| Method | Signature | Description |
+|---|---|---|
+| `` sql`…` `` | `` (template) → Promise<rows> `` | Parameterized query |
+| `sql.unsafe(str, params?)` | `(string, Array?) → Promise<rows>` | String-built, still parameterized |
+| `sql.connect()` | `() → Promise<rows>` | Probe the pool — resolves with the `SELECT 1` rows |
+| `sql.begin()` | `() → Promise<Tx>` | Transaction on one connection |
+| `sql.close()` | `() → undefined` | Close the default pool |
+| `tx.commit()` / `tx.rollback()` | `() → Promise<rows>` | End the transaction (resolves `[]`) |
+| `new SQL(dsn)` | `(string) → SQL` | Pool bound to a DSN |
 
-Output:
+## Not provided
 
-```text
-https:
-example.com
-8080
-/path
-?q=1
-#hash
-```
+These common Node/browser globals are **absent** — with the substitute to
+use instead:
 
-Mutable — set parts and re-serialize:
+| Missing | Use instead |
+|---|---|
+| `Buffer` | `Uint8Array` / `ArrayBuffer` |
+| `require()` / CommonJS | `import` / `export` |
+| `process.nextTick` | `queueMicrotask(fn)` |
+| `setImmediate` | `setTimeout(fn, 0)` |
+| `structuredClone` | built into `postMessage`; clone by messaging yourself |
+| `AbortController` / `signal` | not supported by `fetch` |
+| `addEventListener` on `WebSocket` | `ws.onopen = …` style handlers |
+| `TextEncoder#encodeInto` | `encode()` |
+| `process.stdout.write` | `console.log` (goes to **stderr**) |
+| DOM, `window` | backend runtime |
 
-```js
-const u = new URL("/api/v2", "https://example.com");
-u.pathname = "/api/v3";
-console.log(u.toString());
-```
+Full list with rationale: [Compatibility](/docs/reference/compatibility).
 
-Query strings:
+## See also
 
-```js
-const p = new URLSearchParams("a=1&b=2&a=3");
-console.log(p.get("a"), p.getAll("a"), p.has("b"));
-```
-
-Also URL.parse (returns null instead of throwing) and URL.canParse (returns boolean).
-
-## Fetch
-
-```js
-const res = await fetch("https://httpbin.org/json");
-console.log(res.status, res.ok);
-console.log(await res.json());
-```
-
-Body readers: .text(), .json(), .arrayBuffer(), .bytes(), .blob(), .formData(). Each sets bodyUsed. Full guide: Fetch Client.
-
-Response helpers for servers:
-
-```js
-Response.json({ ok: true });
-Response.redirect("/new", 302);
-Response.error();
-```
-
-## WebSocket
-
-```js
-const ws = new WebSocket("ws://127.0.0.1:3000/ws");
-ws.onopen = () => ws.send("hello server");
-ws.onmessage = (e) => console.log("got:", e.data);
-ws.onclose = () => console.log("closed");
-```
-
-States: readyState 0 (connecting), 1 (open), 2 (closing), 3 (closed). Binary arrives as Uint8Array. Full guide: WebSocket.
-
-## Workers
-
-Multi-threaded JS execution with up to 8 worker threads. Each worker runs an isolated script and talks to the parent through messages.
-
-```js
-// main.js
-const w = new Worker("./worker.js");
-w.onmessage = (e) => console.log("from worker:", e.data);
-w.onerror = (e) => console.error("worker error:", e.message);
-w.postMessage("hello worker");
-```
-
-```js
-// worker.js
-onmessage = (e) => {
-  console.log("from parent:", e.data);
-  postMessage("hello worker");
-};
-```
-
-What happens:
-
-- `new Worker(path)` spawns a thread running the given file. Path is relative to the current script.
-- `w.postMessage(data)` sends a value to the worker. `w.onmessage` receives replies.
-- Inside the worker, the global `onmessage` receives parent messages and the global `postMessage` replies.
-- `w.onerror` fires on uncaught worker errors. `w.terminate()` stops the worker.
-- `options.data` passes an initial value at spawn time, visible as `globalThis.workerData`:
-
-```js
-const w = new Worker("./worker.js", { data: { id: 1 } });
-```
-
-```js
-// worker.js
-console.log(globalThis.workerData.id);
-```
-
-Limits you will hit:
-
-- Max 8 workers per process.
-- Per-worker stack and heap are capped — offload work, don't hoard state.
-- Messages are serialized — no shared memory.
-- Workers cannot open servers. Keep `http.serve` in the main thread.
-
-## FS
-
-Sync only:
-
-```js
-fs.writeFile("out.txt", "Hello from Fairyfly!");
-console.log(fs.exists("out.txt"));
-console.log(fs.readFile("out.txt"));
-fs.mkdir("a/b", true);
-console.log(fs.readdir("."));
-fs.rm("out.txt", true);
-```
-
-Max path 4096 bytes, max read 10MB. Missing files throw.
-
-## Process
-
-```js
-console.log(process.argv);
-console.log(process.pid, process.platform, process.arch);
-console.log(process.cwd());
-process.chdir("/tmp");
-console.log(process.env.HOME);
-process.exit(0);
-```
-
-exit code is clamped 0-255. argv includes runtime and script name. Full reference: CLI.
-
-## Crypto
-
-```js
-console.log(crypto.randomUUID());
-```
-
-Output:
-
-```text
-550e8400-e29b-41d4-a716-446655440000
-```
-
-Random bytes:
-
-```js
-const buf = new Uint8Array(16);
-crypto.getRandomValues(buf);
-```
-
-Hash:
-
-```js
-const hash = await crypto.subtle.digest("SHA-256", new Uint8Array([104, 105]));
-console.log(new Uint8Array(hash).length);
-```
-
-digest accepts SHA-1, SHA-256, SHA-384, SHA-512. Data is ArrayBuffer or typed array.
-
-## Text
-
-UTF-8 only:
-
-```js
-const bytes = new TextEncoder().encode("hello");
-console.log(bytes);
-console.log(new TextDecoder().decode(bytes));
-```
-
-Invalid bytes decode to the replacement character.
-
-## Utils
-
-```js
-console.log(performance.now());
-console.log(btoa("hello"));
-console.log(atob("aGVsbG8="));
-```
-
-performance.now is milliseconds since process start. btoa encodes to base64, atob decodes and throws on invalid input.
-
-## What is missing vs Node
-
-- No require, no CommonJS — ESM only (bare imports resolve via node_modules)
-- No Buffer — use Uint8Array
-- No process.nextTick
-- HTTP/1.1 plain; HTTP/2 over TLS only
-- No DOM
+- [Event loop](/docs/concepts/event-loop) — how these globals interact
+- [Limitations](/docs/reference/limitations) — every hard cap
+- [CLI](/docs/reference/cli) — how to run your code

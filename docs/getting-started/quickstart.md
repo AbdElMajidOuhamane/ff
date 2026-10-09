@@ -78,7 +78,7 @@ The handler receives `(url, method, body)` strings and returns a `Response` (or 
 const db = Database.open("app.db");
 db.execNoArgs("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, text TEXT, done INTEGER)");
 db.exec("INSERT INTO todos (text, done) VALUES (?, ?)", ["Buy milk", 0]);
-console.log(db.rows("SELECT * FROM todos"));
+console.log(JSON.stringify(db.rows("SELECT * FROM todos"), null, 2));
 db.close();
 ```
 

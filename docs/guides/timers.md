@@ -36,7 +36,10 @@ ff timer.js
 const t = setTimeout(() => console.log("never prints"), 20);
 clearTimeout(t);
 console.log("cancelled");
-# cancelled
+```
+
+```
+cancelled
 ```
 
 `setTimeout` returns a numeric id; `clearTimeout(id)` cancels it. Clearing an unknown or expired id is a safe no-op — it never throws. Same pair for intervals: `setInterval` / `clearInterval`.
@@ -78,7 +81,10 @@ Extra arguments pass through (up to 8 after `ms`):
 
 ```js
 setTimeout((a, b) => console.log(a, b), 10, "hello", 42);
-# hello 42
+```
+
+```
+hello 42
 ```
 
 ## Zero-delay yield
@@ -86,8 +92,11 @@ setTimeout((a, b) => console.log(a, b), 10, "hello", 42);
 ```js
 setTimeout(() => console.log("next tick"), 0);
 console.log("now");
-# now
-# next tick
+```
+
+```
+now
+next tick
 ```
 
 `setTimeout(fn, 0)` yields to the event loop's next iteration (the `setImmediate` role in Node). Negative delays behave the same as 0.
@@ -98,9 +107,12 @@ console.log("now");
 queueMicrotask(() => console.log("microtask"));
 setTimeout(() => console.log("timer"), 0);
 console.log("sync");
-# sync
-# microtask
-# timer
+```
+
+```
+sync
+microtask
+timer
 ```
 
 Microtasks drain before timers. Use `queueMicrotask` for work that must run before the next timer or I/O event — it is also the replacement for the missing `process.nextTick`.
@@ -111,7 +123,10 @@ Microtasks drain before timers. Use `queueMicrotask` for work that must run befo
 const t = setTimeout(() => console.log("late"), 5000);
 t.unref();
 console.log("exits immediately");
-# exits immediately
+```
+
+```
+exits immediately
 ```
 
 `setTimeout`/`setInterval` return a `Timeout` object (usable as a numeric id too). `t.unref()` keeps the timer armed but lets the process exit without waiting; `t.ref()` re-arms the hold; `t.hasRef()` reports the state; `t.refresh()` restarts the countdown. Use `unref` for background housekeeping that must not keep a CLI alive.
