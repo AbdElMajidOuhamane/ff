@@ -6,75 +6,75 @@ order: 13
 
 # Process
 
-`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, and exit. It has no `spawn`/`exec` — shelling out doesn't exist in Fairyfly.
+This guide is about *using* `process` in real programs — parsing a CLI,
+reading config, shutting down cleanly, and keeping an eye on memory. For the
+exhaustive member list and exact return shapes, see the
+[`process` API reference](/docs/api/process).
 
-## Quick look
+`process` is Fairyfly's window onto the running program. It has no
+`spawn`/`exec`; the only way to talk to another process is over the network.
+
+## A first look
 
 ```js
 // info.js
 console.log("args:", process.argv);
 console.log("pid:", process.pid, "on", process.platform, process.arch);
 console.log("cwd:", process.cwd());
-console.log("home:", process.env.HOME);
 ```
 
 ```sh
 ff info.js hello
-# args: ["ff", "info.js", "hello"]
+# args: ["ff","info.js","hello"]
 # pid: 12345 on darwin arm64
 # cwd: /Users/ada/demo
-# home: /Users/ada
 ```
 
-## Reference
+## Parsing arguments
 
-| Member | Type | Description |
-|--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime and script name (`["ff", "main.js", …]`) |
-| `process.env` | `object` | Environment snapshot as plain key/value strings |
-| `process.cwd()` | `() => string` | Current working directory |
-| `process.chdir(path)` | `(path) => void` | Change directory — silently does nothing when the path is missing or unreachable (never throws; verify with `cwd()`) |
-| `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
-| `process.pid` | `number` | OS process id |
-| `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
-| `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
-
-## Arguments: `argv`
-
-`argv[0]` is the runtime, `argv[1]` is your script — user args start at index 2:
+`argv[0]` is the runtime and `argv[1]` is the script, so your arguments start
+at index 2. Slice them off and mirror the common subcommand shape:
 
 ```js
-// greet.js
-const name = process.argv[2] ?? "world";
-console.log(`hello, ${name}`);
+// tool.js
+const [cmd, ...rest] = process.argv.slice(2);
+
+switch (cmd) {
+  case "greet":
+    console.log(`hello, ${rest[0] ?? "world"}`);
+    break;
+  case "serve":
+    http.serve({ port: 3000 }, () => new Response("serving"));
+    break;
+  default:
+    console.error("usage: tool.js <greet [name] | serve>");
+    process.exit(1);
+}
 ```
 
 ```sh
-ff greet.js ada
-# hello, ada
-ff greet.js
-# hello, world
+ff tool.js greet ada   # hello, ada
+ff tool.js serve       # serves on 3000
+ff tool.js bogus       # usage… (exit 1)
 ```
 
-A tiny flag parser needs nothing else:
+> `ff -e "<code>"` shifts the layout: `argv` becomes
+> `["ff", "-e", "<code>"]`, so the code string occupies index 2.
+
+Because there's a runtime and a script ahead of your args, `slice(2)` is the
+idiom to remember. A tiny flag parser needs nothing fancier:
 
 ```js
 // serve.js
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf("--port") + 1] ?? 3000);
-
 http.serve({ port }, () => new Response("ok"));
 ```
 
-```sh
-ff serve.js --port 4242
-curl http://127.0.0.1:4242/
-# ok
-```
+## Configuring from the environment
 
-## Environment: `env`
-
-Plain object, string values only. Missing keys read as `undefined` — fail fast on required ones:
+`process.env` is a plain object of string values, captured **once at boot**.
+Read required values eagerly and fail fast; give optional ones a default:
 
 ```js
 // config.js
@@ -89,79 +89,142 @@ http.serve({ port }, () => new Response("ok"));
 PORT=4242 API_TOKEN=secret ff config.js
 ```
 
-> **Note:** `process.env` is a startup snapshot and there is no `.env` loader. Export variables (or prefix the command, as above) before starting `ff`. The `FF_` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`) are read the same way — see the env guide.
-
-## Working directory: `cwd` / `chdir`
-
-```js
-console.log(process.cwd()); // where ff was launched
-process.chdir("/tmp");      // move — verify with cwd(), failures are silent
-console.log(process.cwd()); // /tmp
-```
-
-> **Caution:** `chdir` never throws — a missing or unreachable path is a silent no-op and the cwd stays put. Check `process.cwd()` afterwards when the directory is user-supplied.
-
-Relative file paths in `fs` and module-adjacent lookups resolve against the cwd, so `chdir` before serving from a data dir is a legitimate pattern. Prefer absolute paths in long-lived servers to avoid surprises.
-
-## Exiting: `exit`
-
-```js
-if (badConfig) {
-  console.error("bad config, quitting");
-  process.exit(1);
-}
-```
-
-- Codes clamp to 0–255 (`exit(300)` → `255`, `exit(-5)` → `0`) — clamped, not wrapped mod 256.
-- `exit()` stops the event loop immediately — pending timers, connections, and workers do not drain. The test helper `done()` relies on this to end server-fixture tests cleanly.
-- Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
-- An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
-
-Graceful shutdown instead of a hard cut: there is no signal-handling API — stop servers with `Ctrl-C` from the terminal, or call `process.exit(0)` for programmatic shutdown.
-
-> **Note:** There is no signal-handling API. Stop servers with `Ctrl-C` from the terminal, or `process.exit(0)` for programmatic shutdown.
-
-## Practical example: CLI with subcommands
-
-```js
-// tool.js
-const [cmd, ...rest] = process.argv.slice(2);
-
-if (cmd === "greet") {
-  console.log(`hello, ${rest[0] ?? "world"}`);
-} else if (cmd === "serve") {
-  const port = Number(process.env.PORT ?? 3000);
-  http.serve({ port }, () => new Response("serving"));
-} else {
-  console.error("usage: tool.js <greet [name] | serve>");
-  process.exit(1);
-}
-```
-
 ```sh
-ff tool.js greet ada   # hello, ada
-ff tool.js serve       # serves on 3000 (or $PORT)
-ff tool.js bogus       # usage… (exit 1)
+export API_TOKEN=secret
+ff config.js
 ```
+
+There is no `.env` loader and no live re-read — export variables (or prefix
+the command) before launching `ff`. `process.env` is a snapshot, and since it
+is an ordinary object, writing to it only changes JS state, never the OS
+environment.
+
+## Keeping the working directory honest
+
+`process.cwd()` reports where `ff` was launched. `process.chdir(path)` moves
+you — but it **never throws**: a bad path, or even a non-string argument,
+leaves the cwd unchanged and returns `undefined`. That makes it safe to call
+without a `try/catch`, but it also means failures are invisible unless you
+check:
+
+```js
+// movedir.js
+process.chdir("/tmp/data");       // a missing path is a silent no-op
+console.log("now in", process.cwd());   // confirm where you actually are
+```
+
+Prefer absolute paths in long-lived servers so a stray `chdir` elsewhere can't
+move your file reads out from under you.
+
+## Shutting down
+
+`process.exit(code)` ends the process *now* — the code is clamped to
+`0`–`255` (so `exit(300)` is `255`, `exit(-5)` is `0`), and defaulting to `0`.
+Nothing is drained: pending timers, in-flight requests, and workers are all
+cut off.
+
+```js
+// validate.js
+if (process.env.STRICT !== "1") {
+  console.error("STRICT=1 is required; aborting");
+  process.exit(1);
+}
+```
+
+For "finish the work, *then* quit", drain first and exit last:
+
+```js
+(async () => {
+  await Promise.all([Promise.resolve("a"), Promise.resolve("b")]);   // let work settle
+  process.exit(0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+There is **no signal API** — no `process.on("SIGINT")`. In development, stop a
+server with `Ctrl-C`; for programmatic shutdown, call `process.exit(0)`. An
+uncaught throw at the top level of a script already prints its stack and exits
+`1` for you (see [Errors and exit codes](/docs/concepts/errors)).
+
+## Watching memory
+
+Unlike Node, Fairyfly exposes a single, cheap memory figure: `rss`, the
+process **peak** resident set size in bytes. It's a high-water mark from
+`getrusage`, so it only ever goes up — good for spotting growth, not for
+precise current usage:
+
+```js
+// memwatch.js
+function logRss() {
+  const { rss } = process.memoryUsage();
+  console.detail(`peak rss: ${(rss / 1048576).toFixed(1)} MiB`);
+}
+
+logRss();
+setInterval(logRss, 5000).unref();   // background: never holds the loop open
+```
+
+Emitting one `rss` sample per request is also handy in structured logs:
+
+```js
+http.serve({ port: 3000 }, (url) => {
+  const { rss } = process.memoryUsage();
+  console.log(JSON.stringify({ level: "info", url, rss }));
+  return new Response("ok");
+});
+```
+
+For internal allocation/spill tuning, `process.stats()` returns a bag of
+monotonic counters for the fetch, HTTP, and Postgres subsystems — mostly `0`
+until you actually do work:
+
+```js
+// stats.js
+setTimeout(() => {
+  const s = process.stats();
+  console.log("fetch spills:", s.fetch.bodyHeap, "| pg waiters:", s.pg.waitEnqueue);
+}, 50);
+```
+
+See the [API reference](/docs/api/process#introspection-stats) for the full
+field list. Treat these as diagnostic telemetry, not a stable contract.
+
+## Troubleshooting
+
+**`process.env.X` is undefined** — the variable wasn't exported in the
+launching shell. `X=1 ff app.js` (prefix) or `export X=1` first; no `.env`
+file is read.
+
+**`chdir` didn't move me** — it never throws; a bad path or non-string
+argument is a silent no-op. Log `process.cwd()` after the call to confirm.
+
+**Exit code surprises** — codes clamp to `0`–`255`, and `exit()` skips all
+draining. To "finish work then quit", drain first, then exit. Uncaught
+top-level or module throws already exit `1`; errors thrown *inside* an HTTP
+handler become a `500` instead.
+
+**`spawn is not a function`** — by design. There is no subprocess API; use
+HTTP sidecars.
 
 ## What `process` does *not* have
 
 | Missing (vs Node) | Use instead |
-|-------------------|-------------|
-| `spawn` / `exec` / `execFile` | Nothing in-runtime — call other services over HTTP, or use `fetch` against a sidecar |
-| `nextTick` | `queueMicrotask(fn)` |
-| `uptime()` / `memoryUsage()` / `cpuUsage()` | `performance.now()` for elapsed time; nothing for RSS |
+|---|---|
+| `spawn` / `exec` / `execFile` | Nothing in-runtime — talk to services over HTTP |
+| `nextTick` | `queueMicrotask(fn)` (see [Timers](/docs/guides/timers)) |
+| `uptime()` / `cpuUsage()` | [`performance.now()`](/docs/api/performance) for elapsed time |
 | `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
-| `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
+| `stdin` / `stdout` streams | [`console`](/docs/api/console) writes **stderr**; no readable stdin |
+| `memoryUsage()` beyond `rss` | Only `rss` (peak) is exposed |
 
-Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver to install.
+Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
+to install.
 
-## Troubleshooting
+## See also
 
-**`process.env.X` is undefined** — the variable wasn't exported in the launching shell. `X=1 ff app.js` (prefix) or `export X=1` first. No `.env` file is read.
-
-**`chdir` didn't move me** — it never throws; a bad path is a silent no-op. Log `process.cwd()` after the call to confirm.
-
-**Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
-
-**`spawn is not a function`** — by design. There is no subprocess API; use HTTP sidecars.
+- [`process` API reference](/docs/api/process) — every member and return shape
+- [Environment variables](/docs/guides/env)
+- [Logging](/docs/guides/logging)
+- [Errors and exit codes](/docs/concepts/errors)

@@ -19,8 +19,8 @@ Every global in `Object.getOwnPropertyNames(globalThis)`:
 `WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`)
 · `btoa` · `atob` · `performance` · `queueMicrotask` · `DOMException`
 
-**Fairyfly:** `http` · `fs` · `process` · `Database` · `sql` · `SQL` ·
-`Worker` · `ffi` · `console`
+**Fairyfly:** `http` · `udp` · `fs` · `process` · `Database` · `sql` · `SQL` ·
+`Worker` · `ffi` · `console` · `Timeout` (returned by `setTimeout`/`setInterval`)
 
 **Engine (QuickJS-ng):** `Promise` · `Map`/`Set`/`WeakMap`/`WeakSet` ·
 `Proxy` · `Reflect` · `Symbol` · `Iterator` · `Atomics` ·
@@ -48,6 +48,7 @@ Every global in `Object.getOwnPropertyNames(globalThis)`:
 | `worker_threads` | absent | global `Worker` |
 | `zlib` | absent | `crypto.subtle.digest` won't help — use `ffi` |
 | `fs.promises` | absent | `fs.readFileAsync()` and friends |
+| `dgram` (UDP) | absent as a module | global `udp.socket()` (see [udp](/docs/api/udp)) |
 | `crypto.createHash` / `createHmac` | absent | `crypto.subtle.digest` |
 | `AbortController` / `signal` | absent | not supported by `fetch` |
 | `setTimeout().unref()` (Node Timer) | partial | returns a `Timeout` **object**: `t.unref()`, `t.refresh()`, `t.hasRef()` |

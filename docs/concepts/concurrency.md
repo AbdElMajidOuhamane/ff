@@ -20,7 +20,7 @@ There is no single "4-thread pool" doing everything. Each subsystem owns its thr
 | Subsystem | Threads | Cap / notes |
 |---|---|---|
 | Event-loop pool (`libxev`) | 4 | general loop work |
-| `fs.*Async` | own 4-thread pool + 16 job slots | a 17th concurrent job waits |
+| `fs.*Async` | own 4-thread pool + 16 job slots | a 17th job submitted in one turn throws |
 | `ffi` | own 4-thread pool | each native call parks a pool thread while it runs |
 | `fetch` | 16 dedicated threads (1 MB stack each) | one thread per slot — a 16-way fan-out truly runs in parallel |
 | Postgres / TLS | none | event-driven on the loop thread; no helper threads |
@@ -43,24 +43,27 @@ sections execute one after the other, always.
 
 ```js
 // fanout.js — ff fanout.js
-const urls = [
-  "https://example.com/",
-  "https://example.org/",
-  "https://example.net/",
-];
+(async () => {
+  const urls = [
+    "https://example.com/",
+    "https://example.org/",
+    "https://example.net/",
+  ];
 
-const started = performance.now();
-const results = await Promise.all(urls.map((u) => fetch(u)));
-console.log(`${results.length} responses in ${(performance.now() - started).toFixed(1)}ms`);
-console.log(results.map((r) => r.status).join(", "));
+  const started = performance.now();
+  const results = await Promise.all(urls.map((u) => fetch(u)));
+  console.log(`${results.length} responses in ${(performance.now() - started).toFixed(1)}ms`);
+  console.log(results.map((r) => r.status).join(", "));
+})();
 ```
 
 All three requests are in flight at once — each `fetch` slot has its **own
 thread**, so a fan-out like this costs one loop, not three.
 
-> Top-level `await` works in files (modules). It does **not** work in
-> `ff -e '...'`, which is evaluated as a script — wrap it in an async IIFE
-> there, or put the code in a file.
+> `fanout.js` is a classic script (no `import`/`export`), so the `await`
+lives in an async IIFE. Top-level `await` is only available in files that
+are parsed as modules (they contain `import`/`export`, or end in `.mjs`) —
+it is a `SyntaxError` in `ff -e '...'` and in plain classic scripts.
 
 ## Example: non-blocking file I/O in a handler
 
@@ -91,8 +94,10 @@ w.postMessage({ password: "hunter2" });
 
 Workers have their **own** JS runtime and event loop. They share no state
 and talk only by messages (structured clone). The worker scope has
-`console`, timers, `postMessage`, `workerData`, and `performance` — no
-`fs`, no `fetch`, no `http.serve`.
+`console`, timers, `queueMicrotask`, `postMessage`, `onmessage`, `self`,
+`workerData`, and `performance` — no `fs`, no `fetch`, no `http.serve`,
+no `Worker`. Worker timers return **numeric ids** (there is no `Timeout`
+class in a worker), and a worker file must be a classic script.
 
 ## Limits worth memorising
 
@@ -101,10 +106,10 @@ and talk only by messages (structured clone). The worker scope has
 | Concurrent `fetch` | 16 slots, one thread each |
 | Concurrent HTTP connections | 512 |
 | Loop / fs / ffi pools | 4 threads each (separate pools) |
-| Concurrent `fs.*Async` jobs | 16 |
-| Workers | 8 |
+| Concurrent `fs.*Async` jobs | 16 (a 17th in one turn throws) |
+| Workers | 8 (8 MB stack, 32 MB heap, 1 MB JS stack each) |
 | Worker message | 4 MB |
-| Live timers | 128 |
+| Live timers | 128 per runtime (main and each worker) |
 
 ## Gotchas
 

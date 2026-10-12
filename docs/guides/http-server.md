@@ -6,7 +6,7 @@ order: 1
 
 # HTTP Server
 
-`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body)` — three strings — and returns a `Response`.
+`http.serve` starts an HTTP server bound to `0.0.0.0`. You pass it an options object (or a port number) and a handler; the handler is called per request as `(url, method, body)` — three strings — and returns a `Response`. Add `tls` and the same port also serves HTTPS, WSS, and HTTP/2.
 
 ## Hello-world server
 
@@ -41,31 +41,39 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 });
 ```
 
-## Listening on a specific port
+## Calling shapes and the port
 
-Pass the port in the options object, or use the shorthand form. When omitted, the port defaults to `3000`:
+`http.serve` takes **two** arguments. The first is the options value (an object or a number); the second is the handler. Passing only a handler throws, so there is no one-argument form:
 
 ```js
-// Options object
-http.serve({ port: 4242 }, handler);
+http.serve({ port: 4242 }, handler); // options object
+http.serve(4242, handler);           // port shorthand
+http.serve({}, handler);             // no options — default port 3000
 
-// Shorthand — port number as the first argument
-http.serve(4242, handler);
-
-// Default port 3000
 http.serve(handler);
+// TypeError: http.serve: http.serve requires (options, handler)
+```
+
+When the port is omitted (or isn't a number), the default is `3000`:
+
+```js
+// server.js
+http.serve({}, (url, method, body) => new Response("default port"));
 ```
 
 ```sh
 ff server.js
-curl http://127.0.0.1:4242/
+curl http://127.0.0.1:3000/
+# default port
 ```
+
+`http.serve` returns `undefined`: there is no handle, no `server.port`, and no `server.stop()`. The listener runs until you end the process.
 
 > **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS.
 
 ## Inspecting the incoming request
 
-The handler receives three strings: `url` (path + query string), `method` (e.g. `"GET"`), and `body` (request text, empty string when none). Log them to see what's coming in:
+The handler receives three strings: `url` (path + query string), `method`, and `body` (request text, empty string when none). `method` is passed **exactly as the client sent it** — `curl -X post` gives you `"post"`, so normalize case before comparing. Log the values to see what's coming in:
 
 ```js
 // server.js
@@ -125,7 +133,7 @@ Three return shapes are accepted:
 |--------------|--------------|
 | `Response` | Status, headers, and body sent as-is |
 | `{ status, body }` with string or ArrayBuffer body | Sent with that status code |
-| `Promise` of either shape above | Connection waits until it settles |
+| `Promise` of either shape above | Connection parks until it settles (a rejection → `500`) |
 
 > **Caution:** Anything else — including a bare string — produces an empty `200` response. `return "hello"` does **not** send `"hello"`. Always wrap it: `return new Response("hello")`.
 
@@ -208,9 +216,15 @@ curl http://127.0.0.1:3000/notes
 
 > **Note:** `db.lastInsertRowId()` is a method — the `()` is required. Without it you'd serialize the function object instead of the id.
 
+## Handling request bodies and limits
+
+The request line, headers, and body all share one 4096-byte read buffer. A request whose headers parse but whose declared body pushes the total past 4096 bytes gets `413 Payload Too Large`; a header block that never finishes within 4096 bytes closes the connection. Keep request bodies small, or stream them from the client in pieces your handler concatenates.
+
+The response body has a 10 MB hard cap (bodies up to 64 KB sit in a per-slot buffer, larger ones spill to the heap; over 10 MB → `500`). Response headers are capped at 2048 bytes, and a handler that stays pending for 30s is failed with `504 Gateway Timeout`.
+
 ## Smoke-testing with FF_ECHO
 
-Set `FF_ECHO` to any value and every request returns canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
+Set `FF_ECHO` to any value and every request served over HTTP/1.1 — plain or TLS, but not HTTP/2 — returns a canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
 
 ```sh
 FF_ECHO=1 ff server.js
@@ -218,20 +232,25 @@ curl http://127.0.0.1:3000/anything
 # {"message":"ok"}
 ```
 
+`FF_ECHO` is read once when the listener starts. Any value (including an empty string) enables it; only leaving it unset disables it.
+
 ## Reference: limits
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent connections | 512 | The 513th waits for a free slot |
-| Request body | ~4 KB total (headers + body share one read buffer) | Beyond → `413 Payload Too Large` |
+| Concurrent connections | 512 | Once all slots are busy, new connections are accepted then immediately closed — not queued |
+| Request size | 4096 bytes total (request line + headers + body share one read buffer) | Declared body past the cap → `413 Payload Too Large`; unterminated headers → connection closed |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
+| Response headers | 2048 bytes | User headers past the cap are dropped |
 | Hung handler | 30s | Connection fails with `504` |
 | Bind address | Always `0.0.0.0` | No host option exists |
-| Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |
+| Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the [TLS guide](/docs/guides/tls)) |
 
 ## Troubleshooting
 
 **Empty 200 when I return a string** — wrap it: `return new Response("hello")`. Bare strings are not bodies.
+
+**`http.serve requires (options, handler)`** — you called it with one argument. Pass an options object (or a number) first: `http.serve({ port: 3000 }, handler)`.
 
 **Connection refused** — confirm the port in `http.serve({ port })` matches your `curl` command or Docker `-p` mapping. No environment variable overrides it.
 

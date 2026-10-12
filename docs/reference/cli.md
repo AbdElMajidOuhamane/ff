@@ -84,7 +84,7 @@ ff start --cert cert.pem --key key.pem
 FF_CERT=cert.pem FF_KEY=key.pem ff start
 ```
 
-Reads `main` from `ff.json` and runs it as a module (max 10MB). Missing or invalid manifest prints an error and exits.
+Reads `main` from `ff.json` and evaluates it — module or classic script, auto-detected from the file's first tokens (max 10 MB). Missing or invalid manifest prints an error and exits.
 
 | Flag / env | Description |
 |------------|-------------|
@@ -106,7 +106,7 @@ ff imprint
 
 | Form | Effect |
 |------|--------|
-| `ff imprint pkg@ver ...` | Pin pure-JS ESM packages into `ff.json` + `ff.lock` (v2 lock with integrity hashes), materialize `node_modules/` |
+| `ff imprint pkg@ver ...` | Pin pure-JS ESM packages into `ff.json` + `ff.lock` (lockfile with integrity hashes), materialize `node_modules/` |
 | `ff imprint pkg ...` | Same, resolving latest from the registry |
 | `ff imprint` (no args, v2 lock present) | Exact rebuild from the lock (CI-like) |
 | `ff imprint` (no args, no lock) | Resolve from `ff.json`, write the lock |
@@ -187,6 +187,24 @@ ff fmt --check app.js
 
 Delegates to `npx --yes prettier` (needs network, or a global prettier). Without files it prints usage; exit code is non-zero when prettier fails.
 
+## Watch and restart
+
+```sh
+ff --watch app.js
+ff --watch app.js --ca ./ca.pem
+ff --watch start
+```
+
+`--watch` must be the **first** argument. It spawns a supervisor that never runs a runtime itself: it polls the project tree (mtime + size, 200 ms, 100 ms debounce), SIGTERMs the child, waits up to 500 ms, SIGKILLs if needed, and respawns a fresh runtime. Everything after the target is forwarded to the child. Directories `.git`, `node_modules`, `zig-out`, `.zig-cache`, and `zig-cache` are skipped. `--watch start` watches the project and re-runs `ff start` (reading `main` from `ff.json`).
+
+```text
+[watch] watching 12 files under . (poll 200ms)
+[watch] running: ff app.js
+[watch] change: ./app.js — restarting
+```
+
+> **Note:** `--watch` needs a POSIX platform (macOS/Linux). On Windows it exits with an error.
+
 ## Self-update
 
 ```sh
@@ -227,4 +245,5 @@ ff --version
 | `ff compile <f.js> [-o out.ffbc]` | Bytecode, source stripped |
 | `ff fmt [--write\|--check] <files …>` | Prettier via npx |
 | `ff upgrade [--check]` | Self-update from GitHub Releases |
+| `ff --watch <file\|start> [args…]` | Restart the child on file changes |
 | `ff --version` | Print version |

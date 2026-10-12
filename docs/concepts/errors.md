@@ -38,7 +38,7 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 
 | API | Behaviour |
 |---|---|
-| `setTimeout(fn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` |
+| `setTimeout(nonFn)` / `setInterval(nonFn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` |
 | `Database.open()` without a path | **throws** `Database.open requires a file path` |
 | `new Request()` without a URL | **throws** `Request requires a URL string as first argument` |
 | `new Worker()` without a path | **throws** `Worker requires a module path` |
@@ -54,11 +54,13 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 
 ```js
 // Reliable: async variants reject with the error name
-try {
-  const text = await fs.readFileAsync("config.json", "utf8");
-} catch (e) {
-  console.error("cannot read config:", e.message); // "FileNotFound"
-}
+(async () => {
+  try {
+    const text = await fs.readFileAsync("config.json", "utf8");
+  } catch (e) {
+    console.error("cannot read config:", e.message); // "FileNotFound"
+  }
+})();
 
 // Sync: guard with exists()
 if (fs.exists("config.json")) {
@@ -81,18 +83,37 @@ Always attach a `.catch`, or `await` inside a `try`. In an HTTP handler the
 runtime does catch it — a rejected handler Promise becomes a **500**
 response.
 
+The one exception is a **top-level throw in a module** (a file with
+`import`/`export`, or `.mjs`): the module promise rejects synchronously and
+the runtime inspects it, so it prints the stack and exits **1**. But a
+rejection that only settles *after* a top-level `await` is not inspected —
+it is unhandled like any other and exits **0**:
+
+```js
+// boom.mjs — ff boom.mjs
+throw new Error("boom");        // reported, exit 1
+```
+
+```js
+// late.mjs — ff late.mjs
+await Promise.reject(new Error("later"));   // silent, exit 0
+```
+
 ## `fetch` rejects with strings
 
 Failed fetches reject with a **string**, not an `Error`, so `e.message` is
 `undefined`:
 
 ```js
-try {
-  await fetch("notaurl");
-} catch (e) {
-  console.log(typeof e);        // "string"
-  console.log(e);               // "Invalid URL" | "Network error" | "Too many redirects"
-}
+// ff fetch.js (classic script — wrap async code in an IIFE)
+(async () => {
+  try {
+    await fetch("notaurl");
+  } catch (e) {
+    console.log(typeof e);        // "string"
+    console.log(e);               // "Invalid URL" | "Network error" | "Too many redirects"
+  }
+})();
 ```
 
 A diagnostic line also goes to stderr:
@@ -151,7 +172,11 @@ Strings you'll see in practice — useful for assertions in tests:
 | `Invalid URL` | `fetch`, `URL` |
 | `fetch requires a URL string or Request as first argument` | `fetch` |
 | `FileNotFound` | `fs.*Async` rejection |
-| `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` | `ffi` |
+| `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` | `ffi` (`-Dffi=false` build) |
+| `ffi.dlopen requires --allow-ffi` | `ffi.dlopen` without the flag |
+| `ffi.callback requires --allow-ffi` | `ffi.callback` without the flag |
+| `ffi: symbol '<name>' not found` | `ffi.dlopen` with a missing non-optional symbol |
+| `ffi: library is closed` | symbol call after `lib.close()` |
 | `failed to start server (is the port in use?)` | `http.serve` |
 
 ## Gotchas

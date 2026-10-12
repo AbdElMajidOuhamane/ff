@@ -44,14 +44,20 @@ Routing, JSON REST API, SQLite-backed notes API: [HTTP Server guide](/docs/guide
 
 ```js
 // client.js
-const res = await fetch("https://example.com/");
-console.log(res.status, res.ok);
-console.log((await res.text()).length);
+(async () => {
+  const res = await fetch("https://example.com/");
+  console.log(res.status, res.ok);
+  console.log((await res.text()).length);
+})();
 ```
 
 ```sh
 ff client.js
 ```
+
+(Plain `.js` files run as classic scripts, so `await` must sit inside an async
+function. Save the file as `client.mjs`, or start it with an `import`, to use
+top-level `await` as written.)
 
 POST JSON, redirect rules, private-CA trust, mirror script: [Fetch Client guide](/docs/guides/fetch-client). Types and readers: [`fetch` API](/docs/api/fetch).
 
@@ -169,11 +175,15 @@ done("notes");
 ```
 
 ```sh
-ff test notes
-# OK   test/notes.test.js
+ff test/notes.test.js
+# [notes] pass:1 fail:0
 ```
 
 `check`/`done`, server fixtures, `run.sh`: [Testing guide](/docs/guides/testing).
+
+> **Note:** `done()` calls `process.exit()`, so run a `done()`-style file
+> directly (as above) or with `test/run.sh` (one process per file). Under
+> `ff test` (a single shared process) the first `done()` ends the whole run.
 
 ## Bytecode ship
 
@@ -207,6 +217,37 @@ else { console.error("usage: tool.js <greet [name]>"); process.exit(1); }
 ```
 
 Sleep, intervals, unref, microtasks: [Timers guide](/docs/guides/timers). argv/env/exit: [Process guide](/docs/guides/process). Env vars: [Env guide](/docs/guides/env).
+
+## UDP datagrams
+
+```js
+// udp-echo.js
+(async () => {
+  const server = udp.socket();
+  server.bind({ address: "127.0.0.1" });
+  const port = server.getsockname().port;
+
+  const client = udp.socket();
+  const sent = await client.sendto(new TextEncoder().encode("ping"), {
+    address: "127.0.0.1",
+    port,
+  });
+
+  const [data, from] = await server.recvfrom(new Uint8Array(1500));
+  console.log(from.address, from.port, sent, new TextDecoder().decode(data));
+
+  server.close();
+  client.close();
+})();
+```
+
+```sh
+ff udp-echo.js
+# 127.0.0.1 54321 4 ping
+```
+
+Full socket API (`bind` / `connect` / `sendto` / `recvfrom` / `send` / `recv`),
+zero-copy buffers, and errors: [`udp` API](/docs/api/udp).
 
 ## Blobs and forms
 

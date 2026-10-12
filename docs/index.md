@@ -9,7 +9,7 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, batteries
 included (HTTP, fetch, WebSocket, SQLite, Postgres, workers). Scripts and
 ES modules both work — the runtime auto-detects per file.
 
-44 pages in five sections. If you're new: read the three getting-started
+45 pages in five sections. If you're new: read the three getting-started
 pages in order, then keep **Concepts** open while you build — it explains
 *why* the runtime behaves the way it does.
 
@@ -77,6 +77,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | [Blob and FormData](/docs/api/blobs-formdata) | Binary payloads and HTML forms |
 | [SQLite](/docs/api/sqlite) | `Database` — open, query, write, transactions |
 | [Postgres](/docs/api/postgres) | `SQL`/`sql` — queries, types, errors, transactions |
+| [UDP](/docs/api/udp) | `udp.socket` — POSIX datagrams: bind, sendto, recvfrom |
 | [FFI](/docs/api/ffi) | Load C-ABI shared libraries and call them from JS |
 
 ## Reference
@@ -101,6 +102,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | `fs` sync + `*Async` | [API: fs](/docs/api/fs) |
 | `Database` (SQLite) | [API: SQLite](/docs/api/sqlite) |
 | `sql` / `SQL` / `Tx` (Postgres) | [API: Postgres](/docs/api/postgres) |
+| `udp` (`udp.socket`, max 64) | [API: udp](/docs/api/udp) |
 | `Worker` | [API: Worker](/docs/api/worker) · [Workers](/docs/guides/workers) |
 | `URL` / `URLSearchParams` | [API: URL](/docs/api/url) |
 | `crypto`, `btoa`, `atob` | [API: crypto](/docs/api/crypto) |

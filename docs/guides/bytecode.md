@@ -6,7 +6,7 @@ order: 15
 
 # Bytecode
 
-`ff compile` turns an ES module into QuickJS bytecode (`.ffbc`) with **source and debug info stripped**. Run the result with plain `ff` — the loader detects the `.ffbc` magic.
+`ff compile` turns an ES module into QuickJS bytecode (`.ffbc`) with **source and debug info stripped**. Run the result with plain `ff` — the runtime detects the `.ffbc` filename and loads bytecode instead of source.
 
 ## Quick look
 
@@ -33,15 +33,18 @@ ff compile app.js --output dist/app.ffbc
 
 | Form | Output path |
 |------|-------------|
-| `ff compile app.js` | `app.ffbc` (extension replaced) |
+| `ff compile app.js` | `app.ffbc` — the input's **last** extension is replaced |
 | `ff compile app.js -o out.ffbc` | `out.ffbc` |
 | `ff compile app.js --output dist/app.ffbc` | `dist/app.ffbc` |
 
+`-o` and `--output` are equivalent. Without one, the output is the input path with everything from its last `.` replaced by `.ffbc` (`dist/app.js` → `dist/app.ffbc`).
+
 Rules:
 
-- Input must be an ES module; a syntax error prints `compile error in '<path>'` and writes nothing.
-- Input cap is 20MB — larger files fail.
-- Output embeds bytecode only: no source text, no debug info. Stack traces from `.ffbc` won't show original line names.
+- The input is compiled as an **ES module** (`EVAL_TYPE_MODULE`). A syntax error prints `compile error in '<path>'` and writes **nothing**.
+- Input cap is **20 MB** — `ff compile` reads at most that; larger files fail.
+- The object is written with `WRITE_OBJ_BYTECODE | WRITE_OBJ_STRIP_SOURCE | WRITE_OBJ_STRIP_DEBUG`: bytecode only, no source text, no debug info.
+- Success prints `Compiled <input> -> <output> (<N> bytes)`.
 
 ## Running bytecode
 
@@ -49,7 +52,7 @@ Rules:
 ff app.ffbc
 ```
 
-No flag needed — `ff` sniffs the file magic and loads bytecode instead of source. Everything else behaves identically: `ff test`-style harnesses, `FF_ECHO`, TLS flags, and env vars all work the same.
+No flag needed. When the filename ends in `.ffbc`, `ff` reads it as a bytecode object, evaluates it, and then runs the event loop to quiescence — exactly like a source module. Everything else behaves identically: `FF_ECHO`, `--ca` TLS trust, and env vars all apply.
 
 ```sh
 FF_ECHO=1 ff app.ffbc
@@ -57,7 +60,9 @@ curl http://127.0.0.1:3000/x
 # {"message":"ok"}
 ```
 
-> **Note:** `ff test` ignores `.ffbc` files (it only runs `*.test.js`). Keep the `.js` sources for your test suite and compile only what you ship.
+Because bytecode is compiled as a module, its `import`s still resolve through the module loader when you run the `.ffbc`.
+
+> **Note:** `ff test` ignores `.ffbc` files — it only runs `test/*.test.js`. Keep the `.js` sources for your test suite and compile only what you ship.
 
 ## Practical example: ship a server without source
 
@@ -81,21 +86,21 @@ curl http://127.0.0.1:8080/health
 kill %1
 ```
 
-Deploy `main.ffbc` (+ `ff.json` if you use `ff start` semantics elsewhere) instead of `main.js`. Recipients get a working binary artifact with no readable source.
+`ff start` evaluates its `main` as JavaScript **source** — it does not run `.ffbc`. Ship the artifact and run it directly (`ff main.ffbc`), or set your process/supervisor command to that. Keep the `.js` around for `ff start`/tests during development.
 
 ## When to use it (and when not to)
 
 | Use bytecode when… | Keep source when… |
 |---|---|
-| Shipping to environments where source visibility matters | Debugging — stack traces need source |
-| You want the smallest deploy artifact | Iterating locally (`ff file.js` starts faster to type) |
+| Shipping to environments where source visibility matters | Debugging — stack traces are stripped |
+| You want a single deploy artifact with no readable source | Iterating locally (`ff file.js` starts faster to type) |
 | Locking what was reviewed (bytecode matches a build) | Tests run (`ff test` needs `.test.js` sources) |
 
 ## Troubleshooting
 
-**`compile error in 'x.js'`** — the module has a syntax error. Run it first with `ff x.js` to see the real parse error, fix, recompile.
+**`compile error in 'x.js'`** — the input has a syntax error (or uses syntax that isn't valid in a module). Run `ff x.js` to see the real parse error, fix, recompile.
 
-**Output missing after compile** — check the printed path (`Compiled a -> b (N bytes)`); with `-o` a typo'd directory fails the write. Create the dir first.
+**Output missing after compile** — check the printed path (`Compiled a -> b (N bytes)`); with `-o` a typo'd directory fails the write. Create the directory first.
 
 **Stack traces look stripped** — expected. Bytecode drops source + debug info by design; reproduce against the `.js` for real traces.
 

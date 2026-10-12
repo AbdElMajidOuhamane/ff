@@ -63,18 +63,30 @@ Rules that fall out of this:
 
 ## What keeps the process alive
 
-The process exits when none of these are true:
+Each turn, the loop asks whether any *relevant* work remains
+(`hasRelevantWork`). It keeps running while any of these is true:
 
 | Pending work | Where it comes from |
 |---|---|
+| Armed work in the loop | referenced timers, TCP/UDP sockets, and other armed completions |
 | A **referenced** timer armed | `setTimeout` / `setInterval` |
 | An `http.serve` listener running | any active server |
-| A `fetch` in flight | outbound HTTP |
+| A `fetch` in flight | outbound HTTP (16-slot pool) |
 | A WebSocket client connection in flight | `new WebSocket(...)` |
 | A Postgres query in flight | `sql` / `SQL` |
-| An FFI job in flight | `ffi` non-blocking calls |
+| An FFI job in flight | `ffi` `nonblocking` calls **and** foreign-thread callbacks waiting on the bridge |
 | An async `fs` job in flight | `fs.readFileAsync()` etc. — and Known issue: a *completed* job still pins the process, which then never exits (see [fs](/docs/api/fs)) |
 | A live `Worker` | until `terminate()` |
+
+Two subtleties from the source:
+
+- The armed-work check is `loop.active − unref'd-timer-completions > 0`, so an
+  unref'd timer's own submission cannot, by itself, hold the process open.
+  Queued submissions/pending completions only count while **nothing** is
+  unref'd — every other producer is already covered by a counter above.
+- `unref()` never unschedules the timer. It only removes it from the
+  liveness set. So an unref'd timer **still fires** if the loop outlives it
+  (see below).
 
 An **`unref()`'d timer does not hold the process**:
 
@@ -91,7 +103,18 @@ $ echo $?
 ```
 
 That is the whole pattern for background housekeeping (polling, flushing)
-in a CLI: arm it, `unref()` it, and let the script end.
+in a CLI: arm it, `unref()` it, and let the script end. But if something
+else keeps the loop alive past the timer's delay, the unref'd timer runs
+anyway:
+
+```js
+// fires, because the 60 ms referenced timer holds the loop open
+const u = setTimeout(() => console.log("unref fired"), 30);
+u.unref();
+setTimeout(() => console.log("ref fired"), 60);
+// unref fired
+// ref fired
+```
 
 ## Async handlers park connections
 
@@ -115,6 +138,7 @@ error or rejected Promise becomes a **`500`**.
 |---|---|
 | Nothing relevant pending | exit `0` |
 | Uncaught throw / uncaught script error | stack to **stderr**, exit `1` |
+| Unhandled promise rejection | silent, exit `0` — unless the throw is a top-level module throw, which is reported |
 | `process.exit(n)` | exit code clamped to `0–255` |
 | Event-loop backend failure | `ff: event loop error: <name>`, exit `1` |
 | io_uring selected but unavailable | `ff: I/O backend unavailable (…)`, exit `1` |
@@ -133,6 +157,9 @@ Details and more examples: [Errors and exit codes](/docs/concepts/errors).
 - `console` writes to **stderr**, so `ff app.js > out.txt` captures nothing.
 - The loop wakes at most every 100 µs while idle; don't expect sub-100 µs
   timer precision.
+- A top-level `await` rejection inside a module is *not* reported (the
+  module promise settles after the synchronous check); only a top-level
+  *throw* before any `await` is. Attach a `.catch`/`try` there.
 
 ## See also
 

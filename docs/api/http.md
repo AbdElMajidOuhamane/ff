@@ -6,7 +6,7 @@ order: 16
 
 # `http` API
 
-The `http` module starts servers. It has one function, `http.serve`, plus the response helpers you return from your handler.
+The `http` module starts servers. It has one function, `http.serve`, plus the response helpers you return from your handler. The server always binds `0.0.0.0`; plain listeners speak HTTP/1.1, and adding TLS unlocks HTTPS, WSS, and HTTP/2 on the same port.
 
 ## Quick look
 
@@ -23,23 +23,38 @@ curl http://127.0.0.1:3000/
 # hello
 ```
 
-## `http.serve(signatures)`
+## `http.serve(options, handler)`
 
-Three call shapes are accepted:
+`http.serve` takes exactly **two** arguments: an options value first, a handler function second. Calling it with **one** argument throws before anything starts:
 
 ```js
-http.serve(handler);                 // default port 3000
-http.serve(4242, handler);           // port shorthand
-http.serve({ port: 4242 }, handler); // options object
+http.serve(handler);
+// TypeError: http.serve: http.serve requires (options, handler)
 ```
 
-| Signature | Port used |
-|-----------|-----------|
-| `http.serve(handler)` | `3000` |
-| `http.serve(port, handler)` | `port` |
-| `http.serve(options, handler)` | `options.port`, or `3000` when omitted |
+The first argument is either an options object or a port number:
 
-The server binds to `0.0.0.0`. There is no host option.
+```js
+http.serve({ port: 4242 }, handler); // options object
+http.serve(4242, handler);           // port shorthand
+http.serve({}, handler);             // no options — port 3000
+```
+
+| First argument | Port used |
+|----------------|-----------|
+| `{ port }` object | `options.port`, or `3000` when `port` is missing/invalid |
+| number | that number |
+| anything else (`null`, `undefined`, a string, …) | `3000` |
+
+- The port is coerced with QuickJS `toInt32`; a non-numeric value falls back to `3000`.
+- The server always binds `0.0.0.0`. There is **no host option**, no `--port` flag, and no `FF_PORT` env var.
+- The handler must be a function, or `http.serve` throws `TypeError: http.serve: handler must be a function`.
+
+### Return value
+
+`http.serve` returns **`undefined`**. There is no server handle, no `.port`, and no `.stop()` — the port is whatever you passed, and the only way to stop serving is to end the process (`Ctrl-C`, or `process.exit(0)` from your code).
+
+> **Note:** A process has one listener. A second `http.serve` call does not open a new port — the first listener is reused, its port is ignored, and the handler is replaced. A listener is either plain or TLS, decided by the options on the call that started it.
 
 ## Options reference
 
@@ -47,7 +62,7 @@ The server binds to `0.0.0.0`. There is no host option.
 http.serve(
   {
     port: 3000,                       // default 3000
-    tls: { cert: "...", key: "..." }, // optional — enables HTTPS/WSS on the same port
+    tls: { cert: "...", key: "..." }, // optional — enables HTTPS/WSS/H2 on the same port
     websocket: {                      // optional — enables WebSocket upgrades
       open: (socket) => {},
       message: (socket, data) => {},
@@ -61,16 +76,27 @@ http.serve(
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `port` | `number` | `3000` | Listen port |
-| `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN`) or a file path. Cert max 512KB, key max 256KB. Enables HTTPS and WSS alongside plain HTTP/WS |
-| `websocket.open` | `(socket) => void` | none | Fires when a client completes the upgrade |
-| `websocket.message` | `(socket, data) => void` | none | Fires per frame; `data` is a string (text) or `Uint8Array` (binary) |
+| `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN `) or a file path. File paths are read with a **512 KB** cap (both cert and key through this option). Enables HTTPS, WSS, and HTTP/2 on the same port — see the [TLS guide](/docs/guides/tls) |
+| `websocket` | `object` | none | Presence alone enables upgrades; its keys are optional callbacks (below) |
+| `websocket.open` | `(socket) => void` | none | Fires when a client completes the upgrade (after the `101` is written) |
+| `websocket.message` | `(socket, data) => void` | none | Fires per reassembled message; `data` is a `string` (text) or `Uint8Array` (binary) |
 | `websocket.close` | `(socket) => void` | none | Fires when a client disconnects |
 
-When the `websocket` block is present, any request carrying
-`Connection: Upgrade`, `Upgrade: websocket`, and `Sec-WebSocket-Key` is
-upgraded **before your handler runs** — the handler never sees that
-request, and no `{ status: 101 }` branch is needed (a handler that would
-return 404 still gets the `101`). The handler serves plain HTTP only:
+If `tls` is present but `cert`/`key` are not strings, `http.serve` throws `TypeError: http.serve: tls.cert and tls.key must be strings (PEM content or file path)`. If the provider can't be read or parsed, the server refuses to start (you never get a silent plain-HTTP fallback). A binary built with `-Dbearssl=false` throws `TypeError: http.serve: built without TLS …` when you pass `tls`.
+
+## Response headers: what you control
+
+When you return a `Response`, its status, `content-type`, and custom headers are sent. A few things are always managed by the runtime and cannot be overridden from your `Response`:
+
+- `content-length` — computed from the body you return.
+- `connection` — set to `keep-alive` when the connection is kept open.
+- `transfer-encoding` — never emitted; framing is `content-length` only.
+- Header names/values containing `\r` or `\n` are dropped (header-injection guard).
+- If the body is non-empty and you set no `content-type`, `text/plain` is used.
+
+## WebSocket upgrades
+
+When `options.websocket` is an **object**, the server upgrades **before** your handler runs whenever a request's headers contain `Sec-WebSocket-Key:` (case-insensitive). That single header is the trigger — the runtime does **not** also require `Connection: Upgrade` or `Upgrade: websocket`. The `101 Switching Protocols` response is written for the handshake, so the handler never sees it and no `{ status: 101 }` branch is needed (a handler that would return `404` still gets the `101`). The handler serves plain HTTP only:
 
 ```js
 // server.js
@@ -87,7 +113,7 @@ http.serve(
 );
 ```
 
-Server sockets expose `send` / `sendBinary` only — track peers by object reference in a `Set` (see the WebSocket guide).
+Server sockets expose `send` / `sendBinary` only — track peers by object reference in a `Set` (see the [WebSocket guide](/docs/guides/websocket)).
 
 ## Handler reference
 
@@ -105,10 +131,10 @@ Return one of:
 |--------------|--------|
 | `Response` | Status, headers, and body sent as-is |
 | `{ status, body }` (`string` or `ArrayBuffer` body) | Sent with that status code |
-| `Promise` of either shape | Connection parks until it settles |
+| `Promise` of either shape | Connection parks until it settles; a rejection → `500` |
 | Anything else (incl. bare strings) | Empty `200` response |
 
-Async handlers work — the 30s watchdog still applies:
+A handler that **throws** (or returns a rejected promise) produces `500 Internal Server Error`. Async handlers work — the 30s watchdog still applies:
 
 ```js
 http.serve({ port: 3000 }, async (url, method, body) => {
@@ -132,12 +158,12 @@ return Response.redirect("/moved", 301);              // 301 status only — no 
 
 | Helper | Signature | Notes |
 |--------|-----------|-------|
-| `new Response(body, init?)` | `body`: `string \| ArrayBuffer \| null`; `init`: `{ status?, headers? }` | Default `content-type` is `text/plain` when the body has none |
+| `new Response(body, init?)` | `body`: `string \| ArrayBuffer \| Uint8Array \| null`; `init`: `{ status?, statusText?, headers? }` | Default `content-type` is `text/plain` when the body has none |
 | `Response.json(data, init?)` | any JSON-serializable `data` | Sets `content-type: application/json` |
 | `Response.redirect(url, status?)` | redirect target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | — | Status `0`, type `"error"` (fetch-network-error shape) |
 
-Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Each body reads once (`bodyUsed` goes `true`).
+Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Bodies are **re-readable** (`bodyUsed` is a construction-time snapshot that always stays `false`); `bytes()` returns an `ArrayBuffer`, not a `Uint8Array`. See [Request / Response / Headers](/docs/api/request-response).
 
 Headers are case-insensitive and lowercased internally:
 
@@ -180,11 +206,21 @@ curl -X POST http://127.0.0.1:3000/echo -d hi  # hi
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s handler watchdog (→ `504`), plain listeners speak HTTP/1.1 (HTTP/2 needs TLS).
+Full table lives in the [Limitations reference](/docs/reference/limitations); the ones that bite here:
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Concurrent connections | 512 | Once every slot is busy, new connections are accepted then immediately closed — they are **not** queued |
+| Request size | 4096 bytes (request line + headers + body share one read buffer) | A declared body that pushes the total past 4096 → `413 Payload Too Large`; a header block that never terminates within 4096 closes the connection |
+| Response body | 10 MB hard cap | Beyond 10 MB → `500`; bodies up to 64 KB stage in a per-slot static buffer, larger ones spill to the heap |
+| Response headers | 2048 bytes | User headers are dropped once the block would exceed the cap |
+| Hung handler | 30s watchdog | A still-pending handler promise → `504 Gateway Timeout` |
+| Plain protocol | HTTP/1.1 | HTTP/2 needs TLS + ALPN |
 
 ## See also
 
 - [HTTP Server guide](/docs/guides/http-server) — tutorial version of this page
 - [WebSocket guide](/docs/guides/websocket) — `send` / `sendBinary` patterns
 - [TLS guide](/docs/guides/tls) — `tls: { cert, key }` in depth
+- [HTTP/2 guide](/docs/guides/http2) — the same port serving h2
 - [Limitations](/docs/reference/limitations) — every hard cap

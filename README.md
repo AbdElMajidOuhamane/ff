@@ -37,7 +37,7 @@ and a small readable codebase.
 
 ## Documentation
 
-The full guide set lives in [`docs/`](docs/index.md) — 44 pages covering
+The full guide set lives in [`docs/`](docs/index.md) — 45 pages covering
 everything this README summarizes.
 
 | Section | Contents |
@@ -95,7 +95,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~24k lines of Zig across 54 files
+- **The whole codebase should fit in your head** — ~25k lines of Zig across 57 files
 
 It's *not* aimed at:
 
@@ -149,12 +149,14 @@ curl http://127.0.0.1:3000/json  # {"ok":true}
 
 ```js
 // client.js
-const res = await fetch("https://api.example.com/notes", {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ text: "buy milk" }),
-});
-console.log(res.status, await res.text());
+(async () => {
+  const res = await fetch("https://api.example.com/notes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "buy milk" }),
+  });
+  console.log(res.status, await res.text());
+})();
 ```
 
 ```sh
@@ -200,7 +202,8 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
 | `process` | `argv` mirrors the OS argv; `env` is a boot snapshot; `chdir` never throws; exit codes clamp to 0–255 |
 | `TextEncoder` / `TextDecoder` | UTF-8 string ↔ bytes |
-| `WebSocket` | Client with `send` / `sendBinary` / `close`; sync mistakes throw `TypeError: WebSocket: …` |
+| `WebSocket` | Client with `send` (string → text, bytes → binary) and `close`; single `on…` handlers |
+| `udp` | POSIX datagrams (`udp.socket`); binary-only payloads; IP literals only (no DNS) |
 | `ffi` | Native libraries; needs `--allow-ffi` at runtime |
 
 ---
@@ -241,9 +244,7 @@ RSS** on this workload.
 **Reproducing:** `wrk -t8 -c100 -d10s` against the hello-world handler
 (8 threads, 100 keep-alive connections, RSS sampled via `ps`), 3-run
 medians per runtime. Server-side numbers use `ReleaseFast` builds
-(`make build`). Broader interpreter and I/O comparisons live in
-[`bench/run-bench.sh`](bench); memory comparisons use `bench/mem-bench.sh`
-(maintainer-local, not in the repo).
+(`make build`).
 
 ---
 
@@ -399,8 +400,14 @@ Database:
 
 - `fetch`: **16** concurrent slots, HTTP/1.1, 30 s I/O timeout, max 5 redirects
 - No `AbortController` / `signal` / `timeout` / `redirect` init keys
-- WebSocket client: **64** sockets, 16384-byte messages (larger sends truncate)
+- WebSocket client: **64** sockets, 16384-byte messages (an oversized client `send` is dropped; the server closes the connection with code `1009`)
 - Outbound TLS connection pool: **64**
+
+**UDP**
+
+- Max **64** sockets and **64** in-flight `sendto` calls; max datagram **65507** bytes
+- One pending `recvfrom` per socket; IP literals only (no DNS)
+- No `setsockopt`, multicast, or broadcast helpers
 
 **Timers & loop**
 
@@ -417,7 +424,7 @@ Database:
 
 - Max **8**; 32 MB heap, 1 MB JS stack, 8 MB thread stack each
 - 4 MB per message; no `ArrayBuffer` transfer (always copied)
-- Worker scope is `console` + timers + `postMessage` — no `fs`, `fetch`, or `http.serve`
+- Worker scope is `console` + timers + `performance` + `postMessage`/`onmessage`/`self`/`workerData` — no `fs`, `fetch`, or `http.serve`
 - No nested workers; exit only via `terminate()`
 
 **SQLite**

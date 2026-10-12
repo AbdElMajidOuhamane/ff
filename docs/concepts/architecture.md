@@ -23,9 +23,11 @@ codebase makes the rest of the documentation predictable.
 ┌──────────────────▼───────────────────────────────┐
 │ Zig API layer                                    │
 │   api/     console, fs, process, crypto, url,    │
-│            fetch, websocket, sqlite, sql, ffi    │
+│            fetch, websocket (+ websocket_client),│
+│            sqlite, sql, udp, text_encoding, ffi  │
 │   net/     http_native (512-slot server),        │
-│            http2_server, pg_client, async_fetch  │
+│            http2_server, pg_client, async_fetch, │
+│            ws_client, udp_native, tls, tls_server│
 │   event/   loop, timers, microtasks              │
 │   types/   Headers, Request, Response, Blob,     │
 │            FormData, PoolSlice                   │
@@ -44,13 +46,12 @@ codebase makes the rest of the documentation predictable.
 | Directory | Contents | Read when |
 |---|---|---|
 | `src/api/` | Every JS global | Looking up a global's behaviour |
-| `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket | Networking limits or protocol details |
+| `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket, UDP | Networking limits or protocol details |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
-| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData` | Fetch API semantics |
+| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData`, `PoolSlice` | Fetch API semantics |
 | `src/worker/` | Workers + structured clone | Worker limits |
 | `src/commands/` | CLI subcommands | CLI flags |
 | `src/modules/` | ESM resolver | Import resolution rules |
-| `vendor/` | QuickJS, BearSSL, SQLite, nghttp2 (gitignored) | Build problems |
 
 ## Threads
 
@@ -58,11 +59,11 @@ codebase makes the rest of the documentation predictable.
 |---|---|---|
 | JS thread | 1 | All JavaScript, all Promise settlements |
 | Event-loop pool (`libxev`) | 4 | General loop work |
-| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job waits |
-| `ffi` pool | 4 | Each native call parks a pool thread |
+| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th job submitted in one turn throws |
+| `ffi` pool | 4 | Each `nonblocking` native call parks a pool thread |
 | `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound connections |
-| Postgres / TLS | none | Event-driven on the loop thread |
-| `Worker` | up to 8 | Your CPU-bound JS, each with its own runtime |
+| Postgres / TLS / UDP | none | Event-driven on the loop thread |
+| `Worker` | up to 8 | Your CPU-bound JS — each with its own runtime, loop, and 2-thread pool |
 
 There is no single shared pool — loop, `fs`, and `ffi` each own a
 separate 4-thread pool. See [Concurrency](/docs/concepts/concurrency) for

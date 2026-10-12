@@ -32,7 +32,7 @@ ff hello.js
 # hello from fairyfly
 ```
 
-> **Note:** There is no bundled `examples/` directory — always create the file first (or scaffold with `ff init -y demo`).
+> **Note:** No sample files ship with the runtime — create the file first (or scaffold with `ff init -y demo`).
 
 ## Run inline code
 
@@ -109,7 +109,7 @@ console.warn("warned", "here");
 console.error("errored", 42);
 ```
 
-Methods: `log`, `info`, `debug`, `warn`, `error`, `slops`, `redbal`, `detail`. All return `undefined`.
+Methods: `log`, `info`, `debug` (plain), `warn`/`slops` (yellow), `error`/`redbal` (red), `detail` (green), plus the `time`/`timeLog`/`timeEnd` timers. All write to **stderr** and return `undefined`.
 
 ## Microtasks
 
@@ -127,8 +127,37 @@ microtask
 
 No `process.nextTick`. Use `queueMicrotask`.
 
+## UDP datagrams
+
+```js
+// udp.js
+(async () => {
+  const server = udp.socket();
+  server.bind({ address: "127.0.0.1" });
+  const port = server.getsockname().port;
+
+  const client = udp.socket();
+  await client.sendto(new TextEncoder().encode("ping"), { address: "127.0.0.1", port });
+
+  const [data, from] = await server.recvfrom(new Uint8Array(1500));
+  console.log("got", new TextDecoder().decode(data), "from port", from.port);
+
+  server.close();
+  client.close();
+})();
+```
+
+```sh
+ff udp.js
+# got ping from port 54321
+```
+
+POSIX-style datagram sockets — `bind` / `connect` / `sendto` / `recvfrom` / `send` /
+`recv` / `close`. Full reference: [`udp` API](/docs/api/udp).
+
 ## Next steps
 
 - [HTTP Server guide](/docs/guides/http-server) — routing, JSON APIs, TLS
 - [Testing](/docs/guides/testing) — the `check`/`done` pattern
+- [UDP](/docs/api/udp) — datagram sockets
 - [CLI](/docs/reference/cli) — `init`, `start`, `imprint`, `test`, and the rest

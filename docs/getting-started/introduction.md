@@ -14,7 +14,7 @@ Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS.
 
 - Cold start matters (CLI tools, edge functions, short-lived jobs)
 - Memory is capped (strict container limits)
-- You want the whole runtime to fit in your head (~24k lines of Zig across 54 files)
+- You want the whole runtime to fit in your head (~25k lines of Zig across 57 files)
 
 ## When NOT to use Fairyfly
 
@@ -33,12 +33,15 @@ Everything ships in a single binary. No `npm install` needed for core features.
 | TLS | BearSSL, zero-alloc hot path, TLS 1.2 only |
 | SQLite | Embedded database, single-file amalgamation |
 | WebSocket | Server and client, text and binary frames |
+| UDP | POSIX-style datagram sockets (`udp.socket`) |
 | Workers | Up to 8 threads, cooperative concurrency |
 | Fetch | Outbound HTTP client with async support |
+| Postgres | Built-in `sql` client — no driver to install |
 | Crypto | randomUUID, getRandomValues, subtle.digest |
 | File System | Sync read, write, mkdir, rm, readdir (+ `*Async` variants) |
 | Timers | setTimeout, setInterval, queueMicrotask |
 | URL | Full WHATWG URL API |
+| FFI | Load C-ABI shared libraries (`ffi`, needs `--allow-ffi`) |
 
 ## Three rules
 

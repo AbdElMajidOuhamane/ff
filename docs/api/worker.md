@@ -6,7 +6,7 @@ order: 15
 
 # `Worker`
 
-CPU-bound JavaScript on up to **8** OS threads. Each Worker has its own
+CPU-bound JavaScript on up to **8** OS threads. Each Worker gets its own
 JS runtime, event loop, and heap (**32 MB**) — no shared state, only
 messages.
 
@@ -22,16 +22,29 @@ w.postMessage({ password: "hunter2" });
 | | |
 |---|---|
 | Signature | `new Worker(path, options?)` |
-| `path` | Path to a JS file, resolved from the cwd |
-| `options.data` | Any **structured-cloneable** value → `workerData` in the worker |
+| `path` | Path to a JS file, resolved from the process **cwd**; `.js` is appended when the literal path doesn't exist |
+| `options.data` | Any structured-cloneable value → `workerData` in the worker |
 
-Throws `TypeError: Worker requires a module path` with no argument.
-`options.data` that cannot be cloned throws `value could not be cloned`.
+`options` has exactly one meaningful key, `data`. There is no `type` option:
+a worker file is always evaluated as a **classic script**.
+
+Throws a `TypeError` for:
+
+| Situation | Message |
+|---|---|
+| No argument | `Worker requires a module path` |
+| File not found | `Worker module not found` |
+| All 8 slots busy | `too many workers (max 8)` |
+| `data` can't be cloned | `value could not be cloned` |
 
 > The parameter is *named* "module path", but the file is evaluated as a
 > **classic script** (`EVAL_TYPE_GLOBAL`) — `import` / `export` inside a
 > worker file is a `SyntaxError`. Wrap shared code by copying it, or load
 > it in the main thread.
+>
+> Path resolution: `"./w.js"` and `"./w"` both work (the `.js` is appended
+> if the given path doesn't exist). Paths are relative to the **cwd**, not
+> the spawning script. The file itself is capped at **10 MB**.
 
 ## Parent side
 
@@ -40,16 +53,24 @@ Throws `TypeError: Worker requires a module path` with no argument.
 | Method | Signature | Notes |
 |---|---|---|
 | `postMessage(value)` | `(any) → void` | Structured clone; max **4 MB** per message |
-| `terminate()` | `() → void` | Kills the thread; no further events fire |
+| `terminate()` | `() → void` | Kills the thread; idempotent |
+
+`postMessage` throws a `TypeError` (`value could not be cloned`) if the
+value can't be cloned, and a `TypeError: postMessage requires an argument`
+when called with no value. On a **terminated** worker it throws an
+`InternalError` (`postMessage on terminated Worker`).
 
 ### Handlers
 
 ```js
-w.onmessage = (ev) => { /* ev.data — cloned value from the worker */ };
+w.onmessage = (ev) => { /* ev.data   — cloned value from the worker */ };
 w.onerror   = (ev) => { /* ev.message — uncaught error inside the worker */ };
 ```
 
-Both are single-valued properties — assigning twice replaces the first.
+Both are plain properties on the Worker object — assigning twice replaces
+the first, and neither is defined until you assign it. Messages/errors
+received with no handler installed are dropped (errors are also printed to
+stderr as `[worker] unhandled error: …`).
 
 ```js
 w.onerror = (ev) => {
@@ -64,17 +85,27 @@ Globals available inside the worker file:
 
 | Global | Description |
 |---|---|
-| `workerData` | Structured clone of the `options.data` you passed |
-| `postMessage(value)` | Send to the parent |
+| `workerData` | Structured clone of `options.data`, or `undefined` |
+| `postMessage(value)` | Send to the parent (max 4 MB) |
 | `onmessage` | `(ev) => void` — `ev.data` from the parent |
 | `self` | The worker global object |
-| `console` | Same `console` as the parent, same stderr |
-| `setTimeout` / `setInterval` / clear\* | Timers work |
-| `queueMicrotask` | |
-| `performance` | `performance.now()` — **own** origin |
+| `console` | Same `console`, same stderr |
+| `setTimeout(fn, ms?, ...args)` / `setInterval` | Timers; numeric IDs |
+| `clearTimeout(id)` / `clearInterval(id)` | Cancel by numeric ID |
+| `queueMicrotask(fn)` | Standard microtask scheduling |
+| `performance.now()` | Milliseconds; **own** origin |
+
+Timer rules: at most **128** timers per worker (beyond that
+`setTimeout`/`setInterval` throw `too many timers (max 128)`), and at most
+**8** extra callback arguments (`setTimeout accepts at most 8 callback
+arguments`). A negative delay is treated as `0`.
 
 Not available: `fetch`, `fs`, `http`, `Database`, `sql`, `process`,
-`import`.
+`Worker` (no nested workers), `import`. There is **no** worker-side
+`close()` — the parent owns the lifecycle via `terminate()`.
+
+Also absent: **`MessageChannel` / `MessagePort`** and
+**`SharedArrayBuffer`**. The only channel is `postMessage`/`onmessage`.
 
 ```js
 // hash-worker.js
@@ -90,27 +121,35 @@ onmessage = (ev) => {
 
 ## Message contract
 
-Values are **structured-cloned** across the boundary:
+Values are **structured-cloned** across the boundary (the engine's binary
+object format, with reference support so cyclic graphs survive).
 
-| Cloneable | Not cloneable (throws `value could not be cloned`) |
+| Cloneable | Not cloneable (`value could not be cloned`) |
 |---|---|
-| primitives, `null`, `undefined` | functions |
-| `Array`, plain objects | class instances (methods lost) |
-| `Map`, `Set` | `WeakMap` / `WeakSet` |
-| `ArrayBuffer`, `TypedArray`, `DataView` | DOM-ish objects |
-| `Blob` | objects with cycles **are** fine — cycles clone |
+| `null`, `undefined`, numbers, strings, booleans, `bigint` | functions |
+| `Array`, plain objects | `WeakMap` / `WeakSet` |
+| `Date`, `RegExp`, boxed primitives | `Promise` |
+| `Map`, `Set` | symbols (outside the registry) |
+| `ArrayBuffer`, typed arrays | properties with getters/setters |
+| `Error` (revived as a real `Error`, subclass and `message`/`stack` kept) | runtime-specific objects (e.g. `Blob`) |
+| cyclic graphs (cycles are fine) | |
 
-Cloning copies: the receiver gets a snapshot, not a reference. Mutations
-after `postMessage` do not propagate.
+Class instances are cloned as **plain objects** (methods and prototype are
+lost) — the same as browser `structuredClone`. Cloning **copies**: the
+receiver gets a snapshot, not a reference, so mutations after
+`postMessage` do not propagate. `ArrayBuffer`s are copied, not transferred.
 
 ## Limits
 
 | Resource | Cap |
 |---|---|
-| Concurrent workers | 8 |
+| Concurrent workers | 8 (the 9th throws) |
 | Per-message size | 4 MB |
-| Worker heap | 32 MB |
-| Worker threads | OS threads, not the loop's I/O pool |
+| Worker JS heap | 32 MB |
+| Worker JS stack | 1 MB |
+| Worker OS thread stack | 8 MB |
+| Worker module file | 10 MB |
+| Timers per worker | 128 |
 
 ```js
 try {
@@ -147,22 +186,30 @@ w.postMessage("go");
 w.terminate();
 ```
 
-- A worker **never exits on its own** — even an empty script keeps its
-  thread alive, so the main process waits. Call `terminate()`.
-- `terminate()` is immediate; pending `postMessage`s in flight are lost.
-- An uncaught throw in the worker fires `onerror` on the parent; the
-  worker thread keeps running unless you terminate it.
+- A healthy worker **never exits on its own** — even an empty script keeps
+  its thread parked in the event loop. The main process stays alive while
+  any worker is unterminated (`liveCount() > 0` keeps the loop running).
+- `terminate()` is immediate and idempotent; pending `postMessage`s in
+  flight are lost. It closes the channel and reaps (joins) the thread.
+- An error thrown inside the worker's `onmessage` handler is caught, sent
+  to the parent's `onerror`, and the worker keeps running.
+- An **uncaught top-level error** (the worker file itself throws, or the
+  file can't be read) is sent to the parent's `onerror` and **ends that
+  worker's evaluation** — it stops processing further messages but still
+  occupies its slot until you `terminate()` it.
 
 ## Gotchas
 
 - Worker files are **classic scripts** — no `import`/`export`, no
   top-level `await`.
-- No shared memory: `SharedArrayBuffer` exists as a global but Workers
-  don't share one — messages are the contract.
+- No shared memory: there is no `SharedArrayBuffer`, and no
+  `MessageChannel`/`MessagePort` — messages are the only contract.
 - `structuredClone` is not a global; message passing *is* your clone.
 - 4 MB messages are expensive — send indices, not payloads.
 - `console` in a worker writes to the **same stderr** — prefix it
   (`console.log("[w" + workerData.id + "]")`).
+- Worker paths resolve from the **cwd**, not the spawning script — use an
+  absolute path or a path relative to where you launch `ff`.
 
 ## See also
 

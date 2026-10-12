@@ -19,7 +19,8 @@ curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.
 The installer detects your OS and architecture, downloads the matching binary
 from the latest GitHub release, verifies its SHA-256 checksum, and installs to
 `~/.local/bin/ff`. If `~/.local/bin` isn't on your `PATH`, it prints the
-`export` line to add. Update anytime with:
+`export` line to add. Set `FF_INSTALL_DIR=/some/dir` to install elsewhere.
+Update anytime with:
 
 ```sh
 ff upgrade
@@ -131,13 +132,30 @@ Removes `~/.local/bin/ff` only. Zig caches are untouched.
 
 ## Docker
 
+The repo ships a two-stage `Dockerfile` (Debian build stage with Zig 0.16.0,
+alpine runtime). It cross-compiles a static musl binary with `-Dffi=false`, so
+the `ffi` global is present but `ffi.dlopen` throws in the image:
+
 ```sh
 docker build -t fairyfly .
-docker run -p 3000:3000 fairyfly ff server.js
+docker run --rm fairyfly ff --version
+```
+
+The runtime image installs the binary at `/usr/local/bin/ff` (on `PATH`), sets
+`WORKDIR /app`, and runs as a non-root user (`app`, uid 1000). There is no
+default command — pass one, and mount your project at `/app`:
+
+```sh
+docker run --rm -p 3000:3000 -v "$PWD:/app" fairyfly ff server.js
 curl http://127.0.0.1:3000/
 ```
 
-The listen port is set in code via `http.serve({ port })` (default `3000`), not by an env var — map the host port to the same port your code listens on.
+The listen port is set in code via `http.serve({ port })` (default `3000`), not by
+an env var — map the host port to the same port your code listens on.
+
+`docker-compose.yml` in the repo starts only a **Postgres 16** service (user /
+password / database all `fairyfly`, port `5432`) for exercising the `sql` client;
+it does not run `ff` itself.
 
 ## Other Make targets
 

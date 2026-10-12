@@ -12,7 +12,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent connections | 512 | The 513th waits for a free slot |
+| Concurrent connections | 512 | The 513th is accepted then closed immediately |
 | Request body | ~4 KB (shares the 4 KB read buffer) | Beyond → `413 Payload Too Large` |
 | Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
 | Response headers | 2048 bytes | Headers beyond the cap are dropped |
@@ -26,7 +26,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent fetches | 16 | The 17th waits for a free slot |
+| Concurrent fetches | 16 | The 17th rejects immediately with `Failed to start fetch` |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | Followed, max 5 hops | Throws `Too many redirects` |
@@ -37,9 +37,10 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 
 | Area | Limit | When hit |
 |------|-------|----------|
+| Server connections | 512 (shares the HTTP connection table) | The 513th is accepted then closed |
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | 16384 bytes | Larger frames truncate |
-| Handshake URL path | 512 bytes | Longer paths fail |
+| Message size | 16384 bytes | Server closes the connection with code `1009`; an oversized client `send` is silently dropped |
+| Client URL path | 512 bytes | Longer paths fail |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
 
 ## UDP
@@ -58,7 +59,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Area | Limit | When hit |
 |------|-------|----------|
 | Live timers | 128 | `TypeError: too many timers (max 128)` |
-| Extra timer args | 8 after `ms` | Extras ignored |
+| Extra timer args | 8 after `ms` | The 9th throws `TypeError` |
 | Workers | 8 | `too many workers (max 8)` |
 | Worker heap | 32 MB + 1 MB JS stack (8 MB thread stack) | — |
 | Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
@@ -145,3 +146,4 @@ queueMicrotask(fn);
 - HTTP redirects **are followed** (up to 5 hops) by `fetch`.
 - Port shorthand `http.serve(3000, handler)` **works**; the default port is `3000`.
 - `make install` targets **`~/.local/bin/ff`**, not `/usr/local/bin`.
+- `process.memoryUsage()` and `process.stats()` **exist** — RSS (peak, bytes) and allocation/spill counters (see [process](/docs/api/process)).
