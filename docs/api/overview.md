@@ -30,6 +30,7 @@ globals into every script. Bare specifiers still resolve through
 | `WebSocket` | WebSocket client (max 64 sockets) | [WebSocket](/docs/api/websocket) |
 | `Worker` | OS-thread worker (max 8) | [Worker](/docs/api/worker) |
 | `http` | `http.serve(options, handler)` | [http](/docs/api/http) |
+| `udp` | Datagram sockets (`udp.socket`, max 64) | [udp](/docs/api/udp) |
 | `fs` | Sync + Promise filesystem calls | [fs](/docs/api/fs) |
 | `process` | `argv`, `env`, `exit`, `pid`, `memoryUsage`… | [process](/docs/api/process) |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [crypto](/docs/api/crypto) |

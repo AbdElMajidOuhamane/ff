@@ -12,14 +12,25 @@ order: 2
 
 ```js
 // client.js
-const res = await fetch("https://example.com/");
-console.log(res.status, res.ok);
-console.log(await res.text());
+(async () => {
+  const res = await fetch("https://example.com/");
+  console.log(res.status, res.ok);
+  console.log(await res.text());
+})();
 ```
 
 ```sh
 ff client.js
 ```
+
+## Modules vs scripts
+
+`ff` treats a file as an ES module only when its name ends in `.mjs` or
+its first code is `import`/`export`. A plain `.js` file runs as a classic
+script, where top-level `await` is a syntax error — so the runnable
+examples on this page wrap async code in `(async () => { ... })()`. Save
+any of them with a `.mjs` extension if you'd rather use top-level `await`
+as written.
 
 ## `fetch(url, init?)`
 
@@ -140,23 +151,25 @@ Note: redirects your own `http.serve` handler returns via `Response.redirect()` 
 
 ```js
 // client.js
-async function getJSON(url) {
-  const res = await fetch(url, {
-    headers: { authorization: "Bearer TOKEN" },
+(async () => {
+  async function getJSON(url) {
+    const res = await fetch(url, {
+      headers: { authorization: "Bearer TOKEN" },
+    });
+    if (!res.ok) throw new Error(`GET ${url}: ${res.status}`);
+    return res.json();
+  }
+
+  const items = await getJSON("https://api.example.com/items");
+  console.log(items.length, "items");
+
+  const created = await fetch("https://api.example.com/items", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "hello" }),
   });
-  if (!res.ok) throw new Error(`GET ${url}: ${res.status}`);
-  return res.json();
-}
-
-const items = await getJSON("https://api.example.com/items");
-console.log(items.length, "items");
-
-const created = await fetch("https://api.example.com/items", {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ text: "hello" }),
-});
-console.log("created:", created.status);
+  console.log("created:", created.status);
+})();
 ```
 
 ```sh

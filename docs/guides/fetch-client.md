@@ -12,25 +12,38 @@ order: 2
 
 ```js
 // client.js
-const res = await fetch("https://example.com/");
-console.log(res.status); // 200
-console.log(await res.text()); // body text
+(async () => {
+  const res = await fetch("https://example.com/");
+  console.log(res.status); // 200
+  console.log(await res.text()); // body text
+})();
 ```
 
 ```sh
 ff client.js
 ```
 
+## Modules vs scripts
+
+`ff` treats a file as an ES module only when its name ends in `.mjs` or
+its first code is `import`/`export`. A plain `.js` file runs as a classic
+script, where top-level `await` is a syntax error — so the runnable
+examples on this page wrap async code in `(async () => { ... })()`. Save
+any of them with a `.mjs` extension if you'd rather use top-level `await`
+as written.
+
 ## GET with headers
 
 ```js
 // client.js
-const res = await fetch("https://api.example.com/users/42", {
-  headers: { authorization: "Bearer TOKEN" },
-});
+(async () => {
+  const res = await fetch("https://api.example.com/users/42", {
+    headers: { authorization: "Bearer TOKEN" },
+  });
 
-console.log(res.status); // 200
-console.log(res.ok); // true when 200–299
+  console.log(res.status); // 200
+  console.log(res.ok); // true when 200–299
+})();
 ```
 
 Check `res.ok` — HTTP error statuses **resolve**, they don't throw:
@@ -48,14 +61,16 @@ if (!res.ok) {
 
 ```js
 // client.js
-const res = await fetch("https://api.example.com/notes", {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ text: "buy milk" }),
-});
+(async () => {
+  const res = await fetch("https://api.example.com/notes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "buy milk" }),
+  });
 
-const data = await res.json();
-console.log(data); // e.g. { id: 1, text: "buy milk" }
+  const data = await res.json();
+  console.log(data); // e.g. { id: 1, text: "buy milk" }
+})();
 ```
 
 ```sh
@@ -130,17 +145,19 @@ Fetch a list, then POST each item onward, checking every status:
 
 ```js
 // mirror.js
-const src = await fetch("https://api.example.com/items");
-if (!src.ok) throw new Error(`source: ${src.status}`);
+(async () => {
+  const src = await fetch("https://api.example.com/items");
+  if (!src.ok) throw new Error(`source: ${src.status}`);
 
-for (const item of await src.json()) {
-  const dst = await fetch("https://backup.example.com/items", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(item),
-  });
-  console.log(item.id, dst.status);
-}
+  for (const item of await src.json()) {
+    const dst = await fetch("https://backup.example.com/items", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(item),
+    });
+    console.log(item.id, dst.status);
+  }
+})();
 ```
 
 ```sh

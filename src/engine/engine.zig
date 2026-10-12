@@ -28,6 +28,7 @@ const worker_mod = @import("../worker/worker.zig");
 const sql_api = @import("../api/sql.zig");
 const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
+const udp_api = @import("../api/udp.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -236,6 +237,7 @@ pub const Runtime = struct {
         request.setup(ctx);
         response.setup(ctx);
         http.setup(ctx);
+        udp_api.setup(ctx);
         websocket_client.setup(ctx);
         text_encoding.setup(ctx);
         sqlite_api.setup(ctx);
