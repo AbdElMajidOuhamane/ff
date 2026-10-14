@@ -73,15 +73,44 @@ fn lowerAsciiSimd(buf: []u8) void {
 // compare with plain `mem.eql`. Returns null when `name` exceeds `buf`
 // (pathological >128B header name) — the caller then falls back to
 // eqlIgnoreCase, preserving exact semantics in all cases.
+// SIMD (§9): the lowering itself goes through lowerAsciiSimd (same helper
+// as the insert path) instead of a scalar toLower loop.
 fn lowerQuery(name: []const u8, buf: []u8) ?[]u8 {
     if (name.len > buf.len) return null;
-    for (name, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    @memcpy(buf[0..name.len], name);
+    lowerAsciiSimd(buf[0..name.len]);
     return buf[0..name.len];
 }
 
 inline fn nameMatches(stored_lower: []const u8, query: []const u8, query_lower: ?[]const u8) bool {
     if (query_lower) |q| return std.mem.eql(u8, stored_lower, q);
     return std.ascii.eqlIgnoreCase(stored_lower, query);
+}
+
+// ── Oracle test: SIMD lowercase must match std.ascii.toLower exactly ──
+// Covers every byte value at full 256B width plus vector-boundary lengths
+// with deterministic fill (the justified-SIMD pattern needs a scalar
+// oracle, like unmask's — see ws_native.zig).
+test "lowerAsciiSimd matches std.ascii.toLower" {
+    // 1. Every byte value 0..255 in one 256B pass.
+    var full: [256]u8 = undefined;
+    var want: [256]u8 = undefined;
+    for (0..256) |b| {
+        full[b] = @intCast(b);
+        want[b] = std.ascii.toLower(@intCast(b));
+    }
+    lowerAsciiSimd(&full);
+    try std.testing.expectEqualSlices(u8, &want, &full);
+    // 2. Boundary lengths around the vector width(s).
+    const lens = [_]usize{ 0, 1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128 };
+    var buf: [128]u8 = undefined;
+    var exp: [128]u8 = undefined;
+    for (lens) |len| {
+        for (0..len) |i| buf[i] = @intCast((i * 131 + len * 7) & 0xff);
+        for (0..len) |i| exp[i] = std.ascii.toLower(buf[i]);
+        lowerAsciiSimd(buf[0..len]);
+        try std.testing.expectEqualSlices(u8, exp[0..len], buf[0..len]);
+    }
 }
 
 pub const Pair = struct { name: []const u8, value: []const u8 };

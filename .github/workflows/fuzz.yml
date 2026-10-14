@@ -1,0 +1,60 @@
+# Nightly fuzzing — long deterministic runs, one job per target.
+# Each job fuzzes with the commit SHA as seed (TigerBeetle-style: every
+# commit gets a different but reproducible stream). A failure prints the
+# seed; rerun locally with the same seed to reproduce.
+name: Fuzz nightly
+
+permissions: {}
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      events_max:
+        description: "Events per target"
+        default: "5000000"
+        required: false
+      seed:
+        description: "Seed override (default: commit SHA)"
+        default: ""
+        required: false
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ws_frame, http_request, http2_stream, semver, tls_pem, utf8]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-fuzz-zig-${{ hashFiles('build.zig.zon') }}
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-fuzz-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          SEED: ${{ inputs.seed }}
+          EVENTS: ${{ inputs.events_max }}
+          TARGET: ${{ matrix.target }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$SEED" ]; then SEED="$COMMIT_SHA"; fi
+          if [ -z "$EVENTS" ]; then EVENTS=5000000; fi
+          zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- \
+            "$TARGET" "$SEED" --events-max="$EVENTS"

@@ -32,11 +32,13 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // Maintainer's fork fixes kqueue UDP IPv6 address truncation; upstream
+        // mitchellh/libxev base: 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.
+        // Trust the Fairyfly maintainer for this patch; commit/hash pins bound updates.
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+            .url = "https://github.com/AbdElMajidOuhamane/libxev/archive/7fbcdf2368c568f6e4859d798645802054f9c5d4.tar.gz",
+            .hash = "libxev-0.0.0-86vtcy8VFAC_ewQhcSrX3S2BtI_Dl_UiwNWiIZeFNH3y",
         },
-        
     },
     .paths = .{
         "build.zig",

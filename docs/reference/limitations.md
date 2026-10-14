@@ -42,6 +42,17 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Handshake URL path | 512 bytes | Longer paths fail |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
 
+## UDP
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Concurrent sockets | 64 (shared pool) | `udp.socket: no socket slots available` |
+| In-flight `sendto` calls | 64 | `send: SendQueueFull` |
+| Maximum datagram | 65507 bytes | `send: MessageTooLong` |
+| Pending receives per socket | 1 | `recvfrom: RecvPending` |
+| Addresses | IP literals only | Hostnames rejected (`...: invalid address`) |
+| `setsockopt` / multicast | Missing | No socket options |
+
 ## Timers and workers
 
 | Area | Limit | When hit |

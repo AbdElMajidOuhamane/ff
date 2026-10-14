@@ -52,14 +52,23 @@ jobs:
           # still covers FFI fully.
           - name: linux-musl-io_uring
             os: ubuntu-latest
-            flags: "-Dtarget=x86_64-linux-musl -Dffi=false"
+            build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Dtarget=x86_64-linux-musl -Dffi=false"
           - name: linux-musl-epoll
             os: ubuntu-latest
-            flags: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+            build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+            test: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
           # macOS backend is kqueue (native build, FFI enabled).
           - name: macos
             os: macos-latest
-            flags: ""
+            build: "-Doptimize=ReleaseFast"
+            test: ""
+          # ReleaseSafe runs the SAME suite with safety checks on: several
+          # parsers fail silently in ReleaseFast but panic here.
+          - name: linux-musl-release-safe
+            os: ubuntu-latest
+            build: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -82,13 +91,109 @@ jobs:
         run: sh scripts/fetch-vendors.sh
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast ${{ matrix.flags }}
+        run: zig build ${{ matrix.build }}
 
       - name: Zig unit tests
-        run: zig build test ${{ matrix.flags }}
+        run: zig build test ${{ matrix.test }}
 
       - name: JS smoke tests
         run: sh test/fixtures/build.sh && sh test/run.sh
+
+  fuzz-smoke:
+    name: fuzz smoke (ReleaseSafe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-fuzz-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-fuzz-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Fuzz smoke
+        run: zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- smoke
+
+      - name: Canary must fail
+        run: |
+          if zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- canary 1; then
+            echo "canary unexpectedly passed — fuzzer failures are not propagating"
+            exit 1
+          fi
+
+  coverage:
+    name: coverage (kcov, informational)
+    # kcov is not packaged for Ubuntu 24.04 (noble); jammy ships kcov 38.
+    # ubuntu-latest resolves to 24.04 → "Unable to locate package kcov".
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-cov-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-cov-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Install kcov
+        run: sudo apt-get update && sudo apt-get install -y kcov
+
+      - name: Coverage of unit tests
+        run: |
+          rm -rf kcov-output
+          zig build test:build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false
+          kcov --include-path=./src kcov-output ./zig-out/bin/ff-test
+
+      - name: Coverage of fuzzers
+        run: |
+          zig build fuzz:build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz smoke
+          for s in 123 124 125 126 127; do
+            for t in ws_frame http_request semver tls_pem utf8 http2_stream; do
+              kcov --include-path=./src kcov-output ./zig-out/bin/fuzz "$t" "$s" --events-max=200000
+            done
+          done
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz ws_frame 0123456789abcdef0123456789abcdef01234567 --events-max=1000
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz || true
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz bogus || true
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz canary 1 || true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kcov-report
+          path: kcov-output
 
   postgres:
     name: postgres integration tests

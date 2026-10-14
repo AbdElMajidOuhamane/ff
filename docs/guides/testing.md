@@ -102,6 +102,10 @@ Green means every file exited `0` **and** printed no `FAIL` lines. `make test` a
 
 > **Caution:** `run.sh` greps for the word `FAIL`, so any `console.log("FAIL…")` of your own marks the file failed. Only `check()` should ever print it.
 
+## Fuzz runner
+
+Run `zig build fuzz -Doptimize=ReleaseSafe -- <target|smoke> [seed] [--events-max=N]`. Missing or unknown targets and invalid arguments print usage and exit with status `2`.
+
 ## Async and server tests
 
 Top-level `await` works, and the runner pumps the loop after each file:

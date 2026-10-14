@@ -11,3 +11,4 @@ tests
 vendor/sqlite
 vendor/nghttp2
 test/fixtures/libaddon_probe.so
+kcov-output

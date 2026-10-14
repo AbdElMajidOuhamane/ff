@@ -1,5 +1,75 @@
 const std = @import("std");
 
+// Everything a runtime module needs: named imports, C libraries, QuickJS
+// sources, system libs. Built once, shared by the exe, fuzzers and tests
+// so the three roots can never drift apart.
+const RuntimeLibs = struct {
+    xev_shim: *std.Build.Module,
+    c_mod: *std.Build.Module,
+    sql_mod: *std.Build.Module,
+    ffcfg_mod: *std.Build.Module,
+    bssl_mod: ?*std.Build.Module,
+    bssl_lib: ?*std.Build.Step.Compile,
+    sqlite_lib: *std.Build.Step.Compile,
+    nghttp2_lib: *std.Build.Step.Compile,
+    qjs_flags: []const []const u8,
+    bearssl: bool,
+    ffi: bool,
+};
+
+fn runtimeModule(
+    b: *std.Build,
+    root_src: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    libs: RuntimeLibs,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(root_src),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "xev", .module = libs.xev_shim },
+            .{ .name = "quickjs_c", .module = libs.c_mod },
+            .{ .name = "sqlite_c", .module = libs.sql_mod },
+        },
+    });
+    // Vendored C is not UBSan-clean: quickjs-ng v0.16.2's arena allocator
+    // trips the C UB trap (ud2 → SIGILL) in x86_64 ReleaseSafe during
+    // JS_NewRuntime, and the vendored static-lib modules would otherwise
+    // leave __ubsan_handle_* references needing the UBSan runtime at link.
+    // Keep Zig safety checks; disable C UB detection for every C module.
+    mod.sanitize_c = .off;
+    // TLS wiring: build options + declarations module + static library.
+    mod.addImport("ffcfg", libs.ffcfg_mod);
+    if (libs.bearssl) {
+        mod.addImport("bearssl_c", libs.bssl_mod.?);
+        mod.linkLibrary(libs.bssl_lib.?);
+    }
+    // Link SQLite static library
+    mod.linkLibrary(libs.sqlite_lib);
+    // Link nghttp2 static library (resolves the extern fn symbols
+    // declared in src/net/nghttp2_c.zig)
+    mod.linkLibrary(libs.nghttp2_lib);
+    // ── Compile QuickJS C sources ──
+    mod.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs.c"), .flags = libs.qjs_flags });
+    mod.addCSourceFile(.{ .file = b.path("vendor/quickjs/libregexp.c"), .flags = libs.qjs_flags });
+    mod.addCSourceFile(.{ .file = b.path("vendor/quickjs/libunicode.c"), .flags = libs.qjs_flags });
+    mod.addCSourceFile(.{ .file = b.path("vendor/quickjs/dtoa.c"), .flags = libs.qjs_flags });
+    mod.addIncludePath(b.path("vendor/quickjs"));
+    mod.linkSystemLibrary("m", .{});
+    // Link system libffi only when FFI is enabled; otherwise compile
+    // symbol stubs so the extern declarations in src/api/ffi.zig resolve.
+    if (libs.ffi) {
+        mod.linkSystemLibrary("ffi", .{});
+    } else {
+        mod.addCSourceFile(.{ .file = b.path("src/ffi_stubs.c"), .flags = &.{} });
+    }
+    return mod;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -69,19 +139,14 @@ pub fn build(b: *std.Build) void {
         lib.root_module.addIncludePath(b.path("vendor/bearssl/inc"));
         lib.root_module.addIncludePath(b.path("vendor/bearssl/src"));
         lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/bearssl/src"), .files = files.items });
+        // Match the root module: no C UBSan for vendored C (see runtimeModule).
+        lib.root_module.sanitize_c = .off;
         bssl_lib = lib;
     }
 
     // ── nghttp2: HTTP/2 framing + HPACK (always compiled in) ──
     // Bindings are hand-written in src/net/nghttp2_c.zig (explicit extern
     // declarations). The C sources below provide the link-time symbols.
-    const nghttp2_c_mod = b.createModule(.{
-        .root_source_file = b.path("src/net/nghttp2_c.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
     const nghttp2_lib = blk: {
         const io = b.graph.io;
         var nghttp2_files: std.ArrayList([]const u8) = .empty;
@@ -129,6 +194,8 @@ pub fn build(b: *std.Build) void {
                 "-DHAVE_NETINET_IN_H",
             },
         });
+        // Match the root module: no C UBSan for vendored C (see runtimeModule).
+        lib.root_module.sanitize_c = .off;
         lib.installHeadersDirectory(b.path("vendor/nghttp2/includes"), "", .{});
         break :blk lib;
     };
@@ -169,6 +236,8 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_OMIT_UTF16=1",
         },
     });
+    // Match the root module: no C UBSan for vendored C (see runtimeModule).
+    mod_sqlite.sanitize_c = .off;
 
     const sqlite_lib = b.addLibrary(.{
         .linkage = .static,
@@ -177,69 +246,64 @@ pub fn build(b: *std.Build) void {
     });
     sqlite_lib.installHeadersDirectory(b.path("vendor/sqlite"), "", .{});
 
-    // ── Executable ──
-    const exe = b.addExecutable(.{
-        .name = "ff",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libcpp = true,
-            .imports = &.{
-                .{ .name = "xev", .module = b.addModule("xev-shim", .{
-                    .root_source_file = b.path("src/xev.zig"),
-                    .imports = &.{
-                        .{
-                            .name = "xev-inner",
-                            .module = b.dependency("libxev", .{}).module("xev"),
-                        },
-                        .{ .name = "ffcfg", .module = ffcfg_mod },
-                    },
-                }) },
-                .{ .name = "quickjs_c", .module = c_mod },
-                .{ .name = "sqlite_c", .module = sql_mod },
-                .{ .name = "nghttp2_c", .module = nghttp2_c_mod },
+    // Shared by exe, tests and fuzzers (one module instance, no duplicates).
+    const xev_shim = b.addModule("xev-shim", .{
+        .root_source_file = b.path("src/xev.zig"),
+        .imports = &.{
+            .{
+                .name = "xev-inner",
+                .module = b.dependency("libxev", .{}).module("xev"),
             },
-        }),
+            .{ .name = "ffcfg", .module = ffcfg_mod },
+        },
     });
-
-    // TLS wiring: build options + declarations module + static library.
-    exe.root_module.addImport("ffcfg", ffcfg_mod);
-    if (bearssl) {
-        exe.root_module.addImport("bearssl_c", bssl_mod.?);
-        exe.root_module.linkLibrary(bssl_lib.?);
-    }
-
-    // Link SQLite static library
-    exe.root_module.linkLibrary(sqlite_lib);
-
-    // Link nghttp2 static library (resolves the extern fn symbols
-    // declared in src/net/nghttp2_c.zig)
-    exe.root_module.linkLibrary(nghttp2_lib);
 
     // ── Compile QuickJS C sources ──
     const qjs_flags: []const []const u8 = &.{
         "-D_GNU_SOURCE",
     };
 
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs.c"), .flags = qjs_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libregexp.c"), .flags = qjs_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libunicode.c"), .flags = qjs_flags });
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/dtoa.c"), .flags = qjs_flags });
+    const libs: RuntimeLibs = .{
+        .xev_shim = xev_shim,
+        .c_mod = c_mod,
+        .sql_mod = sql_mod,
+        .ffcfg_mod = ffcfg_mod,
+        .bssl_mod = bssl_mod,
+        .bssl_lib = bssl_lib,
+        .sqlite_lib = sqlite_lib,
+        .nghttp2_lib = nghttp2_lib,
+        .qjs_flags = qjs_flags,
+        .bearssl = bearssl,
+        .ffi = ffi,
+    };
 
-    exe.root_module.addIncludePath(b.path("vendor/quickjs"));
-
-    exe.root_module.link_libc = true;
-    exe.root_module.linkSystemLibrary("m", .{});
-    // NEW: link system libffi only when FFI is enabled; otherwise compile
-    // symbol stubs so the extern declarations in src/api/ffi.zig resolve.
-    if (ffi) {
-        exe.root_module.linkSystemLibrary("ffi", .{});
-    } else {
-        exe.root_module.addCSourceFile(.{ .file = b.path("src/ffi_stubs.c"), .flags = &.{} });
-    }
+    // ── Executable ──
+    const exe = b.addExecutable(.{
+        .name = "ff",
+        .root_module = runtimeModule(b, "src/main.zig", target, optimize, libs),
+    });
 
     b.installArtifact(exe);
+
+    // ── Fuzzers: deterministic, seed-driven parser fuzzers (src/fuzz_tests.zig).
+    // Run: zig build fuzz -- <target|smoke> [seed] [--events-max=N]
+    // Always fuzz in ReleaseSafe so OOB/overflow checks fire:
+    //   zig build fuzz -Doptimize=ReleaseSafe -- smoke
+    const fuzz_exe = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = runtimeModule(b, "src/fuzz_tests.zig", target, optimize, libs),
+    });
+    fuzz_exe.stack_size = 4 * 1024 * 1024;
+    fuzz_exe.root_module.omit_frame_pointer = false;
+
+    const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
+    const fuzz_build_step = b.step("fuzz:build", "Build fuzzers (no run)");
+    fuzz_build_step.dependOn(&install_fuzz.step);
+
+    const fuzz_run = b.addRunArtifact(fuzz_exe);
+    if (b.args) |args| fuzz_run.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Run fuzzers (see src/fuzz_tests.zig)");
+    fuzz_step.dependOn(&fuzz_run.step);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
@@ -249,9 +313,17 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const exe_tests = b.addTest(.{ .root_module = runtimeModule(b, "src/unit_tests.zig", target, optimize, libs) });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // ── Test binary for kcov: DWARF machine-code coverage needs no
+    // compiler instrumentation, so this is a plain build of the same
+    // tests. Run: zig build test:build -Doptimize=ReleaseSafe, then
+    // kcov --include-path=./src kcov-output ./zig-out/bin/ff-test
+    const install_tests = b.addInstallArtifact(exe_tests, .{ .dest_sub_path = "ff-test" });
+    const test_build_step = b.step("test:build", "Build the test binary (no run, for kcov)");
+    test_build_step.dependOn(&install_tests.step);
 }

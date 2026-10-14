@@ -91,31 +91,60 @@ fn parsePartial(s: []const u8) !Partial {
     if (isWild(comps[0])) return unbounded();
     const major = std.fmt.parseInt(u32, comps[0], 10) catch return error.BadRange;
     if (n < 2 or isWild(comps[1])) {
-        return .{
-            .base = .{ .major = major, .minor = 0, .patch = 0 },
-            .has_upper = true,
-            .upper = .{ .major = major + 1, .minor = 0, .patch = 0 },
-        };
+        // "N"/"N.x": when major+1 overflows u32, no parseable version can
+        // have a larger major either, so "unbounded above" is exact.
+        if (std.math.add(u32, major, 1)) |upper| {
+            return .{
+                .base = .{ .major = major, .minor = 0, .patch = 0 },
+                .has_upper = true,
+                .upper = .{ .major = upper, .minor = 0, .patch = 0 },
+            };
+        } else |_| {
+            return .{
+                .base = .{ .major = major, .minor = 0, .patch = 0 },
+                .has_upper = false,
+                .upper = .{ .major = 0, .minor = 0, .patch = 0 },
+            };
+        }
     }
     const minor = std.fmt.parseInt(u32, comps[1], 10) catch return error.BadRange;
     if (n < 3 or isWild(comps[2])) {
+        // "N.M": no representable bound separates N.M from N+1 versions
+        // once minor+1 overflows — fail loud instead of widening the range.
+        const upper = std.math.add(u32, minor, 1) catch return error.UnsupportedRange;
         return .{
             .base = .{ .major = major, .minor = minor, .patch = 0 },
             .has_upper = true,
-            .upper = .{ .major = major, .minor = minor + 1, .patch = 0 },
+            .upper = .{ .major = major, .minor = upper, .patch = 0 },
         };
     }
     return .{ .base = try parseVersion(t), .has_upper = false, .upper = .{ .major = 0, .minor = 0, .patch = 0 } };
 }
 
-fn caretUpper(v: Version) Version {
-    if (v.major > 0) return .{ .major = v.major + 1, .minor = 0, .patch = 0 };
-    if (v.minor > 0) return .{ .major = 0, .minor = v.minor + 1, .patch = 0 };
-    return .{ .major = 0, .minor = 0, .patch = v.patch + 1 };
+fn caretUpper(v: Version) !Version {
+    if (v.major > 0) return .{
+        .major = std.math.add(u32, v.major, 1) catch return error.UnsupportedRange,
+        .minor = 0,
+        .patch = 0,
+    };
+    if (v.minor > 0) return .{
+        .major = 0,
+        .minor = std.math.add(u32, v.minor, 1) catch return error.UnsupportedRange,
+        .patch = 0,
+    };
+    return .{
+        .major = 0,
+        .minor = 0,
+        .patch = std.math.add(u32, v.patch, 1) catch return error.UnsupportedRange,
+    };
 }
 
-fn tildeUpper(v: Version) Version {
-    return .{ .major = v.major, .minor = v.minor + 1, .patch = 0 };
+fn tildeUpper(v: Version) !Version {
+    return .{
+        .major = v.major,
+        .minor = std.math.add(u32, v.minor, 1) catch return error.UnsupportedRange,
+        .patch = 0,
+    };
 }
 
 fn isPartialToken(t: []const u8) bool {
@@ -144,11 +173,11 @@ pub fn satisfies(v: Version, range: []const u8) !bool {
         if (t[0] == '^') {
             const p = try parsePartial(t[1..]);
             if (compare(v, p.base) == .lt) return false;
-            if (compare(v, caretUpper(p.base)) != .lt) return false;
+            if (compare(v, try caretUpper(p.base)) != .lt) return false;
         } else if (t[0] == '~') {
             const p = try parsePartial(t[1..]);
             if (compare(v, p.base) == .lt) return false;
-            if (compare(v, tildeUpper(p.base)) != .lt) return false;
+            if (compare(v, try tildeUpper(p.base)) != .lt) return false;
         } else if (isPartialToken(t)) {
             const p = try parsePartial(t);
             if (compare(v, p.base) == .lt) return false;
@@ -206,4 +235,16 @@ pub fn maxSatisfying(versions: []const []const u8, range: []const u8) !?[]const 
         }
     }
     return best;
+}
+
+test "u32 max partials do not overflow" {
+    try std.testing.expect(try satisfies(.{ .major = 4294967295, .minor = 0, .patch = 0 }, "4294967295"));
+    try std.testing.expectError(
+        error.UnsupportedRange,
+        satisfies(.{ .major = 1, .minor = 0, .patch = 0 }, "1.4294967295"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRange,
+        satisfies(.{ .major = 4294967295, .minor = 0, .patch = 0 }, "^4294967295.0.0"),
+    );
 }

@@ -156,6 +156,12 @@ pub const ParsedRequest = struct {
 
 // ---- SIMD/CI helpers (unchanged) ----
 
+// CPU-native u8 vector width for every scan below (16 on SSE2/baseline,
+// 32 on AVX2, 64 on AVX-512; 16 where the target has no suggestion).
+// Single const so the findTokenCI dispatch threshold can never drift
+// from the width the SIMD scans actually use.
+const vec_len_u8 = simd.suggestVectorLength(u8) orelse 16;
+
 fn freePop() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
@@ -205,7 +211,7 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     const n = needle.len;
     const window_end = haystack.len - n + 1;
     const first = std.ascii.toLower(needle[0]);
-    const N = simd.suggestVectorLength(u8) orelse 16;
+    const N = vec_len_u8;
     const V = @Vector(N, u8);
     const M = std.meta.Int(.unsigned, N);
     const spl_first: V = @splat(first);
@@ -227,12 +233,12 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
 }
 fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0 or haystack.len < needle.len) return null;
-    if (haystack.len - needle.len + 1 >= 16) return findTokenCISimd(haystack, needle);
+    if (haystack.len - needle.len + 1 >= vec_len_u8) return findTokenCISimd(haystack, needle);
     return findTokenCIScalar(haystack, needle);
 }
-fn findHeaderEnd(h: []const u8, from: usize) ?usize {
+pub fn findHeaderEnd(h: []const u8, from: usize) ?usize {
     if (h.len < 4 or from + 4 > h.len) return null;
-    const N = simd.suggestVectorLength(u8) orelse 16;
+    const N = vec_len_u8;
     const V = @Vector(N, u8);
     const M = std.meta.Int(.unsigned, N);
     const spl_lf: V = @splat('\n');
@@ -275,7 +281,7 @@ pub fn classifyMethod(s: []const u8) Method {
     }
     return .none;
 }
-fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
+pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     var pr = ParsedRequest{ .method = "", .method_tag = .none, .url = "", .content_length = 0, .keep_alive = true };
     const region = buf[0..headers_end];
     if (region.len < 10) return pr;
@@ -1867,4 +1873,115 @@ test "stageLargeResponse retains spill for reuse and routes by length" {
     body_lens[id] = 0;
     body_remaining[id] = 0;
     body_source_off[id] = 0;
+}
+
+test "statusReason covers every status code" {
+    const cases = .{
+        .{ 200, "OK" },                 .{ 201, "Created" },             .{ 204, "No Content" },
+        .{ 301, "Moved Permanently" },  .{ 304, "Not Modified" },        .{ 400, "Bad Request" },
+        .{ 401, "Unauthorized" },       .{ 403, "Forbidden" },           .{ 404, "Not Found" },
+        .{ 405, "Method Not Allowed" }, .{ 413, "Payload Too Large" },   .{ 500, "Internal Server Error" },
+        .{ 502, "Bad Gateway" },        .{ 503, "Service Unavailable" }, .{ 418, "Unknown" },
+        .{ 999, "Unknown" },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectEqualStrings(case[1], statusReason(case[0]));
+    }
+}
+
+test "formatResponseHeader/pushStr/appendUInt shapes" {
+    var w: [512]u8 = undefined;
+    var pos: usize = 0;
+    appendUInt(&w, &pos, 0);
+    try std.testing.expectEqualStrings("0", w[0..pos]);
+    pos = 0;
+    appendUInt(&w, &pos, 40120);
+    try std.testing.expectEqualStrings("40120", w[0..pos]);
+    pushStr(&w, &pos, "x");
+    try std.testing.expectEqualStrings("40120x", w[0..pos]);
+    pos = formatResponseHeader(&w, 200, 5, true);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Connection: keep-alive\r\n") != null);
+    pos = formatResponseHeader(&w, 204, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "HTTP/1.1 204 No Content\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "keep-alive") == null);
+    methods[400] = .head;
+    try std.testing.expect(!wantsBodyBytes(400, 200));
+    methods[400] = .get;
+    try std.testing.expect(wantsBodyBytes(400, 200));
+    try std.testing.expect(!wantsBodyBytes(400, 204));
+    try std.testing.expect(!wantsBodyBytes(400, 304));
+    methods[400] = .none;
+}
+
+test "buildResponse writes headers+body and honors suppress" {
+    const id: usize = 400;
+    cflags[id] = .{};
+    buildResponse(id, 200, "hi");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, write_bufs[id][0..write_lens[id]], "hi"));
+    // 204 suppresses the body and omits content-length.
+    buildResponse(id, 204, "hi");
+    try std.testing.expect(!std.mem.endsWith(u8, write_bufs[id][0..write_lens[id]], "hi"));
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "Content-Length") == null);
+    cflags[id].keep_alive = true;
+    buildResponse(id, 404, "");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "Connection: keep-alive\r\n") != null);
+    cflags[id] = .{};
+    write_lens[id] = 0;
+}
+
+test "callHandler without a runtime answers 500" {
+    const id: usize = 401;
+    cflags[id] = .{};
+    const pr = ParsedRequest{
+        .method = "GET",
+        .url = "/",
+        .content_length = 0,
+        .method_tag = .get,
+        .keep_alive = true,
+    };
+    callHandler(id, &pr, "");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 500 Internal Server Error\r\n") != null);
+    cflags[id] = .{};
+    write_lens[id] = 0;
+}
+
+// ── Oracle test: vector token search must match the scalar reference ──
+// Exercises widths around the native lane count plus the `v | 0x20`
+// case-fold's false-positive candidates (e.g. needle "-x": '\r' (0x0D)
+// folds to the same candidate as '-'), which matchCI must then reject.
+// Short-haystack (< needle) cases assert the null guard directly —
+// findTokenCIScalar would underflow `len - needle.len + 1` there.
+test "findTokenCI simd matches scalar" {
+    const needles = [_][]const u8{ "sec-websocket-key:", "a", "A", "-x", ":", "Ab9", "\r\n", "zzzz" };
+    // Deterministic pseudo-random haystacks at SIMD-boundary lengths.
+    const lens = [_]usize{ 0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 255 };
+    var hay: [256]u8 = undefined;
+    for (lens) |len| {
+        const hlen = @min(len, hay.len);
+        for (0..hlen) |i| hay[i] = @intCast((i * 37 + len * 11 + 5) & 0xff);
+        for (needles) |n| {
+            if (hlen < n.len) {
+                try std.testing.expectEqual(@as(?usize, null), findTokenCI(hay[0..hlen], n));
+            } else {
+                try std.testing.expectEqual(findTokenCIScalar(hay[0..hlen], n), findTokenCI(hay[0..hlen], n));
+            }
+        }
+    }
+    // Width-exact boundaries around N with an embedded mixed-case token.
+    const N = vec_len_u8;
+    var i: usize = 0;
+    while (i < 3 * N + 4) : (i += 1) {
+        const total = N + i;
+        if (total > hay.len) break;
+        @memset(hay[0..total], 'q');
+        const at = @min(i, total -| 4);
+        @memcpy(hay[at..][0..4], "KeY:");
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "key:"), findTokenCI(hay[0..total], "key:"));
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "KEY:"), findTokenCI(hay[0..total], "KEY:"));
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "-x"), findTokenCI(hay[0..total], "-x"));
+    }
 }

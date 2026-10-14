@@ -28,7 +28,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
-const h2 = @import("nghttp2_c");
+const h2 = @import("nghttp2_c.zig");
 const http_native = @import("http_native.zig");
 const tls_mod = @import("tls_server.zig");
 const headers_mod = @import("../types/headers.zig");
@@ -211,7 +211,7 @@ pub const Session = struct {
 var sessions: [http_native.MAX_CONN]?*Session = [_]?*Session{null} ** http_native.MAX_CONN;
 var active_stream: [http_native.MAX_CONN]i32 = [_]i32{-1} ** http_native.MAX_CONN;
 
-fn getSession(slot_id: usize) ?*Session {
+pub fn getSession(slot_id: usize) ?*Session {
     return sessions[slot_id];
 }
 
@@ -246,7 +246,7 @@ fn slotFromPtr(p: ?*anyopaque) ?usize {
 
 // ── nghttp2 callbacks ─────────────────────────────────────────────
 
-fn sendCb(
+pub fn sendCb(
     _: ?*h2.Session,
     data: [*]const u8,
     length: usize,
@@ -259,7 +259,7 @@ fn sendCb(
     return @intCast(length);
 }
 
-fn beginHeadersCb(
+pub fn beginHeadersCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
     user_data: ?*anyopaque,
@@ -270,7 +270,7 @@ fn beginHeadersCb(
     return 0;
 }
 
-fn headerCb(
+pub fn headerCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
     name: [*]const u8,
@@ -301,7 +301,7 @@ fn headerCb(
     return 0;
 }
 
-fn dataChunkCb(
+pub fn dataChunkCb(
     _: ?*h2.Session,
     _: u8,
     stream_id: i32,
@@ -318,7 +318,7 @@ fn dataChunkCb(
     return 0;
 }
 
-fn frameRecvCb(
+pub fn frameRecvCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
     user_data: ?*anyopaque,
@@ -343,7 +343,7 @@ fn frameRecvCb(
     return 0;
 }
 
-fn streamCloseCb(
+pub fn streamCloseCb(
     _: ?*h2.Session,
     stream_id: i32,
     _: u32,
@@ -357,7 +357,7 @@ fn streamCloseCb(
 
 /// Response body read callback. Runs synchronously inside session_send
 /// (called from flushNow) and reads only stream-owned copies.
-fn bodyReadCb(
+pub fn bodyReadCb(
     _: ?*h2.Session,
     stream_id: i32,
     buf: [*]u8,
@@ -609,7 +609,7 @@ fn stageNv(st: *Stream, name: []const u8, value: []const u8) ?h2.Nv {
 /// Queue an H2 response for a stream. Copies ALL header/body bytes into
 /// stream-owned storage synchronously, so borrowed JS/stack memory is
 /// safe to free as soon as this returns. The caller flushes afterwards.
-fn submitResponse(
+pub fn submitResponse(
     slot_id: usize,
     stream_id: i32,
     status: u16,

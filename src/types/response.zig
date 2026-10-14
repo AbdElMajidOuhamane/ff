@@ -224,11 +224,21 @@ pub const ResponseData = struct {
         }
     }
     pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
+        if (s) |b| {
+            // Reserve the body and JS_ParseJSON's NUL before retaining either.
+            if (b.len > 0) self.pool.ensureUnusedCapacity(gpa, b.len + 1) catch return;
+        }
         if (self.owned_body) |old| gpa.free(old);
         self.owned_body = null;
+        self._body = .{};
         if (s) |b| {
             self.has_body = b.len > 0;
-            self.storeString(b, &self._body);
+            if (self.has_body) {
+                const off = self.pool.items.len;
+                self.pool.appendSliceAssumeCapacity(b);
+                self.pool.appendAssumeCapacity(0);
+                self._body = .{ .off = @intCast(off), .len = @intCast(b.len) };
+            }
         } else {
             self.has_body = false;
         }
@@ -387,6 +397,27 @@ fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     return promise;
 }
 
+/// JS_ParseJSON requires buf[len] == '\0' (vendor/quickjs/quickjs.c:51193:
+/// "buf must be zero terminated"; the JSON tokenizer at :23734 reads one
+/// byte past buf_end). Pool-backed bodies carry the sentinel appended by
+/// setBody → zero-copy. Heap-owned bodies (setBodyOwned: >64K spill,
+/// ArrayBuffer ctor, clone) are exact-length → NUL-terminate a copy into
+/// `scratch`, or a fresh allocation returned via `heap_out` (caller frees).
+fn bodyForParse(data: *const ResponseData, scratch: []u8, heap_out: *?[]u8) error{OutOfMemory}!?[:0]const u8 {
+    const body = data.body() orelse return null;
+    if (data.owned_body == null) return body.ptr[0..body.len :0];
+    if (body.len < scratch.len) {
+        @memcpy(scratch[0..body.len], body);
+        scratch[body.len] = 0;
+        return scratch[0..body.len :0];
+    }
+    const h = try gpa.alloc(u8, body.len + 1);
+    @memcpy(h[0..body.len], body);
+    h[body.len] = 0;
+    heap_out.* = h;
+    return h[0..body.len :0];
+}
+
 fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
@@ -403,7 +434,16 @@ fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
-    var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    var scratch: [4096]u8 = undefined;
+    var heap_z: ?[]u8 = null;
+    defer if (heap_z) |h| gpa.free(h);
+    const body_z = bodyForParse(data, &scratch, &heap_z) catch {
+        var msg = zigStringToJS(ctx, "out of memory");
+        defer c.freeValue(ctx, msg);
+        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+        return promise;
+    } orelse "";
+    var parsed = c.parseJSON(ctx, body_z.ptr, body_z.len, "");
     defer c.freeValue(ctx, parsed);
     if (c.isException(parsed) != 0) {
         var exc = c.getException(ctx);
@@ -704,4 +744,62 @@ pub fn setup(ctx: ?*c.Context) void {
     _ = c.definePropertyValueStr(ctx, ctor, "redirect", static_redirect, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     const static_error = c.newCFunction(ctx, &responseStaticError, "error", 0);
     _ = c.definePropertyValueStr(ctx, ctor, "error", static_error, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+}
+
+// ── Regression tests: JS_ParseJSON requires buf[len] == '\0' ──
+// setBody must leave a permanent NUL right after the pool-backed body;
+// bodyForParse must hand parseJSON a sentinel-terminated buffer for both
+// pool-backed (zero-copy) and heap-owned (copied) bodies. Pre-fix, the
+// byte after the body was stale heap data → layout-dependent
+// "unexpected data at the end" (see bench/fetch.js ipify repro).
+test "setBody keeps pool-backed bodies NUL-terminated" {
+    var d = ResponseData.init();
+    defer d.deinit();
+    d.setBody("{\"ip\":\"1.2.3.4\"}");
+    const b = d.body().?;
+    try std.testing.expectEqualStrings("{\"ip\":\"1.2.3.4\"}", b);
+    const end = @as(usize, d._body.off) + @as(usize, d._body.len);
+    try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
+    // Sentinel is position-stable: later pool writes append past it.
+    d.setStatusText("still-ok");
+    try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
+    try std.testing.expectEqualStrings("{\"ip\":\"1.2.3.4\"}", d.body().?);
+    // The null branch leaves no body (covers the has_body=false path).
+    d.setBody(null);
+    try std.testing.expect(d.body() == null);
+    d.setBody("");
+    try std.testing.expect(d.body() == null);
+}
+
+test "bodyForParse: zero-copy pool body, NUL copy for owned body" {
+    var d = ResponseData.init();
+    defer d.deinit();
+    var scratch: [16]u8 = undefined;
+    var heap_z: ?[]u8 = null;
+    defer if (heap_z) |h| gpa.free(h);
+
+    d.setBody("abc");
+    const pool_body = d.body().?;
+    const z1 = (try bodyForParse(&d, &scratch, &heap_z)).?;
+    try std.testing.expectEqualStrings("abc", z1);
+    try std.testing.expectEqual(@intFromPtr(pool_body.ptr), @intFromPtr(z1.ptr));
+    try std.testing.expect(heap_z == null);
+
+    const owned = try gpa.dupe(u8, "owned-body-bytes");
+    d.setBodyOwned(owned); // exact-length heap slice, no sentinel
+    const z2 = (try bodyForParse(&d, &scratch, &heap_z)).?;
+    try std.testing.expectEqualStrings("owned-body-bytes", z2);
+    try std.testing.expect(z2.ptr != d.body().?.ptr); // copied
+    try std.testing.expectEqual(@as(u8, 0), z2.ptr[z2.len]);
+    try std.testing.expect(heap_z != null);
+
+    // Owned body smaller than scratch → stack NUL-copy path.
+    if (heap_z) |h| gpa.free(h);
+    heap_z = null;
+    const tiny = try gpa.dupe(u8, "abc");
+    d.setBodyOwned(tiny);
+    const z3 = (try bodyForParse(&d, &scratch, &heap_z)).?;
+    try std.testing.expectEqualStrings("abc", z3);
+    try std.testing.expectEqual(@intFromPtr(&scratch), @intFromPtr(z3.ptr));
+    try std.testing.expect(heap_z == null);
 }
