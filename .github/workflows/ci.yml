@@ -138,7 +138,9 @@ jobs:
 
   coverage:
     name: coverage (kcov, informational)
-    runs-on: ubuntu-latest
+    # kcov is not packaged for Ubuntu 24.04 (noble); jammy ships kcov 38.
+    # ubuntu-latest resolves to 24.04 → "Unable to locate package kcov".
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
       contents: read
