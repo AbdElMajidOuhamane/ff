@@ -52,14 +52,23 @@ jobs:
           # still covers FFI fully.
           - name: linux-musl-io_uring
             os: ubuntu-latest
-            flags: "-Dtarget=x86_64-linux-musl -Dffi=false"
+            build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Dtarget=x86_64-linux-musl -Dffi=false"
           - name: linux-musl-epoll
             os: ubuntu-latest
-            flags: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+            build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+            test: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
           # macOS backend is kqueue (native build, FFI enabled).
           - name: macos
             os: macos-latest
-            flags: ""
+            build: "-Doptimize=ReleaseFast"
+            test: ""
+          # ReleaseSafe runs the SAME suite with safety checks on: several
+          # parsers fail silently in ReleaseFast but panic here.
+          - name: linux-musl-release-safe
+            os: ubuntu-latest
+            build: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -82,13 +91,50 @@ jobs:
         run: sh scripts/fetch-vendors.sh
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast ${{ matrix.flags }}
+        run: zig build ${{ matrix.build }}
 
       - name: Zig unit tests
-        run: zig build test ${{ matrix.flags }}
+        run: zig build test ${{ matrix.test }}
 
       - name: JS smoke tests
         run: sh test/fixtures/build.sh && sh test/run.sh
+
+  fuzz-smoke:
+    name: fuzz smoke (ReleaseSafe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-fuzz-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-fuzz-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Fuzz smoke
+        run: zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- smoke
+
+      - name: Canary must fail
+        run: |
+          if zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- canary 1; then
+            echo "canary unexpectedly passed — fuzzer failures are not propagating"
+            exit 1
+          fi
 
   postgres:
     name: postgres integration tests

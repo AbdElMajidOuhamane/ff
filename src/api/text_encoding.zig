@@ -112,18 +112,11 @@ fn textDecoderCtor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     return obj;
 }
 
-fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    _ = this_val;
-    if (argc < 1) return c.newStringLen(ctx, "", 0);
-    const bytes = backingBytes(ctx, argv[0]) orelse {
-        _ = c.throwTypeError(ctx, "TextDecoder.decode requires ArrayBuffer or TypedArray input");
-        return c.JS_EXCEPTION;
-    };
-    if (bytes.len == 0) return c.newStringLen(ctx, "", 0);
-    if (std.unicode.utf8ValidateSlice(bytes)) {
-        return c.newStringLen(ctx, bytes.ptr, bytes.len);
-    }
-    const out = gpa.alloc(u8, bytes.len * 3) catch return c.throwOutOfMemory(ctx);
+/// Pure UTF-8 lossy-decode core: writes the decoded form of `bytes` into
+/// `out` and returns bytes written. `out` must hold `bytes.len * 3` —
+/// every input byte expands to at most one U+FFFD (3 bytes).
+pub fn decodeUtf8Lossy(bytes: []const u8, out: []u8) usize {
+    std.debug.assert(out.len >= bytes.len * 3);
     var n: usize = 0;
     var i: usize = 0;
     while (i < bytes.len) {
@@ -147,6 +140,22 @@ fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
         n += seq_len;
         i += seq_len;
     }
+    return n;
+}
+
+fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 1) return c.newStringLen(ctx, "", 0);
+    const bytes = backingBytes(ctx, argv[0]) orelse {
+        _ = c.throwTypeError(ctx, "TextDecoder.decode requires ArrayBuffer or TypedArray input");
+        return c.JS_EXCEPTION;
+    };
+    if (bytes.len == 0) return c.newStringLen(ctx, "", 0);
+    if (std.unicode.utf8ValidateSlice(bytes)) {
+        return c.newStringLen(ctx, bytes.ptr, bytes.len);
+    }
+    const out = gpa.alloc(u8, bytes.len * 3) catch return c.throwOutOfMemory(ctx);
+    const n = decodeUtf8Lossy(bytes, out);
     defer gpa.free(out);
     return c.newStringLen(ctx, out.ptr, n);
 }

@@ -16,6 +16,9 @@ pub fn build(b: *std.Build) void {
     ffcfg_opts.addOption([]const u8, "version", ff_version);
     const ffcfg_mod = ffcfg_opts.createModule();
 
+    const coverage = b.option(bool, "coverage", "Enable zig-cov SanitizerCoverage instrumentation (line+block coverage)") orelse false;
+    const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o (cwd-relative), used with -Dcoverage") orelse null;
+
     // ── QuickJS C translation (auto-generates types + inline functions) ──
     const translate = b.addTranslateC(.{
         .root_source_file = b.path("vendor/quickjs/quickjs.h"),
@@ -177,6 +180,18 @@ pub fn build(b: *std.Build) void {
     });
     sqlite_lib.installHeadersDirectory(b.path("vendor/sqlite"), "", .{});
 
+    // Shared by exe, tests and fuzzers (one module instance, no duplicates).
+    const xev_shim = b.addModule("xev-shim", .{
+        .root_source_file = b.path("src/xev.zig"),
+        .imports = &.{
+            .{
+                .name = "xev-inner",
+                .module = b.dependency("libxev", .{}).module("xev"),
+            },
+            .{ .name = "ffcfg", .module = ffcfg_mod },
+        },
+    });
+
     // ── Executable ──
     const exe = b.addExecutable(.{
         .name = "ff",
@@ -186,16 +201,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libcpp = true,
             .imports = &.{
-                .{ .name = "xev", .module = b.addModule("xev-shim", .{
-                    .root_source_file = b.path("src/xev.zig"),
-                    .imports = &.{
-                        .{
-                            .name = "xev-inner",
-                            .module = b.dependency("libxev", .{}).module("xev"),
-                        },
-                        .{ .name = "ffcfg", .module = ffcfg_mod },
-                    },
-                }) },
+                .{ .name = "xev", .module = xev_shim },
                 .{ .name = "quickjs_c", .module = c_mod },
                 .{ .name = "sqlite_c", .module = sql_mod },
                 .{ .name = "nghttp2_c", .module = nghttp2_c_mod },
@@ -241,6 +247,65 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ── Fuzzers: deterministic, seed-driven parser fuzzers (src/fuzz_tests.zig).
+    // Run: zig build fuzz -- <target|smoke> [seed] [--events-max=N]
+    // Always fuzz in ReleaseSafe so OOB/overflow checks fire:
+    //   zig build fuzz -Doptimize=ReleaseSafe -- smoke
+    const fuzz_exe = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            .imports = &.{
+                .{ .name = "xev", .module = xev_shim },
+                .{ .name = "quickjs_c", .module = c_mod },
+                .{ .name = "sqlite_c", .module = sql_mod },
+                .{ .name = "nghttp2_c", .module = nghttp2_c_mod },
+            },
+        }),
+    });
+    fuzz_exe.root_module.addImport("ffcfg", ffcfg_mod);
+    if (bearssl) {
+        fuzz_exe.root_module.addImport("bearssl_c", bssl_mod.?);
+        fuzz_exe.root_module.linkLibrary(bssl_lib.?);
+    }
+    fuzz_exe.root_module.linkLibrary(sqlite_lib);
+    fuzz_exe.root_module.linkLibrary(nghttp2_lib);
+    // Same C sources as the exe: imported modules reference QuickJS
+    // symbols, and compiling them here avoids link roulette.
+    fuzz_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/quickjs.c"), .flags = qjs_flags });
+    fuzz_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libregexp.c"), .flags = qjs_flags });
+    fuzz_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/libunicode.c"), .flags = qjs_flags });
+    fuzz_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/quickjs/dtoa.c"), .flags = qjs_flags });
+    fuzz_exe.root_module.addIncludePath(b.path("vendor/quickjs"));
+    fuzz_exe.root_module.linkSystemLibrary("m", .{});
+    if (ffi) {
+        fuzz_exe.root_module.linkSystemLibrary("ffi", .{});
+    } else {
+        fuzz_exe.root_module.addCSourceFile(.{ .file = b.path("src/ffi_stubs.c"), .flags = &.{} });
+    }
+    fuzz_exe.stack_size = 4 * 1024 * 1024;
+    fuzz_exe.root_module.omit_frame_pointer = false;
+    if (coverage) {
+        // zig-cov: LLVM SanitizerCoverage counters + PC table. Needs the
+        // LLVM backend, so Debug/ReleaseSafe only — never ReleaseFast.
+        fuzz_exe.use_llvm = true;
+        fuzz_exe.root_module.fuzz = true;
+        if (coverage_rt) |rt| fuzz_exe.root_module.addObjectFile(.{ .cwd_relative = rt });
+    }
+
+    const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
+    const fuzz_build_step = b.step("fuzz:build", "Build fuzzers (no run)");
+    fuzz_build_step.dependOn(&install_fuzz.step);
+
+    const fuzz_run = b.addRunArtifact(fuzz_exe);
+    if (b.args) |args| fuzz_run.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Run fuzzers (see src/fuzz_tests.zig)");
+    fuzz_step.dependOn(&fuzz_run.step);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -250,6 +315,11 @@ pub fn build(b: *std.Build) void {
     }
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    if (coverage) {
+        exe_tests.use_llvm = true;
+        exe_tests.root_module.fuzz = true;
+        if (coverage_rt) |rt| exe_tests.root_module.addObjectFile(.{ .cwd_relative = rt });
+    }
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");

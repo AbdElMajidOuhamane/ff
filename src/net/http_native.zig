@@ -230,7 +230,7 @@ fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
     if (haystack.len - needle.len + 1 >= 16) return findTokenCISimd(haystack, needle);
     return findTokenCIScalar(haystack, needle);
 }
-fn findHeaderEnd(h: []const u8, from: usize) ?usize {
+pub fn findHeaderEnd(h: []const u8, from: usize) ?usize {
     if (h.len < 4 or from + 4 > h.len) return null;
     const N = simd.suggestVectorLength(u8) orelse 16;
     const V = @Vector(N, u8);
@@ -275,7 +275,7 @@ pub fn classifyMethod(s: []const u8) Method {
     }
     return .none;
 }
-fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
+pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     var pr = ParsedRequest{ .method = "", .method_tag = .none, .url = "", .content_length = 0, .keep_alive = true };
     const region = buf[0..headers_end];
     if (region.len < 10) return pr;

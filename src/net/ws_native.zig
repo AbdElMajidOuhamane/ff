@@ -85,7 +85,7 @@ pub fn parseHeader(buf: []const u8) ?FrameHdr {
     };
 }
 // Scalar reference (old implementation), kept as the test oracle.
-fn unmaskScalar(buf: []u8, mask: [4]u8) void {
+pub fn unmaskScalar(buf: []u8, mask: [4]u8) void {
     var i: usize = 0;
     const last = buf.len - (buf.len % 4);
     while (i < last) : (i += 4) {

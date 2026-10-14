@@ -103,7 +103,8 @@ GitHub Actions workflow (per `.github/workflows/ci.yml`):
 
     make ci
 
-`make ci` = `make build` + FFI C fixture + `zig build test` + `sh test/run.sh`.
+`make ci` = `make build` + FFI C fixture + `zig build test` + `sh test/run.sh`
++ fuzz smoke.
 
 Pieces, if you need only one:
 
@@ -143,6 +144,29 @@ Server fixture pattern (serve, hit, exit):
     done("server-smoke");
 
 Pick high test ports (3900+) to avoid colliding with a local dev server.
+
+### Fuzzing
+
+Deterministic, seed-driven parser fuzzers live in `src/*_fuzz.zig`,
+dispatched by `src/fuzz_tests.zig` (TigerBeetle-style: no libFuzzer, no
+corpus — the seed fully determines the run):
+
+    zig build fuzz -Doptimize=ReleaseSafe -- smoke            # all targets, fixed seed (fast, in `make ci`)
+    zig build fuzz -Doptimize=ReleaseSafe -- ws_frame 123 --events-max=1000000
+
+Rules:
+
+1. Always fuzz in `ReleaseSafe` — several parsers fail silently in
+   `ReleaseFast` but panic in safe builds.
+2. A failure must print its seed; reproduce with the same seed. Never
+   commit a "fix" without the reproducing seed in the PR.
+3. New parsers taking untrusted bytes ship with a `*_fuzz.zig` target.
+4. `zig build fuzz -- canary 1` must fail — it proves failures propagate.
+
+Nightly long runs live in `.github/workflows/fuzz.yml` (commit SHA as
+seed). Coverage: `make cov` (needs `zig-cov` + `-Dcoverage-rt`; the
+`-Dcoverage` wiring in `build.zig` emits line + exact block coverage —
+our branch-coverage proxy, since kcov-style tools only do lines).
 
 ## Code style
 
@@ -224,7 +248,7 @@ Unexplained large regressions will block review.
 
 Before requesting review (collaborators — push a branch, no forks needed):
 
-- [ ] `make ci` passes locally (build + Zig tests + all JS tests)
+- [ ] `make ci` passes locally (build + Zig tests + all JS tests + fuzz smoke)
 - [ ] `zig fmt` run on touched Zig files
 - [ ] Commit message follows the repo style
       (`fix(ffi): ...`, `perf(pg,sqlite,http): ...`, `docs: ...`, `ci: ...`)
