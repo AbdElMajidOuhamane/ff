@@ -309,6 +309,9 @@ pub const RequestData = struct {
     pub fn setUrl(self: *RequestData, s: []const u8) void {
         self.store(s, &self._url);
     }
+    /// Copy borrowed body bytes into the pool; empty input clears has_body.
+    /// Append a NUL for JSON parsing when storage succeeds. Allocation failures
+    /// are swallowed, so a failed copy or sentinel append is not reported.
     pub fn setBody(self: *RequestData, s: []const u8) void {
         self.has_body = s.len > 0;
         const before = self.pool.items.len;
@@ -501,6 +504,9 @@ fn requestText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     return promise;
 }
 
+/// Mark the body used and return a promise for its parsed JSON value.
+/// Reject empty input with a string and malformed JSON with the parser exception;
+/// a previously used body is still parsed. An invalid receiver throws TypeError.
 fn requestJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;

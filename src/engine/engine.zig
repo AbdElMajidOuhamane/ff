@@ -217,6 +217,10 @@ pub const Runtime = struct {
     event_loop: *EventLoop,
     timer_manager: TimerManager,
 
+    /// Create the main JS context, register globals, and install the event loop
+    /// as the active runtime. `args` supplies process arguments.
+    /// Return InitFailed for QuickJS creation failure or OutOfMemory for arena
+    /// allocation failure. An unavailable io_uring backend exits the process.
     pub fn init(args: std.process.Args) !*Runtime {
         const rt = qjs.newRuntime() orelse return error.InitFailed;
         qjs.setMaxStackSize(rt, 1024 * 1024);

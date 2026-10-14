@@ -16,6 +16,7 @@ const SocketHandle = struct {
     inet6: bool,
 };
 
+/// Close the socket still owned by this handle and free the handle storage.
 fn socketFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     _ = rt;
     if (c.getOpaque(val, udp_class_id)) |ptr| {
@@ -25,6 +26,8 @@ fn socketFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
+/// Throw a JS Error with the formatted message and return JS_EXCEPTION.
+/// Use the literal format string if the message exceeds the local buffer.
 fn throwErr(ctx: ?*c.Context, comptime fmt: []const u8, args: anytype) c.Value {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
@@ -36,6 +39,8 @@ fn throwErr(ctx: ?*c.Context, comptime fmt: []const u8, args: anytype) c.Value {
     return c.JS_EXCEPTION;
 }
 
+/// Wrap an open slot with its current generation and address family.
+/// Handle allocation failure raises a JS out-of-memory exception.
 fn makeSocketObj(ctx: ?*c.Context, slot: u16, inet6: bool) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(udp_class_id));
     const h = gpa.create(SocketHandle) catch return c.throwOutOfMemory(ctx);
@@ -44,6 +49,8 @@ fn makeSocketObj(ctx: ?*c.Context, slot: u16, inet6: bool) c.Value {
     return obj;
 }
 
+/// Borrow a live, non-closing handle, or return null for a stale/closed socket.
+/// A receiver of the wrong class also returns null and sets a JS TypeError.
 fn handleOf(ctx: ?*c.Context, this_val: c.Value) ?*SocketHandle {
     const p = c.getOpaque2(ctx, this_val, udp_class_id) orelse return null;
     const h: *SocketHandle = @ptrCast(@alignCast(p));
@@ -51,6 +58,9 @@ fn handleOf(ctx: ?*c.Context, this_val: c.Value) ?*SocketHandle {
     return h;
 }
 
+/// Coerce a numeric port to int32 and accept values in 0..65535.
+/// A nonnumeric/missing property yields null if required, otherwise dflt;
+/// conversion failure or an out-of-range converted value yields null.
 fn getPort(ctx: ?*c.Context, opts: c.Value, comptime required: bool, comptime dflt: u16) ?u16 {
     const v = c.getPropertyStr(ctx, opts, "port");
     defer c.freeValue(ctx, v);
@@ -63,6 +73,9 @@ fn getPort(ctx: ?*c.Context, opts: c.Value, comptime required: bool, comptime df
     return @intCast(out);
 }
 
+/// Copy a string address into `out`, returning a borrowed slice without a NUL.
+/// Missing/nonstrings yield dflt; conversion failure, empty strings, or strings
+/// exceeding out's capacity yield null. Embedded NUL ends the copied address.
 fn getAddressCopy(
     ctx: ?*c.Context,
     opts: c.Value,
@@ -82,6 +95,9 @@ fn getAddressCopy(
 
 // ── namespace: udp.socket([family]) — socket(2) ─────────────────
 
+/// Create an unbound UDP socket: 'inet6' selects IPv6, 'inet' or nonstring/missing
+/// input selects IPv4. Throw for other strings or native socket allocation failure;
+/// native open errors share the 'no socket slots available' message.
 fn udpSocket(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var inet6 = false;
     if (argc >= 1 and c.isString(argv[0]) != 0) {
@@ -102,6 +118,9 @@ fn udpSocket(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callc
 
 // ── bind(2) ─────────────────────────────────────────────────────
 
+/// Bind to a numeric IP, defaulting to the family wildcard and ephemeral port 0.
+/// Return undefined; throw TypeError for missing/nonobject options and Error
+/// for closed sockets, invalid addresses/ports, or native bind failure.
 fn sockBind(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "bind: socket is closed", .{});
     if (argc < 1 or c.isObject(argv[0]) == 0) {
@@ -124,6 +143,9 @@ fn sockBind(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
 
 // ── connect(2) ──────────────────────────────────────────────────
 
+/// Set the UDP peer from a required numeric IP and port; return undefined.
+/// Throw TypeError for missing/nonobject options and Error for closed sockets,
+/// invalid addresses/ports, or native connect errors (reported by name).
 fn sockConnect(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "connect: socket is closed", .{});
     if (argc < 1 or c.isObject(argv[0]) == 0) {
@@ -145,6 +167,9 @@ fn sockConnect(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
 
 // ── sendto(2) ───────────────────────────────────────────────────
 
+/// Send buffer bytes to a required numeric IP and port, returning a byte-count
+/// promise. Closed sockets, invalid arguments, and submission errors throw
+/// synchronously; send I/O failure or cancellation rejects the promise.
 fn sockSendto(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "sendto: socket is closed", .{});
     if (argc < 2 or c.isObject(argv[1]) == 0) {
@@ -163,6 +188,9 @@ fn sockSendto(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Valu
 
 // ── send(2) — connected ─────────────────────────────────────────
 
+/// Send buffer bytes to the connected peer and return a byte-count promise.
+/// Closed/unconnected sockets, missing data, and submission errors throw
+/// synchronously; send I/O failure rejects the promise.
 fn sockSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "send: socket is closed", .{});
     if (argc < 1) {
@@ -174,6 +202,9 @@ fn sockSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
     return submitSendPromise(ctx, h.slot, argv[0], dest);
 }
 
+/// Create a send promise and submit without copying payload bytes.
+/// Native submission errors become synchronous JS Errors by name;
+/// I/O errors reject the promise. Promise creation failure returns JS_EXCEPTION.
 fn submitSendPromise(
     ctx: ?*c.Context,
     slot: u16,
@@ -193,6 +224,9 @@ fn submitSendPromise(
 
 // ── recvfrom(2) / recv(2) ───────────────────────────────────────
 
+/// Receive into a Uint8Array/ArrayBuffer, resolving to [data view, sender address].
+/// Datagrams exceeding the buffer are truncated. Closed sockets, missing buffers,
+/// and submission errors throw synchronously; I/O failure or close rejects.
 fn sockRecvfrom(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "recvfrom: socket is closed", .{});
     if (argc < 1) {
@@ -202,6 +236,9 @@ fn sockRecvfrom(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     return submitRecvPromise(ctx, h.slot, argv[0], true);
 }
 
+/// Receive from the connected peer into a Uint8Array/ArrayBuffer and resolve to
+/// a view of the received bytes, truncated to buffer capacity. Closed/unconnected
+/// sockets, missing buffers, and submission errors throw; I/O failure or close rejects.
 fn sockRecv(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     const h = handleOf(ctx, this_val) orelse return throwErr(ctx, "recv: socket is closed", .{});
     if (udp_native.peerOf(h.slot) == null)
@@ -213,6 +250,9 @@ fn sockRecv(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
     return submitRecvPromise(ctx, h.slot, argv[0], false);
 }
 
+/// Create a receive promise; with_peer selects [data, address] rather than data.
+/// The result views the supplied buffer. Native submission errors throw JS Errors
+/// by name; I/O errors reject. Promise creation failure returns JS_EXCEPTION.
 fn submitRecvPromise(
     ctx: ?*c.Context,
     slot: u16,
@@ -232,6 +272,7 @@ fn submitRecvPromise(
 
 // ── getsockname(2) / getpeername(2) / close(2) ──────────────────
 
+/// Return the local {address, port, family}; throw for a closed socket or lookup failure.
 fn sockGetsockname(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
@@ -241,6 +282,8 @@ fn sockGetsockname(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     return udp_native.sockAddrToJs(ctx, sa);
 }
 
+/// Return the peer {address, port, family}; throw for closed sockets or lookup
+/// failure, with all native lookup errors reported as 'socket is not connected'.
 fn sockGetpeername(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
@@ -250,6 +293,8 @@ fn sockGetpeername(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     return udp_native.sockAddrToJs(ctx, sa);
 }
 
+/// Begin closing this handle's socket and reject pending operations.
+/// Return undefined; repeated closes and stale generations are harmless.
 fn sockClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
@@ -261,6 +306,7 @@ fn sockClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value
 
 // ── registration ────────────────────────────────────────────────
 
+/// Initialize native slots and register UdpSocket methods and the global udp.socket.
 pub fn setup(ctx: ?*c.Context) void {
     udp_native.init();
 

@@ -74,6 +74,10 @@ fn unbounded() Partial {
     };
 }
 
+/// Parse a version or wildcard into a lower bound and optional exclusive upper bound.
+/// A full version has no upper bound here. A major-only partial at u32's maximum
+/// is unbounded above; a minor increment past u32 returns UnsupportedRange.
+/// Invalid components return BadRange or propagate parseVersion's BadVersion.
 fn parsePartial(s: []const u8) !Partial {
     var t = std.mem.trim(u8, s, " \t");
     if (t.len > 0 and t[0] == 'v') t = t[1..];
@@ -121,6 +125,8 @@ fn parsePartial(s: []const u8) !Partial {
     return .{ .base = try parseVersion(t), .has_upper = false, .upper = .{ .major = 0, .minor = 0, .patch = 0 } };
 }
 
+/// Return the exclusive caret bound by incrementing the first nonzero component,
+/// or the patch for 0.0.x. Return UnsupportedRange if that increment overflows u32.
 fn caretUpper(v: Version) !Version {
     if (v.major > 0) return .{
         .major = std.math.add(u32, v.major, 1) catch return error.UnsupportedRange,
@@ -139,6 +145,8 @@ fn caretUpper(v: Version) !Version {
     };
 }
 
+/// Return the next minor version with patch zero as an exclusive tilde bound.
+/// Return UnsupportedRange if the minor increment overflows u32.
 fn tildeUpper(v: Version) !Version {
     return .{
         .major = v.major,
@@ -158,6 +166,12 @@ fn isPartialToken(t: []const u8) bool {
     return dots < 2;
 }
 
+/// Match exact versions, comparisons, caret/tilde ranges, and wildcard partials;
+/// space-separated terms are ANDed. Prereleases require a '-' in the range.
+/// Empty, '*', and 'latest' ranges match only versions without a prerelease.
+/// Return UnsupportedRange for OR/hyphen ranges or overflowing upper bounds,
+/// and propagate BadRange/BadVersion for malformed terms that are evaluated.
+/// Evaluation stops at the first mismatch, so later terms may not be validated.
 pub fn satisfies(v: Version, range: []const u8) !bool {
     const r = std.mem.trim(u8, range, " \t");
     if (r.len == 0 or std.mem.eql(u8, r, "*") or std.mem.eql(u8, r, "latest")) {

@@ -36,6 +36,9 @@ var g_alpn_ptrs: [2]?[*:0]const u8 = .{ "h2", "http/1.1" };
 // ── PEM plumbing (pure Zig) ─────────────────────────────────────────
 
 /// Extract the next `label` PEM block starting at *cursor; returns decoded DER.
+/// The result borrows `out`. Advance cursor past the closing line on success;
+/// return null without advancing it for missing/malformed blocks, decoding
+/// failure, or insufficient output space. Output may be partly written on failure.
 pub fn pemNextBlock(pem: []const u8, label: []const u8, cursor: *usize, out: []u8) ?[]u8 {
     const begin_head = "-----BEGIN ";
     const end_head = "-----END ";
@@ -61,6 +64,9 @@ pub fn pemNextBlock(pem: []const u8, label: []const u8, cursor: *usize, out: []u
     }
 }
 
+/// Decode base64 into `out` and return the written slice. Ignore spaces, tabs,
+/// CR/LF, and everything from the first '=' onward; unpadded tails are accepted.
+/// Return null for invalid groups or insufficient space; `out` may be partly written.
 pub fn base64Der(body: []const u8, out: []u8) ?[]u8 {
     var o: usize = 0;
     var group: [4]u8 = undefined;

@@ -17,6 +17,8 @@ const RuntimeLibs = struct {
     ffi: bool,
 };
 
+/// Create a runtime root with shared imports, native libraries, and optional TLS/FFI support.
+/// `root_src` is relative to the build root.
 fn runtimeModule(
     b: *std.Build,
     root_src: []const u8,
@@ -64,6 +66,7 @@ fn runtimeModule(
     return mod;
 }
 
+/// Configure the runtime, unit-test, and fuzzer build, install, and run steps.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

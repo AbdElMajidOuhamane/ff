@@ -87,6 +87,7 @@ pub fn parseHeader(buf: []const u8) ?FrameHdr {
     };
 }
 // Scalar reference (old implementation), kept as the test oracle.
+/// XOR bytes in place with the repeating mask, starting at mask[0].
 pub fn unmaskScalar(buf: []u8, mask: [4]u8) void {
     var i: usize = 0;
     const last = buf.len - (buf.len % 4);
@@ -104,6 +105,8 @@ pub fn unmaskScalar(buf: []u8, mask: [4]u8) void {
 // (32 lanes on AVX2, 64 on AVX-512), scalar tail for the remainder.
 // The 4B pattern is broadcast with std.simd.repeat — no manual fill
 // loop, so there is no N%4 shape assumption to keep in sync.
+/// XOR bytes in place with the repeating mask, starting at mask[0].
+/// Applying the same mask twice restores the original bytes.
 pub fn unmask(buf: []u8, mask: [4]u8) void {
     const N = std.simd.suggestVectorLength(u8) orelse 16;
     const V = @Vector(N, u8);

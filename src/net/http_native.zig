@@ -207,6 +207,10 @@ fn ciListHas(value: []const u8, token: []const u8) bool {
     }
     return false;
 }
+/// Search for an ASCII case-insensitive substring; return its first byte offset
+/// or null. Requires a nonempty needle no longer than the haystack.
+/// Vector-scanned matches may be missed if the needle's first byte has bit 0x20
+/// clear after ASCII lowercasing.
 fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     const n = needle.len;
     const window_end = haystack.len - n + 1;
@@ -231,11 +235,16 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     }
     return null;
 }
+/// Return the first ASCII case-insensitive substring offset, or null for no match,
+/// an empty needle, or a needle longer than the haystack.
+/// The vector search's first-byte restriction applies to long inputs.
 fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0 or haystack.len < needle.len) return null;
     if (haystack.len - needle.len + 1 >= vec_len_u8) return findTokenCISimd(haystack, needle);
     return findTokenCIScalar(haystack, needle);
 }
+/// Return the byte offset of the first CRLF-CRLF starting at or after `from`,
+/// or null if incomplete. The returned offset points to the first CR.
 pub fn findHeaderEnd(h: []const u8, from: usize) ?usize {
     if (h.len < 4 or from + 4 > h.len) return null;
     const N = vec_len_u8;
@@ -281,6 +290,11 @@ pub fn classifyMethod(s: []const u8) Method {
     }
     return .none;
 }
+/// Extract borrowed method/URL slices, content length, and connection persistence
+/// from buf[0..headers_end]; `headers_end` must be within buf and normally includes
+/// the terminating CRLF-CRLF. Malformed input returns default or partial fields.
+/// Content lengths accept leading digits even with trailing text; missing or
+/// nonnumeric lengths and numeric overflow fall back to zero.
 pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     var pr = ParsedRequest{ .method = "", .method_tag = .none, .url = "", .content_length = 0, .keep_alive = true };
     const region = buf[0..headers_end];

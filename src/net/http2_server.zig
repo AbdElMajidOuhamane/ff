@@ -211,6 +211,7 @@ pub const Session = struct {
 var sessions: [http_native.MAX_CONN]?*Session = [_]?*Session{null} ** http_native.MAX_CONN;
 var active_stream: [http_native.MAX_CONN]i32 = [_]i32{-1} ** http_native.MAX_CONN;
 
+/// Borrow the session for an in-range HTTP connection slot, or null if absent.
 pub fn getSession(slot_id: usize) ?*Session {
     return sessions[slot_id];
 }
@@ -246,6 +247,9 @@ fn slotFromPtr(p: ?*anyopaque) ?usize {
 
 // ── nghttp2 callbacks ─────────────────────────────────────────────
 
+/// Stage outgoing frame bytes; user_data encodes connection slot + 1.
+/// Return the byte count, ERR_CALLBACK_FAILURE for an invalid/missing session,
+/// or ERR_WOULDBLOCK if output allocation fails.
 pub fn sendCb(
     _: ?*h2.Session,
     data: [*]const u8,
@@ -259,6 +263,8 @@ pub fn sendCb(
     return @intCast(length);
 }
 
+/// Ensure a stream exists for incoming headers. user_data encodes slot + 1;
+/// missing sessions or exhausted stream capacity are ignored, returning zero.
 pub fn beginHeadersCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
@@ -270,6 +276,9 @@ pub fn beginHeadersCb(
     return 0;
 }
 
+/// Store :method and :path, truncated to their respective byte caps.
+/// Ignore other headers, dispatched streams, and unavailable stream slots;
+/// user_data encodes connection slot + 1. Always return zero.
 pub fn headerCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
@@ -301,6 +310,9 @@ pub fn headerCb(
     return 0;
 }
 
+/// Append request body bytes for an undispatched stream; user_data is slot + 1.
+/// Drop the entire chunk if it exceeds the body cap or allocation fails.
+/// Missing sessions/streams are ignored; always return zero.
 pub fn dataChunkCb(
     _: ?*h2.Session,
     _: u8,
@@ -318,6 +330,9 @@ pub fn dataChunkCb(
     return 0;
 }
 
+/// Mark requests ready on END_STREAM, remove reset streams, and record GOAWAY.
+/// user_data encodes slot + 1; missing sessions/streams are ignored.
+/// Always return zero.
 pub fn frameRecvCb(
     _: ?*h2.Session,
     frame: *const h2.Frame,
@@ -343,6 +358,8 @@ pub fn frameRecvCb(
     return 0;
 }
 
+/// Recycle a closed stream's storage; user_data encodes connection slot + 1.
+/// Missing sessions/streams are ignored; always return zero.
 pub fn streamCloseCb(
     _: ?*h2.Session,
     stream_id: i32,
@@ -357,6 +374,9 @@ pub fn streamCloseCb(
 
 /// Response body read callback. Runs synchronously inside session_send
 /// (called from flushNow) and reads only stream-owned copies.
+/// Advance the body offset and return the number of bytes copied, up to length.
+/// Set DATA_FLAG_EOF when exhausted or when the session/stream is absent;
+/// user_data encodes connection slot + 1.
 pub fn bodyReadCb(
     _: ?*h2.Session,
     stream_id: i32,
@@ -609,6 +629,8 @@ fn stageNv(st: *Stream, name: []const u8, value: []const u8) ?h2.Nv {
 /// Queue an H2 response for a stream. Copies ALL header/body bytes into
 /// stream-owned storage synchronously, so borrowed JS/stack memory is
 /// safe to free as soon as this returns. The caller flushes afterwards.
+/// Missing sessions/streams are ignored. Managed, invalid, or excess headers
+/// are omitted; allocation and nghttp2 submission failures are not reported.
 pub fn submitResponse(
     slot_id: usize,
     stream_id: i32,

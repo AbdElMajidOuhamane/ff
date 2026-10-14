@@ -80,6 +80,7 @@ pub const SockAddr = struct {
     port: u16 = 0,
     is_v6: bool = false,
 
+    /// Borrow the formatted address bytes, excluding unused buffer capacity.
     pub fn text(self: *const SockAddr) []const u8 {
         return self.text_buf[0..self.text_len];
     }
@@ -100,6 +101,9 @@ pub fn init() void {
 
 // ── slot lifecycle ──────────────────────────────────────────────
 
+/// Reserve an unbound IPv4 socket, or IPv6 when inet6 is true, and return its slot.
+/// Return OutOfSockets when all slots are occupied, or SystemResources if socket
+/// creation fails. Use genOf with the slot to identify this socket incarnation.
 pub fn open(inet6: bool) !u16 {
     init();
     if (free_len == 0) return error.OutOfSockets;
@@ -119,18 +123,23 @@ pub fn open(inet6: bool) !u16 {
     return slot;
 }
 
+/// Return the generation used to fence handles against reuse of an in-range slot.
 pub fn genOf(slot: u16) u16 {
     return gens[slot];
 }
 
+/// Test whether an in-range slot still belongs to this generation, including
+/// sockets whose close is pending.
 pub fn isOwned(slot: u16, gen: u16) bool {
     return flags[slot].open and gens[slot] == gen;
 }
 
+/// Test whether an in-range slot belongs to this generation and accepts operations.
 pub fn isValid(slot: u16, gen: u16) bool {
     return isOwned(slot, gen) and !flags[slot].closing;
 }
 
+/// Return the peer recorded by connectSock for an in-range slot, or null.
 pub fn peerOf(slot: u16) ?std.Io.net.IpAddress {
     return peers[slot];
 }
@@ -202,6 +211,8 @@ pub fn closeSock(slot: u16, gen: u16) void {
     socks[slot].close(&l.loop, &close_comps[slot], SlotCtx, &close_ctx[slot], closeCb);
 }
 
+/// Recycle a closing slot once close_done and recv_drained are set, advancing
+/// its generation so previous handles become stale.
 fn maybeFinalize(slot: u16) void {
     if (!flags[slot].closing or !flags[slot].close_done or !flags[slot].recv_drained) return;
     flags[slot] = .{};
@@ -214,6 +225,8 @@ fn maybeFinalize(slot: u16) void {
     }
 }
 
+/// Mark a matching generation's close complete and attempt slot recycling.
+/// Close errors are ignored; stale callbacks are disarmed without changing state.
 fn closeCb(
     ud: ?*SlotCtx,
     l: *xev.Loop,
@@ -281,11 +294,15 @@ fn cancelSendCb(
 
 // ── bind / connect / names ──────────────────────────────────────
 
+/// Bind a live slot to a local address; port zero requests an ephemeral port.
+/// Propagate the underlying UDP bind error.
 pub fn bindSock(slot: u16, addr: std.Io.net.IpAddress) !void {
     try socks[slot].bind(addr);
 }
 
 /// connect(2) — synchronous for UDP (sets the default peer).
+/// Record the peer only on success. Return InvalidAddress, BadFileDescriptor,
+/// NotASocket, or ConnectFailed for the corresponding native failure.
 pub fn connectSock(slot: u16, addr: std.Io.net.IpAddress) !void {
     const fd = socks[slot].fd;
     const rc: c_int = switch (addr) {
@@ -318,6 +335,9 @@ pub fn connectSock(slot: u16, addr: std.Io.net.IpAddress) !void {
     peers[slot] = addr;
 }
 
+/// Query a local or peer endpoint and format its IP and host-order port.
+/// Return BadFileDescriptor, NotASocket, NotConnected, SystemResources, or
+/// UnsupportedFamily on native lookup/formatting failure or an unknown family.
 fn getName(fd: std.posix.socket_t, comptime which: enum { local, peer }) !SockAddr {
     var storage: std.c.sockaddr.storage = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -352,10 +372,13 @@ fn getName(fd: std.posix.socket_t, comptime which: enum { local, peer }) !SockAd
     return out;
 }
 
+/// Query a live slot's local endpoint, propagating getName errors.
 pub fn localAddr(slot: u16) !SockAddr {
     return getName(socks[slot].fd, .local);
 }
 
+/// Query a live slot's peer endpoint, propagating getName errors, including
+/// NotConnected when the socket has no peer.
 pub fn peerAddr(slot: u16) !SockAddr {
     return getName(socks[slot].fd, .peer);
 }
@@ -412,6 +435,8 @@ fn formatIp6(bytes: [16]u8, out: *[64]u8) []const u8 {
     return out[0..pos];
 }
 
+/// Append one IPv6 group without leading zeros and advance the byte position.
+/// Requires output space for up to four bytes and a 16-character hex alphabet.
 fn writeIp6Group(out: *[64]u8, pos: *usize, g: u16, hex: []const u8) void {
     if (g == 0) {
         out[pos.*] = '0';
@@ -434,6 +459,10 @@ fn writeIp6Group(out: *[64]u8, pos: *usize, g: u16, hex: []const u8) void {
 
 // ── recvfrom / recv ─────────────────────────────────────────────
 
+/// Arm one receive into a live slot's Uint8Array/ArrayBuffer, retaining JS refs
+/// until completion/cancellation. with_peer selects [data view, sender] instead
+/// of a data view. I/O failure rejects; close rejects pending receives.
+/// Return RecvPending, NotABuffer, or NoLoop before arming on invalid state/input.
 pub fn submitRecv(
     ctx: ?*c.Context,
     slot: u16,
@@ -464,6 +493,9 @@ pub fn submitRecv(
     );
 }
 
+/// Settle a receive with a view of the written bytes and optionally its sender.
+/// Convert read/buffer errors to rejection; release completed or aborted buffer
+/// refs. Ignore stale socket generations and disarm after handling the result.
 fn recvCb(
     ud: ?*SlotCtx,
     l: *xev.Loop,
@@ -544,6 +576,8 @@ fn recvCb(
 /// Zero-copy result view: Uint8Array → buf.subarray(0, n);
 /// ArrayBuffer → new Uint8Array(ab, 0, n). Both keep the backing store
 /// alive via JS refcounting, so freeing our held refs is safe.
+/// Return NotABuffer if subarray is not callable or typed-array creation fails;
+/// an exception from calling subarray is returned as a JS exception value.
 fn makeDataView(ctx: ?*c.Context, buf_val: c.Value, n: usize) !c.Value {
     var size: usize = 0;
     if (c.getUint8Array(ctx, &size, buf_val)) |_| {
@@ -561,6 +595,8 @@ fn makeDataView(ctx: ?*c.Context, buf_val: c.Value, n: usize) !c.Value {
     return view;
 }
 
+/// Reject an outstanding receive with msg and release its held JS references.
+/// Do nothing when no rejection callback is present.
 fn settleRecvErr(ctx: ?*c.Context, id: u16, msg: []const u8) void {
     const reject = recv_reject[id] orelse return;
     const buf_val = recv_bufval[id];
@@ -576,6 +612,12 @@ fn settleRecvErr(ctx: ?*c.Context, id: u16, msg: []const u8) void {
 
 // ── sendto / send ───────────────────────────────────────────────
 
+/// Send borrowed ArrayBuffer/TypedArray bytes from a live slot; queued data stays
+/// borrowed until its completion/cancellation callback, even if close rejects first.
+/// A matching connected peer settles immediately; other destinations use the loop.
+/// Return NotABuffer, MessageTooLong (>65507 bytes), NotConnected (dest is null),
+/// NoLoop, or SendQueueFull before submission. I/O failure rejects rather than
+/// returning an error; success resolves with the byte count.
 pub fn submitSend(
     ctx: ?*c.Context,
     slot: u16,
@@ -633,6 +675,7 @@ pub fn submitSend(
     );
 }
 
+/// Reserve the first free send operation, or return null when the queue is full.
 fn allocSendOp() ?u16 {
     for (send_used, 0..) |used, i| {
         if (!used) {
@@ -643,10 +686,14 @@ fn allocSendOp() ?u16 {
     return null;
 }
 
+/// Make an in-range send operation reusable after its references are released.
 fn freeSendOp(op: u16) void {
     send_used[op] = false;
 }
 
+/// Settle a queued send with its byte count or reject I/O/closed-socket failures.
+/// Release settled references and recycle the operation; ignore callbacks from
+/// an earlier operation epoch and always disarm.
 fn sendCb(
     ud: ?*SendCtx,
     l: *xev.Loop,
@@ -692,6 +739,7 @@ fn sendCb(
 
 // ── JS value helpers ────────────────────────────────────────────
 
+/// Consume and free any pending JS exception from a failed buffer probe.
 fn clearExceptionIfAny(ctx: ?*c.Context) void {
     if (c.hasException(ctx)) {
         const exc = c.getException(ctx);
@@ -700,6 +748,8 @@ fn clearExceptionIfAny(ctx: ?*c.Context) void {
 }
 
 /// Writable bytes of a Uint8Array or ArrayBuffer (recv buffers).
+/// Borrow the backing store; clear probe exceptions and return NotABuffer if
+/// neither representation is available. The caller must keep val alive.
 fn writableBytes(ctx: ?*c.Context, val: c.Value) ![]u8 {
     var size: usize = 0;
     if (c.getUint8Array(ctx, &size, val)) |p| {
@@ -716,6 +766,8 @@ fn writableBytes(ctx: ?*c.Context, val: c.Value) ![]u8 {
 }
 
 /// Borrowed bytes of any ArrayBuffer / TypedArray view (send payloads).
+/// Honor view offsets and byte lengths. Clear probe exceptions and return
+/// NotABuffer for unsupported or invalid backing stores; keep val alive while used.
 fn readBytes(ctx: ?*c.Context, val: c.Value) ![]const u8 {
     var size: usize = 0;
     if (c.getArrayBuffer(ctx, &size, val)) |p| {
@@ -748,6 +800,7 @@ fn readBytes(ctx: ?*c.Context, val: c.Value) ![]const u8 {
     return base[off..][0..len];
 }
 
+/// Create an owned JS Error with msg; return JS_EXCEPTION if Error creation fails.
 fn makeJsError(ctx: ?*c.Context, msg: []const u8) c.Value {
     const err = c.newError(ctx);
     if (c.isException(err) != 0) return err;
@@ -756,6 +809,8 @@ fn makeJsError(ctx: ?*c.Context, msg: []const u8) c.Value {
     return err;
 }
 
+/// Call the rejection callback with a JS Error carrying msg, releasing temporary
+/// values while leaving ownership of the callback with the caller.
 fn rejectWith(ctx: ?*c.Context, reject: c.Value, msg: []const u8) void {
     const err = makeJsError(ctx, msg);
     var args = [_]c.Value{err};
@@ -764,6 +819,7 @@ fn rejectWith(ctx: ?*c.Context, reject: c.Value, msg: []const u8) void {
     c.freeValue(ctx, err);
 }
 
+/// Format an IP endpoint as a JS {address, port, family} object.
 fn addrToJs(ctx: ?*c.Context, addr: std.Io.net.IpAddress) c.Value {
     var sa: SockAddr = .{};
     switch (addr) {
@@ -785,6 +841,8 @@ fn addrToJs(ctx: ?*c.Context, addr: std.Io.net.IpAddress) c.Value {
     return sockAddrToJs(ctx, sa);
 }
 
+/// Create a JS endpoint object with textual address, host-order port, and
+/// family 'inet' or 'inet6'.
 pub fn sockAddrToJs(ctx: ?*c.Context, sa: SockAddr) c.Value {
     const obj = c.newObject(ctx);
     const a = c.newStringLen(ctx, sa.text().ptr, sa.text().len);

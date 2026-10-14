@@ -223,6 +223,9 @@ pub const ResponseData = struct {
             self.owned_body = null;
         }
     }
+    /// Free any owned body and copy borrowed bytes into the pool; null or empty
+    /// input clears has_body. Append a NUL for JSON parsing when storage succeeds.
+    /// Allocation failures are swallowed, so copy/sentinel failure is not reported.
     pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
         if (self.owned_body) |old| gpa.free(old);
         self.owned_body = null;
@@ -402,6 +405,8 @@ fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 /// setBody → zero-copy. Heap-owned bodies (setBodyOwned: >64K spill,
 /// ArrayBuffer ctor, clone) are exact-length → NUL-terminate a copy into
 /// `scratch`, or a fresh allocation returned via `heap_out` (caller frees).
+/// Return null when no body is present and propagate OutOfMemory if allocation
+/// fails. `heap_out` is unchanged when the body fits scratch or is pool-backed.
 fn bodyForParse(data: *const ResponseData, scratch: []u8, heap_out: *?[]u8) error{OutOfMemory}!?[:0]const u8 {
     const body = data.body() orelse return null;
     if (data.owned_body == null) return body.ptr[0..body.len :0];
@@ -417,6 +422,10 @@ fn bodyForParse(data: *const ResponseData, scratch: []u8, heap_out: *?[]u8) erro
     return h[0..body.len :0];
 }
 
+/// Mark the body used and return a promise for its parsed JSON value.
+/// Reject empty input or copy allocation failure with a string, and malformed
+/// JSON with the parser exception. A previously used body is still parsed;
+/// an invalid receiver throws TypeError.
 fn responseJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;

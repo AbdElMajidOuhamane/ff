@@ -75,6 +75,8 @@ fn lowerAsciiSimd(buf: []u8) void {
 // eqlIgnoreCase, preserving exact semantics in all cases.
 // SIMD (§9): the lowering itself goes through lowerAsciiSimd (same helper
 // as the insert path) instead of a scalar toLower loop.
+/// Copy an ASCII-lowercased query into `buf` and return its slice.
+/// Return null without writing when the name exceeds the buffer capacity.
 fn lowerQuery(name: []const u8, buf: []u8) ?[]u8 {
     if (name.len > buf.len) return null;
     @memcpy(buf[0..name.len], name);

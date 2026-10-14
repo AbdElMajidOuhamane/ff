@@ -143,6 +143,9 @@ pub fn decodeUtf8Lossy(bytes: []const u8, out: []u8) usize {
     return n;
 }
 
+/// Decode buffer bytes as UTF-8, replacing each invalid byte with U+FFFD.
+/// Missing input returns an empty string; unsupported input throws TypeError,
+/// and allocation failure raises a JavaScript out-of-memory exception.
 fn decoderDecode(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 1) return c.newStringLen(ctx, "", 0);
