@@ -828,3 +828,16 @@ test "formatIp6 renders compressed groups" {
     }, &buf4);
     try std.testing.expectEqualStrings("2001:db8:0:1::1", mixed);
 }
+
+test "udp open/isValid generation fencing" {
+    init();
+    const s = try open(false);
+    const g = genOf(s);
+    try std.testing.expect(isOwned(s, g));
+    try std.testing.expect(isValid(s, g));
+    try std.testing.expect(!isOwned(s, g +% 1));
+    try std.testing.expect(!isValid(s, g +% 1));
+    closeSock(s, g);
+    try std.testing.expect(!isOwned(s, g));
+    try std.testing.expect(!isValid(s, g));
+}

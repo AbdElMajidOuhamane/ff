@@ -1868,3 +1868,77 @@ test "stageLargeResponse retains spill for reuse and routes by length" {
     body_remaining[id] = 0;
     body_source_off[id] = 0;
 }
+
+test "statusReason covers every status code" {
+    const cases = .{
+        .{ 200, "OK" },                 .{ 201, "Created" },             .{ 204, "No Content" },
+        .{ 301, "Moved Permanently" },  .{ 304, "Not Modified" },        .{ 400, "Bad Request" },
+        .{ 401, "Unauthorized" },       .{ 403, "Forbidden" },           .{ 404, "Not Found" },
+        .{ 405, "Method Not Allowed" }, .{ 413, "Payload Too Large" },   .{ 500, "Internal Server Error" },
+        .{ 502, "Bad Gateway" },        .{ 503, "Service Unavailable" }, .{ 418, "Unknown" },
+        .{ 999, "Unknown" },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectEqualStrings(case[1], statusReason(case[0]));
+    }
+}
+
+test "formatResponseHeader/pushStr/appendUInt shapes" {
+    var w: [512]u8 = undefined;
+    var pos: usize = 0;
+    appendUInt(&w, &pos, 0);
+    try std.testing.expectEqualStrings("0", w[0..pos]);
+    pos = 0;
+    appendUInt(&w, &pos, 40120);
+    try std.testing.expectEqualStrings("40120", w[0..pos]);
+    pushStr(&w, &pos, "x");
+    try std.testing.expectEqualStrings("40120x", w[0..pos]);
+    pos = formatResponseHeader(&w, 200, 5, true);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Connection: keep-alive\r\n") != null);
+    pos = formatResponseHeader(&w, 204, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "HTTP/1.1 204 No Content\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w[0..pos], "keep-alive") == null);
+    methods[400] = .head;
+    try std.testing.expect(!wantsBodyBytes(400, 200));
+    methods[400] = .get;
+    try std.testing.expect(wantsBodyBytes(400, 200));
+    try std.testing.expect(!wantsBodyBytes(400, 204));
+    try std.testing.expect(!wantsBodyBytes(400, 304));
+    methods[400] = .none;
+}
+
+test "buildResponse writes headers+body and honors suppress" {
+    const id: usize = 400;
+    cflags[id] = .{};
+    buildResponse(id, 200, "hi");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, write_bufs[id][0..write_lens[id]], "hi"));
+    // 204 suppresses the body and omits content-length.
+    buildResponse(id, 204, "hi");
+    try std.testing.expect(!std.mem.endsWith(u8, write_bufs[id][0..write_lens[id]], "hi"));
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "Content-Length") == null);
+    cflags[id].keep_alive = true;
+    buildResponse(id, 404, "");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "Connection: keep-alive\r\n") != null);
+    cflags[id] = .{};
+    write_lens[id] = 0;
+}
+
+test "callHandler without a runtime answers 500" {
+    const id: usize = 401;
+    cflags[id] = .{};
+    const pr = ParsedRequest{
+        .method = "GET",
+        .url = "/",
+        .content_length = 0,
+        .method_tag = .get,
+        .keep_alive = true,
+    };
+    callHandler(id, &pr, "");
+    try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 500 Internal Server Error\r\n") != null);
+    cflags[id] = .{};
+    write_lens[id] = 0;
+}

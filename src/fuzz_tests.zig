@@ -10,6 +10,7 @@ const fuzz = @import("testing/fuzz.zig");
 const Fuzzers = .{
     .ws_frame = @import("net/ws_native_fuzz.zig"),
     .http_request = @import("net/http_native_fuzz.zig"),
+    .http2_stream = @import("net/http2_server_fuzz.zig"),
     .semver = @import("commands/semver_fuzz.zig"),
     .tls_pem = @import("net/tls_server_fuzz.zig"),
     .utf8 = @import("api/text_encoding_fuzz.zig"),
