@@ -311,7 +311,16 @@ pub const RequestData = struct {
     }
     pub fn setBody(self: *RequestData, s: []const u8) void {
         self.has_body = s.len > 0;
+        const before = self.pool.items.len;
         self.store(s, &self._body);
+        // JS_ParseJSON requires buf[len] == '\0' (vendor/quickjs/quickjs.c:
+        // 51193 "buf must be zero terminated"). Pool bytes never move, so
+        // this sentinel permanently backs body()'s slice at _body.off +
+        // _body.len — even though the constructor calls other setters after
+        // setBody (their appends land after the sentinel).
+        if (self.has_body and self.pool.items.len > before) {
+            self.pool.append(gpa, 0) catch {};
+        }
     }
     pub fn setIntegrity(self: *RequestData, s: []const u8) void {
         self.store(s, &self._integrity);
@@ -508,7 +517,11 @@ fn requestJson(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
         _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
         return promise;
     }
-    var parsed = c.parseJSON(ctx, body_text.ptr, body_text.len, "");
+    // JS_ParseJSON requires buf[len] == '\0' (quickjs.c:51193); setBody
+    // appended the sentinel (checked here in safe builds by the sentinel
+    // slice). Request bodies are always pool-backed — no copy needed.
+    const body_z: [:0]const u8 = body_text.ptr[0..body_text.len :0];
+    var parsed = c.parseJSON(ctx, body_z.ptr, body_z.len, "");
     defer c.freeValue(ctx, parsed);
     if (c.isException(parsed) != 0) {
         var exc = c.getException(ctx);
@@ -786,4 +799,19 @@ pub fn setup(ctx: ?*c.Context) void {
     defer c.freeValue(ctx, global);
     const ctor = c.newCFunction2(ctx, &requestConstructor, "Request", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "Request", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+}
+
+// ── Regression test: JS_ParseJSON requires buf[len] == '\0' ──
+test "setBody keeps request bodies NUL-terminated for JS_ParseJSON" {
+    var d = RequestData.init();
+    defer d.deinit();
+    d.setBody("{\"a\":1}");
+    const b = d.body().?;
+    try std.testing.expectEqualStrings("{\"a\":1}", b);
+    const end = @as(usize, d._body.off) + @as(usize, d._body.len);
+    try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
+    // Position-stable: constructor-order append (setCache etc.) lands after it.
+    d.setCache("no-store");
+    try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
+    try std.testing.expectEqualStrings("{\"a\":1}", d.body().?);
 }
