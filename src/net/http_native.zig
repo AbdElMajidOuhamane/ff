@@ -156,6 +156,12 @@ pub const ParsedRequest = struct {
 
 // ---- SIMD/CI helpers (unchanged) ----
 
+// CPU-native u8 vector width for every scan below (16 on SSE2/baseline,
+// 32 on AVX2, 64 on AVX-512; 16 where the target has no suggestion).
+// Single const so the findTokenCI dispatch threshold can never drift
+// from the width the SIMD scans actually use.
+const vec_len_u8 = simd.suggestVectorLength(u8) orelse 16;
+
 fn freePop() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
@@ -205,7 +211,7 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
     const n = needle.len;
     const window_end = haystack.len - n + 1;
     const first = std.ascii.toLower(needle[0]);
-    const N = simd.suggestVectorLength(u8) orelse 16;
+    const N = vec_len_u8;
     const V = @Vector(N, u8);
     const M = std.meta.Int(.unsigned, N);
     const spl_first: V = @splat(first);
@@ -227,12 +233,12 @@ fn findTokenCISimd(haystack: []const u8, needle: []const u8) ?usize {
 }
 fn findTokenCI(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0 or haystack.len < needle.len) return null;
-    if (haystack.len - needle.len + 1 >= 16) return findTokenCISimd(haystack, needle);
+    if (haystack.len - needle.len + 1 >= vec_len_u8) return findTokenCISimd(haystack, needle);
     return findTokenCIScalar(haystack, needle);
 }
 pub fn findHeaderEnd(h: []const u8, from: usize) ?usize {
     if (h.len < 4 or from + 4 > h.len) return null;
-    const N = simd.suggestVectorLength(u8) orelse 16;
+    const N = vec_len_u8;
     const V = @Vector(N, u8);
     const M = std.meta.Int(.unsigned, N);
     const spl_lf: V = @splat('\n');
@@ -1941,4 +1947,41 @@ test "callHandler without a runtime answers 500" {
     try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 500 Internal Server Error\r\n") != null);
     cflags[id] = .{};
     write_lens[id] = 0;
+}
+
+// ── Oracle test: vector token search must match the scalar reference ──
+// Exercises widths around the native lane count plus the `v | 0x20`
+// case-fold's false-positive candidates (e.g. needle "-x": '\r' (0x0D)
+// folds to the same candidate as '-'), which matchCI must then reject.
+// Short-haystack (< needle) cases assert the null guard directly —
+// findTokenCIScalar would underflow `len - needle.len + 1` there.
+test "findTokenCI simd matches scalar" {
+    const needles = [_][]const u8{ "sec-websocket-key:", "a", "A", "-x", ":", "Ab9", "\r\n", "zzzz" };
+    // Deterministic pseudo-random haystacks at SIMD-boundary lengths.
+    const lens = [_]usize{ 0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 255 };
+    var hay: [256]u8 = undefined;
+    for (lens) |len| {
+        const hlen = @min(len, hay.len);
+        for (0..hlen) |i| hay[i] = @intCast((i * 37 + len * 11 + 5) & 0xff);
+        for (needles) |n| {
+            if (hlen < n.len) {
+                try std.testing.expectEqual(@as(?usize, null), findTokenCI(hay[0..hlen], n));
+            } else {
+                try std.testing.expectEqual(findTokenCIScalar(hay[0..hlen], n), findTokenCI(hay[0..hlen], n));
+            }
+        }
+    }
+    // Width-exact boundaries around N with an embedded mixed-case token.
+    const N = vec_len_u8;
+    var i: usize = 0;
+    while (i < 3 * N + 4) : (i += 1) {
+        const total = N + i;
+        if (total > hay.len) break;
+        @memset(hay[0..total], 'q');
+        const at = @min(i, total -| 4);
+        @memcpy(hay[at..][0..4], "KeY:");
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "key:"), findTokenCI(hay[0..total], "key:"));
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "KEY:"), findTokenCI(hay[0..total], "KEY:"));
+        try std.testing.expectEqual(findTokenCIScalar(hay[0..total], "-x"), findTokenCI(hay[0..total], "-x"));
+    }
 }

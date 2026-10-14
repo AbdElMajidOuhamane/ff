@@ -7,7 +7,9 @@ const std = @import("std");
 // (no array) while adding parse/mask cost on every frame. Documented here so
 // the skill §3 bool review is recorded as intentional, not missed.
 // SIMD (§9): `unmask` uses explicit @Vector at suggestVectorLength with scalar
-// tail + `unmaskScalar` oracle + test — the justified pattern, not "SIMD is faster".
+// tail + `unmaskScalar` oracle + test — the justified pattern, not "SIMD is
+// faster". The 4B mask pattern is broadcast with std.simd.repeat (no manual
+// fill loop, so no N%4 shape invariant to keep in sync).
 
 // ---- RFC6455 constants ----
 pub const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -100,21 +102,15 @@ pub fn unmaskScalar(buf: []u8, mask: [4]u8) void {
 }
 // In-place XOR with the 4-byte mask at CPU-native vector width
 // (32 lanes on AVX2, 64 on AVX-512), scalar tail for the remainder.
+// The 4B pattern is broadcast with std.simd.repeat — no manual fill
+// loop, so there is no N%4 shape assumption to keep in sync.
 pub fn unmask(buf: []u8, mask: [4]u8) void {
     const N = std.simd.suggestVectorLength(u8) orelse 16;
     const V = @Vector(N, u8);
     var i: usize = 0;
     const body = buf.len & ~@as(usize, N - 1);
     if (body >= N) {
-        var m: [N]u8 = undefined;
-        var k: usize = 0;
-        while (k < N) : (k += 4) {
-            m[k] = mask[0];
-            m[k + 1] = mask[1];
-            m[k + 2] = mask[2];
-            m[k + 3] = mask[3];
-        }
-        const mv: V = m;
+        const mv: V = std.simd.repeat(N, @as(@Vector(4, u8), mask));
         while (i < body) : (i += N) {
             const v: V = buf[i..][0..N].*;
             buf[i..][0..N].* = v ^ mv;

@@ -27,3 +27,15 @@ test {
 test {
     _ = @import("net/ws_native.zig");
 }
+
+test {
+    _ = @import("types/headers.zig");
+}
+
+test {
+    _ = @import("types/response.zig");
+}
+
+test {
+    _ = @import("types/request.zig");
+}
