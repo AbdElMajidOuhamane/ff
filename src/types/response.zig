@@ -224,19 +224,20 @@ pub const ResponseData = struct {
         }
     }
     pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
+        if (s) |b| {
+            // Reserve the body and JS_ParseJSON's NUL before retaining either.
+            if (b.len > 0) self.pool.ensureUnusedCapacity(gpa, b.len + 1) catch return;
+        }
         if (self.owned_body) |old| gpa.free(old);
         self.owned_body = null;
+        self._body = .{};
         if (s) |b| {
             self.has_body = b.len > 0;
-            const before = self.pool.items.len;
-            self.storeString(b, &self._body);
-            // JS_ParseJSON requires buf[len] == '\0' (vendor/quickjs/
-            // quickjs.c:51193 "buf must be zero terminated"). Pool bytes
-            // never move, so this sentinel permanently backs body()'s
-            // slice at _body.off + _body.len (zero-copy parse), even when
-            // later strings are appended after it (Request ctor order).
-            if (self.has_body and self.pool.items.len > before) {
-                self.pool.append(gpa, 0) catch {};
+            if (self.has_body) {
+                const off = self.pool.items.len;
+                self.pool.appendSliceAssumeCapacity(b);
+                self.pool.appendAssumeCapacity(0);
+                self._body = .{ .off = @intCast(off), .len = @intCast(b.len) };
             }
         } else {
             self.has_body = false;

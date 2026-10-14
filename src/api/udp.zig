@@ -38,7 +38,15 @@ fn throwErr(ctx: ?*c.Context, comptime fmt: []const u8, args: anytype) c.Value {
 
 fn makeSocketObj(ctx: ?*c.Context, slot: u16, inet6: bool) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(udp_class_id));
-    const h = gpa.create(SocketHandle) catch return c.throwOutOfMemory(ctx);
+    if (c.isException(obj) != 0) {
+        udp_native.closeSock(slot, udp_native.genOf(slot));
+        return obj;
+    }
+    const h = gpa.create(SocketHandle) catch {
+        c.freeValue(ctx, obj);
+        udp_native.closeSock(slot, udp_native.genOf(slot));
+        return c.throwOutOfMemory(ctx);
+    };
     h.* = .{ .slot = slot, .gen = udp_native.genOf(slot), .inet6 = inet6 };
     c.setOpaque(obj, h);
     return obj;

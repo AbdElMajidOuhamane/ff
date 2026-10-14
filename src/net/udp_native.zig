@@ -173,6 +173,8 @@ pub fn closeSock(slot: u16, gen: u16) void {
             .callback = cancelCb,
         };
         l.loop.add(&cancel_comps[slot]);
+    } else {
+        flags[slot].recv_drained = true;
     }
     // Abort in-flight sends on this socket: reject immediately, keep the
     // data refs until the cancel/send callbacks release them.
@@ -197,7 +199,6 @@ pub fn closeSock(slot: u16, gen: u16) void {
         };
         l.loop.add(&send_cancel_comps[op]);
     }
-    flags[slot].recv_drained = true;
     close_ctx[slot] = .{ .slot = slot, .sock_gen = gen };
     socks[slot].close(&l.loop, &close_comps[slot], SlotCtx, &close_ctx[slot], closeCb);
 }
@@ -252,6 +253,8 @@ fn cancelCb(
         if (g_ctx) |ctx| c.freeValue(ctx, v);
     }
     recv_bufval[id] = null;
+    flags[id].recv_drained = true;
+    maybeFinalize(id);
     return .disarm;
 }
 
@@ -489,8 +492,7 @@ fn recvCb(
             if (g_ctx) |ctx| c.freeValue(ctx, v);
         }
         recv_bufval[id] = null;
-        flags[id].recv_drained = true;
-        maybeFinalize(id);
+        // The cancel completion still owns recv_comps and this slot.
         return .disarm;
     }
     flags[id].recv_armed = false;
@@ -798,6 +800,40 @@ pub fn sockAddrToJs(ctx: ?*c.Context, sa: SockAddr) c.Value {
 }
 
 // ── unit tests (slot pool; no event loop needed) ────────────────
+
+test "udp slot waits for recv cancel even after close and recv callbacks" {
+    for ([_]bool{ false, true }) |cancel_first| {
+        const slot = try open(false);
+        const gen = genOf(slot);
+        const free_before = free_len;
+        _ = std.c.close(socks[slot].fd);
+        flags[slot].closing = true;
+        recv_ctx[slot] = .{ .slot = slot, .sock_gen = gen };
+        close_ctx[slot] = recv_ctx[slot];
+        var loop: xev.Loop = undefined; // callbacks do not access the loop
+        if (cancel_first) {
+            _ = cancelCb(&recv_ctx[slot], &loop, &cancel_comps[slot], .{ .cancel = {} });
+        } else {
+            _ = closeCb(&close_ctx[slot], &loop, &close_comps[slot], socks[slot], {});
+            const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+            var buf: [1]u8 = undefined;
+            _ = recvCb(&recv_ctx[slot], &loop, &recv_comps[slot], &recv_states[slot], addr, socks[slot], .{ .slice = &buf }, 0);
+        }
+        try std.testing.expect(isOwned(slot, gen));
+        try std.testing.expectEqual(free_before, free_len);
+        if (cancel_first) {
+            _ = closeCb(&close_ctx[slot], &loop, &close_comps[slot], socks[slot], {});
+        } else {
+            _ = cancelCb(&recv_ctx[slot], &loop, &cancel_comps[slot], .{ .cancel = {} });
+        }
+        try std.testing.expect(!isOwned(slot, gen));
+        try std.testing.expectEqual(free_before + 1, free_len);
+        const reused = try open(false);
+        try std.testing.expectEqual(slot, reused);
+        try std.testing.expect(genOf(reused) != gen);
+        closeSock(reused, genOf(reused));
+    }
+}
 
 test "udp slot pool alloc/free bumps generation" {
     init();

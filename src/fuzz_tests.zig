@@ -83,11 +83,12 @@ fn mainSingle(gpa: std.mem.Allocator, target: FuzzersEnum, seed: u64, events_max
     std.debug.print("fuzz done target={s} seed={d}\n", .{ @tagName(target), seed });
 }
 
-fn usage() void {
+fn usage() noreturn {
     std.debug.print("usage: fuzz <target|smoke> [seed] [--events-max=N]\n", .{});
     std.debug.print("targets:", .{});
     inline for (comptime std.meta.tags(FuzzersEnum).*) |f| {
         std.debug.print(" {s}", .{@tagName(f)});
     }
     std.debug.print("\n", .{});
+    std.process.exit(2);
 }

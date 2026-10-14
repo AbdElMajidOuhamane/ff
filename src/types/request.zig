@@ -310,17 +310,18 @@ pub const RequestData = struct {
         self.store(s, &self._url);
     }
     pub fn setBody(self: *RequestData, s: []const u8) void {
-        self.has_body = s.len > 0;
-        const before = self.pool.items.len;
-        self.store(s, &self._body);
-        // JS_ParseJSON requires buf[len] == '\0' (vendor/quickjs/quickjs.c:
-        // 51193 "buf must be zero terminated"). Pool bytes never move, so
-        // this sentinel permanently backs body()'s slice at _body.off +
-        // _body.len — even though the constructor calls other setters after
-        // setBody (their appends land after the sentinel).
-        if (self.has_body and self.pool.items.len > before) {
-            self.pool.append(gpa, 0) catch {};
+        if (s.len == 0) {
+            self.has_body = false;
+            self._body = .{};
+            return;
         }
+        // Reserve the body and JS_ParseJSON's NUL before retaining either.
+        self.pool.ensureUnusedCapacity(gpa, s.len + 1) catch return;
+        const off = self.pool.items.len;
+        self.pool.appendSliceAssumeCapacity(s);
+        self.pool.appendAssumeCapacity(0);
+        self._body = .{ .off = @intCast(off), .len = @intCast(s.len) };
+        self.has_body = true;
     }
     pub fn setIntegrity(self: *RequestData, s: []const u8) void {
         self.store(s, &self._integrity);

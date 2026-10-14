@@ -48,10 +48,13 @@ jobs:
       - name: Fetch C vendors
         run: sh scripts/fetch-vendors.sh
       - name: Fuzz ${{ matrix.target }}
+        env:
+          SEED: ${{ inputs.seed }}
+          EVENTS: ${{ inputs.events_max }}
+          TARGET: ${{ matrix.target }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          SEED="${{ inputs.seed }}"
-          if [ -z "$SEED" ]; then SEED="${{ github.sha }}"; fi
-          EVENTS="${{ inputs.events_max }}"
+          if [ -z "$SEED" ]; then SEED="$COMMIT_SHA"; fi
           if [ -z "$EVENTS" ]; then EVENTS=5000000; fi
           zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- \
-            ${{ matrix.target }} "$SEED" --events-max="$EVENTS"
+            "$TARGET" "$SEED" --events-max="$EVENTS"
