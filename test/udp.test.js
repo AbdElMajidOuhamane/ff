@@ -139,6 +139,70 @@ const [abView] = await withTimeout(srv.recvfrom(ab), 2000, "recv ab");
 check("ArrayBuffer target yields view", abView instanceof Uint8Array && abView.buffer === ab && abView.byteOffset === 0);
 check("ArrayBuffer view bytes", abView.length === payload.length && eqBytes(abView, payload));
 
+// Send and receive views with nonzero offsets; guard bytes must stay untouched.
+const sendBacking = new Uint8Array([99, 99, 4, 0, 255, 5, 99]);
+const sendView = sendBacking.subarray(2, 6);
+const receiveBacking = new Uint8Array(16);
+receiveBacking.fill(77);
+const receiveView = receiveBacking.subarray(3, 11);
+check("offset send count", (await withTimeout(cli.send(sendView), 2000, "offset send")) === 4);
+const [offsetData] = await withTimeout(srv.recvfrom(receiveView), 2000, "offset receive");
+check("offset receive bytes", eqBytes(offsetData, new Uint8Array([4, 0, 255, 5])));
+check("offset receive aliases target", offsetData.buffer === receiveBacking.buffer && offsetData.byteOffset === 3);
+check("receive prefix guard", eqBytes(receiveBacking.subarray(0, 3), new Uint8Array([77, 77, 77])));
+check("receive suffix guard", eqBytes(receiveBacking.subarray(7), new Uint8Array(9).fill(77)));
+check("send view remains unchanged", eqBytes(sendBacking, new Uint8Array([99, 99, 4, 0, 255, 5, 99])));
+
+// Non-byte typed arrays send their bytes, including the view's offset.
+const typedBacking = new Uint8Array([99, 99, 10, 20, 30, 40, 99, 99]);
+const typedPayload = new Uint16Array(typedBacking.buffer, 2, 2);
+check("typed send byte count", (await withTimeout(cli.send(typedPayload), 2000, "typed send")) === 4);
+const [typedData] = await withTimeout(srv.recvfrom(new Uint8Array(8)), 2000, "typed receive");
+check("typed send raw bytes", eqBytes(typedData, typedBacking.subarray(2, 6)));
+
+// A truncated datagram's remainder must not leak into the next receive.
+await withTimeout(cli.send(new Uint8Array([11, 12, 13, 14])), 2000, "truncation send");
+const [shortData] = await withTimeout(srv.recvfrom(new Uint8Array(2)), 2000, "truncation receive");
+check("truncation returns prefix", eqBytes(shortData, new Uint8Array([11, 12])));
+await withTimeout(cli.send(new Uint8Array([21])), 2000, "post truncation send");
+const [nextData] = await withTimeout(srv.recvfrom(new Uint8Array(8)), 2000, "post truncation receive");
+check("truncation discards remainder", eqBytes(nextData, new Uint8Array([21])));
+
+// A rejected second receive must leave the first receive usable.
+const firstReceive = srv.recvfrom(new Uint8Array(8));
+check("duplicate recv rejected", /RecvPending/.test(throwMsg(() => srv.recvfrom(new Uint8Array(8))) || ""));
+await withTimeout(cli.send(new Uint8Array([31])), 2000, "pending receive send");
+const [firstData] = await withTimeout(firstReceive, 2000, "first receive survives");
+check("first recv survives duplicate", eqBytes(firstData, new Uint8Array([31])));
+
+// Empty datagrams are messages, and the documented maximum is inclusive.
+check("empty send count", (await withTimeout(cli.send(new Uint8Array(0)), 2000, "empty send")) === 0);
+try {
+  const [emptyData, emptySender] = await withTimeout(srv.recvfrom(new Uint8Array(8)), 2000, "empty receive");
+  check("empty datagram received", emptyData.length === 0 && emptySender.port === cli.getsockname().port);
+} catch (error) {
+  check("empty datagram received: " + msgOf(error), false);
+}
+const maximum = new Uint8Array(65507);
+for (let i = 0; i < maximum.length; i++) maximum[i] = i % 256;
+check("maximum send count", (await withTimeout(cli.send(maximum), 2000, "maximum send")) === maximum.length);
+const [maximumData] = await withTimeout(srv.recvfrom(new Uint8Array(maximum.length)), 2000, "maximum receive");
+check("maximum datagram intact", eqBytes(maximumData, maximum));
+
+// Reconnecting replaces the default peer used by connected send().
+const other = udp.socket();
+try {
+  other.bind({ address: IP });
+  const otherPort = other.getsockname().port;
+  cli.connect({ address: IP, port: otherPort });
+  check("reconnect updates peer", cli.getpeername().port === otherPort);
+  await withTimeout(cli.send(new Uint8Array([41])), 2000, "reconnect send");
+  const [rerouted] = await withTimeout(other.recvfrom(new Uint8Array(8)), 2000, "reconnect receive");
+  check("reconnect routes to new peer", eqBytes(rerouted, new Uint8Array([41])));
+} finally {
+  other.close();
+}
+
 srv.close();
 cli.close();
 
@@ -180,6 +244,15 @@ check("connect port required", /port required/.test(throwMsg(() => E.connect({ a
 check("connect invalid address", /invalid address/.test(throwMsg(() => E.connect({ address: "nope", port: 1 })) || ""));
 check("recvfrom non-buffer throws", /NotABuffer/.test(throwMsg(() => E.recvfrom(42)) || ""));
 check("recvfrom plain array throws", /NotABuffer/.test(throwMsg(() => E.recvfrom([1, 2, 3])) || ""));
+check("recvfrom non-byte view throws", /NotABuffer/.test(throwMsg(() => E.recvfrom(new Uint16Array(2))) || ""));
+check("bind options required", /options object required/.test(throwMsg(() => E.bind()) || ""));
+check("connect options required", /options object required/.test(throwMsg(() => E.connect()) || ""));
+check("sendto options required", /requires/.test(throwMsg(() => E.sendto(new Uint8Array(1))) || ""));
+check("recvfrom buffer required", /requires a buffer/.test(throwMsg(() => E.recvfrom()) || ""));
+check("bind negative port rejected", /invalid port/.test(throwMsg(() => E.bind({ port: -1 })) || ""));
+check("connect negative port rejected", /port required/.test(throwMsg(() => E.connect({ address: IP, port: -1 })) || ""));
+check("sendto nonnumeric port rejected", /port required/.test(throwMsg(() => E.sendto(new Uint8Array(1), { address: IP, port: "1234" })) || ""));
+check("sendto empty address rejected", /address required/.test(throwMsg(() => E.sendto(new Uint8Array(1), { address: "", port: 1 })) || ""));
 check("oversized datagram", /MessageTooLong/.test(throwMsg(() => E.sendto(new Uint8Array(65508), { address: IP, port: 1 })) || ""));
 E.close();
 
@@ -198,6 +271,9 @@ check("closed sendto throws", /closed/.test(throwMsg(() => H.sendto(new Uint8Arr
 check("closed recvfrom throws", /closed/.test(throwMsg(() => H.recvfrom(new Uint8Array(1))) || ""));
 check("closed getsockname throws", /closed/.test(throwMsg(() => H.getsockname()) || ""));
 check("closed getpeername throws", /closed/.test(throwMsg(() => H.getpeername()) || ""));
+check("closed connect throws", /closed/.test(throwMsg(() => H.connect({ address: IP, port: 1 })) || ""));
+check("closed send throws", /closed/.test(throwMsg(() => H.send(new Uint8Array(1))) || ""));
+check("closed recv throws", /closed/.test(throwMsg(() => H.recv(new Uint8Array(1))) || ""));
 
 const P = udp.socket();
 P.bind({ address: IP });
@@ -224,13 +300,18 @@ for (const s of pool) s.close();
 await sleep(100);
 const reopened = udp.socket();
 check("slots recycled after close", typeof reopened.sendto === "function");
+// An old handle must remain closed even when its native slot is recycled.
+for (const closed of pool) closed.close();
+reopened.bind({ address: IP });
+check("stale close preserves recycled socket", reopened.getsockname().address === IP && reopened.getsockname().port > 0);
+check("stale bind remains rejected", /closed/.test(throwMsg(() => pool[pool.length - 1].bind({})) || ""));
 reopened.close();
 }
 
 main().then(
   () => done("udp"),
   (e) => {
-    console.log("FAIL: unhandled " + msgOf(e));
+    check("UDP tests complete: " + msgOf(e), false);
     done("udp");
   },
 );

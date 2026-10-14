@@ -39,3 +39,23 @@ test {
 test {
     _ = @import("types/request.zig");
 }
+
+test {
+    _ = @import("testing/semver_test.zig");
+}
+
+test {
+    _ = @import("testing/simd_test.zig");
+}
+
+test {
+    _ = @import("testing/body_test.zig");
+}
+
+test {
+    _ = @import("testing/text_encoding_test.zig");
+}
+
+test {
+    _ = @import("testing/fuzz_test.zig");
+}
