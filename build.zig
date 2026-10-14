@@ -36,6 +36,12 @@ fn runtimeModule(
             .{ .name = "sqlite_c", .module = libs.sql_mod },
         },
     });
+    // Vendored C is not UBSan-clean: quickjs-ng v0.16.2's arena allocator
+    // trips the C UB trap (ud2 → SIGILL) in x86_64 ReleaseSafe during
+    // JS_NewRuntime, and the vendored static-lib modules would otherwise
+    // leave __ubsan_handle_* references needing the UBSan runtime at link.
+    // Keep Zig safety checks; disable C UB detection for every C module.
+    mod.sanitize_c = .off;
     // TLS wiring: build options + declarations module + static library.
     mod.addImport("ffcfg", libs.ffcfg_mod);
     if (libs.bearssl) {
@@ -133,6 +139,8 @@ pub fn build(b: *std.Build) void {
         lib.root_module.addIncludePath(b.path("vendor/bearssl/inc"));
         lib.root_module.addIncludePath(b.path("vendor/bearssl/src"));
         lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/bearssl/src"), .files = files.items });
+        // Match the root module: no C UBSan for vendored C (see runtimeModule).
+        lib.root_module.sanitize_c = .off;
         bssl_lib = lib;
     }
 
@@ -186,6 +194,8 @@ pub fn build(b: *std.Build) void {
                 "-DHAVE_NETINET_IN_H",
             },
         });
+        // Match the root module: no C UBSan for vendored C (see runtimeModule).
+        lib.root_module.sanitize_c = .off;
         lib.installHeadersDirectory(b.path("vendor/nghttp2/includes"), "", .{});
         break :blk lib;
     };
@@ -226,6 +236,8 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_OMIT_UTF16=1",
         },
     });
+    // Match the root module: no C UBSan for vendored C (see runtimeModule).
+    mod_sqlite.sanitize_c = .off;
 
     const sqlite_lib = b.addLibrary(.{
         .linkage = .static,
