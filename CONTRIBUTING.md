@@ -164,9 +164,13 @@ Rules:
 4. `zig build fuzz -- canary 1` must fail — it proves failures propagate.
 
 Nightly long runs live in `.github/workflows/fuzz.yml` (commit SHA as
-seed). Coverage: `make cov` (needs `zig-cov` + `-Dcoverage-rt`; the
-`-Dcoverage` wiring in `build.zig` emits line + exact block coverage —
-our branch-coverage proxy, since kcov-style tools only do lines).
+seed). Coverage: `make cov` (requires `kcov` — `brew install kcov` on
+macOS, `apt install kcov` on Linux); report at `kcov-output/index.html`
+([merged] unions the test + fuzzer runs). TigerBeetle uses the same
+tool: DWARF machine-code line/instrumentation-point coverage, not
+branch coverage. Plain kcov counts Zig `unreachable`/`@panic` paths as
+uncovered; if that noise dominates, use the Zig-aware fork
+(roc-lang/zig-kcov) instead.
 
 ## Code style
 

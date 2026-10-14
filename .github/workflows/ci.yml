@@ -136,6 +136,63 @@ jobs:
             exit 1
           fi
 
+  coverage:
+    name: coverage (kcov, informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-cov-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: vendor
+          key: ${{ runner.os }}-cov-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Install kcov
+        run: sudo apt-get update && sudo apt-get install -y kcov
+
+      - name: Coverage of unit tests
+        run: |
+          rm -rf kcov-output
+          zig build test:build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false
+          kcov --include-path=./src kcov-output ./zig-out/bin/ff-test
+
+      - name: Coverage of fuzzers
+        run: |
+          zig build fuzz:build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz smoke
+          for s in 123 124 125 126 127; do
+            for t in ws_frame http_request semver tls_pem utf8 http2_stream; do
+              kcov --include-path=./src kcov-output ./zig-out/bin/fuzz "$t" "$s" --events-max=200000
+            done
+          done
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz ws_frame 0123456789abcdef0123456789abcdef01234567 --events-max=1000
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz || true
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz bogus || true
+          kcov --include-path=./src kcov-output ./zig-out/bin/fuzz canary 1 || true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kcov-report
+          path: kcov-output
+
   postgres:
     name: postgres integration tests
     runs-on: ubuntu-latest
