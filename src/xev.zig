@@ -28,3 +28,4 @@ pub const available = inner.available;
 pub const backend = chosen.backend;
 pub const is_io_uring = use_io_uring;
 pub const Result = chosen.Result;
+pub const Stream = chosen.Stream;

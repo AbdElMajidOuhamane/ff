@@ -19,8 +19,8 @@ Every global in `Object.getOwnPropertyNames(globalThis)`:
 `WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`)
 · `btoa` · `atob` · `performance` · `queueMicrotask` · `DOMException`
 
-**Fairyfly:** `http` · `fs` · `process` · `Database` · `sql` · `SQL` ·
-`Worker` · `ffi` · `console`
+**Fairyfly:** `http` · `fs` · `process` · `child_process` · `Database` ·
+`sql` · `SQL` · `Worker` · `ffi` · `console`
 
 **Engine (QuickJS-ng):** `Promise` · `Map`/`Set`/`WeakMap`/`WeakSet` ·
 `Proxy` · `Reflect` · `Symbol` · `Iterator` · `Atomics` ·
@@ -43,7 +43,7 @@ Every global in `Object.getOwnPropertyNames(globalThis)`:
 | `structuredClone` | absent as global | clone via `postMessage` |
 | `path` / `os` / `util` / `events` | absent | string ops, `URL`, arrays |
 | `stream` | absent | arrays, `Response.text()` |
-| `child_process` | absent | `Worker`, or spawn yourself |
+| `child_process` | partial | `spawn` / `exec` / `execSync` — no streams, stdin, or fork |
 | `net` / `tls` / `http` modules | absent | global `http.serve` (+ [TLS](/docs/guides/tls)) |
 | `worker_threads` | absent | global `Worker` |
 | `zlib` | absent | `crypto.subtle.digest` won't help — use `ffi` |
@@ -89,6 +89,7 @@ These are the ones that bite during a port:
 | `setTimeout(fn, …)` | Returns a `Timeout` **object**, not a number |
 | `WebSocket` | Single `on…` handler per event; no `addEventListener` |
 | Worker files | Evaluated as **classic scripts** — `import`/`export` throws |
+| `child_process` | No streams/events — use `wait()` + captured `stdout`/`stderr`; children are not killed on exit |
 
 ## Porting checklist
 

@@ -37,7 +37,7 @@ and a small readable codebase.
 
 ## Documentation
 
-The full guide set lives in [`docs/`](docs/index.md) — 44 pages covering
+The full guide set lives in [`docs/`](docs/index.md) — 45 pages covering
 everything this README summarizes.
 
 | Section | Contents |
@@ -195,6 +195,7 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `sql` / `SQL` | Postgres tagged templates; failures reject with real `Error`s (`code` / `severity` / `message`) |
 | `fs` | Sync calls return `undefined` on failure (never throw); six `*Async` Promise variants |
 | `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message |
+| `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
@@ -419,6 +420,13 @@ Database:
 - 4 MB per message; no `ArrayBuffer` transfer (always copied)
 - Worker scope is `console` + timers + `postMessage` — no `fs`, `fetch`, or `http.serve`
 - No nested workers; exit only via `terminate()`
+
+**child_process**
+
+- Max **8** concurrent children; the 9th `spawn` throws
+- POSIX only (macOS/Linux); `maxBuffer` defaults to 1 MB per stream
+- No stdin, streams, or events — use `wait()` + captured `stdout`/`stderr`
+- Children are **not** killed when ff exits — call `kill()`
 
 **SQLite**
 

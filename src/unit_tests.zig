@@ -1,4 +1,3 @@
-// ── Unit-test registry (TigerBeetle-style) ──
 // `zig build test` collects `test` blocks ONLY from files reached via
 // `test { _ = @import(...); }` from this root. Plain const-imports (as in
 // src/main.zig) do NOT propagate test discovery — that silently ran zero
@@ -38,4 +37,7 @@ test {
 
 test {
     _ = @import("types/request.zig");
+}
+test {
+    _ = @import("api/child_process.zig");
 }

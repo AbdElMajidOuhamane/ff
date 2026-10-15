@@ -93,7 +93,7 @@ queueMicrotask(fn);
 | Bare specifiers | Resolved via `node_modules` | Needs `ff imprint` install first |
 | `Buffer` | Missing | Use `Uint8Array` |
 | DOM / `window` | Missing | Backend only |
-| `process.spawn` / `exec` | Missing | `process` has exit/cwd/chdir/pid/platform/arch/env/argv only |
+| Subprocess API | Separate global | `child_process.spawn` / `exec` / `execSync` — see the child_process section below |
 
 ## SQLite
 
@@ -121,6 +121,16 @@ queueMicrotask(fn);
 | stdout/stdin streams | Missing | No `process.stdout.write` or stdin reads |
 | `hrtime`, `kill` | Missing | — |
 | Runaway JS watchdog | None | An infinite loop hangs the process |
+
+## child_process
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Concurrent children | 8 | The 9th `spawn` throws / `exec` rejects |
+| `maxBuffer` | 1 MB per stream (default) | Overflow SIGTERMs the child; `exec` rejects, `spawn` sets `truncated` |
+| Platform | POSIX only (macOS/Linux) | Windows throws |
+| stdin, streams, events | Missing | Use `wait()` + captured `stdout` / `stderr` |
+| ff exit | Children are not killed | Call `kill()` yourself |
 
 ## TLS and bytecode
 

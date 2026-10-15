@@ -11,6 +11,7 @@ const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 // C2: async FS completions drain here (Promise settlements on the JS thread).
 const fs_mod = @import("../api/fs.zig");
+const child_process = @import("../api/child_process.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -97,6 +98,7 @@ pub const EventLoop = struct {
         // `await fs.readFileAsync()` would exit before settling).
         if (fs_mod.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
+        if (child_process.liveCount() > 0) return true;
         // Queue entries only count as blocking when nothing is unref'd:
         // with an unref'd timer pending, an entry in submissions may be that
         // timer's own submission, and waiting on it is precisely the bug.
@@ -173,6 +175,7 @@ pub const EventLoop = struct {
             }
             fs_mod.drainCompleted(ctx);
             worker_mod.drainCompleted(ctx);
+            child_process.drainCompleted(ctx);
             microtasks.pumpMicrotasks(ctx);
             if (gc_ticks >= next_gc_check) {
                 next_gc_check += GC_POLICE;

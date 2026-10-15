@@ -29,6 +29,7 @@ const sql_api = @import("../api/sql.zig");
 const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 const udp_api = @import("../api/udp.zig");
+const child_process_api = @import("../api/child_process.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -244,6 +245,7 @@ pub const Runtime = struct {
         sql_api.setup(ctx);
         worker_mod.setup(ctx);
         ffi_api.setup(ctx);
+        child_process_api.setup(ctx);
         {
             var timeout_def = qjs.ClassDef{
                 .class_name = "Timeout",
@@ -291,6 +293,7 @@ pub const Runtime = struct {
         pg_client.setLoop(&loop_ptr.loop);
         ffi_api.setLoop(&loop_ptr.loop);
         fs_api.setLoop(&loop_ptr.loop);
+        child_process_api.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{

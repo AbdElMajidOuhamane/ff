@@ -9,7 +9,7 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, batteries
 included (HTTP, fetch, WebSocket, SQLite, Postgres, workers). Scripts and
 ES modules both work — the runtime auto-detects per file.
 
-44 pages in five sections. If you're new: read the three getting-started
+45 pages in five sections. If you're new: read the three getting-started
 pages in order, then keep **Concepts** open while you build — it explains
 *why* the runtime behaves the way it does.
 
@@ -69,6 +69,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | [`fs`](/docs/api/fs) | Sync and Promise-based filesystem calls |
 | [`console`](/docs/api/console) | Every method, aliases, `time`/`timeLog`/`timeEnd` |
 | [`process`](/docs/api/process) | `argv`, `env`, `pid`, `memoryUsage`, `stats` |
+| [`child_process`](/docs/api/child-process) | `spawn` / `exec` / `execSync`, output capture, signals |
 | [`URL`](/docs/api/url) | `URL`, `URLSearchParams`, `URL.parse`, `URL.canParse` |
 | [`crypto`](/docs/api/crypto) | `randomUUID`, `getRandomValues`, `subtle.digest`, `btoa`/`atob` |
 | [Text encoding](/docs/api/text-encoding) | `TextEncoder` / `TextDecoder` |
@@ -107,6 +108,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | `TextEncoder` / `TextDecoder` | [API: Text encoding](/docs/api/text-encoding) |
 | `Blob` / `FormData` | [Blob and FormData](/docs/api/blobs-formdata) |
 | `process` | [API: process](/docs/api/process) · [Process](/docs/guides/process) |
+| `child_process` | [API: child_process](/docs/api/child-process) |
 | `ffi` (needs `--allow-ffi`) | [API: FFI](/docs/api/ffi) |
 | ESM resolution, `import.meta.url` | [Modules](/docs/guides/modules) |
 | Packages: `ff imprint` / `ff sever` | [Packages](/docs/guides/packages) |

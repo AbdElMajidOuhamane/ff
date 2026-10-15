@@ -6,7 +6,7 @@ order: 13
 
 # Process
 
-`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, and exit. It has no `spawn`/`exec` — shelling out doesn't exist in Fairyfly.
+`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, and exit. Subprocesses live on the separate [child_process](/docs/api/child-process) global.
 
 ## Quick look
 
@@ -148,7 +148,7 @@ ff tool.js bogus       # usage… (exit 1)
 
 | Missing (vs Node) | Use instead |
 |-------------------|-------------|
-| `spawn` / `exec` / `execFile` | Nothing in-runtime — call other services over HTTP, or use `fetch` against a sidecar |
+| `spawn` / `exec` / `execFile` | Separate global: [child_process](/docs/api/child-process) — `spawn`, `exec`, `execSync` |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `memoryUsage()` / `cpuUsage()` | `performance.now()` for elapsed time; nothing for RSS |
 | `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
@@ -164,4 +164,4 @@ Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
 
 **Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
 
-**`spawn is not a function`** — by design. There is no subprocess API; use HTTP sidecars.
+**`process.spawn is not a function`** — subprocesses live on the separate [child_process](/docs/api/child-process) global: `child_process.exec("…")` or `child_process.spawn(cmd, args)`.
