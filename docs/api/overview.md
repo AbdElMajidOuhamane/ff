@@ -33,6 +33,7 @@ globals into every script. Bare specifiers still resolve through
 | `udp` | Datagram sockets (`udp.socket`, max 64) | [udp](/docs/api/udp) |
 | `fs` | Sync + Promise filesystem calls | [fs](/docs/api/fs) |
 | `process` | `argv`, `env`, `exit`, `pid`, `memoryUsage`… | [process](/docs/api/process) |
+| `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | [child_process](/docs/api/child-process) |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [crypto](/docs/api/crypto) |
 | `btoa`, `atob` | Base64 encode / decode | [crypto](/docs/api/crypto) |
 | `Database` | SQLite (`Database.open(path)`) | [SQLite](/docs/api/sqlite) |

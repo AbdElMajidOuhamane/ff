@@ -5,6 +5,7 @@ const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
 const ffi_api = @import("api/ffi.zig");
+const child_process_api = @import("api/child_process.zig");
 const loop_mod = @import("event/loop.zig");
 const microtasks = @import("event/microtasks.zig");
 const init_cmd = @import("commands/init.zig");
@@ -126,6 +127,8 @@ fn runAndExit(runtime: *engine.Runtime) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    child_process_api.setIo(init.io);
+
     if (builtin.os.tag != .windows) {
         resetIgnoredInterrupt();
         maybeStartParentWatchdog();

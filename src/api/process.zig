@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const async_fetch = @import("../net/async_fetch.zig");
 const http_native = @import("../net/http_native.zig");
 const pg_client = @import("../net/pg_client.zig");
+const child_process = @import("child_process.zig");
 
 const Io = std.Io;
 
@@ -111,7 +112,11 @@ fn statsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     _ = c.definePropertyValueStr(ctx, pg_obj, "arenaResetFail", c.newInt64(ctx, pg_client.stat_arena_reset_fail.load(.monotonic)), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, pg_obj, "freelistDestroy", c.newInt64(ctx, pg_client.stat_freelist_destroy.load(.monotonic)), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, root, "pg", pg_obj, c.PROP_C_W_E);
-
+    const child_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, child_obj, "spawned", c.newInt64(ctx, @intCast(child_process.stat_spawned.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, child_obj, "truncated", c.newInt64(ctx, @intCast(child_process.stat_truncated.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, child_obj, "outHeap", c.newInt64(ctx, @intCast(child_process.stat_out_heap.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, root, "child", child_obj, c.PROP_C_W_E);
     return root;
 }
 
