@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
+const tls_tunnel = @import("./tls_tunnel.zig");
 const response_mod = @import("../types/response.zig");
 const headers_mod = @import("../types/headers.zig");
 const builtin = @import("builtin");
@@ -419,8 +420,47 @@ fn runJob(slot_id: u16) void {
             failSlot(s, "Invalid URL");
             return;
         };
-        var req = tls.client().request(current_method, current_uri, .{ .extra_headers = http_hdrs }) catch |err| {
+        // Proxy routing is per hop: redirects may cross hosts, so host/port/
+        // protocol come from THIS hop's URI before picking a client (the
+        // NO_PROXY bypass routes to the direct, proxy-free client).
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const protocol = http.Client.Protocol.fromUri(current_uri) orelse {
+            failSlot(s, "Invalid URL");
+            return;
+        };
+        const hop_host = current_uri.getHost(&host_buf) catch {
+            failSlot(s, "Invalid URL");
+            return;
+        };
+        const hop_port: u16 = current_uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
+        const req_client = tls.clientForHost(hop_host.bytes, hop_port, protocol);
+        // https through a proxy: std.http.Client cannot TLS-upgrade its
+        // CONNECT tunnel (ziglang/zig#19878), so tls_tunnel builds the TLS
+        // connection and request() adopts it through RequestOptions.connection.
+        var tunnel_conn: ?*http.Client.Connection = null;
+        if (protocol == .tls) {
+            if (tls.httpsProxyFor(hop_host.bytes, hop_port)) |proxy| {
+                tunnel_conn = tls_tunnel.connect(req_client, proxy, hop_host, hop_port) catch |err| {
+                    std.debug.print("[fetch] tunnel failed: {s} url={s}\n", .{ @errorName(err), current_url });
+                    failSlot(s, "Network error");
+                    return;
+                };
+            }
+        }
+        var req = req_client.request(current_method, current_uri, .{
+            .extra_headers = http_hdrs,
+            .connection = tunnel_conn,
+        }) catch |err| {
             std.debug.print("[fetch] request failed: {s} url={s}\n", .{ @errorName(err), current_url });
+            // request() did not adopt the tunnel connection; release it here
+            // or it stays pinned in the pool's used list forever.
+            if (tunnel_conn) |cn| {
+                cn.closing = true;
+                req_client.connection_pool.release(cn, req_client.io);
+            }
             failSlot(s, "Network error");
             return;
         };

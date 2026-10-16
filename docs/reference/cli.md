@@ -212,6 +212,22 @@ ff --version
 # ff 0.1.0-canary (macos-aarch64)
 ```
 
+## Proxy environment
+
+Outbound `fetch` / `WebSocket` requests in every command honor the standard
+proxy environment variables. They are read once at process start:
+
+| Variable | Applies to |
+|----------|------------|
+| `HTTP_PROXY` / `http_proxy` | `http://` and `ws://` requests |
+| `HTTPS_PROXY` / `https_proxy` | `https://` and `wss://` requests |
+| `ALL_PROXY` / `all_proxy` | both, when the protocol-specific variable is unset |
+| `NO_PROXY` / `no_proxy` | comma-separated bypass list (`*` bypasses all; `host`, `.host`, `host:port` accepted) |
+
+Proxy URLs may carry credentials (`http://user:pass@proxy:8080`). SOCKS is
+not supported. See [fetch Proxies](/docs/api/fetch#proxies) for matching
+details and examples.
+
 ## Summary
 
 | Command | Purpose |

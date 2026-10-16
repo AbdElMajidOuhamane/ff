@@ -28,6 +28,10 @@ test {
 }
 
 test {
+    _ = @import("net/proxy.zig");
+}
+
+test {
     _ = @import("types/headers.zig");
 }
 

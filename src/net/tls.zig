@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const http = std.http;
+const proxy_mod = @import("proxy.zig");
 // ============================================================
 // Outbound TLS transport — DOD / SoA connection slot pool.
 //
@@ -65,6 +67,22 @@ var client_initialized = false;
 /// bundle at init(). Set by start.zig (--cert) or via FF_CA_FILE/FF_CERT env.
 pub var ca_file: ?[]const u8 = null;
 
+// ---- Proxy configuration ----
+// initProxies() populates http_client.http_proxy / https_proxy from the
+// standard env vars (http_proxy, HTTP_PROXY, all_proxy, ALL_PROXY and the
+// https variants) through std's initDefaultProxies. std then does the
+// actual proxying: absolute-form request lines for forward proxies,
+// CONNECT tunnels for TLS, proxy-authorization from URL userinfo.
+//
+// std does not implement NO_PROXY, so matching hosts are routed to a
+// second, proxy-free client instead. Both clients share the same io
+// backend and CA configuration.
+var proxy_arena_state: std.heap.ArenaAllocator = undefined;
+var proxy_arena_ready = false;
+var no_proxy: ?proxy_mod.NoProxy = null;
+var direct_client: http.Client = undefined;
+var direct_initialized = false;
+
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
@@ -77,31 +95,164 @@ pub fn init() void {
     };
     // DO NOT set http_client.now here — leave it null so request()
     // auto-scans system root certificates on the first HTTPS call.
+    initProxies();
     const ca_env: ?[]const u8 = ca_file orelse blk: {
         const p = std.c.getenv("FF_CA_FILE") orelse std.c.getenv("FF_CERT") orelse break :blk null;
         break :blk std.mem.span(p);
     };
     if (ca_env) |path| {
-        var file = std.Io.Dir.cwd().openFile(http_client.io, path, .{}) catch {
-            std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
-            return;
-        };
-        defer file.close(http_client.io);
-        var file_reader = file.reader(http_client.io, &.{});
-        http_client.ca_bundle.addCertsFromFile(
-            std.heap.page_allocator,
-            &file_reader,
-            0,
-        ) catch |e| {
-            std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
-        };
+        applyCaFile(&http_client, path);
+        if (direct_initialized) applyCaFile(&direct_client, path);
     }
     client_initialized = true;
 }
+
+/// Load a PEM CA bundle into one client. `path` is borrowed (argv/env
+/// memory); the cert data is copied into the client's bundle.
+/// Parameter is `target`, not `client`: Zig forbids shadowing the
+/// container-level `pub fn client()`.
+fn applyCaFile(target: *http.Client, path: []const u8) void {
+    var file = std.Io.Dir.cwd().openFile(target.io, path, .{}) catch {
+        std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
+        return;
+    };
+    defer file.close(target.io);
+    var file_reader = file.reader(target.io, &.{});
+    target.ca_bundle.addCertsFromFile(
+        std.heap.page_allocator,
+        &file_reader,
+        0,
+    ) catch |e| {
+        std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
+    };
+}
+
+fn initProxies() void {
+    proxy_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    proxy_arena_ready = true;
+    const arena = proxy_arena_state.allocator();
+
+    // initDefaultProxies takes an Environ.Map; build a borrowed one from
+    // the process environment (same iteration as api/process.zig's env
+    // setup). The map itself is only needed for this call.
+    var env = std.process.Environ.Map.init(std.heap.page_allocator);
+    defer env.deinit();
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const entry_str = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, entry_str, '=') orelse continue;
+        if (eq == 0) continue;
+        env.put(entry_str[0..eq], entry_str[eq + 1 ..]) catch return;
+    }
+    http_client.initDefaultProxies(arena, &env) catch |e| {
+        std.debug.print("[proxy] env parse failed: {s}\n", .{@errorName(e)});
+    };
+
+    // Uri.getHostAlloc only copies when the host is percent-encoded; for a
+    // normal URL it BORROWS the string it was parsed from — here, the env
+    // map value that `defer env.deinit()` frees when this function returns.
+    // Re-home both host slices in the arena (alive until tls.deinit), or the
+    // first connect() self-proxy comparison reads freed memory (SIGSEGV).
+    // supports_connect stays at std's default (true): CONNECT serves https://
+    // tunnels and the ws:// raw handshake, and std falls back to forward-proxy
+    // mode when the proxy rejects CONNECT (covered by test/proxy.test.js).
+    if (http_client.http_proxy) |p| {
+        if (arena.dupe(u8, p.host.bytes)) |owned| {
+            p.host.bytes = owned;
+        } else |_| {
+            http_client.http_proxy = null;
+        }
+    }
+    if (http_client.https_proxy) |p| {
+        if (arena.dupe(u8, p.host.bytes)) |owned| {
+            p.host.bytes = owned;
+        } else |_| {
+            http_client.https_proxy = null;
+        }
+    }
+
+    if (http_client.http_proxy == null and http_client.https_proxy == null) return;
+
+    // NO_PROXY: parsed here (std has no support) and enforced by routing
+    // matching hosts to `direct_client` in clientForHost below.
+    if (std.c.getenv("no_proxy") orelse std.c.getenv("NO_PROXY")) |raw| {
+        if (proxy_mod.parse(arena, std.mem.span(raw))) |np| {
+            no_proxy = np;
+        } else |e| {
+            std.debug.print("[proxy] NO_PROXY ignored ({s})\n", .{@errorName(e)});
+        }
+    }
+    if (no_proxy) |np| {
+        if (np.entries.len > 0 or np.bypass_all) {
+            direct_client = .{
+                .allocator = std.heap.page_allocator,
+                .io = io_backend.io(),
+            };
+            direct_initialized = true;
+        }
+    }
+    if (builtin.mode == .Debug) logProxies();
+}
+
+fn logProxies() void {
+    if (http_client.http_proxy) |p| {
+        std.debug.print("[proxy] http -> {s}:{d}\n", .{ p.host.bytes, p.port });
+    }
+    if (http_client.https_proxy) |p| {
+        std.debug.print("[proxy] https -> {s}:{d}\n", .{ p.host.bytes, p.port });
+    }
+    if (no_proxy) |np| {
+        std.debug.print("[proxy] no_proxy: {d} entries, bypass_all={}\n", .{
+            np.entries.len,
+            np.bypass_all,
+        });
+    }
+}
+
+/// Pick the client for one outbound request: the direct client when
+/// NO_PROXY matches the target (and a proxy is actually configured for the
+/// request's protocol), otherwise the shared client.
+/// Thread-safe: both clients and the NO_PROXY table are fixed after init().
+pub fn clientForHost(host: []const u8, port: u16, protocol: http.Client.Protocol) *http.Client {
+    if (direct_initialized) {
+        const proxied = switch (protocol) {
+            .plain => http_client.http_proxy != null,
+            .tls => http_client.https_proxy != null,
+        };
+        if (proxied) {
+            if (no_proxy) |np| {
+                if (np.bypasses(host, port)) return &direct_client;
+            }
+        }
+    }
+    return &http_client;
+}
+
+/// Proxy to use for an https/wss request to `host:port`, or null when the
+/// request goes direct (no https_proxy configured, or NO_PROXY matches).
+/// Callers hand the result to net/tls_tunnel.connect, which upgrades the
+/// CONNECT tunnel to TLS that std.http.Client cannot (ziglang/zig#19878).
+pub fn httpsProxyFor(host: []const u8, port: u16) ?*http.Client.Proxy {
+    const proxy = http_client.https_proxy orelse return null;
+    if (no_proxy) |np| {
+        if (np.bypasses(host, port)) return null;
+    }
+    return proxy;
+}
+
 pub fn deinit() void {
     if (!client_initialized) return;
+    if (direct_initialized) {
+        direct_client.deinit();
+        direct_initialized = false;
+    }
     http_client.deinit();
     io_backend.deinit();
+    if (proxy_arena_ready) {
+        proxy_arena_state.deinit();
+        proxy_arena_ready = false;
+    }
+    no_proxy = null;
     client_initialized = false;
 }
 pub fn client() *http.Client {
