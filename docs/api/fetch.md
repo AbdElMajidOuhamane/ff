@@ -147,6 +147,33 @@ Followed automatically up to 5 hops. `res.redirected` and `res.url` tell you whe
 
 Note: redirects your own `http.serve` handler returns via `Response.redirect()` carry no `Location` header, so nothing follows them — see Gotchas.
 
+## Proxies
+
+`fetch` honors the standard proxy environment variables. They are read once
+at process start — set them before launching `ff`:
+
+| Variable | Applies to |
+|----------|------------|
+| `HTTP_PROXY` / `http_proxy` | `http://` requests |
+| `HTTPS_PROXY` / `https_proxy` | `https://` requests |
+| `ALL_PROXY` / `all_proxy` | both, when the protocol-specific variable is unset |
+| `NO_PROXY` / `no_proxy` | comma-separated bypass list |
+
+Proxy URLs may include credentials (`http://user:pass@proxy:8080`), which
+are sent as `proxy-authorization`. `http://` requests are tunneled with
+`CONNECT` (falling back to an absolute-form request line when the proxy
+refuses it); `https://` targets always tunnel through `CONNECT` and carry
+real end-to-end TLS to the target. `NO_PROXY` entries match the host itself
+and its subdomains (`example.com` also matches `api.example.com`); append
+`:port` to scope an entry, and `*` bypasses every host. Only HTTP proxies
+are supported (no SOCKS), and the proxy URL itself must be `http://` — an
+`https://` proxy URL (TLS to the proxy) is rejected.
+
+```sh
+HTTP_PROXY=http://127.0.0.1:8080 ff client.js
+NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js
+```
+
 ## Full example
 
 ```js
@@ -178,7 +205,7 @@ ff client.js
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, no abort/`signal`, HTTP/1.1 only.
+Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
 

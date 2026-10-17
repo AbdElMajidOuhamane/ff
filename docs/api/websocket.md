@@ -138,6 +138,15 @@ ws.onerror = (e) => console.error("ws error:", e.message);
 
 Only `ws://` and `wss://` URLs are accepted. For `wss://` to private CAs, the same trust rules as `fetch` apply (`--ca` for scripts, `FF_CA_FILE` for `ff start`).
 
+### Proxies
+
+The WebSocket client shares the runtime's HTTP client, so the proxy
+environment variables apply exactly as they do for `fetch` (see
+[fetch Proxies](/docs/api/fetch#proxies)): `HTTP_PROXY` / `HTTPS_PROXY` /
+`ALL_PROXY` / `NO_PROXY`, read once at process start. `wss://` tunnels
+through `CONNECT`. `ws://` also needs a proxy that accepts `CONNECT` for the
+target port — a forward-only HTTP proxy will reject the connection.
+
 ### Client errors
 
 Two shapes, depending on when the failure happens. Synchronous mistakes
@@ -147,7 +156,7 @@ throw immediately — every message starts with a `WebSocket: ` prefix:
 new WebSocket("http://localhost:3000/");
 // TypeError: WebSocket: invalid WebSocket URL (expected ws:// or wss://)
 new WebSocket();
-// TypeError: WebSocket: WebSocket constructor requires a URL
+// TypeError: WebSocket: constructor requires a URL
 ```
 
 A failed connection at runtime (refused, unreachable) does **not** throw

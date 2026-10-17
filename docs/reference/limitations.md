@@ -32,6 +32,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Redirects | Followed, max 5 hops | Throws `Too many redirects` |
 | Abort / `signal` | Not supported | `signal` / `timeout` / `redirect` init keys are ignored |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
+| Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
 
 ## WebSocket
 
@@ -41,6 +42,7 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Message size | 16384 bytes | Larger frames truncate |
 | Handshake URL path | 512 bytes | Longer paths fail |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
+| Proxy | Same env vars as `fetch` | `ws://` needs a CONNECT-capable proxy |
 
 ## UDP
 

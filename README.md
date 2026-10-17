@@ -363,6 +363,8 @@ Environment variables:
 - `FF_ECHO` (any value, even empty — only unsetting disables) — run the server in echo mode (returns canned response)
 - `FF_CERT` / `FF_KEY` — TLS cert/key paths (same as `--cert/--key`)
 - `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
+- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (or lowercase) — HTTP proxy for outbound `fetch` / `WebSocket`; `ws://` follows `HTTP_PROXY`, `wss://` follows `HTTPS_PROXY`
+- `NO_PROXY` (or `no_proxy`) — comma-separated hosts that bypass the proxy (`*` bypasses all)
 - `FF_WATCH_PARENT` — set internally by `--watch` (orphan watchdog)
 
 Database:
@@ -402,6 +404,7 @@ Database:
 - No `AbortController` / `signal` / `timeout` / `redirect` init keys
 - WebSocket client: **64** sockets, 16384-byte messages (larger sends truncate)
 - Outbound TLS connection pool: **64**
+- Proxies: HTTP proxies only (no SOCKS), configured via `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
 
 **Timers & loop**
 

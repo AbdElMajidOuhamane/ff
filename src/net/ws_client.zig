@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const tls = @import("./tls.zig");
+const tls_tunnel = @import("./tls_tunnel.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig"); // CHANGED
@@ -291,14 +292,36 @@ fn connectSlot(s: usize) void {
             failClose(s, null, "invalid url", &req);
             return;
         };
-        req = tls.client().request(.GET, uri, .{
+        const wss_client = tls.clientForHost(hosts[s], ports[s], .tls);
+        // wss through a proxy: std.http.Client cannot TLS-upgrade its CONNECT
+        // tunnel (ziglang/zig#19878), so tls_tunnel builds the TLS connection
+        // and request() adopts it through RequestOptions.connection.
+        var tunnel_conn: ?*http.Client.Connection = null;
+        if (tls.httpsProxyFor(hosts[s], ports[s])) |proxy| {
+            const host_name = std.Io.net.HostName.init(hosts[s]) catch {
+                failClose(s, null, "invalid host", &req);
+                return;
+            };
+            tunnel_conn = tls_tunnel.connect(wss_client, proxy, host_name, ports[s]) catch {
+                failClose(s, null, "connect failed", &req);
+                return;
+            };
+        }
+        req = wss_client.request(.GET, uri, .{
             .extra_headers = &[_]http.Header{
                 .{ .name = "Upgrade", .value = "websocket" },
                 .{ .name = "Connection", .value = "Upgrade" },
                 .{ .name = "Sec-WebSocket-Key", .value = keys[s][0..24] },
                 .{ .name = "Sec-WebSocket-Version", .value = "13" },
             },
+            .connection = tunnel_conn,
         }) catch {
+            // request() did not adopt the tunnel connection; release it into
+            // its own client pool or it stays pinned in the used list.
+            if (tunnel_conn) |cn| {
+                cn.closing = true;
+                cn.client.connection_pool.release(cn, cn.client.io);
+            }
             failClose(s, null, "connect failed", &req);
             return;
         };
@@ -333,7 +356,7 @@ fn connectSlot(s: usize) void {
             failClose(s, null, "invalid host", &req);
             return;
         };
-        conn = tls.client().connect(host, ports[s], .plain) catch {
+        conn = tls.clientForHost(hosts[s], ports[s], .plain).connect(host, ports[s], .plain) catch {
             failClose(s, null, "connect failed", &req);
             return;
         };
@@ -479,7 +502,11 @@ fn cleanupConn(s: usize, conn: ?*http.Client.Connection, r: *?http.Client.Reques
         if (r.*) |*rr| rr.connection = null;
         if (conn) |cn| {
             cn.closing = true;
-            tls.client().connection_pool.release(cn, tls.client().io);
+            // Release into the pool of the client that owns the connection:
+            // NO_PROXY routes wss to direct_client, proxied wss to the shared
+            // client (and tls_tunnel connections also live in the shared
+            // client's pool). Releasing into the wrong pool corrupts it.
+            cn.client.connection_pool.release(cn, cn.client.io);
         }
     } else if (fd >= 0) {
         _ = std.c.close(fd);
