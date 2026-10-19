@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("../util/cli.zig");
 const engine = @import("../engine/engine.zig");
 const qjs = @import("../engine/quickjs_shim.zig");
 const microtasks = @import("../event/microtasks.zig");
@@ -26,7 +27,8 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.deinit();
     }
 
-    std.debug.print("Fairyfly REPL — .exit to quit, .clear to clear\n", .{});
+    cli.heading("Fairyfly REPL");
+    cli.bullet(".exit to quit, .clear to clear", .{});
     var buf: [8192]u8 = undefined;
 
     while (readLine(&buf)) |line| {

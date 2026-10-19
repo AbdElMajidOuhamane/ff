@@ -100,7 +100,7 @@ fn resolveTree(gpa: Alloc, io: Io, directs: []const Pin) !void {
         try installDist(io, gpa, kv.key_ptr.*, c.version, c.tarball, c.integrity);
     }
     try tree.writeLock(io);
-    std.debug.print("ff.lock written.\n", .{});
+    cli.ok("ff.lock written", .{});
 }
 
 fn upsertFfJson(gpa: Alloc, io: Io, name: []const u8, ver: []const u8) !void {
@@ -156,15 +156,15 @@ fn installAll(io: Io) !void {
                     if (lock.value.object.get("packages")) |pkgs| {
                         if (pkgs == .object) {
                             try installFromLock(io, gpa, &pkgs.object);
-                            std.debug.print("Done (from ff.lock). Run: ff start\n", .{});
+                            cli.ok("installed from ff.lock — run 'ff start'", .{});
                             return;
                         }
                     }
                 }
             }
-            std.debug.print("ff.lock is not v2 — resolving from ff.json instead.\n", .{});
+            cli.bullet("ff.lock is not v2 — resolving from ff.json", .{});
         } else |_| {
-            std.debug.print("ff.lock is not valid JSON — resolving from ff.json instead.\n", .{});
+            cli.bullet("ff.lock is not valid JSON — resolving from ff.json", .{});
         }
     } else |_| {}
     const ff = dir.readFileAlloc(io, "ff.json", gpa, .limited(1024 * 1024)) catch {
@@ -187,7 +187,7 @@ fn installAll(io: Io) !void {
         try directs.append(gpa, .{ .name = kv.key_ptr.*, .spec = kv.value_ptr.string });
     }
     try resolveTree(gpa, io, directs.items);
-    std.debug.print("Done. Run: ff start\n", .{});
+    cli.ok("done — run 'ff start'", .{});
 }
 
 fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
@@ -196,7 +196,7 @@ fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
         if (!std.mem.startsWith(u8, key, prefix)) {
-            std.debug.print("  skip lock entry {s}: expected node_modules/<name>\n", .{key});
+            cli.warn("skipping lock entry '{s}': expected node_modules/<name>", .{key});
             continue;
         }
         const name = key[prefix.len..];
@@ -220,7 +220,7 @@ fn lockStr(o: std.json.ObjectMap, field: []const u8) ?[]const u8 {
 }
 
 fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarball: []const u8, integrity: []const u8) !void {
-    std.debug.print("imprint {s}@{s} ...\n", .{ name, version });
+    cli.step("imprinting {s}@{s}", .{ name, version });
     const tmp_base = try gpa.dupe(u8, name);
     defer gpa.free(tmp_base);
     for (tmp_base) |*ch| {
@@ -269,9 +269,11 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
     }
     var n: usize = 0;
     if (root_paths.items.len > 0) {
-        std.debug.print("  esm entries: {d} root", .{root_paths.items.len});
-        if (sub_keys.items.len > 0) std.debug.print(" + {d} subpath", .{sub_keys.items.len});
-        std.debug.print("\n", .{});
+        if (sub_keys.items.len > 0) {
+            cli.bullet("esm entries: {d} root + {d} subpath", .{ root_paths.items.len, sub_keys.items.len });
+        } else {
+            cli.bullet("esm entries: {d} root", .{root_paths.items.len});
+        }
         n += try copyClosure(io, gpa, stage, dest, name, root_paths.items, null);
     } else {
         n = gateAndCopyTree(io, gpa, stage, dest) catch |err| {
@@ -307,7 +309,7 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
     if (n == 0) {
         cli.failWithHint("package '{s}' has no copyable JS after the pure-ESM gate", .{name}, "only pure-JS ESM packages are supported", .{});
     }
-    std.debug.print("  ok -> {s}/ ({d} files)\n", .{ dest, n });
+    cli.ok("installed {s} ({d} files)", .{ dest, n });
 }
 
 fn verifyIntegrity(data: []const u8, integrity: []const u8) void {
@@ -486,7 +488,7 @@ const Tree = struct {
                 return;
             }
             if (optional) {
-                std.debug.print("  skip optional {s}@{s} (have {s} via {s})\n", .{ name, spec, have.version, have.parent });
+                cli.bullet("skip optional {s}@{s} (have {s} via {s})", .{ name, spec, have.version, have.parent });
                 return;
             }
             cli.failWithHint("'{s}' needs '{s}@{s}' but {s} is pinned via '{s}'", .{ parent, name, spec, have.version, have.parent }, "pin \"{s}\" in ff.json dependencies to override", .{name});
@@ -501,7 +503,7 @@ const Tree = struct {
         while (vit.next()) |kv| try list.append(gpa, kv.key_ptr.*);
         const pick = try semver.maxSatisfying(list.items, spec) orelse {
             if (optional) {
-                std.debug.print("  skip optional {s}@{s}: no satisfying version\n", .{ name, spec });
+                cli.bullet("skip optional {s}@{s}: no satisfying version", .{ name, spec });
                 return;
             }
             cli.failWithHint("no version of '{s}' satisfies '{s}' (needed by '{s}')", .{ name, spec, parent }, "pin a compatible version in ff.json", .{});
@@ -517,7 +519,7 @@ const Tree = struct {
         if (self.packs.get(name)) |p| return p.value;
         const url = try std.fmt.allocPrint(self.gpa, "https://registry.npmjs.org/{s}", .{name});
         defer self.gpa.free(url);
-        std.debug.print("  resolve {s} ...\n", .{name});
+        cli.step("resolving {s}", .{name});
         const body = try curlToAllocH(self.gpa, io, url, &.{ "-H", "Accept: application/vnd.npm.install-v1+json" });
         defer self.gpa.free(body);
         const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, body, .{}) catch
@@ -592,7 +594,7 @@ const Tree = struct {
             cli.failWithHint("cannot write ff.lock: {s}", .{cli.fileErrText(err)}, "check disk space and permissions", .{});
         };
         try Io.Dir.cwd().rename("ff.lock.tmp", Io.Dir.cwd(), "ff.lock", io);
-        if (migrated) std.debug.print("migrated ff.lock to v2 format.\n", .{});
+        if (migrated) cli.bullet("migrated ff.lock to v2 format", .{});
     }
 };
 
@@ -657,7 +659,7 @@ fn gateSource(path: []const u8, src: []const u8) !void {
         "exports.",
     }) |needle| {
         if (std.mem.indexOf(u8, src, needle) != null) {
-            std.debug.print("  REJECT {s}: needs {s} (pure-JS ESM only)\n", .{ path, needle });
+            cli.warn("rejected {s}: needs {s} (pure-JS ESM only)", .{ path, needle });
             return error.NeedsNodeBuiltins;
         }
     }
@@ -749,7 +751,7 @@ fn collectImportEntries(io: Io, gpa: Alloc, stage: []const u8) !std.ArrayList(En
     while (it.next()) |kv| {
         if (std.mem.eql(u8, kv.key_ptr.*, "./package.json")) continue; // manifest self-reference, never code
         if (std.mem.indexOfScalar(u8, kv.key_ptr.*, '*') != null) {
-            std.debug.print("  note: skip wildcard export {s} (v1)\n", .{kv.key_ptr.*});
+            cli.bullet("skip wildcard export {s} (v1)", .{kv.key_ptr.*});
             continue;
         }
         const v = kv.value_ptr.*;
@@ -1032,7 +1034,7 @@ fn copyClosure(
             if (written == null) {
                 cli.failWithHint("'{s}' imports '{s}', which is missing from the package", .{ pkg, clean }, "the published package looks broken", .{});
             }
-            std.debug.print("  missing imported file {s}\n", .{clean});
+            cli.warn("missing imported file '{s}'", .{clean});
             return error.MissingImport;
         };
         defer gpa.free(found.logical);
@@ -1040,7 +1042,7 @@ fn copyClosure(
         if (!isJsFile(found.logical)) {
             // Data entries (e.g. a re-exported package.json): acknowledged,
             // not copied. package.json itself is always copied by installDist.
-            std.debug.print("  note: skip non-JS entry {s}\n", .{found.logical});
+            cli.bullet("skip non-JS entry {s}", .{found.logical});
             continue;
         }
         const dp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dest, found.logical });
@@ -1069,7 +1071,7 @@ fn copyClosure(
         for (specs.items) |spec| {
             if (!isRelativeSpec(spec)) continue;
             const joined = joinRelPaths(gpa, base_dir orelse ".", spec) catch |err| {
-                std.debug.print("  warning: cannot resolve {s} from {s}: {s}\n", .{ spec, found.logical, @errorName(err) });
+                cli.warn("cannot resolve '{s}' from '{s}' ({s})", .{ spec, found.logical, @errorName(err) });
                 continue;
             };
             // Ownership to the queue; deduped at pop time via seen.

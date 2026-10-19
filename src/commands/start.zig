@@ -92,6 +92,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.event_loop.deinit();
         runtime.deinit();
     }
+    cli.step("starting {s}", .{main_name});
     if (!runtime.evalModule(source, main_name_z)) microtasks.had_error = true;
     runtime.event_loop.runWithMicrotasks(runtime.ctx);
     if (microtasks.had_error) std.process.exit(1);

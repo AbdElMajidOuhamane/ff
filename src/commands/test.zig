@@ -86,7 +86,11 @@ fn printResult(ok: bool, sub: []const u8) void {
     const word = if (ok) "OK" else "FAIL";
     const pad = if (ok) "   " else " ";
     if (cli.useColor()) {
-        std.debug.print("{s}{s}{s}{s}{s}\n", .{ if (ok) cli.green else cli.red, word, cli.reset, pad, sub });
+        if (ok) {
+            std.debug.print(cli.green ++ cli.glyph_ok ++ " OK" ++ cli.reset ++ "   {s}\n", .{sub});
+        } else {
+            std.debug.print(cli.red ++ cli.glyph_fail ++ " FAIL" ++ cli.reset ++ " {s}\n", .{sub});
+        }
     } else {
         std.debug.print("{s}{s}{s}\n", .{ word, pad, sub });
     }
@@ -94,8 +98,11 @@ fn printResult(ok: bool, sub: []const u8) void {
 
 fn printSummary(pass: u32, fail: u32) void {
     if (cli.useColor()) {
-        const fail_color = if (fail > 0) cli.red else cli.dim;
-        std.debug.print("\n{s}{d} passed{s}, {s}{d} failed{s}\n", .{ cli.green, pass, cli.reset, fail_color, fail, cli.reset });
+        if (fail == 0) {
+            std.debug.print("\n" ++ cli.green ++ cli.glyph_ok ++ " {d} passed" ++ cli.reset ++ ", {d} failed\n", .{ pass, fail });
+        } else {
+            std.debug.print("\n" ++ cli.green ++ "{d} passed" ++ cli.reset ++ ", " ++ cli.red ++ "{d} failed" ++ cli.reset ++ "\n", .{ pass, fail });
+        }
     } else {
         std.debug.print("\n{d} passed, {d} failed\n", .{ pass, fail });
     }

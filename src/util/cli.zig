@@ -16,6 +16,12 @@ pub const dim = "\x1b[2m";
 pub const bold = "\x1b[1m";
 pub const reset = "\x1b[0m";
 
+// Status glyphs. Kept as UTF-8 in every mode; only color is TTY-gated.
+pub const glyph_ok = "✓";
+pub const glyph_step = "→";
+pub const glyph_fail = "✗";
+pub const glyph_bullet = "•";
+
 // -1 = not probed yet, 0 = plain, 1 = color.
 var color_state: i8 = -1;
 
@@ -66,6 +72,42 @@ pub fn hint(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+/// Success confirmation: green check when colored.
+pub fn ok(comptime fmt: []const u8, args: anytype) void {
+    if (useColor()) {
+        std.debug.print(green ++ glyph_ok ++ reset ++ " " ++ fmt ++ "\n", args);
+    } else {
+        std.debug.print(glyph_ok ++ " " ++ fmt ++ "\n", args);
+    }
+}
+
+/// Neutral action/progress line: dim arrow when colored.
+pub fn step(comptime fmt: []const u8, args: anytype) void {
+    if (useColor()) {
+        std.debug.print(dim ++ glyph_step ++ reset ++ " " ++ fmt ++ "\n", args);
+    } else {
+        std.debug.print(glyph_step ++ " " ++ fmt ++ "\n", args);
+    }
+}
+
+/// Secondary detail under a step: dim bullet when colored.
+pub fn bullet(comptime fmt: []const u8, args: anytype) void {
+    if (useColor()) {
+        std.debug.print("  " ++ dim ++ glyph_bullet ++ reset ++ " " ++ fmt ++ "\n", args);
+    } else {
+        std.debug.print("  " ++ glyph_bullet ++ " " ++ fmt ++ "\n", args);
+    }
+}
+
+/// Section title: bold when colored.
+pub fn heading(comptime text: []const u8) void {
+    if (useColor()) {
+        std.debug.print(bold ++ text ++ reset ++ "\n", .{});
+    } else {
+        std.debug.print(text ++ "\n", .{});
+    }
+}
+
 /// Print `error: <message>` and exit 1.
 pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     errorMsg(fmt, args);
@@ -92,25 +134,42 @@ pub fn usageFail(comptime usage: []const u8, comptime fmt: []const u8, args: any
 }
 
 pub fn printUsage() void {
-    std.debug.print(
-        \\Usage:
-        \\  ff init [-y|--yes] [<dir>]  Initialize a new project
-        \\  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock
-        \\  ff sever [pkg ...] [--force]  Remove dep(s)
-        \\  ff start [--cert cert.pem --key key.pem]   Run the project
-        \\  ff test [filter]     Run test/*.test.js
-        \\  ff repl              Interactive REPL
-        \\  ff upgrade [--check] Self-update from GitHub Releases
-        \\  ff compile <f.js> [-o out.ffbc]  Compile to bytecode
-        \\  ff fmt [--write|--check] <files...>  Format via prettier
-        \\  ff --watch <file|start>  Restart on file changes
-        \\  ff -e <code>         Run inline JavaScript
-        \\  ff <file.js>         Run a JavaScript file
-        \\  --allow-ffi           Allow ffi.dlopen (native libraries)
-        \\  ff --version         Print runtime version
-        \\  -h, --help           Show this help
-        \\
-    , .{});
+    heading("Usage:");
+    std.debug.print("  ff <file.js> [--ca <path>] [--allow-ffi]\n", .{});
+    std.debug.print("  ff -e <code> [--ca <path>] [--allow-ffi]\n", .{});
+    std.debug.print("  ff --watch <file|start> [--ca <path>]\n", .{});
+    std.debug.print("  ff <command> [options]\n", .{});
+    std.debug.print("\n", .{});
+    heading("Commands:");
+    helpItem("init [-y] [<dir>]", "Initialize a new project");
+    helpItem("start", "Run the project (main from ff.json)");
+    helpItem("test [filter]", "Run test/*.test.js");
+    helpItem("repl", "Interactive REPL");
+    helpItem("imprint [pkg...]", "Add exact dep(s) to ff.json + ff.lock");
+    helpItem("sever [pkg...]", "Remove dep(s)");
+    helpItem("compile <file.js>", "Compile to bytecode (-o out.ffbc)");
+    helpItem("fmt <files...>", "Format via prettier (--write|--check)");
+    helpItem("upgrade [--check]", "Self-update from GitHub Releases");
+    helpItem("help", "Show this help");
+    std.debug.print("\n", .{});
+    heading("Options:");
+    helpItem("--ca <path>", "Trust an extra CA bundle (ff <file> / ff -e)");
+    helpItem("--cert, --key", "PEM cert/key for TLS (ff start)");
+    helpItem("--allow-ffi", "Allow ffi.dlopen (native libraries)");
+    helpItem("--version", "Print runtime version");
+    helpItem("-h, --help", "Show this help");
+}
+
+const help_column = 22;
+
+// One aligned row in the usage summary (bold command when colored).
+pub fn helpItem(comptime cmd: []const u8, comptime desc: []const u8) void {
+    const pad: []const u8 = if (cmd.len < help_column) "                      "[0 .. help_column - cmd.len] else " ";
+    if (useColor()) {
+        std.debug.print("  " ++ bold ++ "{s}" ++ reset ++ "{s}{s}\n", .{ cmd, pad, desc });
+    } else {
+        std.debug.print("  {s}{s}{s}\n", .{ cmd, pad, desc });
+    }
 }
 
 test "fileErrText maps common open failures" {

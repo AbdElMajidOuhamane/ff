@@ -68,5 +68,5 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     dir.writeFile(io, .{ .sub_path = out_path, .data = buf[0..size] }) catch |err| {
         cli.failWithHint("cannot write '{s}': {s}", .{ out_path, cli.fileErrText(err) }, "check the output path", .{});
     };
-    std.debug.print("Compiled {s} -> {s} ({d} bytes)\n", .{ in_path, out_path, size });
+    cli.ok("Compiled {s} → {s} ({d} bytes)", .{ in_path, out_path, size });
 }

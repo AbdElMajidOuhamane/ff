@@ -76,7 +76,7 @@ fn severMany(io: Io, gpa: Alloc, names: []const []const u8) !void {
     // Report misses before touching disk: warn, never abort the run.
     for (names) |n| {
         if (!hadDep(ff.value, n) and !dirExists(io, "node_modules", n)) {
-            std.debug.print("  {s}: not installed\n", .{n});
+            cli.warn("'{s}' is not installed", .{n});
         }
     }
     const out = try std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
@@ -85,7 +85,7 @@ fn severMany(io: Io, gpa: Alloc, names: []const []const u8) !void {
     try Io.Dir.cwd().rename("ff.json.tmp", Io.Dir.cwd(), "ff.json", io);
     // Prune: named packages + everything unreachable afterwards.
     try pruneTree(io, gpa, &root, names);
-    std.debug.print("Done.\n", .{});
+    cli.ok("done", .{});
 }
 
 fn isNamed(key: []const u8, names: []const []const u8) bool {
@@ -164,7 +164,7 @@ fn pruneTree(io: Io, gpa: Alloc, root: *std.json.Value, removed: []const []const
     } else |_| {}
     defer if (have_lock) lock.deinit();
     if (!have_lock) {
-        std.debug.print("  no usable ff.lock — removing named packages only (run ff imprint to regenerate the lock).\n", .{});
+        cli.warn("no usable ff.lock — removing named packages only (run 'ff imprint' to regenerate the lock)", .{});
         for (removed) |n| removeEntry(io, n, true);
         return;
     }
@@ -213,10 +213,10 @@ fn pruneTree(io: Io, gpa: Alloc, root: *std.json.Value, removed: []const []const
                 const p = std.fmt.allocPrint(gpa, "node_modules/{s}", .{e.name}) catch continue;
                 defer gpa.free(p);
                 dir.deleteFile(io, p) catch {
-                    std.debug.print("  warning: could not remove stray file {s}\n", .{p});
+                    cli.warn("could not remove stray file {s}", .{p});
                     continue;
                 };
-                std.debug.print("  stray {s} removed\n", .{e.name});
+                cli.bullet("removed stray {s}", .{e.name});
             }
             continue;
         }
@@ -244,12 +244,12 @@ fn removeEntry(io: Io, name: []const u8, explicit: bool) void {
     const dir = Io.Dir.cwd();
     var buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "node_modules/{s}", .{name}) catch {
-        std.debug.print("  warning: name too long, skipped {s}\n", .{name});
+        cli.warn("name too long, skipped {s}", .{name});
         return;
     };
     dir.deleteTree(io, path) catch {
         dir.deleteFile(io, path) catch {
-            std.debug.print("  warning: could not remove {s}\n", .{path});
+            cli.warn("could not remove {s}", .{path});
             return;
         };
     };
@@ -260,9 +260,9 @@ fn removeEntry(io: Io, name: []const u8, explicit: bool) void {
         }
     }
     if (explicit) {
-        std.debug.print("  severed {s}\n", .{name});
+        cli.bullet("severed {s}", .{name});
     } else {
-        std.debug.print("  pruned {s} (orphaned)\n", .{name});
+        cli.bullet("pruned {s} (orphaned)", .{name});
     }
 }
 
@@ -356,13 +356,13 @@ fn severAll(io: Io, gpa: Alloc, force: bool) !void {
         } else |_| {}
     } else |_| {}
     if (installed.items.len == 0 and dep_count == 0) {
-        std.debug.print("Nothing to sever: node_modules is absent and dependencies are empty.\n", .{});
+        cli.ok("nothing to sever: node_modules is absent and dependencies are empty", .{});
         return;
     }
     if (!force and !promptYesNo(gpa, installed.items.len, dep_count)) return;
     dir.deleteTree(io, "node_modules") catch |err| {
         if (err != error.FileNotFound and err != error.NotDir) {
-            std.debug.print("  warning: node_modules removal: {s}\n", .{@errorName(err)});
+            cli.warn("node_modules removal: {s}", .{@errorName(err)});
         }
     };
     // ff.json: preserve everything, empty only dependencies (fail loud if bad).
@@ -419,8 +419,8 @@ fn severAll(io: Io, gpa: Alloc, force: bool) !void {
         try dir.writeFile(io, .{ .sub_path = "ff.lock.tmp", .data = out });
         try Io.Dir.cwd().rename("ff.lock.tmp", Io.Dir.cwd(), "ff.lock", io);
     }
-    for (installed.items) |n| std.debug.print("  severed {s}\n", .{n});
-    if (dep_count > 0) std.debug.print("  dependencies cleared ({d})\n", .{dep_count});
+    for (installed.items) |n| cli.bullet("severed {s}", .{n});
+    if (dep_count > 0) cli.bullet("cleared {d} dependencies", .{dep_count});
 }
 
 // y/N prompt, default No. EOF and empty input mean No.

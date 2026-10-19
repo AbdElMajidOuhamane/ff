@@ -41,4 +41,9 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     if (term != .exited or term.exited != 0) {
         cli.failWithHint("prettier failed", .{}, "install prettier with 'npm i -g prettier'", .{});
     }
+    if (write) {
+        cli.ok("formatted {d} file(s)", .{files.items.len});
+    } else {
+        cli.ok("{d} file(s) formatted correctly", .{files.items.len});
+    }
 }

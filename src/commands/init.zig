@@ -101,10 +101,12 @@ pub fn run(io: Io, args: []const []const u8) !void {
     };
 
     // ── Done (bun/deno style: no banner, just files + next steps) ──
-    std.debug.print("\nDone! {s}@{s} initialized.\n", .{ final_name, final_version });
-    std.debug.print(" + {s}\n", .{main_path});
-    std.debug.print(" + {s}\n", .{ff_path});
-    std.debug.print("\nTo get started, run:\n", .{});
+    std.debug.print("\n", .{});
+    cli.ok("Initialized {s}@{s}", .{ final_name, final_version });
+    cli.bullet("{s}", .{main_path});
+    cli.bullet("{s}", .{ff_path});
+    std.debug.print("\n", .{});
+    cli.heading("Next steps:");
     if (target_dir) |d| {
         std.debug.print("  cd {s}\n", .{std.mem.trimEnd(u8, d, "/")});
     }

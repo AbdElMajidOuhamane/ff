@@ -20,6 +20,9 @@ hint: <what to try next>
 - `error` is printed in red and `hint` in dim when stderr is a TTY. Color is
 auto-disabled when output is piped or redirected, or when `NO_COLOR` is set (to
 any value).
+- Progress, success, and detail lines use a small glyph vocabulary: `→` for a
+step in progress, `✓` for a completed step, and `•` for secondary detail. The
+glyphs are plain UTF-8; only color is TTY-gated.
 - Every command exits `0` on success and `1` on failure. This includes usage
 errors (missing arguments, unknown options), a missing or invalid `ff.json`,
 network/registry failures, integrity mismatches, and failed tests. Several
@@ -111,6 +114,16 @@ FF_CERT=cert.pem FF_KEY=key.pem ff start
 
 Reads `main` from `ff.json` and runs it as a module (max 10MB). Missing or invalid manifest prints an error and exits.
 
+When the entry starts an HTTP server, ff prints the step and the bound URL:
+
+```text
+→ starting main.js
+✓ server listening on http://localhost:3000
+  • websocket support enabled
+```
+
+With TLS (`--cert`/`--key` or `http.serve({ tls })`) the URL uses `https://`.
+
 | Flag / env | Description |
 |------------|-------------|
 | `--cert <path>` | PEM certificate (max 512KB) |
@@ -198,7 +211,7 @@ Compiles an ES module to QuickJS bytecode with **source and debug info stripped*
 
 ```sh
 ff compile app.js
-# Compiled app.js -> app.ffbc (12345 bytes)
+# ✓ Compiled app.js → app.ffbc (12345 bytes)
 ff app.ffbc
 ```
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("../util/cli.zig");
 const c = @import("../c.zig").c;
 const http_native = @import("http_native.zig");
 const tls_server = @import("tls_server.zig");
@@ -149,7 +150,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     };
 
     http_native.init(&loop_ptr.loop, port) catch |err| {
-        std.debug.print("[http] FAILED: {}\n", .{err});
+        cli.errorMsg("cannot start server on port {d}: {s}", .{ port, @errorName(err) });
         throwTypeError(ctx, "failed to start server (is the port in use?)");
         return c.JS_EXCEPTION;
     };

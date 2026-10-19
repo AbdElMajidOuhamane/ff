@@ -179,7 +179,7 @@ ff test notes
 
 ```sh
 ff compile app.js -o app.ffbc
-# Compiled app.js -> app.ffbc (12345 bytes)
+# ✓ Compiled app.js → app.ffbc (12345 bytes)
 ff app.ffbc
 ```
 

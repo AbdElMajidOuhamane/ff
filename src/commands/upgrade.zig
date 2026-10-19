@@ -79,10 +79,10 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     const lv = semver.parseVersion(lat) catch
         fail("latest version '{s}' is not semver", .{latest});
     if (semver.compare(cv, lv) != .lt) {
-        std.debug.print("ff {s} is up to date.\n", .{ffcfg.version});
+        cli.ok("ff {s} is up to date", .{ffcfg.version});
         return;
     }
-    std.debug.print("Update available: {s} -> {s}\n", .{ ffcfg.version, latest });
+    cli.step("update available: {s} → {s}", .{ ffcfg.version, latest });
     if (check_only) return;
 
     const asset = try assetName(allocator);
@@ -144,5 +144,5 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
             fail("failed to move {s} -> {s}", .{ tmp_path, exe });
         }
     }
-    std.debug.print("Upgraded to {s} ({s}) at {s}.\n", .{ latest, asset, exe });
+    cli.ok("upgraded to {s} ({s}) at {s}", .{ latest, asset, exe });
 }
