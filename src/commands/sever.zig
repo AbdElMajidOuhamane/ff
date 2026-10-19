@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Alloc = std.mem.Allocator;
+const cli = @import("../util/cli.zig");
 const c = @cImport({
     @cInclude("stdio.h");
 });
@@ -47,13 +48,12 @@ fn severMany(io: Io, gpa: Alloc, names: []const []const u8) !void {
     const dir = Io.Dir.cwd();
     // Load ff.json (fail loud — never guess at manifest surgery).
     const ff_src = dir.readFileAlloc(io, "ff.json", gpa, .limited(1024 * 1024)) catch {
-        std.debug.print("No ff.json found. Run 'ff init' first.\n", .{});
-        return;
+        cli.failWithHint("no ff.json in this directory", .{}, "run 'ff init' to create one", .{});
     };
     defer gpa.free(ff_src);
     const ff = try std.json.parseFromSlice(std.json.Value, gpa, ff_src, .{});
     defer ff.deinit();
-    if (ff.value != .object) return error.InvalidManifest;
+    if (ff.value != .object) cli.fail("ff.json is not a JSON object", .{});
     // Rewrite root preserving every field except the removed dep keys.
     var root: std.json.Value = .{ .object = .{} };
     defer root.object.deinit(gpa);
@@ -369,11 +369,10 @@ fn severAll(io: Io, gpa: Alloc, force: bool) !void {
     if (dir.readFileAlloc(io, "ff.json", gpa, .limited(1024 * 1024))) |ff_src| {
         defer gpa.free(ff_src);
         const p = std.json.parseFromSlice(std.json.Value, gpa, ff_src, .{}) catch {
-            std.debug.print("ff.json is not valid JSON — refusing to overwrite it. Fix or delete it first.\n", .{});
-            return error.InvalidManifest;
+            cli.failWithHint("ff.json is not valid JSON", .{}, "fix or delete it first", .{});
         };
         defer p.deinit();
-        if (p.value != .object) return error.InvalidManifest;
+        if (p.value != .object) cli.fail("ff.json is not a JSON object", .{});
         var root: std.json.Value = .{ .object = .{} };
         defer root.object.deinit(gpa);
         var it = p.value.object.iterator();

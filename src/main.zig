@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cli = @import("util/cli.zig");
 const engine = @import("engine/engine.zig");
 const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
@@ -19,10 +20,6 @@ const upgrade_cmd = @import("commands/upgrade.zig");
 const compile_cmd = @import("commands/compile.zig");
 const fmt_cmd = @import("commands/fmt.zig");
 const watch_cmd = @import("commands/watch.zig");
-const c = @cImport({
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-});
 const Command = enum {
     init,
     imprint,
@@ -34,6 +31,7 @@ const Command = enum {
     compile,
     fmt,
     watch,
+    help,
     e_flag,
     file,
     version,
@@ -52,6 +50,7 @@ fn parseCommand(arg: []const u8) Command {
     if (std.mem.eql(u8, arg, "-e")) return .e_flag;
     if (std.mem.eql(u8, arg, "--version")) return .version;
     if (std.mem.eql(u8, arg, "--watch")) return .watch;
+    if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
     return .file;
 }
 fn shutdownRuntime(runtime: *engine.Runtime) void {
@@ -64,8 +63,7 @@ fn parseCaFlag(init: std.process.Init) void {
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--ca")) {
             tls.ca_file = it.next() orelse {
-                std.debug.print("Error: --ca requires a path\n", .{});
-                std.process.exit(1);
+                cli.failWithHint("--ca requires a path", .{}, "usage: ff <file> --ca <path>", .{});
             };
             return;
         }
@@ -126,7 +124,7 @@ fn runAndExit(runtime: *engine.Runtime) void {
     if (microtasks.had_error) std.process.exit(1);
 }
 
-pub fn main(init: std.process.Init) !void {
+fn run(init: std.process.Init) !void {
     child_process_api.setIo(init.io);
 
     if (builtin.os.tag != .windows) {
@@ -136,11 +134,11 @@ pub fn main(init: std.process.Init) !void {
     parseAllowFfiFlag(init);
     var args_iter = init.minimal.args.iterate();
     const exe = args_iter.next() orelse {
-        printUsage();
+        cli.printUsage();
         return;
     };
     const first_arg = args_iter.next() orelse {
-        printUsage();
+        cli.printUsage();
         return;
     };
     const cmd = parseCommand(first_arg);
@@ -186,8 +184,7 @@ pub fn main(init: std.process.Init) !void {
                 if (target == null) {
                     if (std.mem.eql(u8, a, "--ca")) {
                         const v = args_iter.next() orelse {
-                            std.debug.print("Error: --ca requires a path\n", .{});
-                            std.process.exit(1);
+                            cli.failWithHint("--ca requires a path", .{}, "usage: ff --watch <file|start> --ca <path>", .{});
                         };
                         try forward.append(std.heap.page_allocator, a);
                         try forward.append(std.heap.page_allocator, v);
@@ -199,8 +196,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             const t = target orelse {
-                std.debug.print("Error: --watch requires a file or 'start'\n", .{});
-                std.process.exit(1);
+                cli.failWithHint("--watch requires a file or 'start'", .{}, "usage: ff --watch <file|start>", .{});
             };
             if (std.mem.eql(u8, t, "start")) {
                 try watch_cmd.run(init.io, exe, .start, t, forward.items);
@@ -215,10 +211,10 @@ pub fn main(init: std.process.Init) !void {
                 @tagName(builtin.cpu.arch),
             });
         },
+        .help => cli.printUsage(),
         .e_flag => {
             const code = args_iter.next() orelse {
-                std.debug.print("Error: -e requires an argument\n", .{});
-                std.process.exit(1);
+                cli.failWithHint("-e requires an argument", .{}, "usage: ff -e '<code>'", .{});
             };
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
@@ -227,20 +223,28 @@ pub fn main(init: std.process.Init) !void {
             runAndExit(runtime);
         },
         .file => {
+            if (first_arg.len > 0 and first_arg[0] == '-') {
+                if (std.mem.eql(u8, first_arg, "--ca")) {
+                    cli.failWithHint("--ca must follow a script", .{}, "usage: ff <file> --ca <path>", .{});
+                }
+                cli.failWithHint("unknown option '{s}'", .{first_arg}, "run 'ff --help'", .{});
+            }
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
-            const file = c.fopen(first_arg.ptr, "rb") orelse {
-                std.debug.print("Error: could not open file '{s}'\n", .{first_arg});
-                std.process.exit(1);
+            const allocator = std.heap.page_allocator;
+            const buf = std.Io.Dir.cwd().readFileAllocOptions(
+                init.io,
+                first_arg,
+                allocator,
+                .unlimited,
+                .of(u8),
+                0,
+            ) catch |err| {
+                cli.failWithHint("cannot open '{s}': {s}", .{ first_arg, cli.fileErrText(err) }, "check the path and try again", .{});
             };
-            defer _ = c.fclose(file);
-            _ = c.fseek(file, 0, c.SEEK_END);
-            const size: usize = @intCast(c.ftell(file));
-            _ = c.fseek(file, 0, c.SEEK_SET);
-            const buf = try std.heap.page_allocator.allocSentinel(u8, size, 0);
-            defer std.heap.page_allocator.free(buf);
-            _ = c.fread(buf.ptr, 1, size, file);
+            defer allocator.free(buf);
+            const size = buf.len;
 
             if (std.mem.endsWith(u8, first_arg, ".ffbc")) {
                 const obj = qjs.readObject(runtime.ctx, buf.ptr, size, qjs.READ_OBJ_BYTECODE);
@@ -272,23 +276,16 @@ pub fn main(init: std.process.Init) !void {
                 runAndExit(runtime);
             }
         },
-        .none => printUsage(),
+        .none => cli.printUsage(),
     }
 }
-fn printUsage() void {
-    std.debug.print("Usage:", .{});
-    std.debug.print("  ff init [-y|--yes] [<dir>]  Initialize a new project", .{});
-    std.debug.print("  ff imprint [pkg[@ver] ...]  Add exact dep(s) to ff.json + ff.lock", .{});
-    std.debug.print("  ff sever [pkg ...] [--force]  Remove dep(s)", .{});
-    std.debug.print("  ff start [--cert cert.pem --key key.pem]   Run the project", .{});
-    std.debug.print("  ff test [filter]     Run test/*.test.js", .{});
-    std.debug.print("  ff repl              Interactive REPL", .{});
-    std.debug.print("  ff upgrade [--check] Self-update from GitHub Releases", .{});
-    std.debug.print("  ff compile <f.js> [-o out.ffbc]  Compile to bytecode", .{});
-    std.debug.print("  ff fmt [--write|--check] <files...>  Format via prettier", .{});
-    std.debug.print("  ff --watch <file|start>  Restart on file changes", .{});
-    std.debug.print("  ff -e <code>         Run inline JavaScript", .{});
-    std.debug.print("  ff <file.js>         Run a JavaScript file", .{});
-    std.debug.print("  --allow-ffi           Allow ffi.dlopen (native libraries)", .{});
-    std.debug.print("  ff --version         Print runtime version", .{});
+
+// Entry point: any error that escapes a command (a bug, not a handled user
+// error) is reported once here instead of leaking as a raw `error: Name`.
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
+        cli.errorMsg("unexpected error: {s}", .{@errorName(err)});
+        cli.hint("this is a bug — please report it with the command you ran", .{});
+        std.process.exit(1);
+    };
 }

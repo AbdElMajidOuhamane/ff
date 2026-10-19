@@ -45,3 +45,7 @@ test {
 test {
     _ = @import("api/child_process.zig");
 }
+
+test {
+    _ = @import("util/cli.zig");
+}

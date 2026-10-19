@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Alloc = std.mem.Allocator;
+const cli = @import("../util/cli.zig");
 const c = @cImport({
     @cInclude("stdio.h");
 });
@@ -21,8 +22,7 @@ pub fn run(io: Io, args: []const []const u8) !void {
         } else if (target_dir == null) {
             target_dir = a;
         } else {
-            std.debug.print("Unexpected argument '{s}'. Usage: ff init [-y|--yes] [<dir>]\n", .{a});
-            return error.InvalidArgs;
+            cli.usageFail("ff init [-y|--yes] [<dir>]", "unexpected argument '{s}'", .{a});
         }
     }
 
@@ -36,8 +36,7 @@ pub fn run(io: Io, args: []const []const u8) !void {
     if (target_dir) |d| {
         // mkdir -p target (cwd-relative)
         Io.Dir.cwd().createDirPath(io, d) catch |err| {
-            std.debug.print("Could not create directory '{s}': {s}\n", .{ d, @errorName(err) });
-            return err;
+            cli.failWithHint("cannot create directory '{s}': {s}", .{ d, cli.fileErrText(err) }, "check the path and permissions", .{});
         };
         prefix_owned = try std.fmt.allocPrint(gpa, "{s}/", .{std.mem.trimEnd(u8, d, "/")});
         prefix = prefix_owned.?;
@@ -91,11 +90,15 @@ pub fn run(io: Io, args: []const []const u8) !void {
     ;
     const main_path = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, final_main });
     defer gpa.free(main_path);
-    try dir.writeFile(io, .{ .sub_path = main_path, .data = main_content });
+    dir.writeFile(io, .{ .sub_path = main_path, .data = main_content }) catch |err| {
+        cli.failWithHint("cannot write '{s}': {s}", .{ main_path, cli.fileErrText(err) }, "check permissions in this directory", .{});
+    };
 
     const ff_path = try std.fmt.allocPrint(gpa, "{s}ff.json", .{prefix});
     defer gpa.free(ff_path);
-    try dir.writeFile(io, .{ .sub_path = ff_path, .data = out });
+    dir.writeFile(io, .{ .sub_path = ff_path, .data = out }) catch |err| {
+        cli.failWithHint("cannot write '{s}': {s}", .{ ff_path, cli.fileErrText(err) }, "check permissions in this directory", .{});
+    };
 
     // ── Done (bun/deno style: no banner, just files + next steps) ──
     std.debug.print("\nDone! {s}@{s} initialized.\n", .{ final_name, final_version });

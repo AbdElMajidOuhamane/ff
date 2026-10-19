@@ -6,7 +6,32 @@ order: 1
 
 # CLI
 
-`ff` is a single binary. Run it with no arguments to print the built-in usage summary.
+`ff` is a single binary. Run it with no arguments to print the built-in usage summary; `ff -h`, `ff --help`, and `ff help` print the same.
+
+## Errors & exit codes
+
+ff renders its own diagnostics in a fixed shape:
+
+```text
+error: <message>
+hint: <what to try next>
+```
+
+- `error` is printed in red and `hint` in dim when stderr is a TTY. Color is
+auto-disabled when output is piped or redirected, or when `NO_COLOR` is set (to
+any value).
+- Every command exits `0` on success and `1` on failure. This includes usage
+errors (missing arguments, unknown options), a missing or invalid `ff.json`,
+network/registry failures, integrity mismatches, and failed tests. Several
+failure paths that used to print a message but exit `0` — `ff upgrade` on a
+network error, `ff start`/`--watch start` with no `ff.json`, `ff imprint` or
+`ff sever` with a malformed manifest, TLS setup errors in `ff start` — now exit
+`1`.
+- An unknown option prints `error: unknown option '--x'` and a hint to run
+`ff --help`; a missing argument prints the same `error:` plus the command's
+one-line `Usage:`.
+- JavaScript exceptions are **not** part of this shape: they keep their own
+`Error: …` output from the runtime and REPL.
 
 ## Quick look
 
@@ -198,7 +223,7 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 
 | Situation | Effect |
 |-----------|--------|
-| No releases published or network failure | Prints `upgrade: <reason>`, exits `1` |
+| No releases published or network failure | Prints `error: <reason>` (with a hint where useful), exits `1` |
 | Already latest | Prints up-to-date, exits |
 | `--check` | Prints the newer version, exits without downloading |
 | Update available | Downloads `ff-<os>-<arch>`, `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
@@ -244,3 +269,4 @@ details and examples.
 | `ff fmt [--write\|--check] <files …>` | Prettier via npx |
 | `ff upgrade [--check]` | Self-update from GitHub Releases |
 | `ff --version` | Print version |
+| `ff -h\|--help\|help` | Print usage |

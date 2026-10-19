@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("../util/cli.zig");
 
 // ff fmt [--write|--check] <files...> — delegate to prettier.
 pub fn run(io: std.Io, init: std.process.Init) !void {
@@ -20,24 +21,24 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         }
     }
     if (files.items.len == 0) {
-        std.debug.print("Usage: ff fmt [--write|--check] <files...>\n", .{});
-        return;
+        cli.usageFail("ff fmt [--write|--check] <files...>", "no files given", .{});
     }
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "npx", "--yes", "prettier", if (write) "--write" else "--check" });
     try argv.appendSlice(allocator, files.items);
 
-    var child = try std.process.spawn(io, .{
+    var child = std.process.spawn(io, .{
         .argv = argv.items,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
-    });
+    }) catch |err| {
+        cli.failWithHint("cannot run 'npx': {s}", .{cli.fileErrText(err)}, "install Node.js (npx is required)", .{});
+    };
     defer child.kill(io);
     const term = try child.wait(io);
     if (term != .exited or term.exited != 0) {
-        std.debug.print("ff fmt: prettier failed (install with `npm i -g prettier`?)\n", .{});
-        std.process.exit(1);
+        cli.failWithHint("prettier failed", .{}, "install prettier with 'npm i -g prettier'", .{});
     }
 }

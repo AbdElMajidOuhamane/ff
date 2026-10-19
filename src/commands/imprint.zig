@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Alloc = std.mem.Allocator;
+const cli = @import("../util/cli.zig");
 const semver = @import("semver.zig");
 
 // ff imprint [pkg[@ver] ...] — direct pins in ff.json, full transitive tree
@@ -77,10 +78,14 @@ fn resolveLatest(io: Io, gpa: Alloc, name: []const u8) ![]u8 {
     defer gpa.free(url);
     const body = try curlToAlloc(gpa, io, url);
     defer gpa.free(body);
-    const j = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    const j = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
+        cli.failWithHint("unexpected response from the npm registry for '{s}'", .{name}, "check the package name, or pin an exact version", .{});
     defer j.deinit();
-    const v = j.value.object.get("version").?.string;
-    return try gpa.dupe(u8, v);
+    if (j.value != .object) cli.failWithHint("malformed registry data for '{s}'", .{name}, "pin an exact version in ff.json", .{});
+    const v = (j.value.object.get("version") orelse
+        cli.failWithHint("no 'version' in registry data for '{s}'", .{name}, "pin an exact version in ff.json", .{}));
+    if (v != .string) cli.failWithHint("malformed registry data for '{s}'", .{name}, "pin an exact version in ff.json", .{});
+    return try gpa.dupe(u8, v.string);
 }
 
 // Shared resolve+install+lock path. Pins borrowed; the tree owns everything.
@@ -105,10 +110,10 @@ fn upsertFfJson(gpa: Alloc, io: Io, name: []const u8, ver: []const u8) !void {
     if (dir.readFileAlloc(io, "ff.json", gpa, .limited(1024 * 1024))) |old| {
         defer gpa.free(old);
         const p = std.json.parseFromSlice(std.json.Value, gpa, old, .{}) catch {
-            std.debug.print("ff.json is not valid JSON — refusing to overwrite it. Fix or delete it first.\n", .{});
-            return error.InvalidManifest;
+            cli.failWithHint("ff.json is not valid JSON", .{}, "fix or delete it before running 'ff imprint'", .{});
         };
         defer p.deinit();
+        if (p.value != .object) cli.fail("ff.json must be a JSON object", .{});
         root = try dupeValue(gpa, p.value);
         std.debug.assert(root.object.count() == p.value.object.count());
     } else |_| {
@@ -131,7 +136,9 @@ fn upsertFfJson(gpa: Alloc, io: Io, name: []const u8, ver: []const u8) !void {
     }
     const out = try std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
     defer gpa.free(out);
-    try dir.writeFile(io, .{ .sub_path = "ff.json.tmp", .data = out });
+    dir.writeFile(io, .{ .sub_path = "ff.json.tmp", .data = out }) catch |err| {
+        cli.failWithHint("cannot write ff.json: {s}", .{cli.fileErrText(err)}, "check disk space and permissions", .{});
+    };
     try Io.Dir.cwd().rename("ff.json.tmp", Io.Dir.cwd(), "ff.json", io);
 }
 
@@ -161,14 +168,14 @@ fn installAll(io: Io) !void {
         }
     } else |_| {}
     const ff = dir.readFileAlloc(io, "ff.json", gpa, .limited(1024 * 1024)) catch {
-        std.debug.print("No ff.json found. Run 'ff init' first.\n", .{});
-        return;
+        cli.failWithHint("no ff.json in this directory", .{}, "run 'ff init' to create one", .{});
     };
     defer gpa.free(ff);
     const p = try std.json.parseFromSlice(std.json.Value, gpa, ff, .{});
     defer p.deinit();
+    if (p.value != .object) cli.fail("ff.json must be a JSON object", .{});
     const deps = if (p.value.object.get("dependencies")) |d| d.object else {
-        std.debug.print("No dependencies in ff.json.\n", .{});
+        cli.hint("no dependencies in ff.json — nothing to install", .{});
         return;
     };
     // Pins borrow from p (alive through resolveTree). The tree dupes all it keeps.
@@ -194,12 +201,22 @@ fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
         }
         const name = key[prefix.len..];
         const e = kv.value_ptr.*;
-        if (e != .object) return error.BadLock;
-        const version = if (e.object.get("version")) |v| (if (v == .string) v.string else return error.BadLock) else return error.BadLock;
-        const tarball = if (e.object.get("resolved")) |v| (if (v == .string) v.string else return error.BadLock) else return error.BadLock;
-        const integrity = if (e.object.get("integrity")) |v| (if (v == .string) v.string else return error.BadLock) else return error.MissingIntegrity;
+        if (e != .object) {
+            cli.failWithHint("ff.lock entry '{s}' is malformed", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
+        }
+        const version = lockStr(e.object, "version") orelse
+            cli.failWithHint("ff.lock entry '{s}' is missing 'version'", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
+        const tarball = lockStr(e.object, "resolved") orelse
+            cli.failWithHint("ff.lock entry '{s}' is missing 'resolved'", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
+        const integrity = lockStr(e.object, "integrity") orelse
+            cli.failWithHint("ff.lock entry '{s}' is missing 'integrity'", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
         try installDist(io, gpa, name, version, tarball, integrity);
     }
+}
+
+fn lockStr(o: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const v = o.get(field) orelse return null;
+    return if (v == .string) v.string else null;
 }
 
 fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarball: []const u8, integrity: []const u8) !void {
@@ -215,9 +232,11 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
     defer gpa.free(tmp);
     try runCmd(io, &.{ "curl", "-fsSL", "-o", tmp, tarball });
     const dir = Io.Dir.cwd();
-    const data = try dir.readFileAlloc(io, tmp, gpa, .limited(64 * 1024 * 1024));
+    const data = dir.readFileAlloc(io, tmp, gpa, .limited(64 * 1024 * 1024)) catch |err| {
+        cli.failWithHint("cannot read the downloaded tarball: {s}", .{cli.fileErrText(err)}, "check network/proxy and retry", .{});
+    };
     defer gpa.free(data);
-    try verifyIntegrity(data, integrity);
+    verifyIntegrity(data, integrity);
     const dest = try std.fmt.allocPrint(gpa, "node_modules/{s}", .{name});
     defer gpa.free(dest);
     const stage = try std.fmt.allocPrint(gpa, "/tmp/ff-stage-{s}", .{safe});
@@ -253,9 +272,14 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
         std.debug.print("  esm entries: {d} root", .{root_paths.items.len});
         if (sub_keys.items.len > 0) std.debug.print(" + {d} subpath", .{sub_keys.items.len});
         std.debug.print("\n", .{});
-        n += try copyClosure(io, gpa, stage, dest, root_paths.items, null);
+        n += try copyClosure(io, gpa, stage, dest, name, root_paths.items, null);
     } else {
-        n = try gateAndCopyTree(io, gpa, stage, dest);
+        n = gateAndCopyTree(io, gpa, stage, dest) catch |err| {
+            if (err == error.NeedsNodeBuiltins) {
+                cli.failWithHint("package '{s}' needs Node built-ins", .{name}, "only pure-JS ESM packages are supported", .{});
+            }
+            return err;
+        };
     }
     for (sub_keys.items) |key| {
         var paths = std.ArrayList([]const u8).empty;
@@ -270,10 +294,10 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
             for (written.items) |w| gpa.free(w);
             written.deinit(gpa);
         }
-        const m = copyClosure(io, gpa, stage, dest, paths.items, &written) catch |err| {
+        const m = copyClosure(io, gpa, stage, dest, name, paths.items, &written) catch |err| {
             if (err == error.NeedsNodeBuiltins or err == error.MissingImport) {
                 for (written.items) |w| dir.deleteFile(io, w) catch {};
-                std.debug.print("  warn: skip subpath {s} ({s})\n", .{ key, @errorName(err) });
+                cli.warn("skipping subpath '{s}' ({s})", .{ key, @errorName(err) });
                 continue;
             }
             return err;
@@ -281,27 +305,34 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
         n += m;
     }
     if (n == 0) {
-        std.debug.print("  EMPTY node_modules/{s}: no .js/.mjs after copy\n", .{name});
-        return error.EmptyPackage;
+        cli.failWithHint("package '{s}' has no copyable JS after the pure-ESM gate", .{name}, "only pure-JS ESM packages are supported", .{});
     }
     std.debug.print("  ok -> {s}/ ({d} files)\n", .{ dest, n });
 }
 
-fn verifyIntegrity(data: []const u8, integrity: []const u8) !void {
+fn verifyIntegrity(data: []const u8, integrity: []const u8) void {
     const prefix = "sha512-";
-    if (!std.mem.startsWith(u8, integrity, prefix)) return error.UnsupportedIntegrity;
+    if (!std.mem.startsWith(u8, integrity, prefix)) {
+        cli.failWithHint("unsupported integrity hash '{s}'", .{integrity}, "only sha512- SRI is supported", .{});
+    }
     const enc = integrity[prefix.len..];
     const b64 = std.base64.standard.Decoder;
-    const size = b64.calcSizeForSlice(enc) catch return error.BadIntegrity;
-    if (size != 64) return error.BadIntegrity;
+    const size = b64.calcSizeForSlice(enc) catch
+        cli.failWithHint("malformed integrity hash '{s}'", .{integrity}, "the registry metadata looks corrupt", .{});
+    if (size != 64) {
+        cli.failWithHint("malformed integrity hash '{s}'", .{integrity}, "the registry metadata looks corrupt", .{});
+    }
     var expected: [64]u8 = undefined;
-    b64.decode(&expected, enc) catch return error.BadIntegrity;
+    b64.decode(&expected, enc) catch
+        cli.failWithHint("malformed integrity hash '{s}'", .{integrity}, "the registry metadata looks corrupt", .{});
     var h = std.crypto.hash.sha2.Sha512.init(.{});
     h.update(data);
     var digest: [64]u8 = undefined;
     h.final(&digest);
     // mem.eql, not constant-time: the digest is public registry data.
-    if (!std.mem.eql(u8, &expected, &digest)) return error.IntegrityMismatch;
+    if (!std.mem.eql(u8, &expected, &digest)) {
+        cli.failWithHint("integrity check failed for the downloaded tarball", .{}, "clear node_modules and retry; check your network/proxy", .{});
+    }
 }
 
 const Tree = struct {
@@ -359,13 +390,16 @@ const Tree = struct {
     // Extract + DUPE everything the tree keeps; the doc is freed by the caller.
     fn chooseOwned(self: *Tree, name: []const u8, version: []const u8, parent: []const u8, optional: bool, doc: std.json.Value) !void {
         const gpa = self.gpa;
-        if (doc != .object) return error.BadManifest;
-        const dist = doc.object.get("dist") orelse return error.BadManifest;
-        if (dist != .object) return error.BadManifest;
-        const tarball = dist.object.get("tarball") orelse return error.BadManifest;
-        if (tarball != .string) return error.BadManifest;
-        const integrity = dist.object.get("integrity") orelse return error.MissingIntegrity;
-        if (integrity != .string) return error.MissingIntegrity;
+        if (doc != .object) cli.fail("registry metadata for '{s}' is malformed", .{name});
+        const dist = doc.object.get("dist") orelse
+            cli.fail("registry metadata for '{s}' has no 'dist'", .{name});
+        if (dist != .object) cli.fail("registry metadata for '{s}' has a malformed 'dist'", .{name});
+        const tarball = dist.object.get("tarball") orelse
+            cli.failWithHint("'{s}' has no tarball url", .{name}, "the package may not be publishable", .{});
+        if (tarball != .string) cli.fail("'{s}' has a malformed tarball url", .{name});
+        const integrity = dist.object.get("integrity") orelse
+            cli.failWithHint("'{s}' has no integrity hash", .{name}, "the registry metadata looks corrupt", .{});
+        if (integrity != .string) cli.failWithHint("'{s}' has a malformed integrity hash", .{name}, "the registry metadata looks corrupt", .{});
         var deps = std.ArrayList(Dep).empty;
         errdefer {
             for (deps.items) |d| {
@@ -404,8 +438,7 @@ const Tree = struct {
             const name = queue.items[head];
             head += 1;
             if (self.inStack(name)) {
-                std.debug.print("cyclic dependencies involving {s} — v1 fails loud\n", .{name});
-                return error.CyclicDependencies;
+                cli.failWithHint("cyclic dependency involving '{s}'", .{name}, "v1 does not support dependency cycles", .{});
             }
             try self.visiting.append(gpa, try gpa.dupe(u8, name));
             // Re-fetch entry every iteration: inserts may realloc the map.
@@ -440,13 +473,13 @@ const Tree = struct {
         const gpa = self.gpa;
         if (self.chosen.getPtr(name)) |have| {
             // Read-only use of the pointer: no map mutation before return.
-            const have_v = semver.parseVersion(have.version) catch return error.BadVersion;
+            const have_v = semver.parseVersion(have.version) catch
+                cli.fail("pinned version '{s}' is not valid semver", .{have.version});
             const ok = semver.satisfies(have_v, spec) catch |err| {
                 if (err == error.UnsupportedRange) {
-                    std.debug.print("conflict: {s} needs {s}@{s} (unsupported range syntax)\n", .{ parent, name, spec });
-                    return err;
+                    cli.failWithHint("'{s}' needs '{s}@{s}' (unsupported range syntax)", .{ parent, name, spec }, "pin an exact version in ff.json", .{});
                 }
-                return err;
+                cli.fail("cannot resolve '{s}@{s}' needed by '{s}': {s}", .{ name, spec, parent, @errorName(err) });
             };
             if (ok) {
                 if (!optional) have.optional = false;
@@ -456,12 +489,12 @@ const Tree = struct {
                 std.debug.print("  skip optional {s}@{s} (have {s} via {s})\n", .{ name, spec, have.version, have.parent });
                 return;
             }
-            std.debug.print("conflict: {s} needs {s}@{s} but {s} is pinned via {s}. Pin \"{s}\" in ff.json dependencies to override.\n", .{ parent, name, spec, have.version, have.parent, name });
-            return error.VersionConflict;
+            cli.failWithHint("'{s}' needs '{s}@{s}' but {s} is pinned via '{s}'", .{ parent, name, spec, have.version, have.parent }, "pin \"{s}\" in ff.json dependencies to override", .{name});
         }
         const pack = try self.getPack(io, name);
-        const versions = pack.object.get("versions") orelse return error.BadManifest;
-        if (versions != .object) return error.BadManifest;
+        const versions = pack.object.get("versions") orelse
+            cli.fail("registry metadata for '{s}' has no versions", .{name});
+        if (versions != .object) cli.fail("registry metadata for '{s}' has malformed versions", .{name});
         var list = std.ArrayList([]const u8).empty;
         defer list.deinit(gpa);
         var vit = versions.object.iterator();
@@ -471,11 +504,10 @@ const Tree = struct {
                 std.debug.print("  skip optional {s}@{s}: no satisfying version\n", .{ name, spec });
                 return;
             }
-            std.debug.print("conflict: no version of {s} satisfies {s} (needed by {s})\n", .{ name, spec, parent });
-            return error.NoSatisfyingVersion;
+            cli.failWithHint("no version of '{s}' satisfies '{s}' (needed by '{s}')", .{ name, spec, parent }, "pin a compatible version in ff.json", .{});
         };
         const entry = versions.object.get(pick).?;
-        if (entry != .object) return error.BadManifest;
+        if (entry != .object) cli.fail("registry metadata for '{s}@{s}' is malformed", .{ name, pick });
         // entry borrows from the run-long pack cache; chooseOwned dupes out.
         try self.chooseOwned(name, pick, parent, optional, entry);
         try queue.append(gpa, try gpa.dupe(u8, name));
@@ -488,8 +520,10 @@ const Tree = struct {
         std.debug.print("  resolve {s} ...\n", .{name});
         const body = try curlToAllocH(self.gpa, io, url, &.{ "-H", "Accept: application/vnd.npm.install-v1+json" });
         defer self.gpa.free(body);
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, body, .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, body, .{}) catch
+            cli.failWithHint("unexpected response from the npm registry for '{s}'", .{name}, "the registry may be down; retry shortly", .{});
         errdefer parsed.deinit();
+        if (parsed.value != .object) cli.failWithHint("unexpected registry data for '{s}'", .{name}, "the package may not exist", .{});
         try self.packs.put(try self.gpa.dupe(u8, name), parsed);
         return self.packs.get(name).?.value;
     }
@@ -513,11 +547,13 @@ const Tree = struct {
             defer gpa.free(ff);
             if (std.json.parseFromSlice(std.json.Value, gpa, ff, .{})) |p| {
                 ff_doc = p;
-                if (p.value.object.get("name")) |n| {
-                    if (n == .string) project_name = n.string;
-                }
-                if (p.value.object.get("version")) |v| {
-                    if (v == .string) project_ver = v.string;
+                if (p.value == .object) {
+                    if (p.value.object.get("name")) |n| {
+                        if (n == .string) project_name = n.string;
+                    }
+                    if (p.value.object.get("version")) |v| {
+                        if (v == .string) project_ver = v.string;
+                    }
                 }
             } else |_| {}
         } else |_| {}
@@ -552,14 +588,16 @@ const Tree = struct {
         }
         const out = try std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
         defer gpa.free(out);
-        try dir.writeFile(io, .{ .sub_path = "ff.lock.tmp", .data = out });
+        dir.writeFile(io, .{ .sub_path = "ff.lock.tmp", .data = out }) catch |err| {
+            cli.failWithHint("cannot write ff.lock: {s}", .{cli.fileErrText(err)}, "check disk space and permissions", .{});
+        };
         try Io.Dir.cwd().rename("ff.lock.tmp", Io.Dir.cwd(), "ff.lock", io);
         if (migrated) std.debug.print("migrated ff.lock to v2 format.\n", .{});
     }
 };
 
 fn collectDepMap(gpa: Alloc, doc: std.json.Value, field: []const u8, optional: bool, out: *std.ArrayList(Dep)) !void {
-    if (doc != .object) return error.BadManifest;
+    if (doc != .object) cli.fail("registry metadata is malformed", .{});
     const d = doc.object.get(field) orelse return;
     if (d != .object) return;
     var it = d.object.iterator();
@@ -593,7 +631,8 @@ fn fetchVersionDoc(gpa: Alloc, io: Io, name: []const u8, version: []const u8) !s
     defer gpa.free(url);
     const body = try curlToAlloc(gpa, io, url);
     defer gpa.free(body);
-    return try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    return std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
+        cli.failWithHint("unexpected response from the npm registry for '{s}@{s}'", .{ name, version }, "the package or version may not exist", .{});
 }
 
 fn isSkippedTreeDir(name: []const u8) bool {
@@ -951,6 +990,7 @@ fn copyClosure(
     gpa: Alloc,
     stage: []const u8,
     dest: []const u8,
+    pkg: []const u8,
     entries: []const []const u8,
     written: ?*std.ArrayList([]u8),
 ) !usize {
@@ -989,7 +1029,10 @@ fn copyClosure(
                     gpa.free(cand);
                 }
             }
-            std.debug.print("  missing file {s} (imported; failing loud)\n", .{clean});
+            if (written == null) {
+                cli.failWithHint("'{s}' imports '{s}', which is missing from the package", .{ pkg, clean }, "the published package looks broken", .{});
+            }
+            std.debug.print("  missing imported file {s}\n", .{clean});
             return error.MissingImport;
         };
         defer gpa.free(found.logical);
@@ -1002,11 +1045,18 @@ fn copyClosure(
         }
         const dp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dest, found.logical });
         defer gpa.free(dp);
-        try gateSource(dp, found.bytes);
+        gateSource(dp, found.bytes) catch |err| {
+            if (written == null and err == error.NeedsNodeBuiltins) {
+                cli.failWithHint("'{s}' depends on Node built-ins", .{pkg}, "only pure-JS ESM packages are supported", .{});
+            }
+            return err;
+        };
         if (std.fs.path.dirname(dp)) |parent| {
             dir.createDirPath(io, parent) catch {};
         }
-        try dir.writeFile(io, .{ .sub_path = dp, .data = found.bytes });
+        dir.writeFile(io, .{ .sub_path = dp, .data = found.bytes }) catch |err| {
+            cli.failWithHint("cannot write '{s}': {s}", .{ dp, cli.fileErrText(err) }, "check disk space and permissions", .{});
+        };
         if (written) |w| try w.append(gpa, try gpa.dupe(u8, dp));
         total += 1;
         var specs = std.ArrayList([]u8).empty;
@@ -1040,9 +1090,15 @@ fn curlToAllocH(gpa: Alloc, io: Io, url: []const u8, extra: []const []const u8) 
     try argv.appendSlice(gpa, &.{ "curl", "-fsSL" });
     try argv.appendSlice(gpa, extra);
     try argv.append(gpa, url);
-    const res = try std.process.run(gpa, io, .{ .argv = argv.items });
+    const res = std.process.run(gpa, io, .{ .argv = argv.items }) catch |err| {
+        cli.failWithHint("cannot run 'curl': {s}", .{cli.fileErrText(err)}, "install curl or check your PATH", .{});
+    };
     defer gpa.free(res.stderr);
-    if (res.term != .exited or res.term.exited != 0) return error.CurlFailed;
+    if (res.term != .exited or res.term.exited != 0) {
+        const detail = std.mem.trim(u8, res.stderr, " \r\n\t");
+        if (detail.len > 0) cli.failWithHint("could not fetch {s}", .{url}, "{s}", .{detail});
+        cli.failWithHint("could not fetch {s}", .{url}, "check your network/proxy; pin an exact version in ff.json", .{});
+    }
     return res.stdout;
 }
 
@@ -1050,12 +1106,35 @@ fn runCmd(io: Io, argv: []const []const u8) !void {
     var gpa_state = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
-    const res = try std.process.run(gpa, io, .{ .argv = argv });
+    const res = std.process.run(gpa, io, .{ .argv = argv }) catch |err| {
+        cli.failWithHint("cannot run '{s}': {s}", .{ argv[0], cli.fileErrText(err) }, "install it or check your PATH", .{});
+    };
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
     if (res.term != .exited or res.term.exited != 0) {
-        std.debug.print("command failed: {s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ argv[0], res.stdout, res.stderr });
-        return error.CommandFailed;
+        cli.errorMsg("'{s}' failed", .{argv[0]});
+        printIndented("stdout", res.stdout);
+        printIndented("stderr", res.stderr);
+        std.process.exit(1);
+    }
+}
+
+// Dim, indented dump of a failed subprocess's output.
+fn printIndented(label: []const u8, data: []const u8) void {
+    const trimmed = std.mem.trimEnd(u8, data, "\r\n");
+    if (trimmed.len == 0) return;
+    if (cli.useColor()) {
+        std.debug.print("  " ++ cli.dim ++ "--- {s} ---" ++ cli.reset ++ "\n", .{label});
+    } else {
+        std.debug.print("  --- {s} ---\n", .{label});
+    }
+    var it = std.mem.splitScalar(u8, trimmed, '\n');
+    while (it.next()) |line| {
+        if (cli.useColor()) {
+            std.debug.print("  " ++ cli.dim ++ "| " ++ cli.reset ++ "{s}\n", .{line});
+        } else {
+            std.debug.print("  | {s}\n", .{line});
+        }
     }
 }
 

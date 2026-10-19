@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cli = @import("../util/cli.zig");
 
 // ff --watch <file|start> — supervisor process.
 //
@@ -56,8 +57,7 @@ fn exportParentPid() void {
 
 pub fn run(io: std.Io, exe: []const u8, mode: Mode, target: []const u8, forward: []const []const u8) !void {
     if (builtin.os.tag == .windows) {
-        std.debug.print("Error: --watch requires a POSIX platform (darwin/linux)\n", .{});
-        std.process.exit(1);
+        cli.fail("--watch requires a POSIX platform (darwin/linux)", .{});
     } else {
         try supervise(io, exe, mode, target, forward);
     }
@@ -69,8 +69,7 @@ fn supervise(io: std.Io, exe: []const u8, mode: Mode, target: []const u8, forwar
     // Watch root: the project tree around the entry.
     const root_path: []const u8 = if (mode == .file) (std.fs.path.dirname(target) orelse ".") else ".";
     const dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |err| {
-        std.debug.print("Error: cannot watch '{s}': {s}\n", .{ root_path, @errorName(err) });
-        std.process.exit(1);
+        cli.failWithHint("cannot watch '{s}': {s}", .{ root_path, cli.fileErrText(err) }, "check the path", .{});
     };
     defer dir.close(io);
 
@@ -140,8 +139,7 @@ fn spawnChild(io: std.Io, argv: []const []const u8, disp: []const u8, pid: *std.
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch |err| {
-        std.debug.print("Error: cannot start ff: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        cli.fail("cannot start ff: {s}", .{@errorName(err)});
     };
     pid.* = child.id.?;
     g_child_pid.store(pid.*, .release);
@@ -235,19 +233,18 @@ fn isSkipped(name: []const u8) bool {
 
 fn resolveMain(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     const src = std.Io.Dir.cwd().readFileAlloc(io, "ff.json", allocator, .limited(1024 * 1024)) catch {
-        std.debug.print("No ff.json found. Run 'ff init' first.\n", .{});
-        std.process.exit(1);
+        cli.failWithHint("no ff.json in this directory", .{}, "run 'ff init' to create one", .{});
     };
     defer allocator.free(src);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, src, .{}) catch {
-        std.debug.print("ff.json is not valid JSON.\n", .{});
-        std.process.exit(1);
+        cli.fail("ff.json is not valid JSON", .{});
     };
     defer parsed.deinit();
+    if (parsed.value != .object) cli.fail("ff.json must be a JSON object", .{});
     const main_val = parsed.value.object.get("main") orelse {
-        std.debug.print("ff.json is missing the 'main' field.\n", .{});
-        std.process.exit(1);
+        cli.failWithHint("ff.json is missing the 'main' field", .{}, "add a \"main\" field pointing at your entry file", .{});
     };
+    if (main_val != .string) cli.fail("ff.json 'main' must be a string", .{});
     return try allocator.dupe(u8, main_val.string);
 }
 
