@@ -150,6 +150,11 @@ queueMicrotask(fn);
 |------|-------|----------|
 | Package type | Pure-JS ESM only | `require(`, `module.exports`, or `node:` imports are rejected |
 | Version graph | One flat `node_modules` | A conflicting transitive version is a hard error |
+| Direct sources | Public HTTPS only; single package at the archive root | Private repos, auth, monorepo subdirectories unsupported |
+| Direct archive size | 128 MB download cap | Larger archives fail |
+| Raw archive URLs | Must end in `.tar.gz` or `.tgz` | Other URL forms are rejected |
+| Build scripts | Not run | The archive must already contain runnable JS |
+| Direct refs | Default to `HEAD`; branch/tag names are mutable | The lock's integrity check fails closed if the archive changes |
 
 ## What is *not* limited (common misconceptions)
 

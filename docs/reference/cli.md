@@ -139,6 +139,9 @@ The port comes only from `http.serve({ port })` (default `3000`). There is no `-
 ```sh
 ff imprint marked@18.0.11
 ff imprint marked
+ff imprint github:owner/repo#v1.2.3
+ff imprint codeberg:owner/repo
+ff imprint https://example.com/pkg.tar.gz
 ff imprint
 ```
 
@@ -146,10 +149,20 @@ ff imprint
 |------|--------|
 | `ff imprint pkg@ver ...` | Pin pure-JS ESM packages into `ff.json` + `ff.lock` (v2 lock with integrity hashes), materialize `node_modules/` |
 | `ff imprint pkg ...` | Same, resolving latest from the registry |
+| `ff imprint github:owner/repo[#ref] ...` | Resolve a GitHub archive; name/version come from its root `package.json` |
+| `ff imprint codeberg:owner/repo[#ref] ...` | Same for Codeberg |
+| `ff imprint https://…/pkg.tar.gz` | Install an explicit `.tar.gz` / `.tgz` URL |
 | `ff imprint` (no args, v2 lock present) | Exact rebuild from the lock (CI-like) |
-| `ff imprint` (no args, no lock) | Resolve from `ff.json`, write the lock |
+| `ff imprint` (no args, no lock) | Resolve from `ff.json` (npm and direct sources), write the lock |
 
 Only ESM-compatible packages pass the pure-ESM gate.
+
+Direct sources also accept `https://github.com/owner/repo[#ref]` and
+`https://codeberg.org/owner/repo[#ref]`; omit `#ref` to use `HEAD`. The archive
+root must contain `package.json`. Private repositories, authentication,
+monorepo subdirectories, and build scripts are not supported. The lock pins the
+archive URL and a computed SHA-512 integrity hash; a moved branch fails the
+integrity check instead of installing different code.
 
 ## Remove packages
 
@@ -274,7 +287,7 @@ details and examples.
 | `ff -e <code> [--allow-ffi]` | Run inline JS as a classic script (`--ca`, `--allow-ffi` optional) |
 | `ff init [-y] [<dir>]` | Scaffold `ff.json` + entry file |
 | `ff start [--cert --key] [--allow-ffi]` | Run `main` from `ff.json` |
-| `ff imprint [pkg[@ver] …]` | Install pure-JS ESM deps |
+| `ff imprint [pkg\|source …]` | Install pure-JS ESM deps from npm, GitHub, Codeberg, or a tarball |
 | `ff sever [pkg …] [--force]` | Remove deps / wipe install |
 | `ff test [filter] [--allow-ffi]` | Run `test/*.test.js` (FFI tests need the flag) |
 | `ff repl` | Interactive REPL |

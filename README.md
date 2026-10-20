@@ -331,8 +331,8 @@ Linux uses **io_uring** by default, **epoll** via `-Dio_uring=false`
 ```
 ff init [-y|--yes] [<dir>]
                          Initialize a new project (writes ff.json)
-ff imprint [pkg[@ver] ...]
-                         Add exact dep(s) to ff.json + ff.lock, fetch pure-JS ESM
+ff imprint [pkg[@ver]|github:…|codeberg:…|url ...]
+                         Add dep(s) from npm, GitHub/Codeberg, or a .tar.gz URL
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
 ff start [--cert cert.pem --key key.pem]
@@ -460,6 +460,12 @@ Database:
 - `ff imprint` installs **pure-JS ESM** packages only; anything using
   `require(`, `module.exports`, or `node:` imports is rejected
 - One flat `node_modules` — a conflicting transitive version is a hard error
+- Direct sources (`github:`, `codeberg:`, `.tar.gz`) must be public HTTPS
+  single-package archives with `package.json` at the root; no auth, monorepo
+  subdirectories, or build scripts
+- Direct refs default to `HEAD`; branch/tag names are mutable, so use a tag or
+  commit when you need an immutable pin. The lock's integrity check fails
+  closed if the archive changes
 
 ---
 

@@ -145,7 +145,7 @@ pub fn printUsage() void {
     helpItem("start", "Run the project (main from ff.json)");
     helpItem("test [filter]", "Run test/*.test.js");
     helpItem("repl", "Interactive REPL");
-    helpItem("imprint [pkg...]", "Add exact dep(s) to ff.json + ff.lock");
+    helpItem("imprint [pkg|repo ...]", "Add deps from npm, GitHub, or Codeberg");
     helpItem("sever [pkg...]", "Remove dep(s)");
     helpItem("compile <file.js>", "Compile to bytecode (-o out.ffbc)");
     helpItem("fmt <files...>", "Format via prettier (--write|--check)");

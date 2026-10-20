@@ -8,6 +8,10 @@ test {
 }
 
 test {
+    _ = @import("commands/imprint.zig");
+}
+
+test {
     _ = @import("net/http_native.zig");
 }
 

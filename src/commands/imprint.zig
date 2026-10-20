@@ -15,6 +15,10 @@ const semver = @import("semver.zig");
 // Gating granularity: the package ROOT must be pure (abort on failure);
 // each SUBPATH entry is gated independently — failure warns and skips that
 // subpath (with partial-file cleanup) instead of aborting the install.
+// Direct sources: github:owner/repo[#ref], codeberg:owner/repo[#ref], or an
+// https .tar.gz URL. The archive's root package.json supplies the package
+// name/version and its npm dependencies; the exact archive URL + SHA-512 are
+// pinned in ff.lock.
 
 const Pin = struct { name: []const u8, spec: []const u8 }; // borrowed; owner frees
 const Dep = struct { name: []u8, spec: []u8, optional: bool }; // owned
@@ -25,6 +29,8 @@ const Chosen = struct {
     parent: []u8,
     optional: bool,
     deps: std.ArrayList(Dep), // owned entries; complete before walk starts
+    stage: ?[]u8 = null, // direct sources: extracted tree
+    source: ?[]u8 = null, // direct sources: normalized ff.json spec
 };
 
 pub fn run(io: Io, args: []const []const u8) !void {
@@ -41,6 +47,19 @@ pub fn run(io: Io, args: []const []const u8) !void {
         directs.deinit(gpa);
     }
     for (args) |arg| {
+        if (isDirectSpec(arg)) {
+            // Probe once to learn the repository's package name for ff.json.
+            // resolveTree downloads again for the staged install.
+            var prep = try prepareDirect(io, gpa, arg);
+            defer prep.deinit(io, gpa);
+            try upsertFfJson(gpa, io, prep.name, prep.spec);
+            try directs.append(gpa, .{
+                .name = try gpa.dupe(u8, prep.name),
+                .spec = try gpa.dupe(u8, prep.spec),
+            });
+            continue;
+        }
+
         const parsed = try splitPkgArg(gpa, arg);
         defer gpa.free(parsed.name);
         defer if (parsed.ver) |v| gpa.free(v);
@@ -90,14 +109,22 @@ fn resolveLatest(io: Io, gpa: Alloc, name: []const u8) ![]u8 {
 
 // Shared resolve+install+lock path. Pins borrowed; the tree owns everything.
 fn resolveTree(gpa: Alloc, io: Io, directs: []const Pin) !void {
-    var tree = Tree.init(gpa);
+    var tree = Tree.init(gpa, io);
     defer tree.deinit();
-    for (directs) |d| try tree.requireExact(io, d.name, d.spec, "ff.json");
+    for (directs) |d| {
+        if (isDirectSpec(d.spec)) {
+            const r = try tree.requireDirect(d.name, d.spec, "ff.json");
+            gpa.free(r.name);
+            gpa.free(r.spec);
+        } else {
+            try tree.requireExact(io, d.name, d.spec, "ff.json");
+        }
+    }
     try tree.walk(io);
     var it = tree.chosen.iterator();
     while (it.next()) |kv| {
         const c = kv.value_ptr;
-        try installDist(io, gpa, kv.key_ptr.*, c.version, c.tarball, c.integrity);
+        try installDist(io, gpa, kv.key_ptr.*, c.version, c.tarball, c.integrity, c.stage);
     }
     try tree.writeLock(io);
     cli.ok("ff.lock written", .{});
@@ -210,7 +237,7 @@ fn installFromLock(io: Io, gpa: Alloc, pkgs: *const std.json.ObjectMap) !void {
             cli.failWithHint("ff.lock entry '{s}' is missing 'resolved'", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
         const integrity = lockStr(e.object, "integrity") orelse
             cli.failWithHint("ff.lock entry '{s}' is missing 'integrity'", .{key}, "delete ff.lock and re-run 'ff imprint'", .{});
-        try installDist(io, gpa, name, version, tarball, integrity);
+        try installDist(io, gpa, name, version, tarball, integrity, null);
     }
 }
 
@@ -219,31 +246,69 @@ fn lockStr(o: std.json.ObjectMap, field: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarball: []const u8, integrity: []const u8) !void {
-    cli.step("imprinting {s}@{s}", .{ name, version });
-    const tmp_base = try gpa.dupe(u8, name);
-    defer gpa.free(tmp_base);
-    for (tmp_base) |*ch| {
-        if (ch.* == '/' or ch.* == '@') ch.* = '_';
-    }
-    const safe = try std.fmt.allocPrint(gpa, "{s}-{s}", .{ tmp_base, version });
-    defer gpa.free(safe);
-    const tmp = try std.fmt.allocPrint(gpa, "/tmp/ff-{s}.tgz", .{safe});
-    defer gpa.free(tmp);
-    try runCmd(io, &.{ "curl", "-fsSL", "-o", tmp, tarball });
-    const dir = Io.Dir.cwd();
-    const data = dir.readFileAlloc(io, tmp, gpa, .limited(64 * 1024 * 1024)) catch |err| {
-        cli.failWithHint("cannot read the downloaded tarball: {s}", .{cli.fileErrText(err)}, "check network/proxy and retry", .{});
+fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarball: []const u8, integrity: []const u8, staged: ?[]const u8) !void {
+    validatePkgName(name) catch {
+        cli.failWithHint("invalid package name '{s}'", .{name}, "the lock or registry data is corrupt", .{});
     };
-    defer gpa.free(data);
-    verifyIntegrity(data, integrity);
+
+    cli.step("imprinting {s}@{s}", .{ name, version });
+    const dir = Io.Dir.cwd();
+
+    var own_stage: ?[]u8 = null;
+    defer {
+        if (own_stage) |s| {
+            dir.deleteTree(io, s) catch {};
+            gpa.free(s);
+        }
+    }
+
+    const stage: []const u8 = staged orelse blk: {
+        const safe = try safeName(gpa, name, version);
+        defer gpa.free(safe);
+        const tmp = try std.fmt.allocPrint(gpa, "/tmp/ff-{s}.tgz", .{safe});
+        defer gpa.free(tmp);
+        const stage_path = try std.fmt.allocPrint(gpa, "/tmp/ff-stage-{s}", .{safe});
+        own_stage = stage_path;
+
+        try runCmd(io, &.{ "curl", "-fsSL", "-o", tmp, tarball });
+        defer dir.deleteFile(io, tmp) catch {};
+
+        const data = dir.readFileAlloc(io, tmp, gpa, .limited(128 * 1024 * 1024)) catch |err| {
+            cli.failWithHint("cannot read the downloaded tarball: {s}", .{cli.fileErrText(err)}, "check network/proxy and retry", .{});
+        };
+        defer gpa.free(data);
+        verifyIntegrity(data, integrity);
+
+        dir.deleteTree(io, stage_path) catch {};
+        dir.deleteFile(io, stage_path) catch {};
+        dir.createDirPath(io, stage_path) catch |err| {
+            cli.failWithHint("cannot create '{s}': {s}", .{ stage_path, cli.fileErrText(err) }, "check disk space and permissions", .{});
+        };
+        try runCmd(io, &.{ "tar", "-xzf", tmp, "-C", stage_path, "--strip-components=1" });
+        break :blk stage_path;
+    };
+
     const dest = try std.fmt.allocPrint(gpa, "node_modules/{s}", .{name});
     defer gpa.free(dest);
-    const stage = try std.fmt.allocPrint(gpa, "/tmp/ff-stage-{s}", .{safe});
-    defer gpa.free(stage);
-    const sh = try std.fmt.allocPrint(gpa, "rm -rf {s} {s} && mkdir -p {s} {s} && tar -xzf {s} -C {s} --strip-components=1 && cp {s}/package.json {s}/", .{ stage, dest, stage, dest, tmp, stage, stage, dest });
-    defer gpa.free(sh);
-    try runCmd(io, &.{ "sh", "-c", sh });
+    dir.deleteTree(io, dest) catch {};
+    dir.deleteFile(io, dest) catch {};
+    dir.createDirPath(io, dest) catch |err| {
+        cli.failWithHint("cannot create '{s}': {s}", .{ dest, cli.fileErrText(err) }, "check disk space and permissions", .{});
+    };
+
+    const pj_src = try std.fmt.allocPrint(gpa, "{s}/package.json", .{stage});
+    defer gpa.free(pj_src);
+    const pj_bytes = dir.readFileAlloc(io, pj_src, gpa, .limited(1024 * 1024)) catch {
+        cli.failWithHint("package '{s}' has no package.json", .{name}, "the archive is not a valid package", .{});
+    };
+    defer gpa.free(pj_bytes);
+
+    const pj_dst = try std.fmt.allocPrint(gpa, "{s}/package.json", .{dest});
+    defer gpa.free(pj_dst);
+    dir.writeFile(io, .{ .sub_path = pj_dst, .data = pj_bytes }) catch |err| {
+        cli.failWithHint("cannot write '{s}': {s}", .{ pj_dst, cli.fileErrText(err) }, "check disk space and permissions", .{});
+    };
+
     // Route 1: root ESM closure (fail loud), then each subpath entry
     // isolated (warn + skip + partial cleanup). Empty root set: legacy
     // whole-tree copy (route 2, unchanged) — nanoid/valibot install
@@ -312,6 +377,18 @@ fn installDist(io: Io, gpa: Alloc, name: []const u8, version: []const u8, tarbal
     cli.ok("installed {s} ({d} files)", .{ dest, n });
 }
 
+fn safeName(gpa: Alloc, name: []const u8, version: []const u8) ![]u8 {
+    const raw = try std.fmt.allocPrint(gpa, "{s}-{s}", .{ name, version });
+    defer gpa.free(raw);
+    const out = try gpa.alloc(u8, raw.len);
+    for (raw, 0..) |ch, i| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-';
+        out[i] = if (ok) ch else '_';
+    }
+    return out;
+}
+
 fn verifyIntegrity(data: []const u8, integrity: []const u8) void {
     const prefix = "sha512-";
     if (!std.mem.startsWith(u8, integrity, prefix)) {
@@ -337,15 +414,282 @@ fn verifyIntegrity(data: []const u8, integrity: []const u8) void {
     }
 }
 
+// ── Direct GitHub/Codeberg/tarball sources ────────────────────────────────
+
+const ForgeKind = enum { github, codeberg };
+
+const DirectSource = struct {
+    kind: ?ForgeKind = null,
+    owner: []const u8 = "",
+    repo: []const u8 = "",
+    ref: []const u8 = "HEAD",
+    tarball: ?[]const u8 = null,
+};
+
+const DirectResult = struct {
+    name: []u8,
+    spec: []u8,
+    added: bool,
+};
+
+const DirectPkg = struct {
+    name: []u8,
+    version: []u8,
+    spec: []u8,
+    tarball: []u8,
+    integrity: []u8,
+    stage: []u8,
+    deps: std.ArrayList(Dep),
+    stage_owned: bool = true,
+
+    fn deinit(self: *DirectPkg, io: Io, gpa: Alloc) void {
+        if (self.stage_owned) Io.Dir.cwd().deleteTree(io, self.stage) catch {};
+        gpa.free(self.name);
+        gpa.free(self.version);
+        gpa.free(self.spec);
+        gpa.free(self.tarball);
+        gpa.free(self.integrity);
+        gpa.free(self.stage);
+        for (self.deps.items) |d| {
+            gpa.free(d.name);
+            gpa.free(d.spec);
+        }
+        self.deps.deinit(gpa);
+    }
+};
+
+fn isDirectSpec(spec: []const u8) bool {
+    return std.mem.startsWith(u8, spec, "github:") or
+        std.mem.startsWith(u8, spec, "codeberg:") or
+        std.mem.startsWith(u8, spec, "https://") or
+        std.mem.startsWith(u8, spec, "git+https://");
+}
+
+fn parseDirectSpec(spec: []const u8) error{InvalidSource}!DirectSource {
+    if (std.mem.startsWith(u8, spec, "github:")) return parseOwnerRepo(spec[7..], .github);
+    if (std.mem.startsWith(u8, spec, "codeberg:")) return parseOwnerRepo(spec[9..], .codeberg);
+
+    var s = spec;
+    if (std.mem.startsWith(u8, s, "git+")) s = s[4..];
+    if (!std.mem.startsWith(u8, s, "https://")) return error.InvalidSource;
+
+    if (std.mem.endsWith(u8, s, ".tar.gz") or std.mem.endsWith(u8, s, ".tgz")) {
+        if (std.mem.indexOfAny(u8, s, " \t\r\n") != null) return error.InvalidSource;
+        return .{ .tarball = s };
+    }
+    if (std.mem.startsWith(u8, s, "https://github.com/")) return parseOwnerRepo(s[19..], .github);
+    if (std.mem.startsWith(u8, s, "https://codeberg.org/")) return parseOwnerRepo(s[22..], .codeberg);
+    return error.InvalidSource;
+}
+
+fn parseOwnerRepo(body: []const u8, kind: ForgeKind) error{InvalidSource}!DirectSource {
+    var ref: []const u8 = "HEAD";
+    var path = body;
+    if (std.mem.indexOfScalar(u8, path, '#')) |i| {
+        ref = path[i + 1 ..];
+        path = path[0..i];
+    }
+    if (path.len == 0 or !validRef(ref)) return error.InvalidSource;
+
+    var p = path;
+    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    const slash = std.mem.indexOfScalar(u8, p, '/') orelse return error.InvalidSource;
+    const owner = p[0..slash];
+    var repo = p[slash + 1 ..];
+    if (std.mem.indexOfScalar(u8, repo, '/') != null) return error.InvalidSource;
+    if (std.mem.endsWith(u8, repo, ".git")) repo = repo[0 .. repo.len - 4];
+    if (!validNamePart(owner) or !validNamePart(repo)) return error.InvalidSource;
+
+    return .{ .kind = kind, .owner = owner, .repo = repo, .ref = ref };
+}
+
+fn validNamePart(s: []const u8) bool {
+    if (s.len == 0 or s.len > 100) return false;
+    if (std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return false;
+    for (s) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-')) return false;
+    }
+    return true;
+}
+
+fn validRef(s: []const u8) bool {
+    if (s.len == 0 or s.len > 200) return false;
+    if (s[0] == '/' or s[s.len - 1] == '/') return false;
+    var prev_slash = false;
+    for (s) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-' or
+            ch == '/' or ch == '+' or ch == '~';
+        if (!ok) return false;
+        if (ch == '/') {
+            if (prev_slash) return false;
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+    }
+    if (std.mem.indexOf(u8, s, "..") != null) return false;
+    return true;
+}
+
+fn archiveUrl(gpa: Alloc, src: DirectSource) ![]u8 {
+    if (src.tarball) |t| return gpa.dupe(u8, t);
+    return switch (src.kind.?) {
+        .github => std.fmt.allocPrint(gpa, "https://codeload.github.com/{s}/{s}/tar.gz/{s}", .{ src.owner, src.repo, src.ref }),
+        .codeberg => std.fmt.allocPrint(gpa, "https://codeberg.org/{s}/{s}/archive/{s}.tar.gz", .{ src.owner, src.repo, src.ref }),
+    };
+}
+
+fn formatDirectSpec(gpa: Alloc, src: DirectSource) ![]u8 {
+    if (src.tarball) |t| return gpa.dupe(u8, t);
+    const kind = switch (src.kind.?) {
+        .github => "github",
+        .codeberg => "codeberg",
+    };
+    if (std.mem.eql(u8, src.ref, "HEAD")) {
+        return std.fmt.allocPrint(gpa, "{s}:{s}/{s}", .{ kind, src.owner, src.repo });
+    }
+    return std.fmt.allocPrint(gpa, "{s}:{s}/{s}#{s}", .{ kind, src.owner, src.repo, src.ref });
+}
+
+fn validatePkgName(name: []const u8) error{InvalidPackageName}!void {
+    if (name.len == 0 or name.len > 214) return error.InvalidPackageName;
+    var rest = name;
+    if (name[0] == '@') {
+        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return error.InvalidPackageName;
+        if (slash <= 1 or slash == name.len - 1) return error.InvalidPackageName;
+        if (!validNamePart(name[1..slash])) return error.InvalidPackageName;
+        rest = name[slash + 1 ..];
+        if (std.mem.indexOfScalar(u8, rest, '/') != null) return error.InvalidPackageName;
+    }
+    if (!validNamePart(rest)) return error.InvalidPackageName;
+}
+
+fn computeIntegrity(gpa: Alloc, data: []const u8) ![]u8 {
+    var h = std.crypto.hash.sha2.Sha512.init(.{});
+    h.update(data);
+    var digest: [64]u8 = undefined;
+    h.final(&digest);
+    const prefix = "sha512-";
+    const b64_len = std.base64.standard.Encoder.calcSize(digest.len);
+    const out = try gpa.alloc(u8, prefix.len + b64_len);
+    @memcpy(out[0..prefix.len], prefix);
+    _ = std.base64.standard.Encoder.encode(out[prefix.len..], &digest);
+    return out;
+}
+
+fn prepareDirect(io: Io, gpa: Alloc, spec: []const u8) !DirectPkg {
+    const src = parseDirectSpec(spec) catch {
+        cli.failWithHint("unsupported package source '{s}'", .{spec}, "use github:owner/repo[#ref], codeberg:owner/repo[#ref], or an https .tar.gz URL", .{});
+    };
+
+    const tarball = try archiveUrl(gpa, src);
+    defer gpa.free(tarball);
+    const normalized = try formatDirectSpec(gpa, src);
+    defer gpa.free(normalized);
+
+    var nonce: u64 = undefined;
+    io.random(std.mem.asBytes(&nonce));
+    const tmp = try std.fmt.allocPrint(gpa, "/tmp/ff-src-{x}.tgz", .{nonce});
+    defer gpa.free(tmp);
+    const stage = try std.fmt.allocPrint(gpa, "/tmp/ff-src-{x}", .{nonce});
+    defer gpa.free(stage);
+    const dir = Io.Dir.cwd();
+
+    try runCmd(io, &.{ "curl", "-fsSL", "-o", tmp, tarball });
+    defer dir.deleteFile(io, tmp) catch {};
+
+    const data = dir.readFileAlloc(io, tmp, gpa, .limited(128 * 1024 * 1024)) catch |err| {
+        cli.failWithHint("cannot read the downloaded archive: {s}", .{cli.fileErrText(err)}, "check network/proxy and retry", .{});
+    };
+    defer gpa.free(data);
+
+    const integrity = try computeIntegrity(gpa, data);
+    defer gpa.free(integrity);
+
+    dir.deleteTree(io, stage) catch {};
+    dir.deleteFile(io, stage) catch {};
+    dir.createDirPath(io, stage) catch |err| {
+        cli.failWithHint("cannot create '{s}': {s}", .{ stage, cli.fileErrText(err) }, "check disk space and permissions", .{});
+    };
+    errdefer dir.deleteTree(io, stage) catch {};
+    try runCmd(io, &.{ "tar", "-xzf", tmp, "-C", stage, "--strip-components=1" });
+
+    const pj_path = try std.fmt.allocPrint(gpa, "{s}/package.json", .{stage});
+    defer gpa.free(pj_path);
+    const pj_src = dir.readFileAlloc(io, pj_path, gpa, .limited(1024 * 1024)) catch {
+        cli.failWithHint("no package.json at the archive root for '{s}'", .{spec}, "only single-package repositories are supported (no monorepo subdirs)", .{});
+    };
+    defer gpa.free(pj_src);
+
+    const pj = std.json.parseFromSlice(std.json.Value, gpa, pj_src, .{}) catch {
+        cli.failWithHint("package.json in '{s}' is not valid JSON", .{spec}, "fix the package manifest and retry", .{});
+    };
+    defer pj.deinit();
+    if (pj.value != .object) cli.fail("package.json in '{s}' must be a JSON object", .{spec});
+
+    const nv = pj.value.object.get("name") orelse
+        cli.failWithHint("package.json in '{s}' has no 'name'", .{spec}, "add a name field to the repository's package.json", .{});
+    if (nv != .string) cli.fail("package.json in '{s}' has a non-string 'name'", .{spec});
+
+    const name = try gpa.dupe(u8, nv.string);
+    errdefer gpa.free(name);
+    validatePkgName(name) catch {
+        cli.failWithHint("package.json name '{s}' is not a valid package name", .{name}, "use letters, digits, '.', '_', '-', and an optional @scope/", .{});
+    };
+
+    const version = blk: {
+        if (pj.value.object.get("version")) |v| {
+            if (v == .string and v.string.len > 0) break :blk try gpa.dupe(u8, v.string);
+        }
+        break :blk try gpa.dupe(u8, "0.0.0");
+    };
+    errdefer gpa.free(version);
+
+    var deps = std.ArrayList(Dep).empty;
+    errdefer {
+        for (deps.items) |d| {
+            gpa.free(d.name);
+            gpa.free(d.spec);
+        }
+        deps.deinit(gpa);
+    }
+    try collectDepMap(gpa, pj.value, "dependencies", false, &deps);
+    try collectDepMap(gpa, pj.value, "optionalDependencies", true, &deps);
+    warnPeers(name, pj.value);
+
+    const spec_copy = try gpa.dupe(u8, normalized);
+    errdefer gpa.free(spec_copy);
+    const tarball_copy = try gpa.dupe(u8, tarball);
+    errdefer gpa.free(tarball_copy);
+    const integrity_copy = try gpa.dupe(u8, integrity);
+    errdefer gpa.free(integrity_copy);
+    const stage_copy = try gpa.dupe(u8, stage);
+    errdefer gpa.free(stage_copy);
+
+    return .{
+        .name = name,
+        .version = version,
+        .spec = spec_copy,
+        .tarball = tarball_copy,
+        .integrity = integrity_copy,
+        .stage = stage_copy,
+        .deps = deps,
+    };
+}
+
 const Tree = struct {
     gpa: Alloc,
+    io: Io,
     chosen: std.StringHashMap(Chosen),
     packs: std.StringHashMap(std.json.Parsed(std.json.Value)),
     visiting: std.ArrayList([]u8),
 
-    fn init(gpa: Alloc) Tree {
+    fn init(gpa: Alloc, io: Io) Tree {
         return .{
             .gpa = gpa,
+            .io = io,
             .chosen = std.StringHashMap(Chosen).init(gpa),
             .packs = std.StringHashMap(std.json.Parsed(std.json.Value)).init(gpa),
             .visiting = std.ArrayList([]u8).empty,
@@ -356,7 +700,7 @@ const Tree = struct {
         var it = self.chosen.iterator();
         while (it.next()) |kv| {
             self.gpa.free(kv.key_ptr.*);
-            freeChosen(self.gpa, kv.value_ptr);
+            self.freeChosen(kv.value_ptr);
         }
         self.chosen.deinit();
         var pi = self.packs.iterator();
@@ -369,16 +713,21 @@ const Tree = struct {
         self.visiting.deinit(self.gpa);
     }
 
-    fn freeChosen(gpa: Alloc, c: *Chosen) void {
-        gpa.free(c.version);
-        gpa.free(c.tarball);
-        gpa.free(c.integrity);
-        gpa.free(c.parent);
-        for (c.deps.items) |d| {
-            gpa.free(d.name);
-            gpa.free(d.spec);
+    fn freeChosen(self: *Tree, c: *Chosen) void {
+        if (c.stage) |s| {
+            Io.Dir.cwd().deleteTree(self.io, s) catch {};
+            self.gpa.free(s);
         }
-        c.deps.deinit(gpa);
+        if (c.source) |s| self.gpa.free(s);
+        self.gpa.free(c.version);
+        self.gpa.free(c.tarball);
+        self.gpa.free(c.integrity);
+        self.gpa.free(c.parent);
+        for (c.deps.items) |d| {
+            self.gpa.free(d.name);
+            self.gpa.free(d.spec);
+        }
+        c.deps.deinit(self.gpa);
     }
 
     // Seed an exact pin. Directs are seeded first, so they always win.
@@ -387,6 +736,90 @@ const Tree = struct {
         const doc = try fetchVersionDoc(self.gpa, io, name, version);
         defer doc.deinit();
         try self.chooseOwned(name, version, parent, false, doc.value);
+    }
+
+    fn requireDirect(self: *Tree, expected: ?[]const u8, spec: []const u8, parent: []const u8) !DirectResult {
+        const gpa = self.gpa;
+
+        if (expected) |n| {
+            if (self.chosen.get(n) != null) {
+                return .{
+                    .name = try gpa.dupe(u8, n),
+                    .spec = try gpa.dupe(u8, spec),
+                    .added = false,
+                };
+            }
+        }
+
+        var p = try prepareDirect(self.io, gpa, spec);
+        defer p.deinit(self.io, gpa);
+
+        if (expected) |n| {
+            if (!std.mem.eql(u8, n, p.name)) {
+                cli.failWithHint("'{s}' provides package '{s}', not '{s}'", .{ spec, p.name, n }, "fix the dependency key in ff.json or the repository's package.json", .{});
+            }
+        }
+
+        if (self.chosen.get(p.name) != null) {
+            if (expected == null) {
+                cli.failWithHint("package '{s}' is already pinned", .{p.name}, "remove the duplicate source argument", .{});
+            }
+            return .{
+                .name = try gpa.dupe(u8, p.name),
+                .spec = try gpa.dupe(u8, p.spec),
+                .added = false,
+            };
+        }
+
+        const key = try gpa.dupe(u8, p.name);
+        errdefer gpa.free(key);
+
+        var deps = std.ArrayList(Dep).empty;
+        errdefer {
+            for (deps.items) |d| {
+                gpa.free(d.name);
+                gpa.free(d.spec);
+            }
+            deps.deinit(gpa);
+        }
+        for (p.deps.items) |d| {
+            try deps.append(gpa, .{
+                .name = try gpa.dupe(u8, d.name),
+                .spec = try gpa.dupe(u8, d.spec),
+                .optional = d.optional,
+            });
+        }
+
+        const version = try gpa.dupe(u8, p.version);
+        errdefer gpa.free(version);
+        const tarball = try gpa.dupe(u8, p.tarball);
+        errdefer gpa.free(tarball);
+        const integrity = try gpa.dupe(u8, p.integrity);
+        errdefer gpa.free(integrity);
+        const parent_copy = try gpa.dupe(u8, parent);
+        errdefer gpa.free(parent_copy);
+        const stage_copy = try gpa.dupe(u8, p.stage);
+        errdefer gpa.free(stage_copy);
+        const source_copy = try gpa.dupe(u8, p.spec);
+        errdefer gpa.free(source_copy);
+        const ret_name = try gpa.dupe(u8, p.name);
+        errdefer gpa.free(ret_name);
+        const ret_spec = try gpa.dupe(u8, p.spec);
+        errdefer gpa.free(ret_spec);
+
+        try self.chosen.put(key, .{
+            .version = version,
+            .tarball = tarball,
+            .integrity = integrity,
+            .parent = parent_copy,
+            .optional = false,
+            .deps = deps,
+            .stage = stage_copy,
+            .source = source_copy,
+        });
+
+        p.stage_owned = false;
+        return .{ .name = ret_name, .spec = ret_spec, .added = true };
     }
 
     // Extract + DUPE everything the tree keeps; the doc is freed by the caller.
@@ -473,6 +906,25 @@ const Tree = struct {
 
     fn requireRange(self: *Tree, io: Io, parent: []const u8, name: []const u8, spec: []const u8, optional: bool, queue: *std.ArrayList([]u8)) !void {
         const gpa = self.gpa;
+
+        if (isDirectSpec(spec)) {
+            if (self.chosen.getPtr(name)) |have| {
+                if (have.source) |src| {
+                    if (!std.mem.eql(u8, src, spec)) {
+                        cli.warn("'{s}' requested as '{s}' but pinned as '{s}'", .{ name, spec, src });
+                    }
+                } else {
+                    cli.warn("'{s}' requested from '{s}' but already pinned from npm", .{ name, spec });
+                }
+                return;
+            }
+            const r = try self.requireDirect(name, spec, parent);
+            gpa.free(r.name);
+            gpa.free(r.spec);
+            if (r.added) try queue.append(gpa, try gpa.dupe(u8, name));
+            return;
+        }
+
         if (self.chosen.getPtr(name)) |have| {
             // Read-only use of the pointer: no map mutation before return.
             const have_v = semver.parseVersion(have.version) catch
@@ -578,6 +1030,7 @@ const Tree = struct {
             try entry.put(gpa, "resolved", .{ .string = try gpa.dupe(u8, c.tarball) });
             try entry.put(gpa, "integrity", .{ .string = try gpa.dupe(u8, c.integrity) });
             if (c.optional) try entry.put(gpa, "optional", .{ .bool = true });
+            if (c.source) |s| try entry.put(gpa, "source", .{ .string = try gpa.dupe(u8, s) });
             var req: std.json.ObjectMap = .{};
             for (c.deps.items) |d| {
                 // Optional deps skipped at resolve time are simply absent.
@@ -1162,4 +1615,58 @@ fn dupeValue(gpa: Alloc, v: std.json.Value) !std.json.Value {
             return .{ .object = out };
         },
     }
+}
+
+test "direct spec parsing and archive urls" {
+    const gpa = std.testing.allocator;
+
+    {
+        const src = try parseDirectSpec("github:owner/repo#v1.2.3");
+        try std.testing.expectEqual(ForgeKind.github, src.kind.?);
+        try std.testing.expectEqualStrings("owner", src.owner);
+        try std.testing.expectEqualStrings("repo", src.repo);
+        try std.testing.expectEqualStrings("v1.2.3", src.ref);
+
+        const url = try archiveUrl(gpa, src);
+        defer gpa.free(url);
+        try std.testing.expectEqualStrings("https://codeload.github.com/owner/repo/tar.gz/v1.2.3", url);
+
+        const norm = try formatDirectSpec(gpa, src);
+        defer gpa.free(norm);
+        try std.testing.expectEqualStrings("github:owner/repo#v1.2.3", norm);
+    }
+
+    {
+        const src = try parseDirectSpec("codeberg:owner/repo");
+        try std.testing.expectEqual(ForgeKind.codeberg, src.kind.?);
+        try std.testing.expectEqualStrings("HEAD", src.ref);
+
+        const url = try archiveUrl(gpa, src);
+        defer gpa.free(url);
+        try std.testing.expectEqualStrings("https://codeberg.org/owner/repo/archive/HEAD.tar.gz", url);
+    }
+
+    {
+        const src = try parseDirectSpec("https://github.com/owner/repo.git#main");
+        try std.testing.expectEqualStrings("owner", src.owner);
+        try std.testing.expectEqualStrings("repo", src.repo);
+        try std.testing.expectEqualStrings("main", src.ref);
+    }
+
+    {
+        const src = try parseDirectSpec("https://example.com/pkg.tar.gz");
+        try std.testing.expect(src.tarball != null);
+
+        const url = try archiveUrl(gpa, src);
+        defer gpa.free(url);
+        try std.testing.expectEqualStrings("https://example.com/pkg.tar.gz", url);
+    }
+}
+
+test "direct spec rejects unsafe input" {
+    try std.testing.expectError(error.InvalidSource, parseDirectSpec("github:owner"));
+    try std.testing.expectError(error.InvalidSource, parseDirectSpec("github:owner/repo/extra"));
+    try std.testing.expectError(error.InvalidSource, parseDirectSpec("github:../repo"));
+    try std.testing.expectError(error.InvalidSource, parseDirectSpec("https://github.com/owner/repo/tree/main"));
+    try std.testing.expectError(error.InvalidSource, parseDirectSpec("http://example.com/pkg.tar.gz"));
 }
