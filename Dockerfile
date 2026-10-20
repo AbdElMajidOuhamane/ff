@@ -16,7 +16,7 @@ RUN sh scripts/fetch-vendors.sh
 RUN case "${TARGETARCH}" in \
       arm64) ZT=aarch64-linux-musl ;; \
       *)     ZT=x86_64-linux-musl ;; \
-    esac && zig build -Doptimize=ReleaseFast -Dtarget=${ZT} -Dffi=false -Dio_uring=true
+    esac && zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget=${ZT} -Dffi=false -Dio_uring=true
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 RUN adduser -D -u 1000 app

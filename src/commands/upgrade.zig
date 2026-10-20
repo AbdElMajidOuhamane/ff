@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cli = @import("../util/cli.zig");
 const ffcfg = @import("ffcfg");
 const semver = @import("semver.zig");
 const c = @cImport({
@@ -10,10 +11,10 @@ const c = @cImport({
 const REPO = "AbdElMajidOuhamane/ff";
 
 // Every failure path in this command previously `return`ed `void`, so
-// `ff upgrade` exited 0 whether or not it did anything. Print, then exit 1.
+// `ff upgrade` exited 0 whether or not it did anything. Route through the
+// shared error formatter, which prints `error: ...` and exits 1.
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("upgrade: " ++ fmt ++ "\n", args);
-    std.process.exit(1);
+    cli.fail(fmt, args);
 }
 
 fn assetName(allocator: std.mem.Allocator) ![]u8 {
@@ -78,10 +79,10 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     const lv = semver.parseVersion(lat) catch
         fail("latest version '{s}' is not semver", .{latest});
     if (semver.compare(cv, lv) != .lt) {
-        std.debug.print("ff {s} is up to date.\n", .{ffcfg.version});
+        cli.ok("ff {s} is up to date", .{ffcfg.version});
         return;
     }
-    std.debug.print("Update available: {s} -> {s}\n", .{ ffcfg.version, latest });
+    cli.step("update available: {s} → {s}", .{ ffcfg.version, latest });
     if (check_only) return;
 
     const asset = try assetName(allocator);
@@ -116,12 +117,12 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.new", .{exe});
     defer allocator.free(tmp_path);
 
-    var dl = try std.process.spawn(io, .{
+    var dl = std.process.spawn(io, .{
         .argv = &.{ "curl", "-fSL", "-o", tmp_path, dl_url },
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
-    });
+    }) catch |err| fail("cannot run curl: {s}", .{@errorName(err)});
     defer dl.kill(io);
     const term = try dl.wait(io);
     if (term != .exited or term.exited != 0) {
@@ -143,5 +144,5 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
             fail("failed to move {s} -> {s}", .{ tmp_path, exe });
         }
     }
-    std.debug.print("Upgraded to {s} ({s}) at {s}.\n", .{ latest, asset, exe });
+    cli.ok("upgraded to {s} ({s}) at {s}", .{ latest, asset, exe });
 }

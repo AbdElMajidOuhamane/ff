@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("../util/cli.zig");
 const engine = @import("../engine/engine.zig");
 const microtasks = @import("../event/microtasks.zig"); // NEW
 
@@ -21,8 +22,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
     }
 
     var test_dir = dir.openDir(io, "test", .{ .iterate = true }) catch {
-        std.debug.print("No test/ directory found.\n", .{});
-        return;
+        cli.failWithHint("no test/ directory found", .{}, "create test/*.test.js files to run", .{});
     };
     defer test_dir.close(io);
 
@@ -46,7 +46,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         defer allocator.free(sub);
 
         const content = dir.readFileAlloc(io, sub, allocator, .limited(10 * 1024 * 1024)) catch {
-            std.debug.print("FAIL {s} (read error)\n", .{sub});
+            printResult(false, sub);
             fail += 1;
             continue;
         };
@@ -65,14 +65,45 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.event_loop.runWithMicrotasks(runtime.ctx);
         const clean = ok and !microtasks.had_error; // NEW: catch async failures
         if (clean) {
-            std.debug.print("OK   {s}\n", .{sub});
+            printResult(true, sub);
             pass += 1;
         } else {
-            std.debug.print("FAIL {s}\n", .{sub});
+            printResult(false, sub);
             fail += 1;
         }
     }
 
-    std.debug.print("\n{d} passed, {d} failed\n", .{ pass, fail });
+    if (pass + fail == 0) {
+        if (filter) |f| cli.fail("no tests match '{s}'", .{f});
+    }
+    printSummary(pass, fail);
     if (fail > 0) std.process.exit(1);
+}
+
+// "OK"/"FAIL" + path. test/run.sh greps for the literal FAIL substring, and
+// ANSI around the word does not hide it; piped output is uncolored anyway.
+fn printResult(ok: bool, sub: []const u8) void {
+    const word = if (ok) "OK" else "FAIL";
+    const pad = if (ok) "   " else " ";
+    if (cli.useColor()) {
+        if (ok) {
+            std.debug.print(cli.green ++ cli.glyph_ok ++ " OK" ++ cli.reset ++ "   {s}\n", .{sub});
+        } else {
+            std.debug.print(cli.red ++ cli.glyph_fail ++ " FAIL" ++ cli.reset ++ " {s}\n", .{sub});
+        }
+    } else {
+        std.debug.print("{s}{s}{s}\n", .{ word, pad, sub });
+    }
+}
+
+fn printSummary(pass: u32, fail: u32) void {
+    if (cli.useColor()) {
+        if (fail == 0) {
+            std.debug.print("\n" ++ cli.green ++ cli.glyph_ok ++ " {d} passed" ++ cli.reset ++ ", {d} failed\n", .{ pass, fail });
+        } else {
+            std.debug.print("\n" ++ cli.green ++ "{d} passed" ++ cli.reset ++ ", " ++ cli.red ++ "{d} failed" ++ cli.reset ++ "\n", .{ pass, fail });
+        }
+    } else {
+        std.debug.print("\n{d} passed, {d} failed\n", .{ pass, fail });
+    }
 }

@@ -8,6 +8,10 @@ test {
 }
 
 test {
+    _ = @import("commands/imprint.zig");
+}
+
+test {
     _ = @import("net/http_native.zig");
 }
 
@@ -44,4 +48,8 @@ test {
 }
 test {
     _ = @import("api/child_process.zig");
+}
+
+test {
+    _ = @import("util/cli.zig");
 }

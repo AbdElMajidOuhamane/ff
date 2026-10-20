@@ -6,7 +6,35 @@ order: 1
 
 # CLI
 
-`ff` is a single binary. Run it with no arguments to print the built-in usage summary.
+`ff` is a single binary. Run it with no arguments to print the built-in usage summary; `ff -h`, `ff --help`, and `ff help` print the same.
+
+## Errors & exit codes
+
+ff renders its own diagnostics in a fixed shape:
+
+```text
+error: <message>
+hint: <what to try next>
+```
+
+- `error` is printed in red and `hint` in dim when stderr is a TTY. Color is
+auto-disabled when output is piped or redirected, or when `NO_COLOR` is set (to
+any value).
+- Progress, success, and detail lines use a small glyph vocabulary: `→` for a
+step in progress, `✓` for a completed step, and `•` for secondary detail. The
+glyphs are plain UTF-8; only color is TTY-gated.
+- Every command exits `0` on success and `1` on failure. This includes usage
+errors (missing arguments, unknown options), a missing or invalid `ff.json`,
+network/registry failures, integrity mismatches, and failed tests. Several
+failure paths that used to print a message but exit `0` — `ff upgrade` on a
+network error, `ff start`/`--watch start` with no `ff.json`, `ff imprint` or
+`ff sever` with a malformed manifest, TLS setup errors in `ff start` — now exit
+`1`.
+- An unknown option prints `error: unknown option '--x'` and a hint to run
+`ff --help`; a missing argument prints the same `error:` plus the command's
+one-line `Usage:`.
+- JavaScript exceptions are **not** part of this shape: they keep their own
+`Error: …` output from the runtime and REPL.
 
 ## Quick look
 
@@ -86,6 +114,16 @@ FF_CERT=cert.pem FF_KEY=key.pem ff start
 
 Reads `main` from `ff.json` and runs it as a module (max 10MB). Missing or invalid manifest prints an error and exits.
 
+When the entry starts an HTTP server, ff prints the step and the bound URL:
+
+```text
+→ starting main.js
+✓ server listening on http://localhost:3000
+  • websocket support enabled
+```
+
+With TLS (`--cert`/`--key` or `http.serve({ tls })`) the URL uses `https://`.
+
 | Flag / env | Description |
 |------------|-------------|
 | `--cert <path>` | PEM certificate (max 512KB) |
@@ -101,6 +139,9 @@ The port comes only from `http.serve({ port })` (default `3000`). There is no `-
 ```sh
 ff imprint marked@18.0.11
 ff imprint marked
+ff imprint github:owner/repo#v1.2.3
+ff imprint codeberg:owner/repo
+ff imprint https://example.com/pkg.tar.gz
 ff imprint
 ```
 
@@ -108,10 +149,20 @@ ff imprint
 |------|--------|
 | `ff imprint pkg@ver ...` | Pin pure-JS ESM packages into `ff.json` + `ff.lock` (v2 lock with integrity hashes), materialize `node_modules/` |
 | `ff imprint pkg ...` | Same, resolving latest from the registry |
+| `ff imprint github:owner/repo[#ref] ...` | Resolve a GitHub archive; name/version come from its root `package.json` |
+| `ff imprint codeberg:owner/repo[#ref] ...` | Same for Codeberg |
+| `ff imprint https://…/pkg.tar.gz` | Install an explicit `.tar.gz` / `.tgz` URL |
 | `ff imprint` (no args, v2 lock present) | Exact rebuild from the lock (CI-like) |
-| `ff imprint` (no args, no lock) | Resolve from `ff.json`, write the lock |
+| `ff imprint` (no args, no lock) | Resolve from `ff.json` (npm and direct sources), write the lock |
 
 Only ESM-compatible packages pass the pure-ESM gate.
+
+Direct sources also accept `https://github.com/owner/repo[#ref]` and
+`https://codeberg.org/owner/repo[#ref]`; omit `#ref` to use `HEAD`. The archive
+root must contain `package.json`. Private repositories, authentication,
+monorepo subdirectories, and build scripts are not supported. The lock pins the
+archive URL and a computed SHA-512 integrity hash; a moved branch fails the
+integrity check instead of installing different code.
 
 ## Remove packages
 
@@ -173,7 +224,7 @@ Compiles an ES module to QuickJS bytecode with **source and debug info stripped*
 
 ```sh
 ff compile app.js
-# Compiled app.js -> app.ffbc (12345 bytes)
+# ✓ Compiled app.js → app.ffbc (12345 bytes)
 ff app.ffbc
 ```
 
@@ -198,18 +249,18 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 
 | Situation | Effect |
 |-----------|--------|
-| No releases published or network failure | Prints `upgrade: <reason>`, exits `1` |
+| No releases published or network failure | Prints `error: <reason>` (with a hint where useful), exits `1` |
 | Already latest | Prints up-to-date, exits |
 | `--check` | Prints the newer version, exits without downloading |
 | Update available | Downloads `ff-<os>-<arch>`, `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
 
-> **Note:** Releases are published at [github.com/AbdElMajidOuhamane/ff/releases](https://github.com/AbdElMajidOuhamane/ff/releases) — `v0.1.0-canary` is the first. With a release available, `ff upgrade` reports up-to-date for current builds, downloads when you're behind, and only takes the failure row on network errors or a missing release asset.
+> **Note:** Releases are published at [github.com/AbdElMajidOuhamane/ff/releases](https://github.com/AbdElMajidOuhamane/ff/releases) — `v0.2.0-beta` is the first. With a release available, `ff upgrade` reports up-to-date for current builds, downloads when you're behind, and only takes the failure row on network errors or a missing release asset.
 
 ## Print the version
 
 ```sh
 ff --version
-# ff 0.1.0-canary (macos-aarch64)
+# ff 0.2.0-beta (macos-aarch64)
 ```
 
 ## Proxy environment
@@ -236,7 +287,7 @@ details and examples.
 | `ff -e <code> [--allow-ffi]` | Run inline JS as a classic script (`--ca`, `--allow-ffi` optional) |
 | `ff init [-y] [<dir>]` | Scaffold `ff.json` + entry file |
 | `ff start [--cert --key] [--allow-ffi]` | Run `main` from `ff.json` |
-| `ff imprint [pkg[@ver] …]` | Install pure-JS ESM deps |
+| `ff imprint [pkg\|source …]` | Install pure-JS ESM deps from npm, GitHub, Codeberg, or a tarball |
 | `ff sever [pkg …] [--force]` | Remove deps / wipe install |
 | `ff test [filter] [--allow-ffi]` | Run `test/*.test.js` (FFI tests need the flag) |
 | `ff repl` | Interactive REPL |
@@ -244,3 +295,4 @@ details and examples.
 | `ff fmt [--write\|--check] <files …>` | Prettier via npx |
 | `ff upgrade [--check]` | Self-update from GitHub Releases |
 | `ff --version` | Print version |
+| `ff -h\|--help\|help` | Print usage |

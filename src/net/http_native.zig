@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = std.simd;
 const xev = @import("xev");
+const cli = @import("../util/cli.zig");
 const c = @import("../c.zig").c;
 const microtasks = @import("../event/microtasks.zig");
 const ws = @import("ws_native.zig");
@@ -1746,8 +1747,9 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
         watchdog_started = true;
     }
     initialized = true;
-    std.debug.print("[http] listening on 0.0.0.0:{d}\n", .{port});
-    if (tls_active) std.debug.print("[http] TLS mode: https/wss active\n", .{});
+    const scheme: []const u8 = if (tls_active) "https" else "http";
+    cli.ok("server listening on {s}://localhost:{d}", .{ scheme, port });
+    if (ws_enabled) cli.bullet("websocket support enabled", .{});
 }
 
 pub fn deinit() void {

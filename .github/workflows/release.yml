@@ -101,13 +101,31 @@ jobs:
 
       - name: Build release binary
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Dversion="${TAG#v}"
+          zig build -Doptimize=ReleaseFast -Dstrip=true -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Dversion="${TAG#v}"
           cp zig-out/bin/ff "${{ matrix.asset }}"
           if [ "${{ matrix.smoke }}" = "true" ]; then
             ./"${{ matrix.asset }}" --version
           else
             file "${{ matrix.asset }}"
           fi
+
+      - name: Verify stripped binary
+        run: |
+          case "${{ matrix.target }}" in
+            *-linux-*)
+              if readelf -S "${{ matrix.asset }}" | grep -Eq '\.(z)?debug_'; then
+                echo "::error::${{ matrix.asset }} still contains DWARF sections"
+                exit 1
+              fi
+              ;;
+            *-macos-*)
+              if otool -l "${{ matrix.asset }}" | grep -q '__DWARF'; then
+                echo "::error::${{ matrix.asset }} still contains DWARF sections"
+                exit 1
+              fi
+              ;;
+          esac
+          ls -lh "${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

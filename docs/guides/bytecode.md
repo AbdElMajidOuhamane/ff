@@ -17,7 +17,7 @@ http.serve({ port: 3000 }, () => new Response("hello from bytecode"));
 
 ```sh
 ff compile app.js
-# Compiled app.js -> app.ffbc (12345 bytes)
+# ✓ Compiled app.js → app.ffbc (12345 bytes)
 ff app.ffbc
 curl http://127.0.0.1:3000/
 # hello from bytecode
