@@ -76,6 +76,8 @@ pub fn build(b: *std.Build) void {
     const bearssl = b.option(bool, "bearssl", "Enable BearSSL TLS (https/wss)") orelse true;
     const ffi = b.option(bool, "ffi", "Enable FFI (dlopen native libraries)") orelse true; // NEW
     const io_uring = b.option(bool, "io_uring", "Use io_uring backend on Linux (default: true; -Dio_uring=false selects epoll)") orelse true;
+    const strip = b.option(bool, "strip", "Strip debug info from the executable (default: ReleaseFast/ReleaseSmall)") orelse
+        (optimize == .ReleaseFast or optimize == .ReleaseSmall);
 
     // ── Build-options module (ffcfg) ──
     const ffcfg_opts = b.addOptions();
@@ -282,6 +284,7 @@ pub fn build(b: *std.Build) void {
         .name = "ff",
         .root_module = runtimeModule(b, "src/main.zig", target, optimize, libs),
     });
+    exe.root_module.strip = strip;
 
     b.installArtifact(exe);
 
@@ -295,6 +298,7 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_exe.stack_size = 4 * 1024 * 1024;
     fuzz_exe.root_module.omit_frame_pointer = false;
+    fuzz_exe.root_module.strip = false;
 
     const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
     const fuzz_build_step = b.step("fuzz:build", "Build fuzzers (no run)");
@@ -314,6 +318,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const exe_tests = b.addTest(.{ .root_module = runtimeModule(b, "src/unit_tests.zig", target, optimize, libs) });
+    exe_tests.root_module.strip = false;
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
