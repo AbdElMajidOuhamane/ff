@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
     ffcfg_opts.addOption(bool, "bearssl", bearssl);
     ffcfg_opts.addOption(bool, "ffi", ffi); // NEW
     ffcfg_opts.addOption(bool, "io_uring", io_uring);
-    const ff_version = b.option([]const u8, "version", "Runtime version string") orelse "0.1.0-canary";
+    const ff_version = b.option([]const u8, "version", "Runtime version string") orelse "0.2.0-beta";
     ffcfg_opts.addOption([]const u8, "version", ff_version);
     const ffcfg_mod = ffcfg_opts.createModule();
 
