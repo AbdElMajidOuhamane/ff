@@ -39,7 +39,7 @@ make install        # copy to ~/.local/bin/ff
 | `make build` | Compile everything (QuickJS, BearSSL, SQLite, nghttp2, xev, runtime) |
 | `make install` | Build + copy the binary to `~/.local/bin/ff` |
 | `make uninstall` | Delete `~/.local/bin/ff` |
-| `make test` | Build + `zig build test` + `test/run.sh` |
+| `make test` | Build + fixtures + `zig build test` + `test/run.sh` |
 
 > **Note:** Installs land in `~/.local/bin/ff`, not `/usr/local/bin`. If `ff` isn't found after install, add the dir to `PATH`:
 >

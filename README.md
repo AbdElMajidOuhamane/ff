@@ -289,8 +289,7 @@ URL slices; per-job Postgres arenas. Details: [Architecture](docs/concepts/archi
 
 Requirements:
 
-- **Zig 0.16** (uses 0.16.0 std APIs)
-- C compiler (clang on macOS, gcc on Linux)
+- **Zig 0.16** (uses 0.16.0 std APIs; Zig also compiles the vendored C sources and the test fixture)
 - A POSIX system (macOS or Linux)
 
 Vendors (`quickjs-ng` 0.16.2, BearSSL 0.6, SQLite 3.53.4, nghttp2 1.70.0)
@@ -317,7 +316,10 @@ zig build -Dio_uring=false         # Linux: epoll backend instead of io_uring
 zig build -Dffi=false              # keep the `ffi` global, but `dlopen`/`callback` throw (needs `--allow-ffi` at runtime regardless)
 zig build -Dversion=1.2.3          # version reported by `ff --version`
 zig build test                     # Zig unit tests
-make test                          # Zig unit tests + test/run.sh
+make fmt                           # zig fmt --check build.zig src/ (CI tidy job)
+make test                          # build + Zig unit tests + JS tests
+make ci                            # fmt + build + Zig/JS tests + fuzz smoke
+make doctor                        # print toolchain state and probe Zig's libc++
 ```
 
 Linux uses **io_uring** by default, **epoll** via `-Dio_uring=false`
