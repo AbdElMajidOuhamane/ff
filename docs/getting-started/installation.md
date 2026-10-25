@@ -146,15 +146,22 @@ The listen port is set in code via `http.serve({ port })` (default `3000`), not 
 | `make build` | `zig build -Doptimize=ReleaseFast` |
 | `make install` | Build + copy to `~/.local/bin/ff` |
 | `make uninstall` | Delete `~/.local/bin/ff` |
-| `make fixtures` | Build the C fixture for `test/ffi.test.js` |
+| `make fixtures` | Rebuild the C fixture for `test/ffi.test.js` with `zig cc` |
+| `make fmt` | `zig fmt --check build.zig src/` (the CI `tidy` job) |
 | `make test` | Build + fixtures + `zig build test` + `test/run.sh` |
-| `make ci` | Same steps as `make test` (the CI entrypoint) |
+| `make ci` | `fmt` + build + fixtures + `zig build test` + `test/run.sh` + fuzz smoke |
+| `make cov` | kcov line coverage into `kcov-output/` (requires `kcov`) |
+| `make doctor` | Print Xcode/SDK/DEVELOPER_DIR/zig state and probe Zig's libc++ build |
 
 ## Troubleshooting
 
 **Zig version mismatch** — `zig version` must print `0.16.x`. With 0.15 or earlier, download 0.16 from the link above and retry.
 
 **Make not found** — macOS: `xcode-select --install`. Debian/Ubuntu: `sudo apt install build-essential`.
+
+**macOS: `error: sub-compilation of libcxx failed` / `INFINITY`** — the selected SDK is the macOS 26/27 one from CommandLineTools, which Zig 0.16.0's bundled libc++ cannot compile against. Run `make doctor`; it reports the state. Fix with `sudo xcode-select -s /Applications/Xcode.app` (the Makefile also selects Xcode automatically when CLT is active).
+
+**macOS: `ld: unknown architecture arm64e.x1`** — an older Xcode linker paired with a newer CLT SDK. The test fixture now builds with `zig cc`, so `make test` is unaffected; for other C projects either align `xcode-select` or set `SDKROOT` to the Xcode SDK.
 
 **`ff: command not found` after `make install`** — `~/.local/bin` isn't on `PATH`. Add the export shown by Make, then open a new shell.
 

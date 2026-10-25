@@ -10,6 +10,13 @@
 cd "$(dirname "$0")/.." || exit 1
 FF=./zig-out/bin/ff
 [ -x "$FF" ] || { echo "ff not built — run make build"; exit 1; }
+
+# `make test` / `make ci` build the fixture first; build it here only when
+# run.sh is invoked on its own (fresh checkout, no make).
+if [ ! -f test/fixtures/libaddon_probe.dylib ] && [ ! -f test/fixtures/libaddon_probe.so ]; then
+    sh test/fixtures/build.sh || exit 1
+fi
+
 fail=0
 for t in test/*.test.js; do
     if out=$("$FF" "$t" --allow-ffi 2>&1); then
