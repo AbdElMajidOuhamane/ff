@@ -15,6 +15,54 @@ promise-based `sendto` / `recvfrom` are new.
 Payloads are **binary only** (`Uint8Array` / `ArrayBuffer`) and addresses
 are **IP literals only** — there is no DNS lookup on this path.
 
+## Permissions
+
+UDP needs `--allow-net` on the addresses it uses:
+
+| Call | Checked scope |
+|---|---|
+| `bind({ address, port })` | Local address and port |
+| `connect({ address, port })` | Peer address and port |
+| `sendto(data, { address, port })` | Destination address and port |
+| `send(data)` | None — inherits the grant from `connect` |
+| `recv(buf)` / `recvfrom(buf)` | None — no source filter |
+
+```sh
+ff echo.js --allow-net=127.0.0.1
+```
+
+- Addresses are **IP literals**, so there is no DNS or hostname matching.
+  `--allow-net=localhost` does not cover `127.0.0.1`.
+- A scope with no port matches every port. That is the usual choice for
+  ephemeral binds: `--allow-net=127.0.0.1`.
+- Port `0` is checked **literally** for an ephemeral bind. A scope like
+  `--allow-net=127.0.0.1:9000` will deny `bind({ address: "127.0.0.1" })`,
+  because the check runs with port `0` before the kernel picks one.
+- IPv6 addresses with a port need brackets in the flag:
+  `--allow-net=[::1]:9000`. Without a port, `--allow-net=::1` is fine.
+- Denial is synchronous and uses the standard shape:
+
+```js
+try {
+  sock.bind({ address: "127.0.0.1", port: 9000 });
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // udp.bind requires --allow-net for '127.0.0.1:9000'
+}
+```
+
+`connect` and `sendto` throw the same way, before any promise is created or
+any datagram is sent. `send` on a connected socket does not re-check the
+destination; the `connect` grant is reused.
+
+> **Incoming traffic is not filtered.** UDP is connectionless: once a socket
+> is bound, `recv` / `recvfrom` accept datagrams from **any** source, even
+> sources outside every `--allow-net` scope. Binding to `0.0.0.0` exposes the
+> socket on all interfaces. Filter `from.address` in JavaScript when source
+> identity matters.
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -40,7 +88,7 @@ are **IP literals only** — there is no DNS lookup on this path.
 ```
 
 ```sh
-ff echo.js
+ff echo.js --allow-net=127.0.0.1
 # 127.0.0.1 54321 4 ping
 ```
 
@@ -54,7 +102,8 @@ with a `.mjs` extension if you'd rather use top-level `await` as written.
 
 ## `udp.socket(family?)`
 
-Creates a UDP socket — the equivalent of `socket(2)`.
+Creates a UDP socket — the equivalent of `socket(2)`. Creating a socket is not
+permission-gated; `bind`, `connect`, and `sendto` are.
 
 ```js
 const a = udp.socket();        // "inet"  — AF_INET
@@ -103,6 +152,14 @@ Read the chosen port back with `sock.getsockname().port`. Invalid input
 throws (`bind: invalid address`, `bind: invalid port`, or
 `bind: failed (address in use?)`).
 
+The permission check uses the **requested** address and port. For an ephemeral
+bind that means port `0`; use a portless scope unless you pin the port.
+
+```sh
+ff server.js --allow-net=127.0.0.1        # ephemeral or any port
+ff server.js --allow-net=127.0.0.1:9000   # only port 9000
+```
+
 ### `connect({ address, port })`
 
 Both fields are **required**. `connect(2)` on a UDP socket doesn't do any
@@ -112,6 +169,12 @@ network handshake — it just records the default peer so you can use
 ```js
 sock.connect({ address: "127.0.0.1", port: 9000 });
 sock.getpeername(); // { address: "127.0.0.1", port: 9000, family: "inet" }
+```
+
+`connect` is permission-checked against the peer:
+
+```sh
+ff client.js --allow-net=127.0.0.1:9000
 ```
 
 ### `await sock.sendto(data, { address, port })`
@@ -125,6 +188,14 @@ const n = await sock.sendto(new Uint8Array([1, 2, 3]), {
 });
 ```
 
+`sendto` is checked against the destination on every call:
+
+```sh
+ff client.js --allow-net=127.0.0.1:9000
+```
+
+A denial throws synchronously, before the promise is returned.
+
 ### `await sock.recvfrom(buf)`
 
 Receives up to `buf.length` bytes and resolves with `[data, sender]`:
@@ -137,7 +208,8 @@ const [data, from] = await sock.recvfrom(buf);
 ```
 
 Only **one receive** may be pending per socket; a second `recvfrom` before
-the first settles throws `recvfrom: RecvPending`.
+the first settles throws `recvfrom: RecvPending`. `recvfrom` does not check
+the sender against `--allow-net` — see the permissions caveat above.
 
 ### `await sock.send(data)` / `await sock.recv(buf)`
 
@@ -153,6 +225,8 @@ await sock.send(new TextEncoder().encode("ping"));
 const buf = new Uint8Array(1500);
 const data = await sock.recv(buf);
 ```
+
+`send` reuses the grant made at `connect` time; there is no per-packet check.
 
 ### `getsockname()` / `getpeername()`
 
@@ -214,6 +288,9 @@ Address objects always have this shape:
 |---------|-----------|
 | `udp.socket: family must be "inet" or "inet6"` | `udp.socket(family)` |
 | `udp.socket: no socket slots available` | `udp.socket()` — 64 in use |
+| `udp.bind requires --allow-net for 'addr:port'` | `bind` outside the net scope |
+| `udp.connect requires --allow-net for 'addr:port'` | `connect` outside the net scope |
+| `udp.sendto requires --allow-net for 'addr:port'` | `sendto` outside the net scope |
 | `bind: invalid address` / `bind: invalid port` | `bind` argument validation |
 | `bind: failed (address in use?)` | `bind(2)` failed |
 | `connect: address required` / `connect: port required` | `connect` without both fields |
@@ -223,6 +300,9 @@ Address objects always have this shape:
 | `recvfrom: NotABuffer` | buffer isn't `Uint8Array` / `ArrayBuffer` |
 | `...: socket is closed` | any method after `close()` |
 | `...: socket closed` | **rejection** of a promise pending at `close()` |
+
+Permission errors are `Error` objects with `name: "PermissionDenied"` and
+`code: "PERMISSION_DENIED"`; the rest are `TypeError`s with plain messages.
 
 ## Full example
 
@@ -254,6 +334,14 @@ Address objects always have this shape:
 })();
 ```
 
+```sh
+ff udp-echo.js --allow-net=127.0.0.1
+# ping
+```
+
+One portless scope covers the ephemeral server port, the dynamic `sendto`
+destination, and the connected client's peer.
+
 ## Limits
 
 | Limit | Value |
@@ -263,10 +351,12 @@ Address objects always have this shape:
 | Maximum datagram | 65507 bytes |
 | Pending receives per socket | 1 |
 | Addresses | IP literals only (no DNS) |
+| Permission scope | `bind`, `connect`, `sendto`; incoming sources are not filtered |
 | Missing features | no `setsockopt`, multicast, or broadcast helpers |
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
 - [WebSocket](/docs/api/websocket) — message-framed transport over TCP
 - [http](/docs/api/http) — TCP servers
 - [API overview](/docs/api/overview) — every injected global

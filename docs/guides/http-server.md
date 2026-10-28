@@ -8,6 +8,38 @@ order: 1
 
 `http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body)` — three strings — and returns a `Response`.
 
+## Permissions
+
+Servers are deny-by-default. Every `http.serve` needs `--allow-net` on the
+bind address:
+
+```sh
+ff server.js --allow-net=0.0.0.0:3000
+```
+
+- The server always binds `0.0.0.0`, and the permission check is always
+  `0.0.0.0:<port>` — even when clients connect over loopback. Granting
+  `127.0.0.1:3000` or `localhost:3000` will not start the listener.
+- A scope without a port (`--allow-net=0.0.0.0`) covers every port.
+- The same grant covers HTTP, WebSocket upgrades, and TLS on that port.
+- `tls.cert` / `tls.key` file paths need `--allow-read`; inline PEM does not.
+  `FF_CERT` / `FF_KEY` used by `ff start` are CLI reads and need no runtime
+  grant.
+- `FF_ECHO` is runtime config and needs no `--allow-env`, but echo mode does
+  **not** bypass the listener's `--allow-net` check.
+- Denial is synchronous:
+
+```js
+try {
+  http.serve({ port: 3000 }, handler);
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // http.serve requires --allow-net for '0.0.0.0:3000'
+}
+```
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Hello-world server
 
 Create `server.js`:
@@ -22,7 +54,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 Run it with `ff`:
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 ```
 
 Verify in another terminal:
@@ -52,16 +84,20 @@ http.serve({ port: 4242 }, handler);
 // Shorthand — port number as the first argument
 http.serve(4242, handler);
 
-// Default port 3000
-http.serve(handler);
+// Options object with the default port 3000
+http.serve({}, handler);
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 ```
 
-> **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS.
+> **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS. The permission scope must name that bind address.
+
+> **Note:** `http.serve(handler)` (one argument) is **not** supported by the
+> current runtime; it throws `TypeError: http.serve requires (options, handler)`.
+> Use `http.serve(3000, handler)` or `http.serve({}, handler)` instead.
 
 ## Inspecting the incoming request
 
@@ -83,7 +119,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl -X POST "http://127.0.0.1:3000/greet?name=ada" -d "hi"
 # server prints:
 # Method: POST
@@ -111,7 +147,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl -i http://127.0.0.1:3000/missing
 # HTTP/1.1 404 Not Found
 # content-type: application/json; charset=utf-8
@@ -149,7 +185,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/          # Home
 curl http://127.0.0.1:3000/users/42  # {"id":42,"name":"Ada"}
 curl -i http://127.0.0.1:3000/nope   # 404 Not found
@@ -194,7 +230,10 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js \
+  --allow-net=0.0.0.0:3000 \
+  --allow-read=notes.db \
+  --allow-write=.
 curl http://127.0.0.1:3000/notes
 # []
 
@@ -206,6 +245,9 @@ curl http://127.0.0.1:3000/notes
 # [{"id":1,"text":"buy milk"}]
 ```
 
+SQLite opens the database read/write and writes WAL siblings next to it; the
+file needs both grants and the parent directory needs `write`.
+
 > **Note:** `db.lastInsertRowId()` is a method — the `()` is required. Without it you'd serialize the function object instead of the id.
 
 ## Smoke-testing with FF_ECHO
@@ -213,10 +255,13 @@ curl http://127.0.0.1:3000/notes
 Set `FF_ECHO` to any value and every request returns canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
 
 ```sh
-FF_ECHO=1 ff server.js
+FF_ECHO=1 ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/anything
 # {"message":"ok"}
 ```
+
+Echo mode is runtime configuration, so it needs no `--allow-env`. It still
+needs the listener grant.
 
 ## Reference: limits
 
@@ -226,10 +271,18 @@ curl http://127.0.0.1:3000/anything
 | Request body | ~4 KB total (headers + body share one read buffer) | Beyond → `413 Payload Too Large` |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
 | Hung handler | 30s | Connection fails with `504` |
-| Bind address | Always `0.0.0.0` | No host option exists |
+| Bind address | Always `0.0.0.0` | No host option exists; the net scope must be `0.0.0.0:<port>` |
 | Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |
 
 ## Troubleshooting
+
+**`http.serve` throws `PermissionDenied`** — the listener's port is outside
+every `--allow-net` scope. Add `--allow-net=0.0.0.0:<port>`. `127.0.0.1` and
+`localhost` will not match the bind address.
+
+**TLS fails with `PermissionDenied` on `tls.cert` / `tls.key`** — the path is
+outside `--allow-read`. Add the file (and any symlink target) to the scope, or
+pass inline PEM, which needs no file grant.
 
 **Empty 200 when I return a string** — wrap it: `return new Response("hello")`. Bare strings are not bodies.
 
@@ -240,3 +293,10 @@ curl http://127.0.0.1:3000/anything
 **`id` comes back wrong in JSON** — you wrote `db.lastInsertRowId` without calling it. Always `db.lastInsertRowId()`.
 
 **Stopping the server** — there is no `server.stop()` API. Stop the process with `Ctrl-C`, or call `process.exit(0)` from your code for programmatic shutdown.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [http API](/docs/api/http) — full `http.serve` reference
+- [TLS guide](/docs/guides/tls) — HTTPS/WSS setup
+- [Limitations](/docs/reference/limitations) — every hard cap

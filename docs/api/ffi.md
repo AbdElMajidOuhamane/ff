@@ -12,7 +12,7 @@ library can be anything with a C ABI: system libz, sqlite3, your own
 `libfoo.dylib`.
 
 Native code runs with the full privileges of the `ff` process and bypasses
-every sandbox guarantee, so the whole global is gated:
+every permission scope, so loading it is gated:
 
 ```sh
 ff app.js --allow-ffi
@@ -20,12 +20,60 @@ ff start --allow-ffi
 ff test --allow-ffi
 ```
 
-Without the flag, `ffi.dlopen` throws and `ffi.allowed` is `false`.
+## Permissions
+
+`--allow-ffi` is a bare switch — there are no per-library scopes. It grants
+every library, and `--allow-all` includes it.
+
+It gates the two APIs that create native executable state:
+
+| API | Without the flag |
+|---|---|
+| `ffi.dlopen(path, symbols)` | throws `TypeError: ffi.dlopen requires --allow-ffi` |
+| `ffi.callback(spec, fn)` | throws `TypeError: ffi.callback requires --allow-ffi` |
+
+`ffi.allowed` reports whether the flag is set:
+
+```js
+console.log(ffi.allowed); // false by default, true with --allow-ffi
+```
+
+Denial here is the exception to the usual `PermissionDenied` contract: it is
+a `TypeError` with **no** `name: "PermissionDenied"` and **no**
+`code: "PERMISSION_DENIED"`:
+
+```js
+try {
+  ffi.dlopen("libz.1.dylib", {});
+} catch (e) {
+  console.error(e.name);    // TypeError
+  console.error(e.code);    // undefined
+  console.error(e.message); // ffi.dlopen requires --allow-ffi
+}
+```
+
+The library path is opened by the OS loader, not by `fs`, so loading a
+`.dylib` / `.so` does **not** need `--allow-read`. `--allow-ffi` is the only
+gate, and it does not constrain the path.
+
+> **Raw pointer helpers are not gated.** `ffi.ptr`, `ffi.view`, `ffi.read`,
+> `ffi.write`, `ffi.copyBytes`, `ffi.cstring`, `ffi.struct`, and `ffi.union`
+> work without `--allow-ffi`. They operate on whatever pointer you hand them
+> and are **not** a sandbox. `ffi.allowed` only describes the native-code
+> entry points, not these helpers.
+
+> **Trust caveat:** a loaded library can read and write files, open sockets,
+> spawn processes, and inspect memory directly. It is not bound by
+> `--allow-read`, `--allow-write`, `--allow-net`, or `--allow-run`. Treat
+> `--allow-ffi` as equivalent to `--allow-all`, and load only code you would
+> trust with the entire process.
 
 > **Prebuilt binaries ship without FFI.** Release binaries and the GHCR image
 > are built with `-Dffi=false`, so `ffi.dlopen` throws
 > `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` even with
 > `--allow-ffi`. FFI works out of the box in source builds (the default).
+
+Full model: [Permissions](/docs/concepts/permissions).
 
 ## Quick look
 
@@ -43,6 +91,10 @@ v.getInt32(0);                     // 3  (quot)
 v.getInt32(4);                     // 1  (rem)
 
 lib.close();
+```
+
+```sh
+ff ffi-demo.js --allow-ffi
 ```
 
 ## dlopen
@@ -101,6 +153,9 @@ ffi.isNull(p); // true for null/undefined and for 0-address pointers
 ffi.cstring(p);        // read a C string → JS string | null
 ffi.cstring(typedArray); // same, from a buffer
 ```
+
+These helpers are available without `--allow-ffi`; see the permissions
+caveat above.
 
 ## Memory
 
@@ -271,6 +326,8 @@ add.pointer;   // FfiPtr — the native code address
 add.close();   // free the native closure (call when C is done with it)
 ```
 
+`ffi.callback` requires `--allow-ffi`, like `ffi.dlopen`.
+
 The spec shape matches symbol specs (`parameters`, `result`). Use
 `add.pointer` as a `function`-type argument:
 
@@ -369,3 +426,13 @@ The rules are C's rules — the FFI adds no safety net:
 - No Windows (POSIX `dlopen` only), no variadic functions.
 - Max 32 parameters, 64 fields/members, 512 bytes per struct/union,
   nesting depth 8.
+- `--allow-ffi` has no path or library scopes; it grants every library.
+- Denial is a `TypeError` without `code`, unlike the `PermissionDenied`
+  contract used by filesystem, network, env, and run APIs.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [child_process](/docs/api/child-process) — another full-authority escape hatch
+- [API overview](/docs/api/overview) — every injected global
+- [Limitations](/docs/reference/limitations) — every hard cap

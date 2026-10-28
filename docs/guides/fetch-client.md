@@ -8,6 +8,44 @@ order: 2
 
 `fetch` is global. It reads `method` / `headers` / `body` from the init object and returns a `Promise<Response>`. Everything else in init (`signal`, `timeout`, `redirect`) is ignored. Method names are exact-case standard tokens — lowercase `"post"` is sent as `GET` (see Troubleshooting).
 
+## Permissions
+
+Outbound requests are deny-by-default. Every `fetch` needs `--allow-net` for
+the destination:
+
+```sh
+ff client.js --allow-net=api.example.com:443
+```
+
+- The URL's **literal host** is matched, lowercased. There is no DNS lookup
+  and no IP matching: `localhost` ≠ `127.0.0.1`, and granting
+  `api.example.com` does not cover `93.184.216.34`.
+- Ports matter. `https://api.example.com/` checks `api.example.com:443`;
+  `http://api.example.com/` checks `api.example.com:80`. Omit the port in the
+  flag to allow every port on that host.
+- `*.example.com` matches subdomains but **not** the apex `example.com`.
+  `*` (or bare `--allow-net`) grants every host and port.
+- Every redirect hop is checked again against the new URL.
+- TLS trust (`--ca`, `FF_CA_FILE`) is separate and does not grant network
+  access. Proxy variables are read by the runtime without `--allow-env`, and
+  the check applies to the destination, not the proxy host — see
+  [fetch Proxies](/docs/api/fetch#proxies).
+
+An initial URL outside the scope **throws synchronously**:
+
+```js
+try {
+  await fetch("https://api.example.com/items");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // fetch requires --allow-net for 'api.example.com:443'
+}
+```
+
+A redirect hop outside the scope **rejects with a string** instead:
+`"PermissionDenied: fetch requires --allow-net"`. Catch both shapes. Full
+model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -20,7 +58,7 @@ order: 2
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=example.com:443
 ```
 
 ## Modules vs scripts
@@ -46,6 +84,10 @@ as written.
 })();
 ```
 
+```sh
+ff client.js --allow-net=api.example.com:443
+```
+
 Check `res.ok` — HTTP error statuses **resolve**, they don't throw:
 
 ```js
@@ -55,7 +97,11 @@ if (!res.ok) {
 }
 ```
 
-> **Caution:** `fetch` only throws on network failures (DNS, refused connection, too many redirects). A `404` or `500` still resolves — always check `res.ok` or `res.status`.
+> **Caution:** HTTP statuses like `404` or `500` resolve normally. Network
+> failures (DNS, refused connection, too many redirects) reject with strings,
+> and an initial permission denial throws a `PermissionDenied` error. Always
+> check `res.ok` or `res.status` after a response; always handle the
+> permission case separately.
 
 ## POST JSON
 
@@ -74,7 +120,7 @@ if (!res.ok) {
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=api.example.com:443
 ```
 
 `string` bodies — and `URLSearchParams`, which coerces to its query string — reach the wire intact. Everything else is coerced with JS `String()` semantics: a `FormData` or `Blob` arrives as `"[object Object]"`, an `ArrayBuffer` as `"[object ArrayBuffer]"`, a `Uint8Array([104, 105])` as `"104,105"`.
@@ -121,6 +167,16 @@ console.log(res.redirected); // true
 console.log(res.url); // where it landed
 ```
 
+Every hop is re-checked against `--allow-net`. A redirect that crosses hosts
+needs both scopes:
+
+```sh
+ff client.js --allow-net=example.com,cdn.example.com
+```
+
+A hop outside the scope rejects with the string
+`"PermissionDenied: fetch requires --allow-net"`.
+
 There is no `redirect: "manual"` mode — the init key is ignored.
 
 ## HTTPS trust
@@ -134,10 +190,14 @@ Public CAs work out of the box. For private/self-signed CAs:
 | Dev TLS pairing | Starting TLS with `--cert`/`FF_CERT` also trusts that cert for `fetch` |
 
 ```sh
-FF_CA_FILE=./ca.pem ff client.js
+FF_CA_FILE=./ca.pem ff client.js --allow-net=api.example.com:443
 ```
 
 > **Note:** `--ca` is **not** accepted by `ff start`. Use `FF_CA_FILE` (or `FF_CERT`) there.
+
+Trust and permission are independent: neither `--ca` nor `FF_CA_FILE` grants
+network access, and `--allow-net` does not make an untrusted certificate
+valid. `FF_CA_FILE` is runtime configuration, so it needs no `--allow-env`.
 
 ## Practical example: synced mirror
 
@@ -161,8 +221,12 @@ Fetch a list, then POST each item onward, checking every status:
 ```
 
 ```sh
-ff mirror.js
+ff mirror.js \
+  --allow-net=api.example.com:443,backup.example.com:443
 ```
+
+Both hosts need their own scope; `*.example.com` would cover neither of these
+two apex domains.
 
 ## Reference: limits
 
@@ -171,11 +235,20 @@ ff mirror.js
 | Concurrent fetches | 16 | The 17th waits for a free slot |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
 | I/O timeout | 30s | Slow servers fail |
-| Redirects | 5 hops max | Throws `Too many redirects` |
+| Redirects | 5 hops max, each re-checked | Throws `Too many redirects` or rejects with a permission string |
 | Abort | Not supported | `signal` / `timeout` init keys ignored |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 
 ## Troubleshooting
+
+**`fetch` throws `PermissionDenied`** — the initial URL's host and port are
+outside every `--allow-net` scope. Add the exact target:
+`--allow-net=api.example.com:443`. Remember `localhost` and `127.0.0.1` are
+different scopes, and HTTPS defaults to port 443.
+
+**A redirect fails with `PermissionDenied: fetch requires --allow-net`** — a
+later hop crossed into a host or port you did not grant. Grant every host in
+the chain, or make the redirect target stay within one host.
 
 **404 resolves instead of throwing** — by design. Check `res.ok` / `res.status` after every call.
 
@@ -183,10 +256,17 @@ ff mirror.js
 
 **`FormData` / `Blob` / `Uint8Array` body arrives mangled** — bodies are string-coerced, not serialized (`"[object Object]"`, `"104,105"`). Send `string`, `URLSearchParams`, or a hand-built multipart string instead.
 
-**Caught fetch error has no `.message`** — network failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`). Log `String(e)`.
+**Caught fetch error has no `.message`** — most failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`, and the redirect-hop permission string). Log `String(e)`. The initial permission denial is the exception: it is an `Error` with `.message`.
 
 **`Too many redirects`** — the chain exceeded 5 hops. Inspect `res.url` on the last good hop or fix the redirect loop server-side.
 
-**TLS verify fails on a private CA** — pass `--ca` (scripts) or `FF_CA_FILE` (`ff start`). Confirm the PEM path is readable.
+**TLS verify fails on a private CA** — pass `--ca` (scripts) or `FF_CA_FILE` (`ff start`). Confirm the PEM path is readable. Trust does not replace `--allow-net`.
 
 **Hanging with 17+ parallel fetches** — the 16-slot pool is full. Await in batches or raise concurrency by sequencing.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [fetch API](/docs/api/fetch) — full reference, proxies, gotchas
+- [HTTP Server guide](/docs/guides/http-server) — serving instead of calling
+- [Limitations](/docs/reference/limitations) — every hard cap

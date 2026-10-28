@@ -94,6 +94,52 @@ cd demo
 ../zig-out/bin/ff start
 ```
 
+The generated `main.js` only logs, so it needs no grants. Program loading is a
+carve-out: `ff start` reads `ff.json` and its `main` without `--allow-read`.
+Once `main.js` calls `http.serve`, start it with the listener scope:
+
+```sh
+../zig-out/bin/ff start --allow-net=0.0.0.0:3000
+```
+
+## Permissions
+
+The binary is deny-by-default. A loaded script cannot read files, open
+sockets, inspect `process.env`, spawn processes, or load native libraries
+until the launch command grants it.
+
+```sh
+ff server.js --allow-net=0.0.0.0:3000
+ff notes.js --allow-read=notes.db --allow-write=.
+ff tool.js --allow-run=git
+ff addon.js --allow-ffi
+ff test --allow-all
+```
+
+- Flags are CLI-only. There is no `ff.json` field and no environment variable
+  that grants access.
+- Scopes are comma-split and repeatable: `--allow-read=src,views`.
+- A bare flag grants the whole category: `--allow-net` means any host and port.
+- `ff start` takes the flags after `start`; `ff --watch` forwards them to the
+  child it restarts.
+- `ff test` applies the flags to every test file in that run. The repo's
+  `test/run.sh` uses `--allow-all` because the suite exercises every category.
+- A missing grant fails before I/O with `PermissionDenied` /
+  `PERMISSION_DENIED`. FFI is the exception: `ffi.dlopen` / `ffi.callback`
+  throw `TypeError` without a `code`.
+- `--allow-run` and `--allow-ffi` are trust-equivalent to full access.
+  Permissions catch mistakes; they are not an OS sandbox.
+
+`globalThis.permissions` reports the six enabled categories as booleans:
+
+```sh
+ff -e 'console.log(JSON.stringify(permissions))' --allow-read=.
+# {"read":true,"write":false,"net":false,"env":false,"run":false,"ffi":false}
+```
+
+It does not expose the scopes, and reassigning its properties does not change
+enforcement. Full model: [Permissions](/docs/concepts/permissions).
+
 ## Install on PATH
 
 ```sh
@@ -115,9 +161,12 @@ export PATH="$HOME/.local/bin:$PATH"
 Then from anywhere:
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 ff --version
 ```
+
+A server that also reads static files needs the matching read scope, for
+example `--allow-read=./public`.
 
 > **Note:** Installs go to `~/.local/bin/ff`, never `/usr/local/bin`. This project has no `sudo make install` path — if you need a system-wide binary, copy it there yourself.
 
@@ -131,13 +180,32 @@ Removes `~/.local/bin/ff` only. Zig caches are untouched.
 
 ## Docker
 
+The image contains the `ff` binary, not your app. Mount the app or bake it into
+a derived image:
+
 ```sh
 docker build -t fairyfly .
-docker run -p 3000:3000 fairyfly ff server.js
+
+# terminal 1 — mount the current directory as /app
+docker run --rm -p 3000:3000 -v "$PWD":/app \
+  fairyfly ff server.js --allow-net=0.0.0.0:3000
+
+# terminal 2
 curl http://127.0.0.1:3000/
 ```
 
-The listen port is set in code via `http.serve({ port })` (default `3000`), not by an env var — map the host port to the same port your code listens on.
+`ff.json` inside the image does **not** carry the permission policy. Put the
+`--allow-*` flags in the container command (or the image `CMD`). A listener on
+port 3000 needs `--allow-net=0.0.0.0:3000`; static files read with `fs` need
+`--allow-read=/app/public` (or whichever path the app uses).
+
+The listen port comes from `http.serve({ port })` (default `3000`). The
+runtime has no `FF_PORT` or `--port` override. If the app reads `PORT`, add
+`--allow-env=PORT` and `-e PORT=3000`, then make the net scope match that port.
+
+> **io_uring images need a permissive seccomp profile.** Docker's default
+> profile blocks io_uring; run with `--security-opt seccomp=unconfined`, or
+> build an image with `zig build -Dio_uring=false` for an epoll binary.
 
 ## Other Make targets
 
@@ -165,6 +233,21 @@ The listen port is set in code via `http.serve({ port })` (default `3000`), not 
 
 **`ff: command not found` after `make install`** — `~/.local/bin` isn't on `PATH`. Add the export shown by Make, then open a new shell.
 
-**Permission denied** — prefer `make install` (user-local). Don't `sudo` anything; this project has no system-install path.
+**`Permission denied` while installing** — prefer `make install` (user-local). Don't `sudo` anything; this project has no system-install path.
 
-**Docker: connection refused** — confirm `http.serve({ port })` matches the `-p` mapping and the handler is actually registered (try `FF_ECHO=1` smoke mode first).
+**Runtime `PermissionDenied`** — the script hit an ungranted API. The message names the flag and scope, for example
+`http.serve requires --allow-net for '0.0.0.0:3000'`. Add the flag to the
+same command; `ff.json` and environment variables cannot grant it.
+
+**Docker: `PermissionDenied` in the logs** — add the runtime flags to the
+container command (or image `CMD`). A listener on port 3000 needs
+`--allow-net=0.0.0.0:3000`.
+
+**Docker: connection refused** — confirm `http.serve({ port })` matches the `-p` mapping and the handler is actually registered (try `FF_ECHO=1` smoke mode first). If the logs show `PermissionDenied`, fix the missing grant before debugging the port.
+
+## See also
+
+- [Quickstart](/docs/getting-started/quickstart) — first script and server
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [Deploy](/docs/guides/deploy) — production start commands and Docker
+- [CLI](/docs/reference/cli) — every command and flag

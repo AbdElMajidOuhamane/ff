@@ -22,30 +22,32 @@ and a small readable codebase.
 
 1. [Documentation](#documentation)
 2. [Installation](#installation)
-3. [Why Fairyfly](#why-fairyfly)
-4. [Quick start](#quick-start)
-5. [Example tour](#example-tour)
-6. [API at a glance](#api-at-a-glance)
-7. [Performance](#performance)
-8. [Architecture](#architecture)
-9. [Building from source](#building-from-source)
-10. [CLI reference](#cli-reference)
-11. [Limitations vs Node / browser](#limitations-vs-node--browser)
-12. [License](#license)
+3. [Permissions](#permissions)
+4. [Why Fairyfly](#why-fairyfly)
+5. [Quick start](#quick-start)
+6. [Example tour](#example-tour)
+7. [API at a glance](#api-at-a-glance)
+8. [Performance](#performance)
+9. [Architecture](#architecture)
+10. [Building from source](#building-from-source)
+11. [CLI reference](#cli-reference)
+12. [Limitations vs Node / browser](#limitations-vs-node--browser)
+13. [License](#license)
 
 ---
 
 ## Documentation
 
-The full guide set lives in [`docs/`](docs/index.md) — 45 pages covering
+The full guide set lives in [`docs/`](docs/index.md) — 46 pages covering
 everything this README summarizes.
 
 | Section | Contents |
 |---|---|
 | [Getting started](docs/getting-started/introduction.md) | Introduction, installation, quickstart |
-| [Guides](docs/index.md) | HTTP server, fetch, WebSocket, TLS, HTTP/2, Postgres packages, modules, workers, timers, testing, bytecode, environment, deploy |
+| [Concepts](docs/concepts/permissions.md) | Permissions, event loop, concurrency, errors, architecture |
+| [Guides](docs/guides/http-server.md) | HTTP server, fetch, WebSocket, TLS, HTTP/2, workers, timers, logging, modules, process, environment, packages, bytecode, testing, deploy |
 | [API reference](docs/api/overview.md) | Every global and module on one page |
-| [Reference](docs/reference/cli.md) | CLI, limitations, examples |
+| [Reference](docs/reference/cli.md) | CLI, limitations, compatibility, examples |
 
 ---
 
@@ -88,6 +90,50 @@ See [Building from source](#building-from-source).
 
 ---
 
+## Permissions
+
+Native APIs are **deny-by-default**. The only policy input is `--allow-*` on
+the command line — no `ff.json` field, no environment variable, no runtime
+toggle.
+
+| Flag | Grants | Scope |
+|---|---|---|
+| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve` | paths |
+| `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
+| `--allow-net` | `fetch`, WebSocket, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
+| `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` for the global `sql` | exact names |
+| `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
+| `--allow-ffi` | `ffi.dlopen` / `ffi.callback` | bare flag only |
+| `--allow-all` | every category above, including FFI | bare flag only |
+
+```sh
+ff server.js --allow-net=0.0.0.0:3000
+ff app.js --allow-read=. --allow-write=.
+ff test --allow-all
+```
+
+- Flags are repeatable and comma-split: `--allow-read=src,views`.
+- A bare flag grants the whole category: `--allow-net` means any host and port.
+- `http.serve` always binds `0.0.0.0`; use `--allow-net=0.0.0.0:<port>`, not
+  `127.0.0.1:<port>`.
+- Path scopes resolve against the **launch** cwd and stay fixed. A later
+  `process.chdir()` does not move them.
+- Missing access throws `PermissionDenied` (`code: "PERMISSION_DENIED"`)
+  before I/O starts. FFI is the exception: `ffi.dlopen` / `ffi.callback`
+  throw `TypeError` without a `code`.
+- `ff start --cert/--key` and `FF_CERT` / `FF_KEY` are CLI/runtime reads and
+  need no `--allow-read`; a `tls` object inside JS does.
+- `exec` / `execSync` run `/bin/sh -c`, so `/bin/sh` must be in `--allow-run`.
+  Permitting the shell permits any command string.
+- Workers inherit the policy; `globalThis.permissions` reports the six enabled
+  categories but not the scopes.
+- `--allow-run` and `--allow-ffi` are trust-equivalent to full access. These
+  are in-process checks, not an OS sandbox.
+
+Full model: [Permissions](docs/concepts/permissions.md).
+
+---
+
 ## Why Fairyfly
 
 Modern backend development doesn't need a 50 MB runtime to start. Fairyfly is
@@ -122,12 +168,16 @@ cd demo
 ff start
 ```
 
+The generated `main.js` only logs, so `ff start` needs no flags. Once it serves
+HTTP, run `ff start --allow-net=0.0.0.0:3000` (add other grants as needed).
+
 ---
 
 ## Example tour
 
 Three copy-pasteable programs covering the core loop — serve, call, store.
-Each links to the guide with the full story.
+Each links to the guide with the full story. Commands carry the minimum
+permission flags.
 
 **Serve** ([HTTP Server guide](docs/guides/http-server.md)):
 
@@ -141,7 +191,8 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
+# another terminal:
 curl http://127.0.0.1:3000/json  # {"ok":true}
 ```
 
@@ -158,7 +209,7 @@ console.log(res.status, await res.text());
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=api.example.com:443
 ```
 
 **Store** ([SQLite guide](docs/api/sqlite.md)):
@@ -176,7 +227,7 @@ db.close();
 ```
 
 ```sh
-ff notes.js
+ff notes.js --allow-read=notes.db --allow-write=.
 ```
 
 ---
@@ -188,21 +239,23 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | Global | What to know |
 |---|---|
 | `console` | Prints **every** argument, joined with spaces — to **stderr** |
-| `fetch` | 16 slots, HTTP/1.1; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
-| `http.serve` | `(url, method, body)` handler, all strings; return a `Response`; WebSocket upgrades are automatic |
+| `fetch` | 16 slots, HTTP/1.1; needs `--allow-net` on the target `host:port`; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
+| `http.serve` | `(url, method, body)` handler, all strings; needs `--allow-net=0.0.0.0:<port>`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
 | `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
-| `Database` | `Database.open(path)`; synchronous; failures throw plain strings, not `Error`s |
-| `sql` / `SQL` | Postgres tagged templates; failures reject with real `Error`s (`code` / `severity` / `message`) |
-| `fs` | Sync calls return `undefined` on failure (never throw); six `*Async` Promise variants |
-| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message |
-| `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
+| `Database` | `Database.open(path)`; needs `--allow-read` + `--allow-write` on the file and `--allow-write` on the parent; synchronous; SQL failures throw plain strings |
+| `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
+| `fs` | Sync calls return `undefined` on I/O failure; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
+| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; inherits the parent's permissions |
+| `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; needs `--allow-run`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
-| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot; `chdir` never throws; exit codes clamp to 0–255 |
+| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `chdir` is read-gated and throws on denial; exit codes clamp to 0–255 |
 | `TextEncoder` / `TextDecoder` | UTF-8 string ↔ bytes |
-| `WebSocket` | Client with `send` / `sendBinary` / `close`; sync mistakes throw `TypeError: WebSocket: …` |
-| `ffi` | Native libraries; needs `--allow-ffi` at runtime |
+| `WebSocket` | Client with `send` / `sendBinary` / `close`; needs `--allow-net`; sync mistakes throw `TypeError: WebSocket: …` |
+| `udp` | Datagram sockets with `bind` / `sendto` / `recvfrom`; needs `--allow-net` on the address |
+| `permissions` | Booleans for the six enabled categories; scopes are not exposed |
+| `ffi` | Native libraries; `dlopen` / `callback` need `--allow-ffi`; raw pointer helpers are not gated |
 
 ---
 
@@ -337,28 +390,36 @@ ff imprint [pkg[@ver]|github:…|codeberg:…|url ...]
                          Add dep(s) from npm, GitHub/Codeberg, or a .tar.gz URL
 ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
-ff start [--cert cert.pem --key key.pem]
+ff start [--allow-*] [--cert cert.pem --key key.pem]
                          Run ff.json's "main" (TLS enabled with cert+key)
 ff --watch <file|start> [args...]
                          Restart the child when files change (200ms poll)
 
-ff test [filter]         Run test/*.test.js
+ff test [filter] [--allow-*]
+                         Run test/*.test.js
 ff repl                  Interactive REPL
 ff upgrade [--check]     Self-update from GitHub Releases
 ff compile <f.js> [-o out.ffbc]
                          Compile to bytecode (run back with ff <file.ffbc>)
 ff fmt [--write|--check] <files...>
                          Format via prettier (needs npx/network)
-ff -e <code>             Run inline JavaScript code
-ff <file.js>             Run a JavaScript file
-ff <file.js> --allow-ffi Allow ffi.dlopen (native libraries)
+ff -e <code> [--allow-*] Run inline JavaScript code
+ff <file.js> [--allow-*] Run a JavaScript file
 ff --version             Print runtime version
+```
+
+Every command that starts a JS runtime — `ff <file>`, `ff -e`, `ff start`,
+`ff test`, `ff repl`, `ff --watch` — accepts the `--allow-*` flags. `--watch`
+forwards them to the child, for example:
+
+```sh
+ff --watch app.js --allow-net=api.example.com:443
 ```
 
 **`ff --watch`** never runs a runtime itself — it polls the project tree
 (mtime + size, 200 ms, 100 ms debounce), then SIGTERMs the child, waits up to
 500 ms, SIGKILLs, and respawns. `--watch` must be the **first** argument.
-Forward everything after the target (e.g. `ff --watch app.js --ca cert.pem`).
+Forward everything after the target (permission flags included).
 
 Environment variables:
 
@@ -369,15 +430,30 @@ Environment variables:
 - `NO_PROXY` (or `no_proxy`) — comma-separated hosts that bypass the proxy (`*` bypasses all)
 - `FF_WATCH_PARENT` — set internally by `--watch` (orphan watchdog)
 
+`FF_*`, the proxy variables, and `FF_WATCH_PARENT` are runtime/CLI
+configuration and are not gated by `--allow-env`. Application access through
+`process.env` is filtered to names granted by `--allow-env`; a disallowed name
+is `undefined`.
+
 Database:
 
 - `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` —
-  configure the global `sql`
-- `PG_TEST_DSN` — used by the Postgres test files (they self-skip if unset)
+  configure the global `sql`; grant each name with `--allow-env` and the
+  resolved host with `--allow-net`
+- `PG_TEST_DSN` — used by the Postgres test files (they self-skip if unset);
+  grant it to the test command
 
 ---
 
 ## Limitations vs Node / browser
+
+**Permissions**
+
+- Deny-by-default; only CLI `--allow-*` flags grant access
+- In-process checks, not an OS sandbox. A symlink race can escape a path
+  scope; `--allow-run` and `--allow-ffi` are trust-equivalent to full access
+- Scopes are fixed at launch and inherited by workers
+- Module loading is a carve-out; imported code runs with the process's grants
 
 **Modules & language**
 
@@ -425,9 +501,11 @@ Database:
 - 4 MB per message; no `ArrayBuffer` transfer (always copied)
 - Worker scope is `console` + timers + `postMessage` — no `fs`, `fetch`, or `http.serve`
 - No nested workers; exit only via `terminate()`
+- Inherits the parent's permission policy; there is no per-worker grant
 
 **child_process**
 
+- Needs `--allow-run` on `argv[0]`; `exec` / `execSync` also need `/bin/sh`
 - Max **8** concurrent children; the 9th `spawn` throws
 - POSIX only (macOS/Linux); `maxBuffer` defaults to 1 MB per stream
 - No stdin, streams, or events — use `wait()` + captured `stdout`/`stderr`
@@ -439,7 +517,8 @@ Database:
   multi-statement SQL
 - Positional `?` parameters only (no named `:x` / `$x`)
 - Integer columns beyond 2⁵³ lose precision in JS
-- Failures throw plain strings, not `Error`s — log `String(e)`
+- SQL failures throw plain strings, not `Error`s — log `String(e)`;
+  `Database.open` permission denials are real `Error`s with `.code`
 
 **Postgres**
 
@@ -450,10 +529,11 @@ Database:
 
 **Process**
 
-- `process.env` is a snapshot taken at boot — assigning to it does not affect
-  the OS environment
+- `process.env` is a snapshot taken at boot, filtered by `--allow-env` —
+  disallowed names are `undefined`; assigning does not affect the OS environment
 - No `stdout`/`stdin` streams, no `hrtime`, no `kill`
-- `chdir` never throws — a bad path is a silent no-op; check `cwd()`
+- `process.chdir` needs `--allow-read` on the target; denial throws
+  `PermissionDenied`, and an OS failure throws `chdir failed`
 - Exit codes clamp to 0–255 (no mod-256 wrap)
 - No interrupt/watchdog for runaway JS — an infinite loop hangs the process
 

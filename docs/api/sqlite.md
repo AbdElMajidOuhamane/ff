@@ -8,6 +8,54 @@ order: 3
 
 `Database` is global — no import, no package. One file per database, synchronous calls, WAL mode on, 5s busy timeout by default.
 
+## Permissions
+
+`Database.open` touches the filesystem, so on-disk databases need both
+`read` and `write` grants:
+
+| Check | Flag | Why |
+|---|---|---|
+| Database file | `--allow-read` **and** `--allow-write` | SQLite opens read/write and may create the file |
+| Parent directory | `--allow-write` | WAL and `-shm` siblings are created next to the database |
+
+```sh
+ff notes.js --allow-read=notes.db --allow-write=.
+```
+
+- `:memory:` is exempt — no file is touched, so no flags are needed.
+- Both file grants are required even for a query-only workload: the handle is
+  opened with `SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE`.
+- A write scope naming only the database **file** is not enough. SQLite writes
+  `notes.db-wal` and `notes.db-shm` beside it, so the containing directory
+  must be writable too.
+- Relative paths resolve against the **current** cwd; scopes are resolved
+  against the **launch** cwd and never move. If you `process.chdir()` before
+  opening, the path lands in the new directory but must still fall inside a
+  scope captured at startup.
+- Denial happens before `sqlite3_open`, and the error is a real `Error`:
+
+```js
+try {
+  Database.open("notes.db");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // Database.open requires --allow-read for 'notes.db'
+}
+```
+
+The three possible messages are:
+
+```text
+Database.open requires --allow-read for 'notes.db'
+Database.open requires --allow-write for 'notes.db'
+Database.open requires --allow-write for '.'
+```
+
+The third uses the parent directory exactly as derived from the path passed to
+`open` (`.` when there is no directory component).
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -26,7 +74,7 @@ db.close();
 ```
 
 ```sh
-ff notes.js
+ff notes.js --allow-read=notes.db --allow-write=.
 ```
 
 ## `Database.open(path)`
@@ -38,7 +86,11 @@ const mem = Database.open(":memory:");
 
 Opens (creating when missing) and returns the handle. Every open enables `PRAGMA journal_mode=WAL` and a 5000ms busy timeout — override the latter per handle with `busyTimeout(ms)`.
 
-> **Caution:** The path is relative to the process cwd. `Database.open("app.db")` in `ff start` lands next to where you launched, not necessarily next to your script.
+> **Caution:** The path is relative to the process cwd. `Database.open("app.db")` in `ff start` lands next to where you launched, not necessarily next to your script. Permission scopes are fixed at launch, so launch from the directory you intend to write to, or pass an absolute path that a scope covers.
+
+`:memory:` gets an ephemeral database that disappears when the handle closes. It
+is the easiest option for tests and scratch work because it needs no filesystem
+permissions.
 
 ## Reading: `row` / `rows`
 
@@ -81,6 +133,9 @@ try {
   console.error(typeof e, e instanceof Error); // "string" false — e.message is undefined
 }
 ```
+
+Permission errors are the exception: they are real `Error` objects thrown by
+`Database.open`, with `name` and `code` set.
 
 ## Introspection: `changes` / `lastInsertRowId`
 
@@ -172,7 +227,10 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js \
+  --allow-read=notes.db \
+  --allow-write=. \
+  --allow-net=0.0.0.0:3000
 curl -X POST http://127.0.0.1:3000/notes \
   -H "content-type: application/json" -d '{"text":"buy milk"}'
 # {"id":1,"text":"buy milk"}
@@ -184,7 +242,13 @@ curl http://127.0.0.1:3000/notes
 
 **`no such table: x`** — the `execNoArgs(CREATE TABLE …)` never ran (fresh cwd? different `open` path?). Paths are cwd-relative — log `process.cwd()` when in doubt.
 
-**Caught error has no `.message`** — SQL failures throw plain strings (`typeof e === "string"`), so `e.message` is `undefined` and `e instanceof Error` is `false`. Log `String(e)`. (Pure argument mistakes, e.g. calling `exec()` with no SQL, throw real `TypeError`s.)
+**`Database.open` throws `PermissionDenied`** — check which message you got.
+`...requires --allow-read for 'notes.db'` means the file scope is missing;
+`...requires --allow-write for 'notes.db'` means the file write scope is
+missing; `...requires --allow-write for '.'` means the **parent directory** is
+not writable. A common fix is `--allow-read=notes.db --allow-write=.`.
+
+**Caught error has no `.message`** — SQL failures throw plain strings (`typeof e === "string"`), so `e.message` is `undefined` and `e instanceof Error` is `false`. Log `String(e)`. `Database.open` permission failures are real `Error`s and do have `.message`.
 
 **`database is locked`** — contention beat the busy timeout. Raise `db.busyTimeout(ms)`, shorten write transactions, or serialize writers through one handle.
 
@@ -193,3 +257,10 @@ curl http://127.0.0.1:3000/notes
 **Queries after `close()` throw** — by design. Open one handle per process (or per worker) and close only at shutdown.
 
 **`transaction requires a function argument`** — you passed a non-function (e.g. the *result* of calling it). Pass the closure: `db.transaction(() => { … })`.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [Postgres API](/docs/api/postgres) — network database client
+- [API overview](/docs/api/overview) — every injected global
+- [Limitations](/docs/reference/limitations) — every hard cap

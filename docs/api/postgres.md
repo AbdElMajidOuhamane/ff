@@ -8,6 +8,89 @@ order: 5
 
 `SQL` (and the ready-made `sql`) is global — no import, no package. Native Zig client, extended protocol, lazy pool of up to 10 connections.
 
+## Permissions
+
+Postgres is a network database, so connection setup needs `--allow-net`:
+
+| Operation | Needs |
+|---|---|
+| `new SQL(dsn)` | `--allow-net=<host>:<port>` — checked in the constructor |
+| Global `sql` (first use) | The same net grant, plus `--allow-env` for any `PG_TEST_DSN` / `DATABASE_URL` / `PG*` variables it should read |
+| `sql.connect()` | Net grant on the configured host and port |
+
+```sh
+ff todos.js --allow-net=127.0.0.1:5432
+```
+
+- The check uses the literal host from the DSN. `localhost` and `127.0.0.1`
+  are different scopes; there is no DNS matching.
+- The default port is `5432` when the DSN omits one, and that is the port
+  checked. `postgres://user:pass@db.example.com/app` needs
+  `--allow-net=db.example.com:5432`.
+- IPv6 hosts with a port need brackets in the flag:
+  `--allow-net=[::1]:5432`.
+- A scope without a port matches any port: `--allow-net=db.example.com`.
+
+### Global `sql` and environment permission
+
+The global `sql` reads configuration **through the permission filter**, not
+through `process.env`. A variable that `--allow-env` does not grant is silently
+ignored, and the next source is tried:
+
+```text
+PG_TEST_DSN → DATABASE_URL → PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE → defaults
+```
+
+```sh
+# Use an env DSN:
+ff app.js --allow-env=PG_TEST_DSN --allow-net=db.example.com:5432
+
+# Use PG* pieces:
+ff app.js \
+  --allow-env=PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE \
+  --allow-net=db.example.com:5432
+
+# No env grant: falls back to 127.0.0.1:5432
+ff app.js --allow-net=127.0.0.1:5432
+```
+
+The defaults are host `127.0.0.1`, port `5432`, user `postgres`, empty
+password, database `postgres`.
+
+> **Gotcha:** a missing `--allow-env` does **not** raise `PermissionDenied` for
+> the variable. It quietly falls through to the default host, which can look
+> like "connection refused" rather than a permissions problem.
+
+### Denial shapes
+
+`new SQL(dsn)` checks eagerly and names the host:
+
+```js
+try {
+  new SQL("postgres://u:p@127.0.0.1:5432/app");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // SQL requires --allow-net for '127.0.0.1:5432'
+}
+```
+
+The global pool is built lazily, on first use, and its denial message is
+generic:
+
+```js
+try {
+  await sql`SELECT 1`;
+} catch (e) {
+  console.error(e.message); // sql requires --allow-net for 'configured host'
+}
+```
+
+`sql.unsafe`, `sql.begin`, and `sql.connect` use the same generic
+`'configured host'` detail with their own API name. They do not print the
+actual host, so check the DSN and your `--allow-net` scope when debugging.
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -29,7 +112,7 @@ sql.close();
 ```
 
 ```sh
-ff todos.js
+ff todos.js --allow-net=127.0.0.1:5432
 ```
 
 ## `new SQL(dsn)` / global `sql`
@@ -39,11 +122,20 @@ const sql = new SQL("postgres://user:pass@127.0.0.1:5432/app");
 await sql.connect(); // optional: probe with SELECT 1, rejects if unreachable
 ```
 
-`new SQL(dsn)` builds a pool around that DSN. The global `sql` is the same API preconfigured from the environment — checked in order: `PG_TEST_DSN`, `DATABASE_URL`, then `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`, then defaults (`127.0.0.1:5432`, user `postgres`).
+`new SQL(dsn)` builds a pool around that DSN and checks its host/port
+immediately. The global `sql` is the same API preconfigured from the
+environment — checked in order: `PG_TEST_DSN`, `DATABASE_URL`, then `PGHOST` /
+`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`, then defaults
+(`127.0.0.1:5432`, user `postgres`, database `postgres`). Only variables
+granted by `--allow-env` are visible to this lookup.
 
-Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10.
+Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10. For the global `sql`, that first query is also when the net permission check runs.
 
-> **Caution:** With no DSN argument and no environment set, queries reject with `TypeError: no database pool`. Export `PG_TEST_DSN` (or pass the DSN) before running.
+> **Caution:** With no DSN argument and no granted environment, the global
+> `sql` points at `127.0.0.1:5432` and needs
+> `--allow-net=127.0.0.1:5432`. If that host is not running Postgres, the query
+> rejects with a connection error. Export an allowed DSN — or pass one to
+> `new SQL(dsn)` — to point somewhere else.
 
 ## Reading and writing: tag / `unsafe`
 
@@ -126,6 +218,10 @@ try {
 | `message` | Server message text |
 | `detail` | Extra context when the server sends it |
 
+Permission failures are different: they are local `Error` objects with
+`name: "PermissionDenied"` and `code: "PERMISSION_DENIED"`, thrown before a
+connection is attempted. They have no SQLSTATE `severity` or `detail`.
+
 ## Transactions: `begin` + `transaction(fn)`
 
 ```js
@@ -183,7 +279,10 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 ```
 
 ```sh
-PG_TEST_DSN='postgres://fairyfly:fairyfly@127.0.0.1:5432/fairyfly' ff server.js
+PG_TEST_DSN='postgres://fairyfly:fairyfly@127.0.0.1:5432/fairyfly' \
+ff server.js \
+  --allow-env=PG_TEST_DSN \
+  --allow-net=127.0.0.1:5432,0.0.0.0:3000
 curl -X POST http://127.0.0.1:3000/notes \
   -H "content-type: application/json" -d '{"text":"buy milk"}'
 # {"id":1,"text":"buy milk"}
@@ -191,13 +290,32 @@ curl http://127.0.0.1:3000/notes
 # [{"id":1,"text":"buy milk"}]
 ```
 
+The DSN is read through `process.env`, so `--allow-env=PG_TEST_DSN` is
+required. The net grant covers both the database connection and the HTTP
+listener.
+
 Full working app: `examples/todo-app/` (CRUD + jsonb/arrays + transactions). Script tour: `examples/sql-todo.js`.
 
 ## Troubleshooting
 
-**`TypeError: no database pool`** — no DSN argument and no `PG_TEST_DSN` / `DATABASE_URL` / `PG*` variables. Export one, or use `new SQL(dsn)`.
+**`PermissionDenied: sql requires --allow-net for 'configured host'`** — the
+global pool cannot reach the configured host. Add the host and port to
+`--allow-net`. The message does not name the host, so check which config source
+won: `PG_TEST_DSN`, `DATABASE_URL`, `PG*`, or the `127.0.0.1:5432` default.
 
-**Connection refused** — Postgres isn't listening (Docker not up? `docker compose up -d`), or the host/port in the DSN is wrong.
+**`PermissionDenied: SQL requires --allow-net for 'host:port'`** — same issue
+from the `new SQL(dsn)` constructor. The message names the checked host; add
+that exact scope. `localhost` will not match `127.0.0.1`.
+
+**`PG_TEST_DSN` seems ignored** — `--allow-env=PG_TEST_DSN` is missing. The
+global `sql` silently falls through to `DATABASE_URL`, the `PG*` variables, or
+the defaults. `process.env.PG_TEST_DSN` is also `undefined` without the grant.
+
+**`TypeError: no database pool`** — the global pool could not be built, for
+example because an allowed DSN variable is malformed. Fix the DSN or pass one
+to `new SQL(dsn)`.
+
+**Connection refused** — Postgres isn't listening (Docker not up? `docker compose up -d`), or the host/port in the DSN is wrong. If you expected an env DSN but got the default, check `--allow-env`.
 
 **`password authentication failed`** — credentials in the DSN don't match the server. Check `PGUSER` / `PGPASSWORD`; environment variables override nothing once a DSN argument is passed.
 
@@ -208,3 +326,10 @@ Full working app: `examples/todo-app/` (CRUD + jsonb/arrays + transactions). Scr
 **`no operator matches` / type errors at the server** — a parameter was encoded as a different type than the column expects (e.g. `text` param against an `integer` column). Cast in the SQL (`$1::int`) or pass the right JS type.
 
 **Queries after `sql.close()` fail** — by design. Close only at shutdown, one pool per process (per worker).
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [SQLite API](/docs/api/sqlite) — embedded, filesystem-gated database
+- [API overview](/docs/api/overview) — every injected global
+- [Limitations](/docs/reference/limitations) — every hard cap

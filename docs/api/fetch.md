@@ -8,6 +8,50 @@ order: 2
 
 `fetch` is a global function. It sends one HTTP request and resolves with a `Response` — including for HTTP error statuses like `404` or `500`.
 
+## Permissions
+
+`fetch` reaches the network, so every request needs `--allow-net`:
+
+| Scope | Grants |
+|---|---|
+| `--allow-net=api.example.com` | That host on **any** port |
+| `--allow-net=api.example.com:443` | That host and port only |
+| `--allow-net=*.example.com` | Subdomains, but **not** the apex `example.com` |
+| `--allow-net=*` or bare `--allow-net` | Every host and port |
+
+- Matching uses the URL's **literal host**, lowercased. There is no DNS
+  resolution and no IP matching: `localhost` and `127.0.0.1` are different
+  scopes, and granting `api.example.com` does not permit fetching
+  `https://93.184.216.34/`.
+- Default ports count. `https://example.com/` checks `example.com:443`;
+  `http://example.com/` checks `example.com:80`.
+- Every redirect hop is checked independently against the new URL.
+- A configured proxy does not change the destination check; see
+  [Proxies](#proxies) for the proxy-host caveat.
+
+Failure takes two different shapes:
+
+```js
+// Initial URL outside --allow-net: fetch() throws synchronously.
+try {
+  fetch("https://api.example.com/items");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+}
+
+// A redirect hop outside --allow-net: the promise rejects with a string.
+try {
+  await fetch("https://allowed.example.com/");
+} catch (e) {
+  console.error(String(e)); // PermissionDenied: fetch requires --allow-net
+}
+```
+
+The initial denial message names the host and port:
+`fetch requires --allow-net for 'api.example.com:443'`. The redirect-hop
+string carries neither `code` nor the host. Full model:
+[Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -20,7 +64,7 @@ order: 2
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=example.com:443
 ```
 
 ## Modules vs scripts
@@ -110,6 +154,9 @@ console.log(await res.json());
 | `method` / `url` / `headers` | As passed to the constructor |
 | `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; single-read |
 
+`fetch(req)` applies the same `--allow-net` check to `req.url` as it does to a
+string URL, including on redirect hops.
+
 ## `Headers` reference
 
 Case-insensitive; names are lowercased internally:
@@ -125,7 +172,7 @@ h.delete("x-id");
 h.entries(); h.keys(); h.values();
 h.forEach((value, key) => console.log(key, value));
 h.toString();
-h.size;
+h.size();              // header count
 ```
 
 | Method | Description |
@@ -137,13 +184,18 @@ h.size;
 | `append(name, value)` | Add another value |
 | `delete(name)` | Remove the header |
 | `entries()` / `keys()` / `values()` / `forEach()` | Iterate |
-| `toString()` / `size` | Debug string / header count |
+| `toString()` / `size()` | Debug string / header count |
 
 CR/LF characters in header values are dropped.
 
 ## Redirects
 
 Followed automatically up to 5 hops. `res.redirected` and `res.url` tell you where the response actually came from. Past 5 hops, `fetch` throws `Too many redirects`. There is no manual-redirect mode.
+
+Every hop is re-checked against `--allow-net`. A redirect from an allowed host
+to a host outside the scope rejects the promise with the string
+`"PermissionDenied: fetch requires --allow-net"`; the initial request is not
+retried and no `Response` is produced.
 
 Note: redirects your own `http.serve` handler returns via `Response.redirect()` carry no `Location` header, so nothing follows them — see Gotchas.
 
@@ -170,9 +222,16 @@ are supported (no SOCKS), and the proxy URL itself must be `http://` — an
 `https://` proxy URL (TLS to the proxy) is rejected.
 
 ```sh
-HTTP_PROXY=http://127.0.0.1:8080 ff client.js
-NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js
+HTTP_PROXY=http://127.0.0.1:8080 ff client.js --allow-net=api.example.com:443
+NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js --allow-net=api.example.com:443
 ```
+
+> **Permissions caveat:** proxy variables are read by the runtime directly, so
+> no `--allow-env` grant is needed. `--allow-net` is checked against the
+> **destination** URL, not the proxy host. If the environment configures a
+> proxy, an allowed request will connect to that proxy even when its host is
+> absent from every `--allow-net` scope. Set `NO_PROXY` or clear the proxy
+> variables when that is not intended.
 
 ## Full example
 
@@ -200,14 +259,20 @@ NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=api.example.com:443
 ```
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, every hop re-checked against `--allow-net`, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
+
+**Permission denial is two different shapes.** The initial URL throws a real
+`Error` with `name: "PermissionDenied"` and `code: "PERMISSION_DENIED"`.
+A redirect-hop denial rejects with the plain string
+`"PermissionDenied: fetch requires --allow-net"` — no `code`, no host. Catch
+both, and log with `String(e)` so string rejections print something useful.
 
 **Method names are exact-case.** `fetch` matches `init.method` against the standard tokens verbatim — `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"`. Anything else, including lowercase (`"post"`), is sent as `GET` (a body is still attached). Your `http.serve` handler likewise sees the method exactly as the client sent it, so normalize before comparing (`method.toUpperCase() === "POST"`).
 
@@ -219,10 +284,11 @@ Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body 
 return new Response(null, { status: 302, headers: { Location: "/new-path" } });
 ```
 
-**Rejections are plain strings.** Network failures reject with `"Network error"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"` — `e.message` is `undefined`, so log `String(e)`.
+**Rejections are plain strings.** Network failures reject with `"Network error"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"` — `e.message` is `undefined`, so log `String(e)`. The initial permission denial is the exception: it throws an `Error` and never reaches the promise.
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
 - [Fetch Client guide](/docs/guides/fetch-client) — tutorial version of this page
 - [HTTP Server guide](/docs/guides/http-server) — serving instead of calling
 - [Limitations](/docs/reference/limitations) — every hard cap

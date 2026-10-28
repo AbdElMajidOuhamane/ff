@@ -9,16 +9,18 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, batteries
 included (HTTP, fetch, WebSocket, SQLite, Postgres, workers). Scripts and
 ES modules both work — the runtime auto-detects per file.
 
-45 pages in five sections. If you're new: read the three getting-started
-pages in order, then keep **Concepts** open while you build — it explains
-*why* the runtime behaves the way it does.
+46 pages in five sections. If you're new: read the three getting-started
+pages in order, then read [Permissions](/docs/concepts/permissions) before
+your first server — it explains the deny-by-default flags. Keep **Concepts**
+open while you build; it explains *why* the runtime behaves the way it does.
 
 ## Start here
 
 1. [Introduction](/docs/getting-started/introduction) — what it is and when to pick it
 2. [Installation](/docs/getting-started/installation) — prebuilt, source, or Docker
 3. [Quickstart](/docs/getting-started/quickstart) — first server in five minutes
-4. [HTTP Server](/docs/guides/http-server) — hello-world to a JSON REST API
+4. [Permissions](/docs/concepts/permissions) — deny-by-default flags and scopes
+5. [HTTP Server](/docs/guides/http-server) — hello-world to a JSON REST API
 
 ## Getting started
 
@@ -36,6 +38,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | [Concurrency](/docs/concepts/concurrency) | Loop vs I/O pool vs Workers — which primitive to reach for |
 | [Errors and exit codes](/docs/concepts/errors) | What throws, what gets swallowed, how failures surface |
 | [Architecture](/docs/concepts/architecture) | Layers, directories, threads, and the hot path |
+| [Permissions](/docs/concepts/permissions) | Deny-by-default native access — flags, scopes, enforcement, errors |
 
 ## Guides
 
@@ -66,6 +69,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | [`fetch`](/docs/api/fetch) | `fetch()` — init keys, redirects, limits |
 | [Request / Response / Headers](/docs/api/request-response) | Constructors, statics, body readers, `Headers` |
 | [`WebSocket`](/docs/api/websocket) | Client API and server socket API |
+| [`udp`](/docs/api/udp) | Datagram sockets — bind, sendto, recvfrom, connected send/recv |
 | [`fs`](/docs/api/fs) | Sync and Promise-based filesystem calls |
 | [`console`](/docs/api/console) | Every method, aliases, `time`/`timeLog`/`timeEnd` |
 | [`process`](/docs/api/process) | `argv`, `env`, `pid`, `memoryUsage`, `stats` |
@@ -99,6 +103,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | `http.serve` (HTTP, TLS, HTTP/2, WebSocket) | [API: http](/docs/api/http) · [HTTP Server](/docs/guides/http-server) |
 | `fetch`, `Request`, `Response`, `Headers` | [API: fetch](/docs/api/fetch) · [API: Request/Response](/docs/api/request-response) |
 | `WebSocket` client | [API: WebSocket](/docs/api/websocket) · [WebSocket](/docs/guides/websocket) |
+| UDP datagram sockets | [API: UDP](/docs/api/udp) |
 | `fs` sync + `*Async` | [API: fs](/docs/api/fs) |
 | `Database` (SQLite) | [API: SQLite](/docs/api/sqlite) |
 | `sql` / `SQL` / `Tx` (Postgres) | [API: Postgres](/docs/api/postgres) |
@@ -110,6 +115,7 @@ pages in order, then keep **Concepts** open while you build — it explains
 | `process` | [API: process](/docs/api/process) · [Process](/docs/guides/process) |
 | `child_process` | [API: child_process](/docs/api/child-process) |
 | `ffi` (needs `--allow-ffi`) | [API: FFI](/docs/api/ffi) |
+| Permission flags (`--allow-*`) | [Permissions](/docs/concepts/permissions) · [CLI](/docs/reference/cli) |
 | ESM resolution, `import.meta.url` | [Modules](/docs/guides/modules) |
 | Packages: `ff imprint` / `ff sever` | [Packages](/docs/guides/packages) |
 | Bytecode: `ff compile` | [Bytecode](/docs/guides/bytecode) |

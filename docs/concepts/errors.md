@@ -10,6 +10,11 @@ There are no custom error classes in Fairyfly. You get QuickJS's built-ins
 — `Error`, `TypeError`, `SyntaxError`, `RangeError` — plus a handful of
 APIs that reject with plain strings.
 
+Permission failures are ordinary `Error` objects with extra properties:
+`name` is `PermissionDenied` and `code` is `PERMISSION_DENIED`. There is no
+`PermissionDenied` constructor, so check `e.code` rather than using
+`instanceof`.
+
 ## Uncaught errors
 
 An exception that escapes your script prints the message and stack to
@@ -44,10 +49,14 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 | `new Worker()` without a path | **throws** `Worker requires a module path` |
 | `sql` template with no pool | **throws** `no database pool` |
 | Postgres `tx` after `commit()` | **throws** `transaction is closed` |
-| `fs.readFile` / `writeFile` / `mkdir` / `rm` / `readdir` | **does not throw** — returns `undefined` on failure |
-| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — but a *successful* call hangs the process afterwards (Known issue; see [fs](/docs/api/fs)) |
+| `fs.readFile` / `writeFile` / `mkdir` / `rm` / `readdir` | **does not throw on I/O errors** — returns `undefined`; **throws `PermissionDenied`** when the path is outside the matching `--allow-read` / `--allow-write` scope |
+| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — but a permission denial throws synchronously before the promise exists, and a *successful* call hangs the process afterwards (Known issue; see [fs](/docs/api/fs)) |
+| `process.chdir()` | **throws `PermissionDenied`** when the target is outside `--allow-read`; a missing or unreachable path is still a silent no-op |
+| `process.env` | **never throws** — names outside `--allow-env` are absent (`undefined`) |
+| `fetch` / `WebSocket` / `http.serve` / `Database.open` / `child_process` / `SQL` | **throw `PermissionDenied`** before I/O without the matching flag; a redirect-hop denial rejects `fetch` with a string instead |
+| `ffi.dlopen` / `ffi.callback` | **throw `TypeError`** without `--allow-ffi` |
 
-> **Sync `fs` swallows errors today.** A missing file, a bad directory, an
+> **Sync `fs` swallows I/O errors today.** A missing file, a bad directory, an
 > unreadable path — all return `undefined` with no exception. Always check
 > `fs.exists()` first, or use the Promise variants, which report the real
 > error:
@@ -63,6 +72,18 @@ try {
 // Sync: guard with exists()
 if (fs.exists("config.json")) {
   const text = fs.readFile("config.json");
+}
+```
+
+Permission denial is separate from I/O failure — it throws even for sync calls:
+
+```js
+try {
+  fs.readFile("/etc/passwd");
+} catch (e) {
+  console.log(e.name);    // "PermissionDenied"
+  console.log(e.code);    // "PERMISSION_DENIED"
+  console.log(e.message); // "fs.readFile requires --allow-read for '/etc/passwd'"
 }
 ```
 
@@ -101,6 +122,15 @@ A diagnostic line also goes to stderr:
 [fetch] request failed: ConnectionRefused url=http://127.0.0.1:1/
 ```
 
+Permission denial is different:
+
+- The **initial** `fetch` check throws an `Error` named `PermissionDenied` with
+  `code: "PERMISSION_DENIED"` before the request is submitted. In an `async`
+  function that surfaces as a rejected promise.
+- A denial on a **redirect hop** rejects the fetch promise with a plain string:
+  `PermissionDenied: fetch requires --allow-net`. That string has no
+  `.message` and no `.code`.
+
 ## Server-side failures
 
 | Failure | Response |
@@ -110,12 +140,17 @@ A diagnostic line also goes to stderr:
 | Response body over 10 MB | `500` |
 | Request body over the 4 KB read buffer | `413 Payload Too Large` |
 
+A permission denial is not a handler failure: `http.serve` checks its bind scope
+when the server starts, and `fs` / `fetch` denials inside a handler are thrown
+as normal JavaScript exceptions (uncaught → `500`).
+
 ## Exit codes
 
 | Call | Exit code |
 |---|---|
 | normal end of script | `0` |
 | uncaught error | `1` |
+| uncaught permission denial | `1` |
 | `process.exit(300)` | `255` (clamped) |
 | `process.exit(-5)` | `0` (clamped) |
 | event-loop failure | `1` |
@@ -153,19 +188,35 @@ Strings you'll see in practice — useful for assertions in tests:
 | `FileNotFound` | `fs.*Async` rejection |
 | `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` | `ffi` |
 | `failed to start server (is the port in use?)` | `http.serve` |
+| `fs.readFile requires --allow-read for '<path>'` | `fs` — `Error` named `PermissionDenied`, code `PERMISSION_DENIED` |
+| `process.chdir requires --allow-read for '<path>'` | `process.chdir` — `PermissionDenied` |
+| `fetch requires --allow-net for '<host>:<port>'` | `fetch` — `PermissionDenied` |
+| `http.serve requires --allow-net for '0.0.0.0:<port>'` | `http.serve` — `PermissionDenied` |
+| `Database.open requires --allow-read for '<path>'` | SQLite — `PermissionDenied` |
+| `child_process requires --allow-run for '<program>'` | `child_process` — `PermissionDenied` |
+| `ffi.dlopen requires --allow-ffi` | `ffi` — `TypeError`, no `code` |
+| `PermissionDenied: fetch requires --allow-net` | `fetch` redirect — plain string |
 
 ## Gotchas
 
-- `e.message` is `undefined` for `fetch` rejections — check `typeof e`.
+- `e.message` is `undefined` for ordinary `fetch` rejections and redirect
+  permission denials — check `typeof e`. Initial permission errors are real
+  `Error` objects.
 - A successful `fs.*Async` call hangs the process afterwards (it prints, then never exits) — Known issue, see [fs](/docs/api/fs).
-- Sync `fs` failures are silent; don't write `try/catch` around them
-  expecting an exception.
+- Sync `fs` **I/O** failures are silent; don't write `try/catch` around them
+  expecting an exception. Permission denials do throw.
+- `process.env` never throws; a disallowed variable is just `undefined`.
+- There is no `PermissionDenied` constructor — check `e.code` or `e.name`.
+- `ffi.dlopen` / `ffi.callback` use a `TypeError` (`requires --allow-ffi`) with
+  no `code`; this is the one permission gate outside the `PermissionDenied`
+  shape.
 - There is no `process.on("uncaughtException")` and no `unhandledRejection`
   hook — there's nothing to subscribe to.
 - Errors thrown inside a `Worker` surface on the parent via `onerror`.
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions)
 - [Event loop](/docs/concepts/event-loop)
 - [Limitations](/docs/reference/limitations)
 - [Compatibility](/docs/reference/compatibility)

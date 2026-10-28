@@ -19,8 +19,8 @@ console.log("home:", process.env.HOME);
 ```
 
 ```sh
-ff info.js hello
-# args: ["/usr/local/bin/ff", "info.js", "hello"]
+ff info.js hello --allow-env=HOME
+# args: ["/usr/local/bin/ff", "info.js", "hello", "--allow-env=HOME"]
 # pid: 12345 on darwin arm64
 # cwd: /Users/ada/demo
 # home: /Users/ada
@@ -30,14 +30,27 @@ ff info.js hello
 
 | Member | Type | Description |
 |--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime and script name (`["/path/to/ff", "main.js", …]`) |
-| `process.env` | `object` | Environment snapshot as plain key/value strings |
+| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and any `--allow-*` flags (`["/path/to/ff", "main.js", …]`) |
+| `process.env` | `object` | Filtered environment snapshot — only names granted by `--allow-env` appear |
 | `process.cwd()` | `() => string` | Current working directory |
-| `process.chdir(path)` | `(path) => void` | Change directory — silent no-op on failure (`undefined` returned, cwd unchanged) |
+| `process.chdir(path)` | `(path) => void` | Change directory — throws `PermissionDenied` when the target is outside `--allow-read`; a missing/unreachable path is a silent no-op |
 | `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+
+## Permissions
+
+Only two members are gated:
+
+| Member | Flag | Notes |
+|--------|------|-------|
+| `process.env` | `--allow-env=NAME,…` | Built once at startup; disallowed keys are absent |
+| `process.chdir(path)` | `--allow-read=<target>` | The target must be inside a read scope |
+
+Everything else — `argv`, `cwd`, `exit`, `pid`, `platform`, `arch`,
+`memoryUsage`, `stats` — is always available. `process.exit()` works even when
+every category is denied.
 
 ## Arguments: `argv`
 
@@ -56,6 +69,10 @@ ff greet.js
 # hello, world
 ```
 
+Permission flags are **not stripped** from `argv`: `ff app.js --allow-read=.`
+leaves `--allow-read=.` in `process.argv`. They are also interpreted as policy,
+so do not use a `--allow-*`-shaped value as an application argument.
+
 A tiny flag parser needs nothing else:
 
 ```js
@@ -67,14 +84,16 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-ff serve.js --port 4242
+ff serve.js --port 4242 --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 # ok
 ```
 
 ## Environment: `env`
 
-Plain object, string values only. Missing keys read as `undefined` — fail fast on required ones:
+A plain object with string values, built at startup from the OS environment and
+filtered by `--allow-env`. A name outside the grant is absent, so it reads as
+`undefined` — fail fast on required ones:
 
 ```js
 // config.js
@@ -86,22 +105,46 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-PORT=4242 API_TOKEN=secret ff config.js
+PORT=4242 API_TOKEN=secret ff config.js \
+  --allow-env=PORT,API_TOKEN \
+  --allow-net=0.0.0.0:3000
 ```
 
-> **Note:** `process.env` is a startup snapshot and there is no `.env` loader. Export variables (or prefix the command, as above) before starting `ff`. The `FF_` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`) are read the same way — see the env guide.
+> **Note:** `process.env` is a startup snapshot, not a live view, and there is
+> no `.env` loader. Export variables (or prefix the command, as above) before
+> starting `ff`. Only granted names are copied into the object; bare
+> `--allow-env` grants all of them. The `FF_*` variables (`FF_ECHO`, `FF_CERT`,
+> `FF_KEY`, `FF_CA_FILE`) are read by the runtime itself, but the application
+> sees them only if `--allow-env` includes them.
 
 ## Working directory: `cwd` / `chdir`
 
 ```js
 console.log(process.cwd()); // where ff was launched
-process.chdir("/tmp");      // move — a bad path is a silent no-op
-console.log(process.cwd()); // /tmp
+process.chdir("/tmp");      // needs --allow-read=/tmp
+console.log(process.cwd()); // /private/tmp on macOS, /tmp on Linux
 ```
 
-`chdir` **never throws**: on a missing/unreachable path it returns `undefined` and the cwd stays put. Verify with `process.cwd()` if the path is user-supplied.
+```sh
+ff move.js --allow-read=/tmp
+```
 
-Relative file paths in `fs` and module-adjacent lookups resolve against the cwd, so `chdir` before serving from a data dir is a legitimate pattern. Prefer absolute paths in long-lived servers to avoid surprises.
+`chdir` has two distinct failure modes:
+
+- **Permission denial** — the target is outside the `read` scopes. It throws an
+  `Error` named `PermissionDenied` with `code: "PERMISSION_DENIED"` before the
+  working directory changes.
+- **OS failure** — the path was allowed but is missing or unreachable. It
+  returns `undefined` and the cwd stays put. Verify with `process.cwd()` when
+  the path is user-supplied.
+
+Scope roots are fixed at launch. A later `chdir` does **not** move them, so
+`--allow-read=.` remains the launch directory. Relative `fs` paths resolve
+against the new cwd and must still land inside a scope captured at startup.
+
+Relative file paths in `fs` and module-adjacent lookups resolve against the cwd,
+so `chdir` before serving from a data dir is a legitimate pattern. Prefer
+absolute paths in long-lived servers to avoid surprises.
 
 ## Exiting: `exit`
 
@@ -138,9 +181,12 @@ if (cmd === "greet") {
 
 ```sh
 ff tool.js greet ada   # hello, ada
-ff tool.js serve       # serves on 3000 (or $PORT)
+ff tool.js serve --allow-env=PORT --allow-net=0.0.0.0:3000
 ff tool.js bogus       # usage… (exit 1)
 ```
+
+`greet` is pure JS and needs no flags. `serve` needs `net`, plus `env` if it
+should read `PORT`.
 
 ## What `process` does *not* have
 
@@ -158,9 +204,17 @@ Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
 
 ## Troubleshooting
 
-**`process.env.X` is undefined** — the variable wasn't exported in the launching shell. `X=1 ff app.js` (prefix) or `export X=1` first. No `.env` file is read.
+**`process.env.X` is undefined** — either the variable wasn't exported in the
+launching shell, or `--allow-env` does not include it. Check both:
+`X=1 ff app.js --allow-env=X`. No `.env` file is read.
 
-**`chdir` silently does nothing** — the path is missing or unreachable. It never throws; call `process.cwd()` afterwards when the dir is user-supplied.
+**`chdir` threw `PermissionDenied`** — the target is outside every `read`
+scope. Add `--allow-read=<target>` (or a parent directory). This is different
+from a missing directory, which is still a silent no-op.
+
+**`chdir` silently does nothing** — the path is allowed but missing or
+unreachable. It returns `undefined` and leaves the cwd unchanged; call
+`process.cwd()` afterwards when the dir is user-supplied.
 
 **Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
 

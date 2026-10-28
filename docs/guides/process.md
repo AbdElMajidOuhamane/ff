@@ -19,8 +19,8 @@ console.log("home:", process.env.HOME);
 ```
 
 ```sh
-ff info.js hello
-# args: ["ff", "info.js", "hello"]
+ff info.js hello --allow-env=HOME
+# args: ["ff", "info.js", "hello", "--allow-env=HOME"]
 # pid: 12345 on darwin arm64
 # cwd: /Users/ada/demo
 # home: /Users/ada
@@ -30,14 +30,18 @@ ff info.js hello
 
 | Member | Type | Description |
 |--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime and script name (`["ff", "main.js", …]`) |
-| `process.env` | `object` | Environment snapshot as plain key/value strings |
+| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and `--allow-*` flags (`["ff", "main.js", …]`) |
+| `process.env` | `object` | Filtered environment snapshot — only names granted by `--allow-env` appear |
 | `process.cwd()` | `() => string` | Current working directory |
-| `process.chdir(path)` | `(path) => void` | Change directory — silently does nothing when the path is missing or unreachable (never throws; verify with `cwd()`) |
+| `process.chdir(path)` | `(path) => void` | Change directory — throws `PermissionDenied` outside `--allow-read`; a missing/unreachable path is a silent no-op |
 | `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+
+> **Permissions:** `process.env` needs `--allow-env`; `process.chdir` needs
+> `--allow-read` on the target. Everything else in this table is ungated. See
+> [Permissions](/docs/concepts/permissions).
 
 ## Arguments: `argv`
 
@@ -56,6 +60,10 @@ ff greet.js
 # hello, world
 ```
 
+Permission flags are **not stripped** from `argv`: `ff app.js --allow-read=.`
+leaves `--allow-read=.` in `process.argv`. They are also interpreted as policy,
+so do not use a `--allow-*`-shaped value as an application argument.
+
 A tiny flag parser needs nothing else:
 
 ```js
@@ -67,14 +75,16 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-ff serve.js --port 4242
+ff serve.js --port 4242 --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 # ok
 ```
 
 ## Environment: `env`
 
-Plain object, string values only. Missing keys read as `undefined` — fail fast on required ones:
+A plain object with string values, built at startup from the OS environment and
+filtered by `--allow-env`. A name outside the grant is absent, so it reads as
+`undefined` — fail fast on required ones:
 
 ```js
 // config.js
@@ -86,22 +96,42 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-PORT=4242 API_TOKEN=secret ff config.js
+PORT=4242 API_TOKEN=secret ff config.js \
+  --allow-env=PORT,API_TOKEN \
+  --allow-net=0.0.0.0:3000
 ```
 
-> **Note:** `process.env` is a startup snapshot and there is no `.env` loader. Export variables (or prefix the command, as above) before starting `ff`. The `FF_` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`) are read the same way — see the env guide.
+> **Note:** `process.env` is a startup snapshot and there is no `.env` loader.
+> Export variables (or prefix the command, as above) before starting `ff`.
+> Only granted names are copied into the object; bare `--allow-env` grants all
+> of them. The `FF_*` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`)
+> are read by the runtime itself, but the application sees them only if
+> `--allow-env` includes them. See the [env guide](/docs/guides/env).
 
 ## Working directory: `cwd` / `chdir`
 
 ```js
 console.log(process.cwd()); // where ff was launched
-process.chdir("/tmp");      // move — verify with cwd(), failures are silent
-console.log(process.cwd()); // /tmp
+process.chdir("/tmp");      // needs --allow-read=/tmp
+console.log(process.cwd()); // /private/tmp on macOS, /tmp on Linux
 ```
 
-> **Caution:** `chdir` never throws — a missing or unreachable path is a silent no-op and the cwd stays put. Check `process.cwd()` afterwards when the directory is user-supplied.
+```sh
+ff move.js --allow-read=/tmp
+```
 
-Relative file paths in `fs` and module-adjacent lookups resolve against the cwd, so `chdir` before serving from a data dir is a legitimate pattern. Prefer absolute paths in long-lived servers to avoid surprises.
+> **Caution:** `chdir` throws `PermissionDenied` when the target is outside the
+> `read` scopes. Once allowed, a missing or unreachable path is a silent no-op
+> and the cwd stays put. Check `process.cwd()` afterwards when the directory is
+> user-supplied.
+
+Scope roots are fixed at launch. A later `chdir` does **not** move them, so
+`--allow-read=.` remains the launch directory. Relative `fs` paths resolve
+against the new cwd and must still land inside a scope captured at startup.
+
+Relative file paths in `fs` and module-adjacent lookups resolve against the cwd,
+so `chdir` before serving from a data dir is a legitimate pattern. Prefer
+absolute paths in long-lived servers to avoid surprises.
 
 ## Exiting: `exit`
 
@@ -117,9 +147,7 @@ if (badConfig) {
 - Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
 - An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
-Graceful shutdown instead of a hard cut: there is no signal-handling API — stop servers with `Ctrl-C` from the terminal, or call `process.exit(0)` for programmatic shutdown.
-
-> **Note:** There is no signal-handling API. Stop servers with `Ctrl-C` from the terminal, or `process.exit(0)` for programmatic shutdown.
+Graceful shutdown: there is no signal-handling API — stop servers with `Ctrl-C` from the terminal, or call `process.exit(0)` for programmatic shutdown.
 
 ## Practical example: CLI with subcommands
 
@@ -140,9 +168,12 @@ if (cmd === "greet") {
 
 ```sh
 ff tool.js greet ada   # hello, ada
-ff tool.js serve       # serves on 3000 (or $PORT)
+ff tool.js serve --allow-env=PORT --allow-net=0.0.0.0:3000
 ff tool.js bogus       # usage… (exit 1)
 ```
+
+`greet` is pure JS and needs no flags. `serve` needs `net`, plus `env` if it
+should read `PORT`.
 
 ## What `process` does *not* have
 
@@ -150,17 +181,28 @@ ff tool.js bogus       # usage… (exit 1)
 |-------------------|-------------|
 | `spawn` / `exec` / `execFile` | Separate global: [child_process](/docs/api/child-process) — `spawn`, `exec`, `execSync` |
 | `nextTick` | `queueMicrotask(fn)` |
-| `uptime()` / `memoryUsage()` / `cpuUsage()` | `performance.now()` for elapsed time; nothing for RSS |
+| `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
 | `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
 | `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
+
+(`process.memoryUsage()` does exist — its `rss` is a peak counter from
+`getrusage`, see the [API page](/docs/api/process).)
 
 Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver to install.
 
 ## Troubleshooting
 
-**`process.env.X` is undefined** — the variable wasn't exported in the launching shell. `X=1 ff app.js` (prefix) or `export X=1` first. No `.env` file is read.
+**`process.env.X` is undefined** — either the variable wasn't exported in the
+launching shell, or `--allow-env` does not include it. Check both:
+`X=1 ff app.js --allow-env=X`. No `.env` file is read.
 
-**`chdir` didn't move me** — it never throws; a bad path is a silent no-op. Log `process.cwd()` after the call to confirm.
+**`chdir` threw `PermissionDenied`** — the target is outside every `read`
+scope. Add `--allow-read=<target>` (or a parent directory). This is different
+from a missing directory, which is still a silent no-op.
+
+**`chdir` didn't move me** — the path is allowed but missing or unreachable. It
+returns `undefined` and leaves the cwd unchanged; log `process.cwd()` after the
+call to confirm.
 
 **Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
 
