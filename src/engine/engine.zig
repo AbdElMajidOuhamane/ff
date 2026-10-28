@@ -9,6 +9,7 @@ const microtasks = @import("../event/microtasks.zig");
 const console_api = @import("../api/console.zig");
 const fs_api = @import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
+const permissions_api = @import("../api/permissions.zig");
 const crypto_api = @import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
 const fetch_api = @import("../api/fetch.zig");
@@ -229,6 +230,7 @@ pub const Runtime = struct {
         console_api.setup(ctx);
         fs_api.setup(ctx);
         process_api.setup(ctx, args);
+        permissions_api.setup(ctx);
         crypto_api.setup(ctx);
         url_api.setup(ctx);
         fetch_api.setup(ctx);

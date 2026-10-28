@@ -6,6 +6,8 @@ const tls_server = @import("tls_server.zig");
 const tls = @import("tls.zig");
 const engine = @import("../engine/engine.zig");
 const api_ws = @import("../api/websocket.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 pub var server_running = std.atomic.Value(bool).init(false);
 
@@ -18,6 +20,15 @@ fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     var out: i32 = 0;
     if (c.toInt32(ctx, &out, val) == -1) return default;
     return @intCast(out);
+}
+
+/// Returns false with a pending JS exception when the bind is not allowed.
+fn allowListen(ctx: ?*c.Context, port: u16) bool {
+    if (perm.global().checkNet("0.0.0.0", port) == .allowed) return true;
+    var detail_buf: [32]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "0.0.0.0:{d}", .{port}) catch "0.0.0.0";
+    _ = deny.throw(ctx, "http.serve", .net, detail);
+    return false;
 }
 
 /// Copy a JS string into a page_allocator-owned Zig slice (caller frees).
@@ -69,6 +80,21 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     };
     defer std.heap.page_allocator.free(key_str);
 
+    // A path here was chosen by JS, so it is a file read like any other.
+    // Inline PEM content needs no filesystem access.
+    if (!std.mem.startsWith(u8, cert_str, "-----BEGIN ")) {
+        if (perm.global().checkPath(.read, cert_str) == .denied) {
+            _ = deny.throw(ctx, "http.serve tls.cert", .read, cert_str);
+            return false;
+        }
+    }
+    if (!std.mem.startsWith(u8, key_str, "-----BEGIN ")) {
+        if (perm.global().checkPath(.read, key_str) == .denied) {
+            _ = deny.throw(ctx, "http.serve tls.key", .read, key_str);
+            return false;
+        }
+    }
+
     const cert_pem = resolvePem(cert_str) orelse {
         throwTypeError(ctx, "could not read tls.cert");
         return false;
@@ -109,6 +135,8 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     if (c.isObject(opts_val) != 0) {
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
         port = extractIntFromVal(ctx, port_val, 3000);
+        c.freeValue(ctx, port_val);
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
 
         const ws_obj_val = c.getPropertyStr(ctx, opts_val, "websocket");
         if (c.isObject(ws_obj_val) != 0) {
@@ -128,6 +156,9 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
     } else if (c.isNumber(opts_val) != 0) {
         port = extractIntFromVal(ctx, opts_val, 3000);
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+    } else {
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
     }
 
     const handler_val = argv[1];

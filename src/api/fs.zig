@@ -2,29 +2,45 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const xev = @import("xev");
 const microtasks = @import("../event/microtasks.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
 
 const gpa = std.heap.smp_allocator;
 
-const MAX_PATH = 4096;
+const MAX_PATH = std.fs.max_path_bytes;
 const MAX_READ = 10 * 1024 * 1024;
 
 fn getIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
+fn argFail(ctx: ?*c.Context) c.Value {
+    return if (c.hasException(ctx)) c.JS_EXCEPTION else c.JS_UNDEFINED;
+}
+
 fn jsPathArg(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_int, buf: []u8) ?[]const u8 {
     if (argc <= index) return null;
     const val = argv[@intCast(index)];
     if (c.isString(val) == 0) return null;
+
     var str_len: usize = 0;
     const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return null;
     defer c.freeCString(ctx, str_ptr);
-    const len = @min(str_len, buf.len);
-    @memcpy(buf[0..len], str_ptr[0..len]);
-    return buf[0..len];
+
+    if (std.mem.indexOfScalar(u8, str_ptr[0..str_len], 0) != null) {
+        throwErr(ctx, "path contains a NUL byte");
+        return null;
+    }
+    if (str_len >= buf.len) {
+        throwErr(ctx, "path too long");
+        return null;
+    }
+
+    @memcpy(buf[0..str_len], str_ptr[0..str_len]);
+    return buf[0..str_len];
 }
 
 fn throwErr(ctx: ?*c.Context, msg: []const u8) void {
@@ -40,7 +56,10 @@ fn jsBoolArg(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: c_in
 fn readFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.readFile", .read, path);
 
     const io = getIo();
     const content = Dir.cwd().readFileAlloc(
@@ -74,7 +93,10 @@ fn readFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]
 fn writeFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.writeFile", .write, path);
 
     if (argc < 2) return c.JS_UNDEFINED;
     const data_val = argv[1];
@@ -96,7 +118,10 @@ fn writeFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c
 fn existsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_FALSE;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.exists", .read, path);
 
     const io = getIo();
     const found = if (Dir.cwd().access(io, path, .{})) true else |_| false;
@@ -106,7 +131,10 @@ fn existsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
 fn mkdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.mkdir", .write, path);
 
     const recursive = jsBoolArg(ctx, argc, argv, 1);
     const io = getIo();
@@ -126,7 +154,10 @@ fn mkdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 fn rmCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.rm", .write, path);
 
     const recursive = jsBoolArg(ctx, argc, argv, 1);
     const io = getIo();
@@ -149,7 +180,10 @@ fn readdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     _ = this_val;
 
     var path_buf: [MAX_PATH]u8 = undefined;
-    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return c.JS_UNDEFINED;
+    const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse return argFail(ctx);
+
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.readdir", .read, path);
 
     const io = getIo();
     var dir = Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
@@ -585,9 +619,14 @@ fn readFileAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv:
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.readFileAsync requires a path");
         return c.JS_EXCEPTION;
     };
+
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.readFileAsync", .read, path);
+
     var mode: u8 = 0;
     if (argc >= 2 and c.isString(argv[1]) != 0) {
         var mode_len: usize = 0;
@@ -603,9 +642,14 @@ fn writeFileAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.writeFileAsync requires a path");
         return c.JS_EXCEPTION;
     };
+
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.writeFileAsync", .write, path);
+
     if (argc < 2) {
         _ = c.throwTypeError(ctx, "fs.writeFileAsync requires data");
         return c.JS_EXCEPTION;
@@ -620,9 +664,12 @@ fn existsAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.existsAsync requires a path");
         return c.JS_EXCEPTION;
     };
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.existsAsync", .read, path);
     return submitJob(ctx, .exists, path, 0, false, &.{});
 }
 
@@ -630,9 +677,12 @@ fn mkdirAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.mkdirAsync requires a path");
         return c.JS_EXCEPTION;
     };
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.mkdirAsync", .write, path);
     return submitJob(ctx, .mkdir, path, 0, jsBoolArg(ctx, argc, argv, 1), &.{});
 }
 
@@ -640,9 +690,12 @@ fn rmAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.rmAsync requires a path");
         return c.JS_EXCEPTION;
     };
+    if (perm.global().checkPath(.write, path) == .denied)
+        return deny.throw(ctx, "fs.rmAsync", .write, path);
     return submitJob(ctx, .rm, path, 0, jsBoolArg(ctx, argc, argv, 1), &.{});
 }
 
@@ -650,9 +703,12 @@ fn readdirAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: 
     _ = this_val;
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = jsPathArg(ctx, argc, argv, 0, &path_buf) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         _ = c.throwTypeError(ctx, "fs.readdirAsync requires a path");
         return c.JS_EXCEPTION;
     };
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "fs.readdirAsync", .read, path);
     return submitJob(ctx, .readdir, path, 0, false, &.{});
 }
 

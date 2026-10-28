@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const builtin = @import("builtin");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 // C3: stat counters live in the net modules (verified: nothing in their
 // import closures references api/process, so no cycle).
 const async_fetch = @import("../net/async_fetch.zig");
@@ -32,10 +34,17 @@ fn extractString(ctx: ?*c.Context, argc: c_int, argv: [*c]const c.Value, index: 
     var str_len: usize = 0;
     const str_ptr = c.toCStringLen(ctx, &str_len, val) orelse return null;
     defer c.freeCString(ctx, str_ptr);
-    var buf: [4096]u8 = undefined;
-    const len = @min(str_len, buf.len);
-    @memcpy(buf[0..len], str_ptr[0..len]);
-    return gpa.dupeZ(u8, buf[0..len]) catch null;
+
+    if (std.mem.indexOfScalar(u8, str_ptr[0..str_len], 0) != null) {
+        throwErr(ctx, "path contains a NUL byte");
+        return null;
+    }
+    if (str_len >= std.fs.max_path_bytes) {
+        throwErr(ctx, "path too long");
+        return null;
+    }
+
+    return gpa.dupeZ(u8, str_ptr[0..str_len]) catch null;
 }
 
 fn exitCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -66,16 +75,21 @@ fn cwdCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
 fn chdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     const path = extractString(ctx, argc, argv, 0) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
         throwErr(ctx, "chdir requires a path argument");
         return c.JS_UNDEFINED;
     };
     defer gpa.free(path);
+
+    if (perm.global().checkPath(.read, path) == .denied)
+        return deny.throw(ctx, "process.chdir", .read, path);
 
     const io = getIo();
     std.process.setCurrentPath(io, path) catch {
         throwErr(ctx, "chdir failed");
         return c.JS_UNDEFINED;
     };
+    perm.refreshCwd();
     return c.JS_UNDEFINED;
 }
 
@@ -187,6 +201,7 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
     while (c_environ[i]) |entry| : (i += 1) {
         const entry_str = std.mem.span(entry);
         if (std.mem.indexOfScalar(u8, entry_str, '=')) |eq_pos| {
+            if (!perm.global().checkEnv(entry_str[0..eq_pos])) continue;
             const key_atom = c.newAtomLen(ctx, entry_str.ptr, eq_pos);
             if (key_atom == 0) continue;
             const val = entry_str[eq_pos + 1 ..];

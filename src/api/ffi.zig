@@ -35,6 +35,7 @@ const c = @import("../c.zig").c;
 const xev = @import("xev");
 const microtasks = @import("../event/microtasks.zig");
 const ffcfg = @import("ffcfg");
+const permissions = @import("../security/permissions.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -341,12 +342,6 @@ const ArgSpec = struct {
 
 const MAX_ARGS: usize = 32;
 const MAX_STRUCT: usize = 512; // fixed return arena; larger → error at dlopen
-
-var allow: bool = false;
-
-pub fn setAllow(v: bool) void {
-    allow = v;
-}
 
 var lib_class_id: c.ClassID = 0;
 var ptr_class_id: c.ClassID = 0;
@@ -1710,7 +1705,7 @@ fn parseSymbol(ctx: ?*c.Context, lib: *Lib, name: []const u8, desc: c.Value, han
 
 fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
-    if (!allow) {
+    if (!permissions.global().ffiAllowed()) {
         _ = c.throwTypeError(ctx, "ffi.dlopen requires --allow-ffi");
         return c.JS_EXCEPTION;
     }
@@ -2106,7 +2101,7 @@ fn callbackFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 
 fn callbackFactory(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
-    if (!allow) {
+    if (!permissions.global().ffiAllowed()) {
         _ = c.throwTypeError(ctx, "ffi.callback requires --allow-ffi");
         return c.JS_EXCEPTION;
     }
@@ -2405,6 +2400,6 @@ pub fn setup(ctx: *c.Context) void {
     const cb_f = c.newCFunction(ctx, callbackFactory, "callback", 2);
     _ = c.definePropertyValueStr(ctx, ffi_obj, "callback", cb_f, c.PROP_C_W_E);
 
-    _ = c.definePropertyValueStr(ctx, ffi_obj, "allowed", jsBool(ctx, allow), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, ffi_obj, "allowed", jsBool(ctx, permissions.global().ffiAllowed()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, global, "ffi", ffi_obj, c.PROP_C_W_E);
 }

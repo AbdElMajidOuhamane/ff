@@ -135,9 +135,11 @@ pub fn usageFail(comptime usage: []const u8, comptime fmt: []const u8, args: any
 
 pub fn printUsage() void {
     heading("Usage:");
-    std.debug.print("  ff <file.js> [--ca <path>] [--allow-ffi]\n", .{});
-    std.debug.print("  ff -e <code> [--ca <path>] [--allow-ffi]\n", .{});
-    std.debug.print("  ff --watch <file|start> [--ca <path>]\n", .{});
+    std.debug.print("  ff <file.js> [--allow-read[=paths]] [--allow-write[=paths]]\n", .{});
+    std.debug.print("              [--allow-net[=hosts]] [--allow-env[=names]]\n", .{});
+    std.debug.print("              [--allow-run[=programs]] [--allow-ffi] [--allow-all]\n", .{});
+    std.debug.print("  ff -e <code> [same permission flags]\n", .{});
+    std.debug.print("  ff --watch <file|start> [--ca <path>] [permission flags]\n", .{});
     std.debug.print("  ff <command> [options]\n", .{});
     std.debug.print("\n", .{});
     heading("Commands:");
@@ -155,7 +157,13 @@ pub fn printUsage() void {
     heading("Options:");
     helpItem("--ca <path>", "Trust an extra CA bundle (ff <file> / ff -e)");
     helpItem("--cert, --key", "PEM cert/key for TLS (ff start)");
+    helpItem("--allow-read[=p]", "Read files under p (repeatable, comma-split)");
+    helpItem("--allow-write[=p]", "Write files under p");
+    helpItem("--allow-net[=h:p]", "Connect/listen to host:port (*.example.com ok)");
+    helpItem("--allow-env[=N]", "Read environment variable N");
+    helpItem("--allow-run[=P]", "Execute program P (exec* needs /bin/sh)");
     helpItem("--allow-ffi", "Allow ffi.dlopen (native libraries)");
+    helpItem("--allow-all", "Grant every permission, including FFI");
     helpItem("--version", "Print runtime version");
     helpItem("-h, --help", "Show this help");
 }

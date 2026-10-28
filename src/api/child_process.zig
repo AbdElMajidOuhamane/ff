@@ -13,6 +13,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
 const Io = std.Io;
@@ -636,6 +638,15 @@ fn parseOptionsInto(ctx: ?*c.Context, a: std.mem.Allocator, plan: *Plan, opts: c
 // ── launch ──────────────────────────────────────────────────────────
 
 fn launch(ctx: ?*c.Context, plan: *const Plan, xc: ?ExecCtx) c.Value {
+    if (perm.global().checkRun(plan.argv[0]) == .denied) {
+        if (xc) |x| {
+            c.freeValue(ctx, x.reject);
+            c.freeValue(ctx, x.resolve);
+            c.freeValue(ctx, x.promise);
+        }
+        return deny.throw(ctx, "child_process", .run, plan.argv[0]);
+    }
+
     const i = acquireSlot() orelse {
         if (xc) |x| {
             rejectWith(ctx, x.reject, "too many child processes (max 8)");
@@ -798,6 +809,9 @@ fn jsExecSync(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Valu
     var plan = Plan{ .argv = list[0..] };
     const opts_val = if (argc >= 2) argv[1] else c.JS_UNDEFINED;
     if (!parseOptionsInto(ctx, a, &plan, opts_val)) return c.JS_EXCEPTION;
+
+    if (perm.global().checkRun(plan.argv[0]) == .denied)
+        return deny.throw(ctx, "child_process.execSync", .run, plan.argv[0]);
 
     const limit: Io.Limit = if (plan.max_buffer == std.math.maxInt(usize)) .unlimited else .limited(plan.max_buffer);
     const res = std.process.run(gpa, getIo(), .{

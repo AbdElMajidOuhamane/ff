@@ -17,6 +17,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const pg = @import("../net/pg_client.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -24,6 +26,7 @@ var sql_class_id: c.ClassID = 0;
 var tx_class_id: c.ClassID = 0;
 var default_pool: ?*pg.Pool = null;
 var default_pool_fail: ?[]u8 = null;
+var default_pool_denied = false;
 
 pub fn setup(ctx: ?*c.Context) void {
     if (ctx) |c0| pg.setCtx(c0);
@@ -89,6 +92,7 @@ pub fn deinit() void {
         gpa.free(s);
         default_pool_fail = null;
     }
+    default_pool_denied = false;
 }
 
 fn sqlFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
@@ -136,12 +140,18 @@ fn getDefaultPool() !*pg.Pool {
     if (default_pool) |p| return p;
     if (default_pool_fail) |msg| {
         std.debug.print("sql: {s}\n", .{msg});
-        return error.PoolFailed;
+        return if (default_pool_denied) error.PermissionDenied else error.PoolFailed;
     }
     const cfg = loadConfig() catch |err| {
         default_pool_fail = gpa.dupe(u8, @errorName(err)) catch null;
         return err;
     };
+    if (perm.global().checkNet(cfg.host, cfg.port) == .denied) {
+        freeLooseConfig(cfg);
+        default_pool_denied = true;
+        default_pool_fail = gpa.dupe(u8, "PermissionDenied: sql requires --allow-net") catch null;
+        return error.PermissionDenied;
+    }
     default_pool = pg.Pool.create(cfg) catch |err| {
         freeLooseConfig(cfg);
         default_pool_fail = gpa.dupe(u8, @errorName(err)) catch null;
@@ -149,6 +159,12 @@ fn getDefaultPool() !*pg.Pool {
     };
     freeLooseConfig(cfg);
     return default_pool.?;
+}
+
+fn envIfAllowed(name: [:0]const u8) ?[]const u8 {
+    if (!perm.global().checkEnv(name)) return null;
+    const v = std.c.getenv(name.ptr) orelse return null;
+    return std.mem.span(v);
 }
 
 fn loadConfig() !pg.Config {
@@ -161,32 +177,32 @@ fn loadConfig() !pg.Config {
     errdefer gpa.free(cfg.password);
     cfg.database = try gpa.dupe(u8, cfg.database);
     errdefer gpa.free(cfg.database);
-    if (std.c.getenv("PG_TEST_DSN")) |url| {
-        try parseDsn(std.mem.span(url), &cfg);
+    if (envIfAllowed("PG_TEST_DSN")) |url| {
+        try parseDsn(url, &cfg);
         return cfg;
     }
-    if (std.c.getenv("DATABASE_URL")) |url| {
-        try parseDsn(std.mem.span(url), &cfg);
+    if (envIfAllowed("DATABASE_URL")) |url| {
+        try parseDsn(url, &cfg);
         return cfg;
     }
-    if (std.c.getenv("PGHOST")) |v| {
+    if (envIfAllowed("PGHOST")) |v| {
         gpa.free(cfg.host);
-        cfg.host = try gpa.dupe(u8, std.mem.span(v));
+        cfg.host = try gpa.dupe(u8, v);
     }
-    if (std.c.getenv("PGPORT")) |v| {
-        cfg.port = std.fmt.parseInt(u16, std.mem.span(v), 10) catch 5432;
+    if (envIfAllowed("PGPORT")) |v| {
+        cfg.port = std.fmt.parseInt(u16, v, 10) catch 5432;
     }
-    if (std.c.getenv("PGUSER")) |v| {
+    if (envIfAllowed("PGUSER")) |v| {
         gpa.free(cfg.user);
-        cfg.user = try gpa.dupe(u8, std.mem.span(v));
+        cfg.user = try gpa.dupe(u8, v);
     }
-    if (std.c.getenv("PGPASSWORD")) |v| {
+    if (envIfAllowed("PGPASSWORD")) |v| {
         gpa.free(cfg.password);
-        cfg.password = try gpa.dupe(u8, std.mem.span(v));
+        cfg.password = try gpa.dupe(u8, v);
     }
-    if (std.c.getenv("PGDATABASE")) |v| {
+    if (envIfAllowed("PGDATABASE")) |v| {
         gpa.free(cfg.database);
-        cfg.database = try gpa.dupe(u8, std.mem.span(v));
+        cfg.database = try gpa.dupe(u8, v);
     }
     return cfg;
 }
@@ -236,6 +252,10 @@ fn parseDsn(url: []const u8, cfg: *pg.Config) !void {
 fn sqlTagGlobal(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     const pool = getDefaultPool() catch |err| {
+        if (err == error.PermissionDenied) {
+            _ = deny.throw(ctx, "sql", .net, "configured host");
+            return c.JS_EXCEPTION;
+        }
         _ = c.throwTypeError(ctx, @errorName(err));
         return c.JS_EXCEPTION;
     };
@@ -701,7 +721,11 @@ fn encodeArrayParam(ctx: ?*c.Context, alloc: std.mem.Allocator, arr: c.Value) !E
 }
 
 fn jsUnsafe(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch {
+    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch |err| {
+        if (err == error.PermissionDenied) {
+            _ = deny.throw(ctx, "sql.unsafe", .net, "configured host");
+            return c.JS_EXCEPTION;
+        }
         _ = c.throwTypeError(ctx, "no database pool");
         return c.JS_EXCEPTION;
     };
@@ -815,7 +839,11 @@ fn runUnsafe(ctx: ?*c.Context, pool: *pg.Pool, tx: ?*pg.Tx, tx_obj: c.Value, arg
 fn jsBegin(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
-    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch {
+    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch |err| {
+        if (err == error.PermissionDenied) {
+            _ = deny.throw(ctx, "sql.begin", .net, "configured host");
+            return c.JS_EXCEPTION;
+        }
         _ = c.throwTypeError(ctx, "no database pool");
         return c.JS_EXCEPTION;
     };
@@ -908,7 +936,11 @@ fn jsClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) 
 fn jsConnect(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
-    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch {
+    const pool = poolFromThis(ctx, this_val) orelse getDefaultPool() catch |err| {
+        if (err == error.PermissionDenied) {
+            _ = deny.throw(ctx, "sql.connect", .net, "configured host");
+            return c.JS_EXCEPTION;
+        }
         _ = c.throwTypeError(ctx, "no database pool");
         return c.JS_EXCEPTION;
     };
@@ -1031,6 +1063,14 @@ fn sqlCtor(ctx: ?*c.Context, new_target: c.Value, argc: c_int, argv: [*c]c.Value
         }
         c.freeValue(ctx, max);
     }
+
+    if (perm.global().checkNet(cfg.host, cfg.port) == .denied) {
+        var detail_buf: [300]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ cfg.host, cfg.port }) catch cfg.host;
+        freeLooseConfig(cfg);
+        return deny.throw(ctx, "SQL", .net, detail);
+    }
+
     const pool = pg.Pool.create(cfg) catch {
         freeLooseConfig(cfg);
         _ = c.throwTypeError(ctx, "failed to create pool");

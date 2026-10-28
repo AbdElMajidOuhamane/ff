@@ -2,6 +2,8 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const ws_client = @import("../net/ws_client.zig");
 const ws = @import("../net/ws_native.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -136,6 +138,12 @@ fn wsConstructor(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         throwTypeError(ctx, "invalid WebSocket URL (expected ws:// or wss://)");
         return c.JS_EXCEPTION;
     };
+
+    if (perm.global().checkNet(parsed.host, parsed.port) == .denied) {
+        var detail_buf: [300]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ parsed.host, parsed.port }) catch parsed.host;
+        return deny.throw(ctx, "WebSocket", .net, detail);
+    }
 
     const obj = c.newObjectClass(ctx, @intCast(ws_client_class_id));
     _ = c.definePropertyValueStr(ctx, obj, "readyState", c.newInt32(ctx, 0), c.PROP_C_W_E);

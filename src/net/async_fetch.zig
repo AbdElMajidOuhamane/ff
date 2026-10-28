@@ -7,6 +7,7 @@ const response_mod = @import("../types/response.zig");
 const headers_mod = @import("../types/headers.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig");
+const perm = @import("../security/permissions.zig");
 
 var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -436,6 +437,10 @@ fn runJob(slot_id: u16) void {
             .plain => 80,
             .tls => 443,
         };
+        if (perm.global().checkNet(hop_host.bytes, hop_port) == .denied) {
+            failSlot(s, "PermissionDenied: fetch requires --allow-net");
+            return;
+        }
         const req_client = tls.clientForHost(hop_host.bytes, hop_port, protocol);
         // https through a proxy: std.http.Client cannot TLS-upgrade its
         // CONNECT tunnel (ziglang/zig#19878), so tls_tunnel builds the TLS

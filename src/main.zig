@@ -5,7 +5,7 @@ const engine = @import("engine/engine.zig");
 const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
-const ffi_api = @import("api/ffi.zig");
+const permissions = @import("security/permissions.zig");
 const child_process_api = @import("api/child_process.zig");
 const loop_mod = @import("event/loop.zig");
 const microtasks = @import("event/microtasks.zig");
@@ -69,14 +69,15 @@ fn parseCaFlag(init: std.process.Init) void {
         }
     }
 }
-fn parseAllowFfiFlag(init: std.process.Init) void {
-    var it = init.minimal.args.iterate();
-    while (it.next()) |a| {
-        if (std.mem.eql(u8, a, "--allow-ffi")) {
-            ffi_api.setAllow(true);
-            return;
-        }
-    }
+fn parsePermissions(init: std.process.Init) void {
+    permissions.initFromArgs(init.minimal.args) catch |err| {
+        cli.failWithHint(
+            "invalid permission flag: {s}",
+            .{@errorName(err)},
+            "usage: --allow-<read|write|net|env|run|ffi>[=scope,...]",
+            .{},
+        );
+    };
 }
 
 // POSIX forces SIGINT/SIGQUIT to ignore for background jobs, so `kill -INT`
@@ -131,7 +132,7 @@ fn run(init: std.process.Init) !void {
         resetIgnoredInterrupt();
         maybeStartParentWatchdog();
     }
-    parseAllowFfiFlag(init);
+    parsePermissions(init);
     var args_iter = init.minimal.args.iterate();
     const exe = args_iter.next() orelse {
         cli.printUsage();
@@ -181,16 +182,16 @@ fn run(init: std.process.Init) !void {
             var forward = std.ArrayList([]const u8).empty;
             defer forward.deinit(std.heap.page_allocator);
             while (args_iter.next()) |a| {
-                if (target == null) {
-                    if (std.mem.eql(u8, a, "--ca")) {
-                        const v = args_iter.next() orelse {
-                            cli.failWithHint("--ca requires a path", .{}, "usage: ff --watch <file|start> --ca <path>", .{});
-                        };
-                        try forward.append(std.heap.page_allocator, a);
-                        try forward.append(std.heap.page_allocator, v);
-                    } else {
-                        target = a;
-                    }
+                if (std.mem.eql(u8, a, "--ca")) {
+                    const v = args_iter.next() orelse {
+                        cli.failWithHint("--ca requires a path", .{}, "usage: ff --watch <file|start> --ca <path>", .{});
+                    };
+                    try forward.append(std.heap.page_allocator, a);
+                    try forward.append(std.heap.page_allocator, v);
+                } else if (permissions.isPermissionFlag(a)) {
+                    try forward.append(std.heap.page_allocator, a);
+                } else if (target == null) {
+                    target = a;
                 } else {
                     try forward.append(std.heap.page_allocator, a);
                 }

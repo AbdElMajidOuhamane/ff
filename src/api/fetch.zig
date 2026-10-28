@@ -4,6 +4,8 @@ const request_mod = @import("../types/request.zig");
 const headers_mod = @import("../types/headers.zig");
 const async_fetch = @import("../net/async_fetch.zig");
 const tls = @import("../net/tls.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 const gpa = std.heap.smp_allocator;
 const http = std.http;
 
@@ -127,6 +129,13 @@ fn ensureFetchInit(ctx: ?*c.Context) void {
     fetch_inited = true;
 }
 
+fn rejectInvalidUrl(ctx: ?*c.Context, cap: [2]c.Value, promise: c.Value) c.Value {
+    var msg = zigStringToJS(ctx, "Invalid URL");
+    _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
+    c.freeValue(ctx, msg);
+    return promise;
+}
+
 fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "fetch requires a URL string or Request as first argument");
@@ -245,10 +254,7 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         // (this function has no error returns) → the reserved name/value
         // pools leaked on every early return. Explicit cleanup instead.
         in_flight_headers.deinit();
-        var msg = zigStringToJS(ctx, "Invalid URL");
-        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
-        c.freeValue(ctx, msg);
-        return promise;
+        return rejectInvalidUrl(ctx, cap, promise);
     };
     var method_str = method_override orelse "GET";
     if (body_borrowed != null and std.mem.eql(u8, method_str, "GET")) { // ◀ FIX-4 (was: body_payload)
@@ -257,11 +263,35 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     const method = parseMethod(method_str);
     const uri = std.Uri.parse(url_slice) catch {
         in_flight_headers.deinit();
-        var msg = zigStringToJS(ctx, "Invalid URL");
-        _ = c.call(ctx, cap[1], c.JS_UNDEFINED, 1, &msg);
-        c.freeValue(ctx, msg);
-        return promise;
+        return rejectInvalidUrl(ctx, cap, promise);
     };
+
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+    {
+        in_flight_headers.deinit();
+        return rejectInvalidUrl(ctx, cap, promise);
+    }
+
+    const host_comp = uri.host orelse {
+        in_flight_headers.deinit();
+        return rejectInvalidUrl(ctx, cap, promise);
+    };
+    var host_buf: [256]u8 = undefined;
+    const host = host_comp.toRaw(&host_buf) catch {
+        in_flight_headers.deinit();
+        return rejectInvalidUrl(ctx, cap, promise);
+    };
+    const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+    const port: u16 = uri.port orelse default_port;
+
+    if (perm.global().checkNet(host, port) == .denied) {
+        in_flight_headers.deinit();
+        c.freeValue(ctx, promise);
+        var detail_buf: [320]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ host, port }) catch host;
+        return deny.throw(ctx, "fetch", .net, detail);
+    }
 
     // Transfer ownership of in_flight_headers to async_fetch. Wrap in a
     // pooled HeadersData shell so async_fetch can hold a stable pointer.

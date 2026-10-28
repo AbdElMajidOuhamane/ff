@@ -53,3 +53,7 @@ test {
 test {
     _ = @import("util/cli.zig");
 }
+
+test {
+    _ = @import("security/permissions.zig");
+}
