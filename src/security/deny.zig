@@ -13,15 +13,7 @@ pub fn flag(kind: perm.Kind) []const u8 {
     };
 }
 
-/// Build a PermissionDenied Error. Caller owns the value.
-pub fn make(ctx: ?*c.Context, api: []const u8, kind: perm.Kind, detail: []const u8) c.Value {
-    var msg_buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(
-        &msg_buf,
-        "{s} requires {s} for '{s}'",
-        .{ api, flag(kind), detail },
-    ) catch "permission denied";
-
+fn makeError(ctx: ?*c.Context, msg: []const u8) c.Value {
     const err = c.newError(ctx);
     if (c.isException(err) != 0) return err;
 
@@ -34,9 +26,38 @@ pub fn make(ctx: ?*c.Context, api: []const u8, kind: perm.Kind, detail: []const 
     return err;
 }
 
+/// Build a PermissionDenied Error. Caller owns the value.
+pub fn make(ctx: ?*c.Context, api: []const u8, kind: perm.Kind, detail: []const u8) c.Value {
+    var msg_buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "{s} requires {s} for '{s}'",
+        .{ api, flag(kind), detail },
+    ) catch "permission denied";
+    return makeError(ctx, msg);
+}
+
+/// Build a PermissionDenied Error for a bare flag (FFI has no scope).
+pub fn makeBare(ctx: ?*c.Context, api: []const u8, kind: perm.Kind) c.Value {
+    var msg_buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "{s} requires {s}",
+        .{ api, flag(kind) },
+    ) catch "permission denied";
+    return makeError(ctx, msg);
+}
+
 /// Throw synchronously. Use at every API boundary.
 pub fn throw(ctx: ?*c.Context, api: []const u8, kind: perm.Kind, detail: []const u8) c.Value {
     const err = make(ctx, api, kind, detail);
+    if (c.isException(err) != 0) return err;
+    return c.throw(ctx, err);
+}
+
+/// Throw a bare-flag denial (no scope detail).
+pub fn throwBare(ctx: ?*c.Context, api: []const u8, kind: perm.Kind) c.Value {
+    const err = makeBare(ctx, api, kind);
     if (c.isException(err) != 0) return err;
     return c.throw(ctx, err);
 }

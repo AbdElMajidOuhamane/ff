@@ -167,6 +167,56 @@ try {
   r = await run(`console.log(ffi.allowed)`, ["--allow-ffi"]);
   check("ffi.allowed true with --allow-ffi", r.code === 0 && r.out.includes("true"));
 
+  r = await run(
+    `try { ffi.dlopen("x", {}); } catch (e) { console.log(e.name + " " + e.code); }`,
+  );
+  check(
+    "ffi denial uses PermissionDenied",
+    r.code === 0 && r.out.includes("PermissionDenied PERMISSION_DENIED"),
+  );
+
+  r = await run(`ffi.dlopen("x", {})`);
+  check("ffi.dlopen denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.callback({ parameters: [], result: "void" }, () => {})`);
+  check("ffi.callback denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.read(0n, "u8")`);
+  check("ffi.read denies before dereference", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.write(0n, "u8", 1)`);
+  check("ffi.write denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.copyBytes(0n, 1)`);
+  check("ffi.copyBytes denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.writeBytes(0n, new Uint8Array(1))`);
+  check("ffi.writeBytes denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.cstring(new TextEncoder().encode("hi\\0"))`);
+  check("ffi.cstring denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.ptr(0n)`);
+  check("ffi.ptr denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.view(0n)`);
+  check("ffi.view denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.struct([["a", "i32"]])`);
+  check("ffi.struct denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.union([["a", "i32"]])`);
+  check("ffi.union denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(`ffi.isNull(null)`);
+  check("ffi.isNull denied by default", denied(r, "requires --allow-ffi"));
+
+  r = await run(
+    `const b = new Uint8Array(1); console.log(ffi.ptr(b).addr > 0n)`,
+    ["--allow-ffi"],
+  );
+  check("ffi raw helpers allowed with --allow-ffi", r.code === 0 && r.out.includes("true"));
+
   // ── sqlite ───────────────────────────────────────────────────────
   r = await run(`Database.open(${JSON.stringify(dbPath)})`);
   check("Database.open denied by default", denied(r, "requires --allow-read"));
