@@ -36,8 +36,8 @@ ff addon.js --allow-ffi
 - Scopes are comma-split and repeatable: `--allow-read=src,views`.
 - A bare flag grants the whole category: `--allow-net` means any host and port.
 - Missing access throws `PermissionDenied` (`code: "PERMISSION_DENIED"`) before
-  I/O starts. FFI is the exception: `ffi.dlopen` / `ffi.callback` throw
-  `TypeError` without a `code`.
+  I/O starts. FFI uses the same shape without a scope suffix:
+  `ffi.dlopen requires --allow-ffi`.
 - `--allow-run` and `--allow-ffi` are trust-equivalent to full access.
   Permissions catch mistakes; they are not an OS sandbox.
 

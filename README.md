@@ -103,7 +103,7 @@ toggle.
 | `--allow-net` | `fetch`, WebSocket, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
-| `--allow-ffi` | `ffi.dlopen` / `ffi.callback` | bare flag only |
+| `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | bare flag only |
 | `--allow-all` | every category above, including FFI | bare flag only |
 
 ```sh
@@ -119,8 +119,8 @@ ff test --allow-all
 - Path scopes resolve against the **launch** cwd and stay fixed. A later
   `process.chdir()` does not move them.
 - Missing access throws `PermissionDenied` (`code: "PERMISSION_DENIED"`)
-  before I/O starts. FFI is the exception: `ffi.dlopen` / `ffi.callback`
-  throw `TypeError` without a `code`.
+  before I/O starts. FFI uses the same shape without a scope suffix:
+  `ffi.dlopen requires --allow-ffi`. `ffi.allowed` is the only ungated member.
 - `ff start --cert/--key` and `FF_CERT` / `FF_KEY` are CLI/runtime reads and
   need no `--allow-read`; a `tls` object inside JS does.
 - `exec` / `execSync` run `/bin/sh -c`, so `/bin/sh` must be in `--allow-run`.
@@ -255,7 +255,7 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `WebSocket` | Client with `send` / `sendBinary` / `close`; needs `--allow-net`; sync mistakes throw `TypeError: WebSocket: …` |
 | `udp` | Datagram sockets with `bind` / `sendto` / `recvfrom`; needs `--allow-net` on the address |
 | `permissions` | Booleans for the six enabled categories; scopes are not exposed |
-| `ffi` | Native libraries; `dlopen` / `callback` need `--allow-ffi`; raw pointer helpers are not gated |
+| `ffi` | Native libraries and memory helpers; every entry point except `ffi.allowed` needs `--allow-ffi` |
 
 ---
 

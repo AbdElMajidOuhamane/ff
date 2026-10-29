@@ -22,7 +22,7 @@ designing are:
 | Network scopes | Literal host match with no DNS; `localhost` ≠ `127.0.0.1`; bind is always `0.0.0.0` |
 | Environment scopes | Exact, case-sensitive names; disallowed keys are absent from `process.env` |
 | Run scopes | Basename or absolute path; `exec` / `execSync` also need `/bin/sh` |
-| FFI | Bare `--allow-ffi` only; trust-equivalent to full access |
+| FFI | Bare `--allow-ffi` only; gates every `ffi` entry point except `ffi.allowed`; trust-equivalent to full access |
 | Module loading | `import` and `new Worker(path)` do not need `read`; loaded code runs with the process policy |
 | Isolation | In-process policy, not an OS sandbox; a symlink swapped between check and syscall can escape a path scope |
 | Granularity | Process-global; no per-request or per-user scopes |

@@ -125,8 +125,8 @@ ff test --allow-all
 - `ff test` applies the flags to every test file in that run. The repo's
   `test/run.sh` uses `--allow-all` because the suite exercises every category.
 - A missing grant fails before I/O with `PermissionDenied` /
-  `PERMISSION_DENIED`. FFI is the exception: `ffi.dlopen` / `ffi.callback`
-  throw `TypeError` without a `code`.
+  `PERMISSION_DENIED`. FFI uses the same shape without a scope suffix:
+  `ffi.dlopen requires --allow-ffi`.
 - `--allow-run` and `--allow-ffi` are trust-equivalent to full access.
   Permissions catch mistakes; they are not an OS sandbox.
 

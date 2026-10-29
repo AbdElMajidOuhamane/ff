@@ -22,15 +22,19 @@ ff test --allow-ffi
 
 ## Permissions
 
-`--allow-ffi` is a bare switch — there are no per-library scopes. It grants
-every library, and `--allow-all` includes it.
+`--allow-ffi` is a bare switch — there are no per-library or per-pointer
+scopes. It grants every library and every memory helper, and `--allow-all`
+includes it.
 
-It gates the two APIs that create native executable state:
+Every `ffi` entry point except `ffi.allowed` requires the flag:
 
-| API | Without the flag |
+| Entry point | Without the flag |
 |---|---|
-| `ffi.dlopen(path, symbols)` | throws `TypeError: ffi.dlopen requires --allow-ffi` |
-| `ffi.callback(spec, fn)` | throws `TypeError: ffi.callback requires --allow-ffi` |
+| `ffi.dlopen` | `PermissionDenied: ffi.dlopen requires --allow-ffi` |
+| `ffi.callback` | `PermissionDenied: ffi.callback requires --allow-ffi` |
+| `ffi.ptr` / `ffi.view` / `ffi.cstring` | `PermissionDenied: ffi.ptr requires --allow-ffi` (or the matching name) |
+| `ffi.read` / `ffi.write` / `ffi.copyBytes` / `ffi.writeBytes` | `PermissionDenied: ffi.read requires --allow-ffi` (or the matching name) |
+| `ffi.struct` / `ffi.union` / `ffi.isNull` | `PermissionDenied: ffi.struct requires --allow-ffi` (or the matching name) |
 
 `ffi.allowed` reports whether the flag is set:
 
@@ -38,16 +42,15 @@ It gates the two APIs that create native executable state:
 console.log(ffi.allowed); // false by default, true with --allow-ffi
 ```
 
-Denial here is the exception to the usual `PermissionDenied` contract: it is
-a `TypeError` with **no** `name: "PermissionDenied"` and **no**
-`code: "PERMISSION_DENIED"`:
+Denial uses the same error shape as the other native APIs, minus the scope
+suffix (FFI has no scope):
 
 ```js
 try {
   ffi.dlopen("libz.1.dylib", {});
 } catch (e) {
-  console.error(e.name);    // TypeError
-  console.error(e.code);    // undefined
+  console.error(e.name);    // PermissionDenied
+  console.error(e.code);    // PERMISSION_DENIED
   console.error(e.message); // ffi.dlopen requires --allow-ffi
 }
 ```
@@ -56,11 +59,10 @@ The library path is opened by the OS loader, not by `fs`, so loading a
 `.dylib` / `.so` does **not** need `--allow-read`. `--allow-ffi` is the only
 gate, and it does not constrain the path.
 
-> **Raw pointer helpers are not gated.** `ffi.ptr`, `ffi.view`, `ffi.read`,
-> `ffi.write`, `ffi.copyBytes`, `ffi.cstring`, `ffi.struct`, and `ffi.union`
-> work without `--allow-ffi`. They operate on whatever pointer you hand them
-> and are **not** a sandbox. `ffi.allowed` only describes the native-code
-> entry points, not these helpers.
+> **All pointer and memory helpers are gated.** `ffi.ptr`, `ffi.view`,
+> `ffi.cstring`, `ffi.read`, `ffi.write`, `ffi.copyBytes`, `ffi.writeBytes`,
+> `ffi.struct`, `ffi.union`, and `ffi.isNull` all require `--allow-ffi`.
+> `ffi.allowed` is the only ungated member. There is no pointer-only mode.
 
 > **Trust caveat:** a loaded library can read and write files, open sockets,
 > spawn processes, and inspect memory directly. It is not bound by
@@ -70,8 +72,9 @@ gate, and it does not constrain the path.
 
 > **Prebuilt binaries ship without FFI.** Release binaries and the GHCR image
 > are built with `-Dffi=false`, so `ffi.dlopen` throws
-> `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` even with
-> `--allow-ffi`. FFI works out of the box in source builds (the default).
+> `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` after
+> `--allow-ffi` is granted. That is a build-capability error, not a permission
+> denial. FFI works out of the box in source builds (the default).
 
 Full model: [Permissions](/docs/concepts/permissions).
 
@@ -154,8 +157,8 @@ ffi.cstring(p);        // read a C string → JS string | null
 ffi.cstring(typedArray); // same, from a buffer
 ```
 
-These helpers are available without `--allow-ffi`; see the permissions
-caveat above.
+All pointer and memory helpers require `--allow-ffi`; see
+[Permissions](#permissions).
 
 ## Memory
 
@@ -427,8 +430,8 @@ The rules are C's rules — the FFI adds no safety net:
 - Max 32 parameters, 64 fields/members, 512 bytes per struct/union,
   nesting depth 8.
 - `--allow-ffi` has no path or library scopes; it grants every library.
-- Denial is a `TypeError` without `code`, unlike the `PermissionDenied`
-  contract used by filesystem, network, env, and run APIs.
+- Denial is a `PermissionDenied` Error with `code: "PERMISSION_DENIED"`.
+  FFI messages omit the `for '...'` suffix because there is no scope.
 
 ## See also
 

@@ -33,7 +33,7 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, Postgres DSN variables for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
-| `--allow-ffi` | `ffi.dlopen` / `ffi.callback` | none — bare only |
+| `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | none — bare only |
 | `--allow-all` | every category above, **including FFI** | none |
 
 Rules:
@@ -131,7 +131,9 @@ Rules:
 
 - Bare only: `--allow-ffi=.` is invalid.
 - `--allow-all` includes FFI.
-- `ffi.allowed` reports the current state.
+- `ffi.allowed` reports the current state. Every other `ffi` entry point —
+  `dlopen`, `callback`, `ptr`, `view`, `cstring`, `read`, `write`,
+  `copyBytes`, `writeBytes`, `struct`, `union`, `isNull` — requires the flag.
 - Native code runs with the full privileges of the `ff` process. FFI bypasses
   every other permission, so `--allow-ffi` is trust-equivalent to full access.
 
@@ -152,7 +154,7 @@ Rules:
 | `new SQL(dsn)` | `net` on the DSN host and port | before the pool is created |
 | global `sql` | `net`, plus `env` for `PG_*` / `DATABASE_URL` | before the first query |
 | `child_process.spawn` / `exec` / `execSync` | `run` on `argv[0]` | before the child is created |
-| `ffi.dlopen` / `ffi.callback` | `ffi` | before `dlopen` / callback creation |
+| `ffi.dlopen` / `ffi.callback` / `ffi.*` memory helpers | `ffi` | before `dlopen`, closure creation, pointer creation, or memory access |
 
 `Database.open(":memory:")` is exempt from all path checks. Inline PEM passed to
 `http.serve({ tls: { cert, key } })` is exempt from `read`; a path is not.
@@ -188,9 +190,8 @@ Details:
 - Initial `fetch` denial throws synchronously. A denial on a **redirect hop**
   rejects the fetch promise with a plain string:
   `PermissionDenied: fetch requires --allow-net`. That string has no `.code`.
-- FFI is the one exception to the error shape: `ffi.dlopen` and `ffi.callback`
-  throw a `TypeError` whose message ends in `requires --allow-ffi`, and
-  `ffi.allowed` is `false`. There is no `code` property.
+- FFI uses the same error shape but has no scope suffix:
+  `ffi.read requires --allow-ffi`. `ffi.allowed` is `false` without the flag.
 
 ## Lifetime and inheritance
 

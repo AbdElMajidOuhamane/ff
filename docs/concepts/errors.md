@@ -54,7 +54,7 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 | `process.chdir()` | **throws `PermissionDenied`** when the target is outside `--allow-read`; a missing or unreachable path is still a silent no-op |
 | `process.env` | **never throws** — names outside `--allow-env` are absent (`undefined`) |
 | `fetch` / `WebSocket` / `http.serve` / `Database.open` / `child_process` / `SQL` | **throw `PermissionDenied`** before I/O without the matching flag; a redirect-hop denial rejects `fetch` with a string instead |
-| `ffi.dlopen` / `ffi.callback` | **throw `TypeError`** without `--allow-ffi` |
+| `ffi.dlopen` / `ffi.callback` / all other `ffi` entry points | **throw `PermissionDenied`** without `--allow-ffi` |
 
 > **Sync `fs` swallows I/O errors today.** A missing file, a bad directory, an
 > unreadable path — all return `undefined` with no exception. Always check
@@ -194,7 +194,7 @@ Strings you'll see in practice — useful for assertions in tests:
 | `http.serve requires --allow-net for '0.0.0.0:<port>'` | `http.serve` — `PermissionDenied` |
 | `Database.open requires --allow-read for '<path>'` | SQLite — `PermissionDenied` |
 | `child_process requires --allow-run for '<program>'` | `child_process` — `PermissionDenied` |
-| `ffi.dlopen requires --allow-ffi` | `ffi` — `TypeError`, no `code` |
+| `ffi.dlopen requires --allow-ffi` | `ffi` — `PermissionDenied`, no scope suffix |
 | `PermissionDenied: fetch requires --allow-net` | `fetch` redirect — plain string |
 
 ## Gotchas
@@ -207,9 +207,8 @@ Strings you'll see in practice — useful for assertions in tests:
   expecting an exception. Permission denials do throw.
 - `process.env` never throws; a disallowed variable is just `undefined`.
 - There is no `PermissionDenied` constructor — check `e.code` or `e.name`.
-- `ffi.dlopen` / `ffi.callback` use a `TypeError` (`requires --allow-ffi`) with
-  no `code`; this is the one permission gate outside the `PermissionDenied`
-  shape.
+- FFI denials are `PermissionDenied` too; the message is bare
+  (`ffi.read requires --allow-ffi`) because there is no scope.
 - There is no `process.on("uncaughtException")` and no `unhandledRejection`
   hook — there's nothing to subscribe to.
 - Errors thrown inside a `Worker` surface on the parent via `onerror`.

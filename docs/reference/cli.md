@@ -59,7 +59,7 @@ launch command grants it with a `--allow-*` flag.
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres |
 | `--allow-env` | `process.env`, Postgres DSN environment variables |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` |
-| `--allow-ffi` | `ffi.dlopen` / `ffi.callback` |
+| `--allow-ffi` | All `ffi` entry points except `ffi.allowed` |
 | `--allow-all` | All of the above, including FFI |
 
 Flags are repeatable and comma-split. A bare flag grants the whole category:
@@ -128,7 +128,10 @@ Native APIs are denied unless the matching flag is present. A denied call throws
 ff server.js --allow-ffi
 ```
 
-`--allow-ffi` unlocks the `ffi` global (`ffi.dlopen`). Native code bypasses every permission and sandbox guarantee, so without the flag `ffi.dlopen` throws and `ffi.allowed` is `false`. See [FFI](/docs/api/ffi) for the full API and security contract.
+`--allow-ffi` unlocks the `ffi` global. Native code and raw pointer/memory
+helpers bypass every other permission and sandbox guarantee; without the flag
+every `ffi` entry point except `ffi.allowed` denies, and `ffi.allowed` is
+`false`. See [FFI](/docs/api/ffi) for the full API and security contract.
 
 ## Evaluate inline code
 
