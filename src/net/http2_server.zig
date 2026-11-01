@@ -9,7 +9,7 @@
 //!
 //! Memory rules (DOD: match layout to workload):
 //! 1. Sessions are heap-allocated ON DEMAND — H1 slots cost one null
-//!    pointer (8 B), not a 216 KB Session. No 108 MB static table.
+//!    pointer (8 B), not a 65 KB Session. No static table.
 //! 2. submitResponse COPIES all header/body bytes into stream-owned
 //!    storage synchronously. Nothing borrowed from JS values or stack
 //!    buffers survives the call, so later session_send callbacks can
@@ -17,6 +17,12 @@
 //! 3. Stream recycle RETAINS ArrayList capacity (clearRetainingCapacity).
 //!    Steady state per connection: zero hot-path allocation after warmup.
 //!    True frees happen only in Session.deinit (connection teardown).
+//! 4. Borrow lifetime is per-BLOCK, not per-function. A slice taken from
+//!    JS_ToCString dies at the end of the `defer c.freeCString` block for
+//!    any string that is not plain-ASCII NORMAL (non-ASCII text, or a
+//!    >1024-byte String.prototype.slice all allocate a fresh buffer).
+//!    The plain-object path therefore copies straight into stream-owned
+//!    storage while the borrow is alive (reserveBody + submitResponsePreloaded).
 //!
 //! I/O rule (libxev intrusive queue): exactly one outstanding write per
 //! slot. pumpWrite() refuses to arm while out_armed is set; only
@@ -38,8 +44,16 @@ const gpa = std.heap.smp_allocator;
 pub const MAX_STREAMS = 100;
 const MAX_NV = 128;
 const MAX_METHOD = 16;
-const MAX_PATH = 2048;
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB — matches http_native.MAX_BODY_SIZE
+// Right-sized to the access pattern: real :path values are far below 512 B.
+// 2048 × 100 streams made Stream ~2.2 KB and Session ~219 KB; this is ~650 B
+// and ~65 KB. Oversized paths are REJECTED (400), never truncated — a
+// truncated path would dispatch to the wrong route.
+const MAX_PATH = 512;
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB per stream — matches http_native
+// Per-connection ceiling across all live streams. Without it the effective
+// cap is MAX_STREAMS × MAX_BODY_SIZE (up to 1 GB on one connection).
+// Exceeding it is a protocol-abuse signal: fail the session, don't buffer.
+const MAX_SESSION_BODY: usize = 16 * 1024 * 1024;
 
 /// onRecv return value meaning "protocol error — close the connection".
 pub const FATAL: usize = std.math.maxInt(usize);
@@ -51,8 +65,8 @@ comptime {
     // (StreamFlags + stream_ids) live in dedicated columns; Stream is the
     // cold payload only. Ratchet down.
     std.debug.assert(@sizeOf(StreamFlags) == 1);
-    std.debug.assert(@sizeOf(Stream) <= 2208);
-    std.debug.assert(@sizeOf(Session) <= 2304 * MAX_STREAMS + 128);
+    std.debug.assert(@sizeOf(Stream) <= 672);
+    std.debug.assert(@sizeOf(Session) <= 704 * MAX_STREAMS + 128);
 }
 
 // ── Stream ────────────────────────────────────────────────────────
@@ -60,7 +74,7 @@ comptime {
 // B1 FIX (hot/cold split): per-frame lookups (allocStream/findStream/
 // removeStream) used to scan a 2.2KB AoS Stream — 100× ~2.2KB touched per
 // lookup. Hot scan keys now live in two flat columns (stream_ids: 400B,
-// stream_flags: 100B per session); the cold payload (2KB path + ArrayLists)
+// stream_flags: 100B per session); the cold payload (method/path + ArrayLists)
 // is touched only after the slot is claimed. Template: async_fetch.states,
 // http_native.cflags watchdog.
 
@@ -69,7 +83,8 @@ pub const StreamFlags = packed struct(u8) {
     in_use: bool = false,
     complete: bool = false, // END_STREAM seen (full request received)
     dispatched: bool = false, // handed to the JS handler (or parked-pending)
-    _pad: u5 = 0,
+    bad: bool = false, // malformed :method/:path/:authority → 400
+    _pad: u4 = 0,
 };
 
 /// Cold payload: method/path bodies + response staging. Memory rules 2–3
@@ -128,6 +143,9 @@ pub const Slot = struct {
     pub fn inUse(s: Slot) bool {
         return s.f.in_use;
     }
+    pub fn bad(s: Slot) bool {
+        return s.f.bad;
+    }
     pub fn setDispatched(s: Slot) void {
         s.f.dispatched = true;
     }
@@ -156,6 +174,8 @@ pub const Session = struct {
     out_chunk: usize = 0, // plaintext bytes currently in write_bufs
     out_armed: bool = false, // write completion outstanding (anti-double-arm)
     going_away: bool = false,
+    // Sum of live request-body bytes across streams (bounds MAX_SESSION_BODY).
+    body_bytes: usize = 0,
 
     fn slotOf(self: *Session, stream_id: i32) ?usize {
         for (0..MAX_STREAMS) |i| {
@@ -190,6 +210,8 @@ pub const Session = struct {
     }
     /// Recycle for the next stream on this slot: keeps buffers, drops state.
     fn releaseSlot(self: *Session, i: usize) void {
+        // Give the session budget back before the body buffer is cleared.
+        self.body_bytes -|= self.streams[i].body.items.len;
         self.streams[i].resetPayload();
         self.stream_flags[i] = .{};
         self.stream_ids[i] = 0;
@@ -290,13 +312,49 @@ pub fn headerCb(
     // Only pseudo-headers matter: the H1 handler takes (url, method, body)
     // and never sees headers, so regular headers are dropped for v1 parity.
     if (std.mem.eql(u8, n, ":method")) {
-        const m = @min(v.len, MAX_METHOD);
-        @memcpy(st.p.method_buf[0..m], v[0..m]);
-        st.p.method_len = m;
+        // RFC 7540 §8.1.2: token, no controls. Reject rather than truncate.
+        if (v.len == 0 or v.len > MAX_METHOD) {
+            st.f.bad = true;
+        } else {
+            for (v) |ch| {
+                if (ch <= 0x20 or ch == 0x7f) {
+                    st.f.bad = true;
+                    break;
+                }
+            }
+            @memcpy(st.p.method_buf[0..v.len], v);
+            st.p.method_len = v.len;
+        }
     } else if (std.mem.eql(u8, n, ":path")) {
-        const m = @min(v.len, MAX_PATH);
-        @memcpy(st.p.path_buf[0..m], v[0..m]);
-        st.p.path_len = m;
+        // §8.1.2.3: non-empty, origin-form (starts with '/'). A path longer
+        // than MAX_PATH is an error, not a truncation — a truncated path
+        // dispatches to the wrong route.
+        if (v.len == 0 or v.len > MAX_PATH or v[0] != '/') {
+            st.f.bad = true;
+        } else {
+            for (v) |ch| {
+                if (ch <= 0x20 or ch == 0x7f) {
+                    st.f.bad = true;
+                    break;
+                }
+            }
+            @memcpy(st.p.path_buf[0..v.len], v);
+            st.p.path_len = v.len;
+        }
+    } else if (std.mem.eql(u8, n, ":authority")) {
+        // Not used for routing (no vhost support), but rejected when empty or
+        // control-bearing so the request can't be smuggled past a front end
+        // that does interpret it.
+        if (v.len == 0 or v.len > 255) {
+            st.f.bad = true;
+        } else {
+            for (v) |ch| {
+                if (ch <= 0x20 or ch == 0x7f) {
+                    st.f.bad = true;
+                    break;
+                }
+            }
+        }
     }
     return 0;
 }
@@ -313,8 +371,14 @@ pub fn dataChunkCb(
     const sess = getSession(slot) orelse return 0;
     const st = sess.findStream(stream_id) orelse return 0;
     if (st.dispatched()) return 0;
-    if (st.p.body.items.len + len > MAX_BODY_SIZE) return 0; // over cap: drop tail (v1)
+    if (st.p.body.items.len + len > MAX_BODY_SIZE) return 0; // per-stream cap (v1)
+    // Per-connection budget across all streams. Exceeding it means the peer
+    // is opening many large streams to pin memory; fail the session (nghttp2
+    // treats a non-zero callback return as a fatal session error) instead of
+    // buffering. No allocation is added to the hot path.
+    if (sess.body_bytes + len > MAX_SESSION_BODY) return h2.ERR_CALLBACK_FAILURE;
     st.p.body.appendSlice(gpa, data[0..len]) catch return 0;
+    sess.body_bytes += len;
     return 0;
 }
 
@@ -547,6 +611,14 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     const sess = getSession(slot_id) orelse return;
     const st = sess.findStream(stream_id) orelse return;
     if (st.dispatched() or !st.complete()) return;
+    // Malformed pseudo-headers are rejected here, at dispatch, so they never
+    // reach the JS handler and never influence routing.
+    if (st.bad()) {
+        st.setDispatched();
+        active_stream[slot_id] = stream_id;
+        respondErrorH2(slot_id, 400);
+        return;
+    }
     if (st.p.method_len == 0 or st.p.path_len == 0) {
         st.setDispatched();
         active_stream[slot_id] = stream_id;
@@ -555,12 +627,19 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     }
     st.setDispatched();
     active_stream[slot_id] = stream_id;
-    var pr = http_native.ParsedRequest{
+    // content_length stays 0: H2 has already buffered the whole body, so no
+    // caller derives an offset from this field. Keeping it 0 preserves the
+    // "content_length ≤ READ_BUF_SIZE" invariant that the H1 framing path
+    // relies on for its unchecked `headers_end + content_length` add.
+    const pr = http_native.ParsedRequest{
         .method = st.method(),
         .url = st.path(),
-        .content_length = st.p.body.items.len,
+        .ws_key = "",
+        .content_length = 0,
         .method_tag = http_native.classifyMethod(st.method()),
         .keep_alive = false, // H2 connections are persistent by design
+        .framing_ok = true, // nghttp2 already rejected malformed frames
+        .ws_bad = false,
     };
     http_native.callHandler(slot_id, &pr, st.p.body.items);
 }
@@ -606,15 +685,27 @@ fn stageNv(st: *Stream, name: []const u8, value: []const u8) ?h2.Nv {
     return nv;
 }
 
-/// Queue an H2 response for a stream. Copies ALL header/body bytes into
-/// stream-owned storage synchronously, so borrowed JS/stack memory is
-/// safe to free as soon as this returns. The caller flushes afterwards.
-pub fn submitResponse(
+/// Reserve `n` bytes in the active stream's response body and return the
+/// writable slice (items.len is already advanced). Used by the plain-object
+/// path so a JS-owned string is copied exactly once, into its final home,
+/// while the borrow is still alive (memory rule 4).
+fn reserveBody(slot_id: usize, stream_id: i32, n: usize) ?[]u8 {
+    const sess = getSession(slot_id) orelse return null;
+    const st = sess.findStream(stream_id) orelse return null;
+    st.p.resp_body.clearRetainingCapacity();
+    st.p.resp_body.ensureTotalCapacity(gpa, n) catch return null;
+    const buf = st.p.resp_body.allocatedSlice()[0..n];
+    st.p.resp_body.items.len = n;
+    return buf;
+}
+
+fn submitResponseCore(
     slot_id: usize,
     stream_id: i32,
     status: u16,
     hdrs: ?*headers_mod.HeadersData,
     body: []const u8,
+    preloaded: bool,
 ) void {
     const sess = getSession(slot_id) orelse return;
     if (sess.ng == null) return;
@@ -622,8 +713,8 @@ pub fn submitResponse(
 
     st.p.resp_nv.clearRetainingCapacity();
     st.p.resp_blob.clearRetainingCapacity();
-    st.p.resp_body.clearRetainingCapacity();
     st.p.resp_off = 0;
+    if (!preloaded) st.p.resp_body.clearRetainingCapacity();
 
     // FIX: reserve resp_blob BEFORE any stageNv so appendSlice can never
     // reallocate and invalidate earlier Nv.name/value pointers. Without
@@ -666,13 +757,15 @@ pub fn submitResponse(
         }
     }
 
-    if (body.len > 0 and st.p.resp_nv.items.len < MAX_NV) {
+    // The body length that will actually be sent.
+    const body_len: usize = if (preloaded) st.p.resp_body.items.len else body.len;
+    if (body_len > 0 and st.p.resp_nv.items.len < MAX_NV) {
         var cl_buf: [20]u8 = undefined;
-        const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body.len}) catch "0";
+        const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body_len}) catch "0";
         if (stageNv(st.p, "content-length", cl_str)) |nv| {
             st.p.resp_nv.append(gpa, nv) catch {};
         }
-        st.p.resp_body.appendSlice(gpa, body) catch {};
+        if (!preloaded) st.p.resp_body.appendSlice(gpa, body) catch {};
     }
 
     if (st.p.resp_body.items.len == 0) {
@@ -684,6 +777,30 @@ pub fn submitResponse(
         };
         _ = h2.nghttp2_submit_response2(sess.ng, stream_id, st.p.resp_nv.items.ptr, st.p.resp_nv.items.len, &provider);
     }
+}
+
+/// Queue an H2 response for a stream. Copies ALL header/body bytes into
+/// stream-owned storage synchronously, so borrowed JS/stack memory is
+/// safe to free as soon as this returns. The caller flushes afterwards.
+pub fn submitResponse(
+    slot_id: usize,
+    stream_id: i32,
+    status: u16,
+    hdrs: ?*headers_mod.HeadersData,
+    body: []const u8,
+) void {
+    submitResponseCore(slot_id, stream_id, status, hdrs, body, false);
+}
+
+/// Same, but the body is ALREADY in the stream's resp_body (filled through
+/// reserveBody). Avoids the second copy for plain-object responses.
+pub fn submitResponsePreloaded(
+    slot_id: usize,
+    stream_id: i32,
+    status: u16,
+    hdrs: ?*headers_mod.HeadersData,
+) void {
+    submitResponseCore(slot_id, stream_id, status, hdrs, "", true);
 }
 
 /// Extract status/headers/body from a JS handler result and queue an H2
@@ -699,10 +816,13 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
 
     var status: u16 = 200;
     var body_bytes: []const u8 = "";
+    var body_preloaded = false;
     var hdrs: ?*headers_mod.HeadersData = null;
 
     if (c.isObject(result) != 0) {
         if (response_mod.dataFromJS(ctx, result)) |rd| {
+            // Response instance: body/headers point into ResponseData, which
+            // is owned by `result` and outlives this function. Borrow is safe.
             status = rd.status;
             if (rd.body()) |b| body_bytes = b;
             hdrs = rd.headers;
@@ -711,7 +831,7 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
             defer c.freeValue(ctx, status_val);
             if (c.isUndefined(status_val) == 0 and c.isNull(status_val) == 0) {
                 var out: i32 = 0;
-                if (c.toInt32(ctx, &out, status_val) != -1 and out > 0 and out < 1000) {
+                if (c.toInt32(ctx, &out, status_val) != -1 and out >= 100 and out <= 999) {
                     status = @intCast(out);
                 }
             }
@@ -719,11 +839,28 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
             defer c.freeValue(ctx, body_val);
             if (c.isString(body_val) != 0) {
                 if (c.toCString(ctx, body_val)) |cs| {
+                    // BORROW LIFETIME (memory rule 4): this cstring is freed by
+                    // the defer below when this block exits. Copy straight into
+                    // the stream's response storage — one copy, into the final
+                    // destination — or freed heap reaches the client.
                     defer c.freeCString(ctx, cs);
                     const n = std.mem.len(cs);
-                    if (n > 0) body_bytes = cs[0..n];
+                    if (n > MAX_BODY_SIZE) {
+                        respondErrorH2(slot_id, 500);
+                        return;
+                    }
+                    if (n > 0) {
+                        const dst = reserveBody(slot_id, stream_id, n) orelse {
+                            respondErrorH2(slot_id, 500);
+                            return;
+                        };
+                        @memcpy(dst, cs[0..n]);
+                        body_preloaded = true;
+                    }
                 }
             } else if (c.isObject(body_val) != 0) {
+                // ArrayBuffer storage is owned by body_val, which stays alive
+                // until this function returns (defer freeValue above). Safe.
                 var size: usize = 0;
                 if (c.getArrayBuffer(ctx, &size, body_val)) |p| {
                     if (size > 0) body_bytes = p[0..size];
@@ -736,14 +873,23 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
     const sess = getSession(slot_id) orelse return;
     const st = sess.findStream(stream_id) orelse return;
     const is_head = std.mem.eql(u8, st.method(), "HEAD");
-    if (is_head or status == 204 or status == 304) body_bytes = "";
+    if (is_head or status == 204 or status == 304) {
+        if (body_preloaded) {
+            // Drop the reserved body and send the normal empty response.
+            st.p.resp_body.clearRetainingCapacity();
+            body_preloaded = false;
+        }
+        body_bytes = "";
+    }
     if (body_bytes.len > MAX_BODY_SIZE) {
         respondErrorH2(slot_id, 500);
         return;
     }
-    // submitResponse copies body_bytes synchronously, so the borrows above
-    // (JS strings, ArrayBuffers, ResponseData pools) are safe to free after.
-    submitResponse(slot_id, stream_id, status, hdrs, body_bytes);
+    if (body_preloaded) {
+        submitResponsePreloaded(slot_id, stream_id, status, hdrs);
+    } else {
+        submitResponse(slot_id, stream_id, status, hdrs, body_bytes);
+    }
 }
 
 /// Queue a minimal status-only error response for the active stream.
@@ -833,4 +979,31 @@ test "h2 submitResponse keeps Nv pointers stable across many headers" {
         try std.testing.expect(@intFromPtr(v.ptr) >= blob_start);
         try std.testing.expect(@intFromPtr(v.ptr) + v.len <= blob_end);
     }
+}
+
+test "h2 reserveBody + submitResponsePreloaded copies exactly once" {
+    const sess = initSession(4) orelse return error.NoSession;
+    defer removeSession(4);
+    const st = sess.allocStream(1) orelse return error.NoStream;
+    active_stream[4] = 1;
+    const dst = reserveBody(4, 1, 5) orelse return error.NoReserve;
+    @memcpy(dst, "hello");
+    submitResponsePreloaded(4, 1, 200, null);
+    // Body lives in stream storage; content-length matches the reserved size.
+    try std.testing.expectEqualStrings("hello", st.p.resp_body.items);
+    try std.testing.expect(st.p.resp_nv.items.len >= 2);
+    const cl = st.p.resp_nv.items[1];
+    try std.testing.expectEqualStrings("content-length", cl.name[0..cl.namelen]);
+    try std.testing.expectEqualStrings("5", cl.value[0..cl.valuelen]);
+}
+
+test "h2 session body budget is released with the stream" {
+    const sess = initSession(5) orelse return error.NoSession;
+    defer removeSession(5);
+    const st = sess.allocStream(1) orelse return error.NoStream;
+    st.p.body.appendSlice(gpa, "abcdef") catch return error.OOM;
+    sess.body_bytes += 6;
+    try std.testing.expectEqual(@as(usize, 6), sess.body_bytes);
+    sess.removeStream(1);
+    try std.testing.expectEqual(@as(usize, 0), sess.body_bytes);
 }
