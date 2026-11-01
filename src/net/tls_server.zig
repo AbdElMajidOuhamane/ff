@@ -226,6 +226,7 @@ pub fn recvRecAck(ctx: *Ctx, len: usize) void {
 
 /// Ciphertext the engine wants on the wire (single contiguous span).
 pub fn sendRecReady(ctx: *Ctx) []const u8 {
+    if (!available) return &[_]u8{};
     var n: usize = 0;
     const p = bssl.br_ssl_engine_sendrec_buf(&ctx.eng, &n) orelse return &[_]u8{};
     const base: [*]const u8 = @ptrCast(p);
@@ -233,6 +234,7 @@ pub fn sendRecReady(ctx: *Ctx) []const u8 {
 }
 
 pub fn sendRecAck(ctx: *Ctx, len: usize) void {
+    if (!available) return;
     bssl.br_ssl_engine_sendrec_ack(&ctx.eng, len);
 }
 

@@ -8,7 +8,8 @@
 //! §Tx: begin() pins a conn (Phase 3, pg_client); Tx is tag-callable with
 //!   commit()/rollback()/unsafe(); in-flight jobs dup the Tx object so the
 //!   finalizer only ever sees idle conns; dead tx → sync TypeError.
-//! §Cold: loadConfig/parseDsn/sqlCtor Config dupes; default_pool_fail message.
+//! §Cold: loadConfig/parseDsn/sqlCtor Config dupes; default_pool_fail message;
+//!   TLS anchor loading (one PEM read + decode per process).
 //! §Batch: hands whole query+params to pg_client.sendQuery (frame batch → 1 write).
 //! §Hot/cold: this file stages Job only; I/O + rows live in pg_client.
 //! §SIMD: N/A (string template assembly).
@@ -17,6 +18,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const pg = @import("../net/pg_client.zig");
+const tls_client = @import("../net/tls_client.zig");
 const perm = @import("../security/permissions.zig");
 const deny = @import("../security/deny.zig");
 
@@ -152,6 +154,13 @@ fn getDefaultPool() !*pg.Pool {
         default_pool_fail = gpa.dupe(u8, "PermissionDenied: sql requires --allow-net") catch null;
         return error.PermissionDenied;
     }
+    // TLS anchors must exist before the pool opens a socket; failure here is
+    // fatal (fail closed) rather than a silent plaintext connection.
+    configureTls(&cfg) catch |err| {
+        freeLooseConfig(cfg);
+        default_pool_fail = gpa.dupe(u8, @errorName(err)) catch null;
+        return err;
+    };
     default_pool = pg.Pool.create(cfg) catch |err| {
         freeLooseConfig(cfg);
         default_pool_fail = gpa.dupe(u8, @errorName(err)) catch null;
@@ -177,6 +186,8 @@ fn loadConfig() !pg.Config {
     errdefer gpa.free(cfg.password);
     cfg.database = try gpa.dupe(u8, cfg.database);
     errdefer gpa.free(cfg.database);
+    cfg.sslrootcert = try gpa.dupe(u8, cfg.sslrootcert);
+    errdefer gpa.free(cfg.sslrootcert);
     if (envIfAllowed("PG_TEST_DSN")) |url| {
         try parseDsn(url, &cfg);
         return cfg;
@@ -204,6 +215,13 @@ fn loadConfig() !pg.Config {
         gpa.free(cfg.database);
         cfg.database = try gpa.dupe(u8, v);
     }
+    if (envIfAllowed("PGSSLMODE")) |v| {
+        cfg.sslmode = parseSslMode(v) orelse return error.UnsupportedSslMode;
+    }
+    if (envIfAllowed("PGSSLROOTCERT")) |v| {
+        gpa.free(cfg.sslrootcert);
+        cfg.sslrootcert = try gpa.dupe(u8, v);
+    }
     return cfg;
 }
 
@@ -225,12 +243,19 @@ fn parseDsn(url: []const u8, cfg: *pg.Config) !void {
     }
     var hostport = rest;
     if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
-        const db = rest[slash + 1 ..];
+        var db = rest[slash + 1 ..];
+        if (std.mem.indexOfScalar(u8, db, '?')) |q| {
+            try parseDsnQuery(db[q + 1 ..], cfg);
+            db = db[0..q];
+        }
         if (db.len > 0) {
             gpa.free(cfg.database);
             cfg.database = try gpa.dupe(u8, db);
         }
         hostport = rest[0..slash];
+    } else if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        try parseDsnQuery(rest[q + 1 ..], cfg);
+        hostport = rest[0..q];
     }
     if (std.mem.startsWith(u8, hostport, "[")) {
         const end = std.mem.indexOfScalar(u8, hostport, ']') orelse return error.BadDsn;
@@ -247,6 +272,59 @@ fn parseDsn(url: []const u8, cfg: *pg.Config) !void {
         gpa.free(cfg.host);
         cfg.host = try gpa.dupe(u8, hostport);
     }
+}
+
+/// Query-string options. Only the two modes we can honour are accepted;
+/// `require` / `prefer` / `verify-ca` are refused rather than silently
+/// upgraded or downgraded.
+fn parseDsnQuery(query: []const u8, cfg: *pg.Config) !void {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (std.ascii.eqlIgnoreCase(key, "sslmode")) {
+            cfg.sslmode = parseSslMode(val) orelse return error.UnsupportedSslMode;
+        } else if (std.ascii.eqlIgnoreCase(key, "sslrootcert")) {
+            gpa.free(cfg.sslrootcert);
+            cfg.sslrootcert = try gpa.dupe(u8, val);
+        }
+    }
+}
+
+fn parseSslMode(v: []const u8) ?pg.SslMode {
+    if (std.ascii.eqlIgnoreCase(v, "disable")) return .disable;
+    if (std.ascii.eqlIgnoreCase(v, "verify-full") or
+        std.ascii.eqlIgnoreCase(v, "verify_full")) return .verify_full;
+    // libpq's require/prefer/verify-ca are not expressible on BearSSL: the
+    // client must validate the chain to obtain the key that verifies the
+    // handshake. Refuse rather than pretend.
+    return null;
+}
+
+/// The anchor store is process-global and sealed after the first load, so a
+/// second pool with a different sslrootcert fails loudly instead of silently
+/// trusting the first bundle.
+var pg_tls_anchors_loaded = false;
+
+fn configureTls(cfg: *const pg.Config) !void {
+    if (cfg.sslmode != .verify_full) return;
+    if (!tls_client.available) return error.NoBearssl;
+    if (cfg.sslrootcert.len == 0) return error.MissingSslRootCert;
+    if (pg_tls_anchors_loaded) return;
+
+    // A CA path from the DSN/JS is a file read like any other.
+    if (perm.global().checkPath(.read, cfg.sslrootcert) == .denied)
+        return error.PermissionDenied;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pem = std.Io.Dir.cwd().readFileAlloc(io, cfg.sslrootcert, gpa, .limited(512 * 1024)) catch
+        return error.SslRootCertUnreadable;
+    defer gpa.free(pem);
+    _ = try tls_client.loadAnchorsFromPem(pem);
+    tls_client.sealAnchors();
+    pg_tls_anchors_loaded = true;
 }
 
 fn sqlTagGlobal(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -985,6 +1063,13 @@ fn sqlCtor(ctx: ?*c.Context, new_target: c.Value, argc: c_int, argv: [*c]c.Value
         gpa.free(cfg.password);
         return oom(ctx);
     };
+    cfg.sslrootcert = gpa.dupe(u8, cfg.sslrootcert) catch {
+        gpa.free(cfg.host);
+        gpa.free(cfg.user);
+        gpa.free(cfg.password);
+        gpa.free(cfg.database);
+        return oom(ctx);
+    };
     if (argc >= 1 and c.isString(argv[0]) != 0) {
         var len: usize = 0;
         const ptr = c.toCStringLen(ctx, &len, argv[0]) orelse {
@@ -1062,6 +1147,38 @@ fn sqlCtor(ctx: ?*c.Context, new_target: c.Value, argc: c_int, argv: [*c]c.Value
             if (c.toInt64(ctx, &m, max) == 0 and m > 0 and m <= 100) cfg.max = @intCast(m);
         }
         c.freeValue(ctx, max);
+        const sslmode = c.getPropertyStr(ctx, argv[0], "sslmode");
+        if (c.isString(sslmode) != 0) {
+            var sl: usize = 0;
+            const sp = c.toCStringLen(ctx, &sl, sslmode) orelse {
+                c.freeValue(ctx, sslmode);
+                freeLooseConfig(cfg);
+                return c.JS_EXCEPTION;
+            };
+            const parsed = parseSslMode(sp[0..sl]);
+            c.freeCString(ctx, sp);
+            if (parsed == null) {
+                c.freeValue(ctx, sslmode);
+                freeLooseConfig(cfg);
+                _ = c.throwTypeError(ctx, "sslmode must be 'disable' or 'verify-full'");
+                return c.JS_EXCEPTION;
+            }
+            cfg.sslmode = parsed.?;
+        }
+        c.freeValue(ctx, sslmode);
+        const sslroot = c.getPropertyStr(ctx, argv[0], "sslrootcert");
+        if (c.isString(sslroot) != 0) {
+            var rl: usize = 0;
+            const rp = c.toCStringLen(ctx, &rl, sslroot) orelse {
+                c.freeValue(ctx, sslroot);
+                freeLooseConfig(cfg);
+                return c.JS_EXCEPTION;
+            };
+            gpa.free(cfg.sslrootcert);
+            cfg.sslrootcert = gpa.dupe(u8, rp[0..rl]) catch cfg.sslrootcert;
+            c.freeCString(ctx, rp);
+        }
+        c.freeValue(ctx, sslroot);
     }
 
     if (perm.global().checkNet(cfg.host, cfg.port) == .denied) {
@@ -1070,6 +1187,14 @@ fn sqlCtor(ctx: ?*c.Context, new_target: c.Value, argc: c_int, argv: [*c]c.Value
         freeLooseConfig(cfg);
         return deny.throw(ctx, "SQL", .net, detail);
     }
+
+    // Anchors must be loaded before the pool opens a socket; a failure here is
+    // a hard error rather than a silent plaintext connection.
+    configureTls(&cfg) catch |err| {
+        freeLooseConfig(cfg);
+        _ = c.throwTypeError(ctx, "SQL: TLS setup failed (%s)", @as([*c]const u8, @ptrCast(@errorName(err))));
+        return c.JS_EXCEPTION;
+    };
 
     const pool = pg.Pool.create(cfg) catch {
         freeLooseConfig(cfg);
@@ -1087,4 +1212,5 @@ fn freeLooseConfig(cfg: pg.Config) void {
     gpa.free(cfg.user);
     gpa.free(cfg.password);
     gpa.free(cfg.database);
+    gpa.free(cfg.sslrootcert);
 }

@@ -240,7 +240,7 @@ test "validUtf8 matches the std oracle" {
     try std.testing.expect(validUtf8("héllo")); // 2-byte sequence
     try std.testing.expect(validUtf8("🚀")); // 4-byte sequence
     try std.testing.expect(!validUtf8(&[_]u8{ 0xff, 0xfe }));
-    try std.testing.expect(!validUtf8(&[_]u8{ 0xc3 })); // truncated 2-byte
+    try std.testing.expect(!validUtf8(&[_]u8{0xc3})); // truncated 2-byte
 }
 test "unmask vector equals scalar" {
     const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
