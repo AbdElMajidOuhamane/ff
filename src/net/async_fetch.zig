@@ -20,6 +20,12 @@ const http = std.http;
 
 pub const MAX_FETCH = 16;
 
+// Response-body ceiling, decompressed. A malicious or compromised upstream can
+// otherwise choose both the allocation size (via Content-Length) and the
+// expansion ratio (via gzip/zstd). Worst case here is MAX_FETCH × this value.
+// Policy constant, not a layout one — raise deliberately.
+const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
+
 const JOB_FREE: u8 = 0;
 const JOB_BUSY: u8 = 1;
 const JOB_DONE: u8 = 2;
@@ -132,6 +138,8 @@ fn releaseSlot(s: usize) void {
     freeResolvers(s);
     results[s] = null;
     errs[s] = null;
+    std.debug.assert(free_count < MAX_FETCH);
+    if (free_count >= MAX_FETCH) return;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
@@ -360,14 +368,29 @@ fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]c
     const q = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
     const dir_end = std.mem.lastIndexOfScalar(u8, path[0..q], '/') orelse 0;
     if (auth_end + dir_end + 1 + loc.len > out.len) return null;
-    var n: usize = 0;
+    // FIX: join at auth_end, not auth_start. Writing the directory at
+    // auth_start overwrote the authority ("http://a.com/x/y" + "z" became
+    // "http:///x/z"), so every relative Location failed as an invalid URL.
+    var n: usize = auth_end;
     @memcpy(out[0..auth_end], current_url[0..auth_end]);
-    n = auth_start;
     @memcpy(out[n..][0 .. dir_end + 1], path[0 .. dir_end + 1]);
     n += dir_end + 1;
     @memcpy(out[n..][0..loc.len], loc);
     return out[0..n];
 }
+
+/// Headers that carry caller credentials. Stripped once a redirect leaves the
+/// origin the caller supplied. std.http's `privileged_headers` would do this,
+/// but this path builds `extra_headers` by hand and never marks any.
+fn isCredentialHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "cookie") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(name, "www-authenticate") or
+        std.ascii.eqlIgnoreCase(name, "x-api-key") or
+        std.ascii.eqlIgnoreCase(name, "x-auth-token");
+}
+
 fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
     if (builtin.mode == .Debug) job_counter.reset();
@@ -416,6 +439,17 @@ fn runJob(slot_id: u16) void {
             if (owned_body) |b| gpa.free(b);
         }
     }
+    // Cross-origin redirect state. `first_origin` records the origin the
+    // caller's headers were supplied for; the first hop that differs triggers
+    // a one-time rebuild of the header list without credential headers.
+    var first_origin_buf: [320]u8 = undefined;
+    var first_origin: []const u8 = "";
+    var filtered_buf: [64]http.Header = undefined;
+    var filtered_view: std.ArrayList(http.Header) = .empty;
+    var filtered_used_heap = false;
+    defer if (filtered_used_heap) filtered_view.deinit(gpa);
+    var cross_origin_hdrs: ?[]http.Header = null;
+
     hop: while (true) {
         const current_uri = std.Uri.parse(current_url) catch {
             failSlot(s, "Invalid URL");
@@ -441,6 +475,47 @@ fn runJob(slot_id: u16) void {
             failSlot(s, "PermissionDenied: fetch requires --allow-net");
             return;
         }
+
+        // Origin tracking + credential stripping. Format is host:port:scheme
+        // so a scheme downgrade also counts as crossing the origin.
+        var hop_origin_buf: [320]u8 = undefined;
+        const hop_origin = std.fmt.bufPrint(&hop_origin_buf, "{s}:{d}:{s}", .{
+            hop_host.bytes,
+            hop_port,
+            if (protocol == .tls) "tls" else "plain",
+        }) catch "";
+        if (first_origin.len == 0) {
+            @memcpy(first_origin_buf[0..hop_origin.len], hop_origin);
+            first_origin = first_origin_buf[0..hop_origin.len];
+        }
+        var hop_hdrs: []http.Header = http_hdrs;
+        if (!std.mem.eql(u8, first_origin, hop_origin)) {
+            if (cross_origin_hdrs) |cached| {
+                hop_hdrs = cached;
+            } else {
+                if (http_hdrs.len <= filtered_buf.len) {
+                    var k: usize = 0;
+                    for (http_hdrs) |h| {
+                        if (isCredentialHeader(h.name)) continue;
+                        filtered_buf[k] = h;
+                        k += 1;
+                    }
+                    cross_origin_hdrs = filtered_buf[0..k];
+                } else {
+                    filtered_used_heap = true;
+                    for (http_hdrs) |h| {
+                        if (isCredentialHeader(h.name)) continue;
+                        filtered_view.append(gpa, h) catch {
+                            failSlot(s, "Out of memory");
+                            return;
+                        };
+                    }
+                    cross_origin_hdrs = filtered_view.items;
+                }
+                hop_hdrs = cross_origin_hdrs.?;
+            }
+        }
+
         const req_client = tls.clientForHost(hop_host.bytes, hop_port, protocol);
         // https through a proxy: std.http.Client cannot TLS-upgrade its
         // CONNECT tunnel (ziglang/zig#19878), so tls_tunnel builds the TLS
@@ -456,7 +531,7 @@ fn runJob(slot_id: u16) void {
             }
         }
         var req = req_client.request(current_method, current_uri, .{
-            .extra_headers = http_hdrs,
+            .extra_headers = hop_hdrs,
             .connection = tunnel_conn,
         }) catch |err| {
             std.debug.print("[fetch] request failed: {s} url={s}\n", .{ @errorName(err), current_url });
@@ -554,6 +629,10 @@ fn runJob(slot_id: u16) void {
             failSlot(s, "Out of memory");
             return;
         };
+        // Every early return after this point must return the shell to the
+        // freelist (the size-cap exits below are new).
+        var resp_kept = false;
+        defer if (!resp_kept) response_mod.releaseData(resp_data);
         // F1: take ownership of the slot's parsed headers directly — no
         // create+release of a throwaway HeadersData per fetch.
         resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
@@ -626,6 +705,12 @@ fn runJob(slot_id: u16) void {
             if (wire_cl) |cl| {
                 if (cl > 0) {
                     const len: usize = @intCast(cl);
+                    // The upstream declares the allocation size: never trust it
+                    // past the policy ceiling.
+                    if (len > MAX_RESPONSE_BODY) {
+                        failSlot(s, "ResponseTooLarge: body exceeds limit");
+                        return;
+                    }
                     // Reuse 64K stage buffer; heap spill measured via stat_body_heap.
                     if (len <= body_stage_bufs[s].len) {
                         const b = body_stage_bufs[s][0..len];
@@ -679,6 +764,8 @@ fn runJob(slot_id: u16) void {
                 }
             } else {
                 // Unknown length: fill stage buffer first, spill to heap only if needed.
+                // This path also covers every compressed response, so the cap
+                // bounds decompressed output (decompression-bomb defence).
                 var chunk: [16 * 1024]u8 = undefined;
                 var total: usize = 0;
                 var heap_acc: std.ArrayList(u8) = .empty;
@@ -690,6 +777,10 @@ fn runJob(slot_id: u16) void {
                         break :acc_b 0;
                     };
                     if (n == 0) break;
+                    if (total + n > MAX_RESPONSE_BODY) {
+                        failSlot(s, "ResponseTooLarge: body exceeds limit");
+                        return;
+                    }
                     if (!heap_used and total + n <= body_stage_bufs[s].len) {
                         @memcpy(body_stage_bufs[s][total..][0..n], chunk[0..n]);
                         total += n;
@@ -765,6 +856,7 @@ fn runJob(slot_id: u16) void {
             std.debug.assert(job_counter.alloc_count >= job_counter.free_count);
             std.debug.assert(job_counter.alloc_count - job_counter.free_count <= 1);
         }
+        resp_kept = true;
         okSlot(s, resp_data);
         break :hop;
     }

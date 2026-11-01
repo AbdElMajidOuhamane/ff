@@ -67,6 +67,45 @@ fn lowerAsciiSimd(buf: []u8) void {
     }
 }
 
+// ── Header syntax validation (RFC 7230 §3.2) ──
+// Why here and not in the consumers: std.http.Client writes extra_headers
+// verbatim ("name: value\r\n") and only *asserts* CR/LF-freedom under
+// `std.debug.runtime_safety` (Client.zig request()). ReleaseFast is the
+// shipped mode, so a CRLF-bearing value reaches the wire and splits the
+// request. Validating at the dense-pool append keeps it one pass, zero alloc.
+
+inline fn isTchar(ch: u8) bool {
+    return switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'a'...'z', 'A'...'Z' => true,
+        else => false,
+    };
+}
+
+/// RFC 7230 token — the only byte class legal in a field-name.
+fn validHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!isTchar(ch)) return false;
+    }
+    return true;
+}
+
+/// RFC 7230 field-value: HTAB, SP, VCHAR (0x21-0x7E) and obs-text (0x80-0xFF).
+/// CR, LF, NUL and every other CTL are refused.
+fn validHeaderValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch == '\r' or ch == '\n' or ch == 0) return false;
+        if (ch < 0x20 and ch != '\t') return false;
+        if (ch == 0x7f) return false;
+    }
+    return true;
+}
+
+fn validHeaderPair(name: []const u8, value: []const u8) bool {
+    return validHeaderName(name) and validHeaderValue(value);
+}
+
 // Gap-6 fix: stored names are ALWAYS lowercase (tryAppendEntry lowercases
 // at insert), so per-scan `eqlIgnoreCase` re-cases both sides on every
 // element. Lower the query ONCE per call into caller stack storage, then
@@ -111,6 +150,33 @@ test "lowerAsciiSimd matches std.ascii.toLower" {
         lowerAsciiSimd(buf[0..len]);
         try std.testing.expectEqualSlices(u8, exp[0..len], buf[0..len]);
     }
+}
+
+test "header syntax validation refuses injection primitives" {
+    // Legal.
+    try std.testing.expect(validHeaderPair("x-api-key", "abc"));
+    try std.testing.expect(validHeaderPair("x-api-key", "héllo")); // obs-text
+    try std.testing.expect(validHeaderPair("x-api-key", "a\tb")); // HTAB
+    try std.testing.expect(validHeaderPair("x-api-key", ""));
+    // Request-splitting primitives.
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\r\nX-Injected: 1"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\nb"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\x00b"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\r"));
+    // Illegal names.
+    try std.testing.expect(!validHeaderPair("bad name", "v"));
+    try std.testing.expect(!validHeaderPair("bad:name", "v"));
+    try std.testing.expect(!validHeaderPair("bad\r\nname", "v"));
+    try std.testing.expect(!validHeaderPair("", "v"));
+}
+
+test "tryAppendEntry rejects CRLF instead of storing it" {
+    var h = HeadersData.init();
+    defer h.deinit();
+    try h.tryAppendEntry("x-ok", "v");
+    try std.testing.expectError(error.InvalidHeader, h.tryAppendEntry("x-bad", "a\r\nb"));
+    try std.testing.expectError(error.InvalidHeader, h.tryAppendEntry("bad name", "v"));
+    try std.testing.expectEqual(@as(usize, 1), h.len());
 }
 
 pub const Pair = struct { name: []const u8, value: []const u8 };
@@ -270,6 +336,10 @@ pub const HeadersData = struct {
         self.tryAppendEntry(name, value) catch return;
     }
     pub fn tryAppendEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
+        // Ingest gate: a rejected pair never reaches the pools, so every
+        // downstream serializer (std.http extra_headers, Response headers)
+        // is CRLF-safe by construction.
+        if (!validHeaderPair(name, value)) return error.InvalidHeader;
         const nbase = self.names.items.len;
         try self.names.appendSlice(gpa, name);
         errdefer self.names.items.len = nbase;
@@ -285,6 +355,10 @@ pub const HeadersData = struct {
         });
     }
     pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+        // The replace branch writes `values` directly (no appendEntry), so the
+        // gate must be repeated here or `headers.set("x", "a\r\nb")` would
+        // bypass validation entirely.
+        if (!validHeaderPair(name, value)) return;
         var lower_buf: [128]u8 = undefined;
         const q = lowerQuery(name, &lower_buf);
         var first: ?usize = null;
