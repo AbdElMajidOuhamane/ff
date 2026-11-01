@@ -23,6 +23,31 @@ fn assetName(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "ff-{s}-{s}", .{ os, arch });
 }
 
+/// Find the digest for `asset` in a sha256sum-format manifest
+/// ("<64 hex>  <name>", or "<64 hex> *<name>" for binary mode).
+/// Returns null when the manifest has no entry for this asset — the caller
+/// treats that as fatal rather than installing unverified.
+fn expectedDigest(sums: []const u8, asset: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, sums, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len < 64) continue;
+        const hash = line[0..64];
+        var ok = true;
+        for (hash) |ch| {
+            if (!std.ascii.isHex(ch)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        var rest = std.mem.trimStart(u8, line[64..], " \t");
+        if (rest.len > 0 and rest[0] == '*') rest = rest[1..];
+        if (std.mem.eql(u8, rest, asset)) return hash;
+    }
+    return null;
+}
+
 pub fn run(io: std.Io, init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     var check_only = false;
@@ -87,8 +112,12 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
 
     const asset = try assetName(allocator);
     defer allocator.free(asset);
-    const dl_url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}/{s}", .{ REPO, latest, asset });
+    const dl_base = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}", .{ REPO, latest });
+    defer allocator.free(dl_base);
+    const dl_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dl_base, asset });
     defer allocator.free(dl_url);
+    const sums_url = try std.fmt.allocPrint(allocator, "{s}/sha256sums.txt", .{dl_base});
+    defer allocator.free(sums_url);
 
     var arg_it = init.minimal.args.iterate();
     const argv0 = arg_it.next() orelse "~/.local/bin/ff";
@@ -116,6 +145,8 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.new", .{exe});
     defer allocator.free(tmp_path);
+    const sums_path = try std.fmt.allocPrint(allocator, "{s}.sums", .{exe});
+    defer allocator.free(sums_path);
 
     var dl = std.process.spawn(io, .{
         .argv = &.{ "curl", "-fSL", "-o", tmp_path, dl_url },
@@ -129,6 +160,58 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         fail("download failed ({s})", .{dl_url});
     }
+
+    // ── Integrity check before anything executable is written ──
+    // install.sh verifies the release manifest; this command did not, so a
+    // tampered release asset (or a hostile redirect) became `ff` verbatim.
+    // The manifest comes from the same release, so it proves integrity in
+    // transit, not publisher identity — signatures would be the next step.
+    {
+        var sums_dl = std.process.spawn(io, .{
+            .argv = &.{ "curl", "-fSL", "-o", sums_path, sums_url },
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            fail("cannot run curl: {s}", .{@errorName(err)});
+        };
+        defer sums_dl.kill(io);
+        const sums_term = try sums_dl.wait(io);
+        if (sums_term != .exited or sums_term.exited != 0) {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, sums_path) catch {};
+            fail("checksum manifest download failed ({s}) — refusing to install unverified", .{sums_url});
+        }
+    }
+    defer std.Io.Dir.cwd().deleteFile(io, sums_path) catch {};
+
+    const sums_bytes = std.Io.Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(64 * 1024)) catch {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        fail("cannot read checksum manifest", .{});
+    };
+    defer allocator.free(sums_bytes);
+    const want = expectedDigest(sums_bytes, asset) orelse {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        fail("release has no checksum for {s} — refusing to install unverified", .{asset});
+    };
+
+    // One-shot CLI: hashing the whole binary in memory is simpler than a
+    // streaming reader and bounded by the same limit as the download.
+    const bin = std.Io.Dir.cwd().readFileAlloc(io, tmp_path, allocator, .limited(64 * 1024 * 1024)) catch {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        fail("cannot read downloaded binary", .{});
+    };
+    defer allocator.free(bin);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bin, &digest, .{});
+    const got = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &got, want)) {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        fail("checksum mismatch for {s}: expected {s}, got {s}", .{ asset, want, &got });
+    }
+    cli.ok("verified sha256 {s}", .{&got});
+
     {
         const tmp_z = allocator.dupeZ(u8, tmp_path) catch tmp_path;
         defer if (tmp_z.ptr != tmp_path.ptr) allocator.free(tmp_z);
