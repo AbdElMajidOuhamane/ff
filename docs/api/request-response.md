@@ -27,7 +27,7 @@ const data = await res.json();
 |---|---|
 | Signature | `new Response(body?, init?)` |
 | `body` | `string` \| `ArrayBuffer` \| `Uint8Array` (or `null`/omitted) |
-| `init` | `{ status?, statusText?, headers? }` |
+| `init` | `{ status?, statusText?, headers? }` (status must be `100`–`999`, default `200`) |
 
 ```js
 new Response("hello");
@@ -194,6 +194,7 @@ res.headers.forEach((v, k) => console.log(k, v));
 
 - **`bodyUsed` never flips** — it stays `false` before, during, and after
   every read. Don't branch on it; bodies are simply re-readable.
+- **Status code range (100–999)** — `status` is bounded to valid 3-digit HTTP status codes. Out-of-range numbers (negative, `< 100`, or `> 999`) fall back to default (`200`, or `302` for `Response.redirect`).
 - **`headers.size` is a function** — `h.size` is `undefined`;
   `h.size()` is the number. Same for `URLSearchParams.size`.
 - `clone()` corrupts the copy (`"OKABCDEFGH"` → `"OKOKABCDEF"`) — re-read

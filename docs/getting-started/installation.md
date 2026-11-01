@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/AbdElMajidOuhamane/ff/main/install.
 The installer detects your OS and architecture, downloads the matching binary
 from the latest GitHub release, verifies its SHA-256 checksum, and installs to
 `~/.local/bin/ff`. If `~/.local/bin` isn't on your `PATH`, it prints the
-`export` line to add. Update anytime with:
+`export` line to add. Update anytime with `ff upgrade` (which similarly verifies release checksums before installing):
 
 ```sh
 ff upgrade

@@ -38,6 +38,8 @@ ff info.js hello --allow-env=HOME
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+| `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
+| `process.stats()` | `() => object` | Internal allocator, spill, and pool counters |
 
 ## Permissions
 
@@ -161,6 +163,35 @@ if (badConfig) {
 - An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
 > **Note:** There is no signal-handling API. Stop servers with `Ctrl-C` from the terminal, or `process.exit(0)` for programmatic shutdown.
+
+## Memory and allocator introspection
+
+### `process.memoryUsage()`
+
+Returns an object with the current process Resident Set Size (`rss`) in bytes:
+
+```js
+const { rss } = process.memoryUsage();
+console.log(`RSS: ${(rss / 1024 / 1024).toFixed(1)} MB`);
+```
+
+### `process.stats()`
+
+Returns internal runtime counters tracking heap spills and buffer reuse (useful for benchmarking and performance tuning):
+
+```js
+console.log(process.stats());
+// {
+//   "fetch.bodyHeap": 0,
+//   "fetch.hdrSpill": 0,
+//   "fetch.decompressHeap": 0,
+//   "http.bodySpill": 0,
+//   "http.bodySpillReuse": 0,
+//   ...
+// }
+```
+
+Neither call requires permission flags.
 
 ## Practical example: CLI with subcommands
 

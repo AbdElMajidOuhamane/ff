@@ -23,6 +23,7 @@ still files:
 | `ff start --cert/--key`, `FF_CERT` / `FF_KEY` | No runtime `--allow-read` — the CLI reads them before the engine starts |
 | `--ca` / `FF_CA_FILE` | No `--allow-read` and no `--allow-env` — CLI/runtime trust config |
 | Outbound `fetch` / `wss://` | `--allow-net` on the target host and port |
+| Postgres TLS (`sslrootcert`) | `--allow-read` on the CA PEM bundle path |
 
 ```sh
 ff tls-server.js \
@@ -226,8 +227,23 @@ curl -k https://localhost:8443/
 # hello over tls
 ```
 
+## TLS with PostgreSQL
+
+Fairyfly's BearSSL engine also secures database connections:
+
+```js
+const sql = new SQL("postgres://user:pass@db.example.com:5432/app?sslmode=verify-full&sslrootcert=ca.pem");
+```
+
+```sh
+ff app.js --allow-net=db.example.com:5432 --allow-read=ca.pem
+```
+
+Only `sslmode=verify-full` and `sslmode=disable` are supported. Full details: [Postgres API](/docs/api/postgres#tls--ssl-configuration).
+
 ## Limits you will hit
 
+- Server requires TLS 1.2 minimum (BearSSL profile restricts server versions to TLS 1.2; TLS 1.0 and 1.1 are rejected).
 - One listener is TLS-or-plain per `tls` block. No client-certificate auth.
 - Cert ≤ 512KB, key ≤ 256KB.
 - RSA or EC keys; RSA is the well-trodden path.

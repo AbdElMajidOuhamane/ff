@@ -336,7 +336,7 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 | No releases published or network failure | Prints `error: <reason>` (with a hint where useful), exits `1` |
 | Already latest | Prints up-to-date, exits |
 | `--check` | Prints the newer version, exits without downloading |
-| Update available | Downloads `ff-<os>-<arch>`, `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
+| Update available | Downloads `ff-<os>-<arch>`, fetches `sha256sums.txt`, verifies the SHA-256 checksum (refusing install on mismatch or missing hash), `chmod 755`, replaces the running binary (default `~/.local/bin/ff` unless argv0 is absolute) |
 
 > **Note:** Releases are published at [github.com/AbdElMajidOuhamane/ff/releases](https://github.com/AbdElMajidOuhamane/ff/releases) — `v0.2.0-beta` is the first. With a release available, `ff upgrade` reports up-to-date for current builds, downloads when you're behind, and only takes the failure row on network errors or a missing release asset.
 

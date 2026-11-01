@@ -41,7 +41,7 @@ flag a global needs; `—` means it is always available. Full model:
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | — | [crypto](/docs/api/crypto) |
 | `btoa`, `atob` | Base64 encode / decode | — | [crypto](/docs/api/crypto) |
 | `Database` | SQLite (`Database.open(path)`) | `read` + `write` | [SQLite](/docs/api/sqlite) |
-| `sql`, `SQL` | Postgres tagged templates + pool | `net`; global `sql` also `env` | [Postgres](/docs/api/postgres) |
+| `sql`, `SQL` | Postgres tagged templates + pool | `net` (+ `read` for `sslrootcert`); global `sql` also `env` | [Postgres](/docs/api/postgres) |
 | `ffi` | C-ABI shared libraries (`--allow-ffi`) | `ffi` | [FFI](/docs/api/ffi) |
 | `permissions` | Enabled categories as six booleans | — | [Permissions](/docs/concepts/permissions) |
 | `import.meta.url` | `file://` URL of the current module | — | [Modules](/docs/guides/modules) |
@@ -55,6 +55,7 @@ Notes:
   need `read`. The worker inherits the process policy for everything it calls.
 - `http` always needs `net` for its `0.0.0.0:<port>` bind. `read` is only
   checked when `tls.cert` / `tls.key` are file paths rather than inline PEM.
+- `sql` / `SQL` checks `net` against the target host:port. If TLS is configured with `sslrootcert`, `read` on the CA bundle is also checked. The global `sql` pool checks `env` to discover `DATABASE_URL` / `PG*` settings.
 - `Database.open(":memory:")` needs no path permission.
 
 ### Timer handles
@@ -121,10 +122,10 @@ Full tables: [Response statics and Database methods](#quick-reference).
 | `sql.begin()` | `() → Promise<Tx>` | Transaction on one connection |
 | `sql.close()` | `() → undefined` | Close the default pool |
 | `tx.commit()` / `tx.rollback()` | `() → Promise<rows>` | End the transaction (resolves `[]`) |
-| `new SQL(dsn)` | `(string) → SQL` | Pool bound to a DSN |
+| `new SQL(dsn | options)` | `(string | object) → SQL` | Pool bound to a DSN or options object (`{ host, port, user, password, database, max, sslmode, sslrootcert }`) |
 
-`new SQL(dsn)` checks `net` against the DSN host and port. The global `sql`
-also needs `env` if it should read `PG_TEST_DSN` / `DATABASE_URL` / `PG*` at
+`new SQL(dsn | options)` checks `net` against the target host and port (and `read` on `sslrootcert` if TLS is enabled). The global `sql`
+also needs `env` if it should read `PG_TEST_DSN` / `DATABASE_URL` / `PG*` (including `PGSSLMODE`, `PGSSLROOTCERT`) at
 startup; otherwise it falls back to `127.0.0.1:5432`.
 
 ## Not provided

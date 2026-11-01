@@ -264,7 +264,7 @@ ff client.js --allow-net=api.example.com:443
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, every hop re-checked against `--allow-net`, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `x-api-key`), RFC 7230 header validation, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
 
@@ -273,6 +273,10 @@ Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body 
 A redirect-hop denial rejects with the plain string
 `"PermissionDenied: fetch requires --allow-net"` — no `code`, no host. Catch
 both, and log with `String(e)` so string rejections print something useful.
+
+**Cross-origin redirects strip credentials.** If a redirect crosses to a different origin (different scheme, host, or port), Fairyfly automatically strips sensitive headers (`authorization`, `cookie`, `x-api-key`) to prevent credential leakage.
+
+**Response body limit is 16 MB.** Both the declared Content-Length and decompressed (gzip/deflate) body data are capped at 16 MiB. Larger responses fail and reject the promise.
 
 **Method names are exact-case.** `fetch` matches `init.method` against the standard tokens verbatim — `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"`. Anything else, including lowercase (`"post"`), is sent as `GET` (a body is still attached). Your `http.serve` handler likewise sees the method exactly as the client sent it, so normalize before comparing (`method.toUpperCase() === "POST"`).
 

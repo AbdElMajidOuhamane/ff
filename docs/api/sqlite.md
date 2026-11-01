@@ -86,6 +86,8 @@ const mem = Database.open(":memory:");
 
 Opens (creating when missing) and returns the handle. Every open enables `PRAGMA journal_mode=WAL` and a 5000ms busy timeout — override the latter per handle with `busyTimeout(ms)`.
 
+Paths must be non-empty, must not contain NUL bytes, and `file:` URI filenames are not supported (they throw a `TypeError`).
+
 > **Caution:** The path is relative to the process cwd. `Database.open("app.db")` in `ff start` lands next to where you launched, not necessarily next to your script. Permission scopes are fixed at launch, so launch from the directory you intend to write to, or pass an absolute path that a scope covers.
 
 `:memory:` gets an ephemeral database that disappears when the handle closes. It

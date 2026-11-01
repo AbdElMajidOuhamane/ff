@@ -80,10 +80,11 @@ For each level (starting at the importer's dir, then each parent), the first `no
 
 Then the walk continues to the parent directory. Misses everywhere and the loader prints its standard filename error for the first candidate.
 
-Two sharp edges, both fail **loud**:
+Three sharp edges, all fail **loud**:
 
 - A manifest entry naming a file that isn't on disk is a broken install: `could not load module filename '…'` and a hard error. It never silently falls through to a higher copy (same strictness as npm).
 - Subpath imports (`pkg/feature`) need an `exports` map entry (`"./feature"`) or a matching literal file. No map + no file = keep walking, then fail.
+- **Directory containment security:** Manifest targets (`main`, `module`, `exports`) and bare subpaths containing `..` or attempting to escape the package directory are rejected. A package cannot use relative escapes to read arbitrary host files.
 
 Install packages first — resolution needs the files:
 

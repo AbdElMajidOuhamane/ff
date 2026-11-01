@@ -270,7 +270,10 @@ needs the listener grant.
 | Concurrent connections | 512 | The 513th waits for a free slot |
 | Request body | ~4 KB total (headers + body share one read buffer) | Beyond → `413 Payload Too Large` |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
+| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
+| Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Connection terminated with `400 Bad Request` |
+| Response status | 100..999 | Clamped/validated to 100..999 |
 | Bind address | Always `0.0.0.0` | No host option exists; the net scope must be `0.0.0.0:<port>` |
 | Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |
 

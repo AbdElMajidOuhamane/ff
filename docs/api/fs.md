@@ -47,13 +47,14 @@ Full model: [Permissions](/docs/concepts/permissions).
 ## Read a file
 
 ```js
-const text = fs.readFile("notes.txt");
-console.log(text);
+const text = fs.readFile("notes.txt");                 // string (default)
+const bytes = fs.readFile("image.png", "buffer");      // ArrayBuffer
 ```
 
-Returns the file content as a string, or `undefined` when the **I/O** fails
-(missing file, OS permission). Reads cap at 10MB. Without `--allow-read` on the
-path, the call throws `PermissionDenied` instead.
+Returns the file content as a string (default or `"utf8"`), or as an `ArrayBuffer`
+when `"buffer"` or `"binary"` is passed as the second argument. Returns `undefined`
+when the **I/O** fails (missing file, OS permission). Reads cap at 10MB. Without
+`--allow-read` on the path, the call throws `PermissionDenied` instead.
 
 ```sh
 ff read.js --allow-read=notes.txt
@@ -67,6 +68,8 @@ fs.writeFile("out.txt", "Hello from Fairyfly!");
 ```
 
 Creates the file when missing, overwrites when present. Parent directories must exist — use `mkdir` first. Needs `--allow-write` on the file.
+
+Writes are capped at **10 MB**. Passing data larger than 10 MB throws an error immediately (`fs.writeFile: data exceeds the 10 MiB limit (nothing written)`) instead of silently truncating the file.
 
 ## Check existence
 
@@ -112,7 +115,7 @@ Same names with an `Async` suffix, each returning a Promise:
 
 ```js
 const text = await fs.readFileAsync("notes.txt");          // string (default)
-const bytes = await fs.readFileAsync("data.bin", "buffer"); // Uint8Array
+const bytes = await fs.readFileAsync("data.bin", "buffer"); // ArrayBuffer
 const ok = await fs.existsAsync("notes.txt");               // boolean
 await fs.writeFileAsync("out.txt", "hello");
 await fs.mkdirAsync("a/b", true);
@@ -120,7 +123,7 @@ await fs.rmAsync("out.txt");
 const names = await fs.readdirAsync(".");
 ```
 
-Failures **reject** instead of being swallowed:
+Failures **reject** instead of being swallowed (including `writeFileAsync` with data > 10 MB):
 
 ```js
 try {
@@ -170,8 +173,8 @@ ff example.js --allow-read=. --allow-write=.
 
 - Max path 4096 bytes.
 - Max read 10MB per call.
+- Max write 10MB per call — throws/rejects immediately above 10MB instead of truncating.
 - Sync **I/O** failures return `undefined` — no exception is raised, so a
-  `try/catch` around a missing file catches nothing. Permission denial is the
-  exception and does throw.
+  `try/catch` around a missing file catches nothing. Permission denial and write overflow are exceptions and do throw.
 - Scope roots are fixed at launch; `process.chdir()` does not move them.
 - No file watching — poll with timers instead.

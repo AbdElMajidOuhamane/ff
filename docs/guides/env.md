@@ -127,6 +127,30 @@ FF_ECHO=1 ff app.js --allow-env=FF_ECHO
 Without the grant, `process.env.FF_ECHO` is `undefined` even though echo mode
 is active. The same applies to `FF_CERT`, `FF_KEY`, and `FF_CA_FILE`.
 
+### Database environment variables
+
+The built-in Postgres client (`sql` global) inspects database configuration variables when granted by `--allow-env`:
+
+| Variable | Description |
+|---|---|
+| `PG_TEST_DSN` or `DATABASE_URL` | Full connection DSN (e.g. `postgres://user:pass@host:5432/db?sslmode=verify-full&sslrootcert=ca.pem`) |
+| `PGHOST` | Database server host (default `127.0.0.1`) |
+| `PGPORT` | Database server port (default `5432`) |
+| `PGUSER` | Database user (default `postgres`) |
+| `PGPASSWORD` | Database password |
+| `PGDATABASE` | Database name (default `postgres`) |
+| `PGSSLMODE` | Postgres TLS mode (`disable` or `verify-full`) |
+| `PGSSLROOTCERT` | Path to PEM root CA bundle (requires `--allow-read=<path>`) |
+
+Like application variables, these are only read if explicitly permitted with `--allow-env`:
+
+```sh
+ff app.js \
+  --allow-net=db.internal:5432 \
+  --allow-env=PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE,PGSSLMODE,PGSSLROOTCERT \
+  --allow-read=/etc/ssl/pg-ca.pem
+```
+
 ## Practical example: dev vs prod startup
 
 ```sh

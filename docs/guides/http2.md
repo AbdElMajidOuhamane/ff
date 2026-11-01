@@ -100,7 +100,7 @@ Unchanged — write handlers exactly like the HTTP Server guide:
 
 - Handler signature `(url, method, body)` → `Response | { status, body } | Promise<…>`.
 - `Response.json` / `redirect` / statics, `Headers`, status codes — all identical.
-- Limits still apply: 512 connections, 10 MB response body (64 KB stage buffer spills to the heap), 30s watchdog.
+- Limits still apply: 512 connections, 10 MB response body (64 KB stage buffer spills to the heap), 30s watchdog, 10 MB per-connection request body cap, strict pseudo-header validation.
 - WebSocket upgrades ride the HTTP/1.1 connections on the same port; `h2` connections serve normal requests.
 - Permissions are unchanged: the port grant covers HTTP/2 and HTTP/1.1, and TLS file reads are still `read` scopes.
 

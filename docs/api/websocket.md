@@ -281,7 +281,11 @@ Connect clients with `--allow-net=127.0.0.1:3000`.
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
 | Message size | 16384 bytes | Larger frames truncate |
-| Handshake URL path | 512 bytes | Longer paths fail |
+| Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
+| Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
+| Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |
+| Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
+| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` server-side |
 
 ## Troubleshooting

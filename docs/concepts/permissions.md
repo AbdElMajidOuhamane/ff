@@ -95,7 +95,7 @@ Rules:
 
 ```sh
 --allow-env=HOME,PATH
---allow-env=PG_TEST_DSN,DATABASE_URL,PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE
+--allow-env=PG_TEST_DSN,DATABASE_URL,PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE,PGSSLMODE,PGSSLROOTCERT
 --allow-env                       # every variable
 ```
 
@@ -151,8 +151,8 @@ Rules:
 | `http.serve({ tls })` | `read` for file paths | before the TLS files are loaded |
 | `udp.bind` / `connect` / `sendto` | `net` on the address | before the syscall |
 | `Database.open` | `read` + `write` on the file, `write` on the parent | before `sqlite3_open` |
-| `new SQL(dsn)` | `net` on the DSN host and port | before the pool is created |
-| global `sql` | `net`, plus `env` for `PG_*` / `DATABASE_URL` | before the first query |
+| `new SQL(dsn \| options)` | `net` on host/port, plus `read` on `sslrootcert` if TLS is enabled | before the pool is created |
+| global `sql` | `net`, `read` on `sslrootcert` (if TLS enabled), plus `env` for `PG_*` / `DATABASE_URL` / `PGSSL*` | before the first query |
 | `child_process.spawn` / `exec` / `execSync` | `run` on `argv[0]` | before the child is created |
 | `ffi.dlopen` / `ffi.callback` / `ffi.*` memory helpers | `ffi` | before `dlopen`, closure creation, pointer creation, or memory access |
 

@@ -49,7 +49,9 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 | `new Worker()` without a path | **throws** `Worker requires a module path` |
 | `sql` template with no pool | **throws** `no database pool` |
 | Postgres `tx` after `commit()` | **throws** `transaction is closed` |
-| `fs.readFile` / `writeFile` / `mkdir` / `rm` / `readdir` | **does not throw on I/O errors** — returns `undefined`; **throws `PermissionDenied`** when the path is outside the matching `--allow-read` / `--allow-write` scope |
+| Postgres unsupported `sslmode` | **throws** `sslmode must be 'disable' or 'verify-full'` |
+| `fs.readFile` / `mkdir` / `rm` / `readdir` | **does not throw on I/O errors** — returns `undefined`; **throws `PermissionDenied`** when the path is outside the matching `--allow-read` / `--allow-write` scope |
+| `fs.writeFile` | **does not throw on ordinary I/O errors** — returns `undefined`; **throws** if data exceeds 10 MiB limit; **throws `PermissionDenied`** when path is outside `--allow-write` |
 | `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — but a permission denial throws synchronously before the promise exists, and a *successful* call hangs the process afterwards (Known issue; see [fs](/docs/api/fs)) |
 | `process.chdir()` | **throws `PermissionDenied`** when the target is outside `--allow-read`; a missing or unreachable path is still a silent no-op |
 | `process.env` | **never throws** — names outside `--allow-env` are absent (`undefined`) |
@@ -181,6 +183,9 @@ Strings you'll see in practice — useful for assertions in tests:
 | `sql must be used as a template tag` | Postgres |
 | `template arity mismatch` | Postgres |
 | `transaction is closed` | Postgres |
+| `sslmode must be 'disable' or 'verify-full'` | Postgres |
+| `SQL: TLS setup failed (...)` | Postgres TLS |
+| `fs.writeFile: data exceeds the 10 MiB limit (nothing written)` | `fs.writeFile` |
 | `Request requires a URL string as first argument` | `new Request` |
 | `Response.redirect requires a URL` | `Response.redirect` |
 | `Invalid URL` | `fetch`, `URL` |

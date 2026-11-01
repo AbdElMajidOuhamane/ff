@@ -234,8 +234,11 @@ two apex domains.
 |------|-------|----------|
 | Concurrent fetches | 16 | The 17th waits for a free slot |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
+| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject |
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | 5 hops max, each re-checked | Throws `Too many redirects` or rejects with a permission string |
+| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
+| Header validation | RFC 7230 character validation | CRLF or invalid header characters reject before sending |
 | Abort | Not supported | `signal` / `timeout` init keys ignored |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 

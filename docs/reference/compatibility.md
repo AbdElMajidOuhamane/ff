@@ -95,8 +95,8 @@ These are the ones that bite during a port:
 |---|---|
 | Native permissions | **Deny-by-default**; Node/Bun run with full access — pass `--allow-*` |
 | `console.*` | Writes to **stderr**; all arguments printed; `warn` is yellow, `error` red — non-standard colours |
-| Unhandled rejections | **Silent**, exit `0` (Node exits `1`) |
-| Sync `fs` failures | Return `undefined` on **I/O** failure, never throw; permission denial **throws** `PermissionDenied` |
+| Unhandled rejections / jobs | Bare unhandled promise rejections are silent (exit `0`); uncaught errors in queued microtasks or timer callbacks print to stderr and exit `1` |
+| Sync `fs` failures | Return `undefined` on ordinary **I/O** failure; `writeFile` throws if data > 10 MiB; permission denial **throws** `PermissionDenied` |
 | `process.env` | Filtered snapshot — only `--allow-env` names are present |
 | `process.chdir` | Needs `read` on the target; outside the scope it throws `PermissionDenied` |
 | `fetch` rejection | Ordinary failures reject with a **string** (`"Network error"`); initial permission denial is an `Error`; redirect-hop denial is a string |

@@ -14,8 +14,9 @@ Postgres is a network database, so connection setup needs `--allow-net`:
 
 | Operation | Needs |
 |---|---|
-| `new SQL(dsn)` | `--allow-net=<host>:<port>` — checked in the constructor |
-| Global `sql` (first use) | The same net grant, plus `--allow-env` for any `PG_TEST_DSN` / `DATABASE_URL` / `PG*` variables it should read |
+| `new SQL(dsn)` / `new SQL(options)` | `--allow-net=<host>:<port>` — checked in the constructor |
+| TLS with `sslmode=verify-full` | `--allow-read=<sslrootcert-path>` to load the CA bundle |
+| Global `sql` (first use) | The same net and read grants, plus `--allow-env` for any `PG_TEST_DSN` / `DATABASE_URL` / `PG*` / `PGSSL*` variables |
 | `sql.connect()` | Net grant on the configured host and port |
 
 ```sh
@@ -38,17 +39,18 @@ through `process.env`. A variable that `--allow-env` does not grant is silently
 ignored, and the next source is tried:
 
 ```text
-PG_TEST_DSN → DATABASE_URL → PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE → defaults
+PG_TEST_DSN → DATABASE_URL → PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE/PGSSLMODE/PGSSLROOTCERT → defaults
 ```
 
 ```sh
 # Use an env DSN:
 ff app.js --allow-env=PG_TEST_DSN --allow-net=db.example.com:5432
 
-# Use PG* pieces:
+# Use PG* pieces with TLS:
 ff app.js \
-  --allow-env=PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE \
-  --allow-net=db.example.com:5432
+  --allow-env=PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE,PGSSLMODE,PGSSLROOTCERT \
+  --allow-net=db.example.com:5432 \
+  --allow-read=./ca.pem
 
 # No env grant: falls back to 127.0.0.1:5432
 ff app.js --allow-net=127.0.0.1:5432
@@ -115,27 +117,81 @@ sql.close();
 ff todos.js --allow-net=127.0.0.1:5432
 ```
 
-## `new SQL(dsn)` / global `sql`
+## `new SQL(dsn | options)` / global `sql`
 
 ```js
+// Via DSN string:
 const sql = new SQL("postgres://user:pass@127.0.0.1:5432/app");
+
+// Or via options object:
+const sql = new SQL({
+  host: "127.0.0.1",
+  port: 5432,
+  user: "user",
+  password: "pass",
+  database: "app",
+  max: 10, // pool size (1..100, default 10)
+});
+
 await sql.connect(); // optional: probe with SELECT 1, rejects if unreachable
 ```
 
-`new SQL(dsn)` builds a pool around that DSN and checks its host/port
+`new SQL(dsn | options)` builds a pool and checks its host/port
 immediately. The global `sql` is the same API preconfigured from the
 environment — checked in order: `PG_TEST_DSN`, `DATABASE_URL`, then `PGHOST` /
-`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`, then defaults
+`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE` / `PGSSLMODE` / `PGSSLROOTCERT`, then defaults
 (`127.0.0.1:5432`, user `postgres`, database `postgres`). Only variables
 granted by `--allow-env` are visible to this lookup.
 
-Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10. For the global `sql`, that first query is also when the net permission check runs.
+Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10 (or configured `max`). For the global `sql`, that first query is also when the net permission check runs.
 
 > **Caution:** With no DSN argument and no granted environment, the global
 > `sql` points at `127.0.0.1:5432` and needs
 > `--allow-net=127.0.0.1:5432`. If that host is not running Postgres, the query
 > rejects with a connection error. Export an allowed DSN — or pass one to
 > `new SQL(dsn)` — to point somewhere else.
+
+## TLS / SSL configuration
+
+Postgres connections support TLS encryption using Fairyfly's embedded BearSSL engine:
+
+```js
+// Via DSN query parameters:
+const sql = new SQL("postgres://user:pass@db.example.com:5432/app?sslmode=verify-full&sslrootcert=./ca.pem");
+
+// Or via options object:
+const sql = new SQL({
+  host: "db.example.com",
+  port: 5432,
+  user: "user",
+  password: "pass",
+  database: "app",
+  sslmode: "verify-full",
+  sslrootcert: "./ca.pem",
+});
+```
+
+```sh
+ff app.js \
+  --allow-net=db.example.com:5432 \
+  --allow-read=./ca.pem
+```
+
+### Supported modes
+
+| `sslmode` | Description |
+|---|---|
+| `"verify-full"` | Full TLS handshake: validates server certificate chain against the trusted root in `sslrootcert` and verifies the hostname matches the certificate |
+| `"disable"` | Plaintext TCP connection without TLS |
+
+> **Security Note:** libpq's `require`, `prefer`, and `verify-ca` are **not supported** and throw `TypeError: sslmode must be 'disable' or 'verify-full'`. BearSSL requires chain validation to derive keys for handshake verification, so Fairyfly fails closed rather than allowing unauthenticated or downgrade-vulnerable TLS connections.
+
+### Root certificate rules
+
+- `sslrootcert` points to a PEM-encoded CA bundle (capped at 512 KB).
+- When `sslmode=verify-full`, reading `sslrootcert` is checked against `--allow-read`. A missing grant throws `PermissionDenied`.
+- **Anchor sealing:** The CA trust store is process-global and sealed after the first pool initializes TLS. A subsequent pool that specifies a different `sslrootcert` fails with an error rather than silently trusting the earlier bundle.
+- Environment variables: `PGSSLMODE` and `PGSSLROOTCERT` configure TLS for the global `sql` instance (when permitted by `--allow-env`).
 
 ## Reading and writing: tag / `unsafe`
 
@@ -318,6 +374,16 @@ to `new SQL(dsn)`.
 **Connection refused** — Postgres isn't listening (Docker not up? `docker compose up -d`), or the host/port in the DSN is wrong. If you expected an env DSN but got the default, check `--allow-env`.
 
 **`password authentication failed`** — credentials in the DSN don't match the server. Check `PGUSER` / `PGPASSWORD`; environment variables override nothing once a DSN argument is passed.
+
+**`TypeError: sslmode must be 'disable' or 'verify-full'`** — an unsupported `sslmode` was passed (such as `require` or `prefer`). Only `disable` and `verify-full` are supported.
+
+**`TypeError: SQL: TLS setup failed (PermissionDenied)`** — the path specified by `sslrootcert` is outside your `--allow-read` scope. Add the path to `--allow-read`.
+
+**`TypeError: SQL: TLS setup failed (SslRootCertUnreadable)`** — the CA certificate file at `sslrootcert` could not be read or exceeds 512 KB.
+
+**`TypeError: SQL: TLS setup failed (MissingSslRootCert)`** — `sslmode=verify-full` was set, but no `sslrootcert` path was specified in the DSN, options object, or `PGSSLROOTCERT`.
+
+**`TypeError: SQL: TLS setup failed (NoBearssl)`** — the runtime was compiled without TLS support (`-Dbearssl=false`).
 
 **`relation "x" does not exist`** — the migration never ran on this database (wrong database name? fresh server?). Run the `CREATE TABLE` before the queries.
 

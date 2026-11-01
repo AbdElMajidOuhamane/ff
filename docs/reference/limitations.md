@@ -40,10 +40,13 @@ boundary for hostile code.
 | Request body | ~4 KB (shares the 4 KB read buffer) | Beyond → `413 Payload Too Large` |
 | Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
 | Response headers | 2048 bytes | Headers beyond the cap are dropped |
+| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
+| Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Terminated with `400 Bad Request` |
+| Response status | 100..999 | Clamped/validated to 100..999 |
 | Bind address | Always `0.0.0.0` | No host option, no `FF_PORT`; the net scope must be `0.0.0.0:<port>` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
-| HTTP/2 | TLS + ALPN only (nghttp2) | Plain sockets stay HTTP/1.1 |
+| HTTP/2 | TLS + ALPN only (nghttp2); pseudo-headers validated; 10 MB connection body cap | Plain sockets stay HTTP/1.1 |
 | `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
 
 ## Fetch (client)
@@ -52,8 +55,11 @@ boundary for hostile code.
 |------|-------|----------|
 | Concurrent fetches | 16 | The 17th waits for a free slot |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
+| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject |
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | Followed, max 5 hops | Throws `Too many redirects`; every hop is re-checked against `--allow-net` |
+| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
+| Header validation | RFC 7230 character validation | CRLF or invalid header names/values reject before sending |
 | Abort / `signal` | Not supported | `signal` / `timeout` / `redirect` init keys are ignored |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 | Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
@@ -64,7 +70,11 @@ boundary for hostile code.
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
 | Message size | 16384 bytes | Larger frames truncate |
-| Handshake URL path | 512 bytes | Longer paths fail |
+| Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
+| Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
+| Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |
+| Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
+| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
 | Proxy | Same env vars as `fetch` | `ws://` needs a CONNECT-capable proxy |
 
@@ -101,6 +111,7 @@ queueMicrotask(fn);
 |------|-------|----------|
 | Path length | 4096 bytes | Longer paths fail, including permission scopes |
 | Read per call | 10MB, sync | Larger reads fail |
+| Write per call | 10MB hard cap (sync and async) | Beyond 10MB throws/rejects instead of truncating |
 | Permission scopes | Canonicalized at launch | `chdir` does not move them; symlink targets must stay inside a scope |
 | API style | Sync + six `*Async` Promise variants (`readFileAsync`, `writeFileAsync`, `existsAsync`, `mkdirAsync`, `rmAsync`, `readdirAsync`) | No `fs.watch` — poll with timers |
 
@@ -118,6 +129,7 @@ queueMicrotask(fn);
 | Module system | ESM only | No `require()`, no CommonJS |
 | Relative extensions | Optional for `.js` | `./x` probes `./x.js`, then `./x/index.js`; other extensions must be written out |
 | Bare specifiers | Resolved via `node_modules` | Needs `ff imprint` install first |
+| Package containment | Strict directory boundary | Manifest targets (`main`, `module`, `exports`) and subpaths containing `..` or escaping package root are rejected |
 | Program loading | Not a `read` operation | `import` and `new Worker(path)` work without `--allow-read` |
 | `Buffer` | Missing | Use `Uint8Array` |
 | DOM / `window` | Missing | Backend only |
@@ -137,11 +149,11 @@ queueMicrotask(fn);
 | Area | Limit | When hit |
 |------|-------|----------|
 | Pool | 10 connections | Extra queries queue |
-| TLS (`sslmode`) | Not supported | — |
+| TLS (`sslmode`) | `verify-full` and `disable` supported via BearSSL | `sslmode=verify-full` requires `sslrootcert` pointing to valid PEM CA bundle; libpq modes (`require`, `prefer`, `verify-ca`) rejected |
 | Connection/socket timeouts | None | Slow queries wait indefinitely |
 | `rowCount` | Returned rows only | INSERT/UPDATE row counts are not reported |
 | COPY | Not supported | — |
-| Permission scope | `net` on the DSN host and port | Global `sql` also needs `env` to read `PG_*` / `DATABASE_URL`; otherwise it falls back to `127.0.0.1:5432` |
+| Permission scope | `net` on the DSN host and port, plus `read` on `sslrootcert` when TLS is used | Global `sql` also needs `env` to read `PG_*` / `DATABASE_URL` / `PGSSL*`; otherwise it falls back to `127.0.0.1:5432` |
 
 ## Process
 
@@ -168,7 +180,8 @@ queueMicrotask(fn);
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| TLS versions | TLS 1.2 (BearSSL build) | No TLS 1.3 in the default build |
+| Server TLS versions | TLS 1.2 minimum (TLS 1.0 and 1.1 rejected) | No TLS 1.3 in the default BearSSL build |
+| `ff upgrade` | Verifies SHA-256 digest from `sha256sums.txt` | Mismatched or missing hash refuses install |
 | `ff compile` input | 20MB source | Larger inputs fail |
 | `ff test` file | 10MB | Larger test files are not loaded |
 | REPL line | 8192 bytes | Longer lines truncate |
