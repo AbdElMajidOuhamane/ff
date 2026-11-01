@@ -103,12 +103,18 @@ fn writeFileCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c
     var str_len: usize = 0;
     const str_ptr = c.toCStringLen(ctx, &str_len, data_val) orelse return c.JS_UNDEFINED;
     defer c.freeCString(ctx, str_ptr);
-    const data_final = @min(str_len, MAX_READ);
+    // Do not silently truncate. The old `@min(str_len, MAX_READ)` wrote a
+    // shorter file and reported success — data corruption for any caller
+    // (a dump, a migration) that happened to exceed 10 MiB.
+    if (str_len > MAX_READ) {
+        throwErr(ctx, "fs.writeFile: data exceeds the 10 MiB limit (nothing written)");
+        return c.JS_UNDEFINED;
+    }
 
     const io = getIo();
     Dir.cwd().writeFile(io, .{
         .sub_path = path,
-        .data = str_ptr[0..data_final],
+        .data = str_ptr[0..str_len],
     }) catch |err| {
         throwErr(ctx, @errorName(err));
     };
@@ -392,9 +398,16 @@ fn runOp(job: *FsJob) void {
             job.ok = true;
         },
         .write_file => {
+            // Same rule as the sync path: refuse an oversized write instead of
+            // silently writing a truncated file. submitJob staged the whole
+            // payload, so job.data.len is authoritative.
+            if (job.data.len > MAX_READ) {
+                jobFail(job, error.FileTooLarge);
+                return;
+            }
             Dir.cwd().writeFile(io, .{
                 .sub_path = path,
-                .data = job.data[0..@min(job.data.len, MAX_READ)],
+                .data = job.data,
             }) catch |err| {
                 jobFail(job, err);
                 return;
@@ -657,7 +670,13 @@ fn writeFileAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv
     var str_len: usize = 0;
     const str_ptr = c.toCStringLen(ctx, &str_len, argv[1]) orelse return c.JS_EXCEPTION;
     defer c.freeCString(ctx, str_ptr);
-    return submitJob(ctx, .write_file, path, 0, false, str_ptr[0..@min(str_len, MAX_READ)]);
+    // Reject up front instead of staging a truncated payload (the worker
+    // would otherwise write a short file and resolve successfully).
+    if (str_len > MAX_READ) {
+        _ = c.throwTypeError(ctx, "fs.writeFileAsync: data exceeds the 10 MiB limit");
+        return c.JS_EXCEPTION;
+    }
+    return submitJob(ctx, .write_file, path, 0, false, str_ptr[0..str_len]);
 }
 
 fn existsAsyncCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {

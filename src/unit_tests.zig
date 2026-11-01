@@ -57,3 +57,6 @@ test {
 test {
     _ = @import("security/permissions.zig");
 }
+test {
+    _ = @import("modules/resolver.zig");
+}
