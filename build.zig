@@ -15,6 +15,7 @@ const RuntimeLibs = struct {
     qjs_flags: []const []const u8,
     bearssl: bool,
     ffi: bool,
+    sanitize_c: bool,
 };
 
 fn runtimeModule(
@@ -29,7 +30,6 @@ fn runtimeModule(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .link_libcpp = true,
         .imports = &.{
             .{ .name = "xev", .module = libs.xev_shim },
             .{ .name = "quickjs_c", .module = libs.c_mod },
@@ -40,8 +40,9 @@ fn runtimeModule(
     // trips the C UB trap (ud2 → SIGILL) in x86_64 ReleaseSafe during
     // JS_NewRuntime, and the vendored static-lib modules would otherwise
     // leave __ubsan_handle_* references needing the UBSan runtime at link.
-    // Keep Zig safety checks; disable C UB detection for every C module.
-    mod.sanitize_c = .off;
+    // Keep Zig safety checks; C UB detection is opt-in (-Dsanitize-c=true)
+    // for local debugging of the C side only.
+    mod.sanitize_c = if (libs.sanitize_c) .full else .off;
     // TLS wiring: build options + declarations module + static library.
     mod.addImport("ffcfg", libs.ffcfg_mod);
     if (libs.bearssl) {
@@ -76,6 +77,10 @@ pub fn build(b: *std.Build) void {
     const bearssl = b.option(bool, "bearssl", "Enable BearSSL TLS (https/wss)") orelse true;
     const ffi = b.option(bool, "ffi", "Enable FFI (dlopen native libraries)") orelse true; // NEW
     const io_uring = b.option(bool, "io_uring", "Use io_uring backend on Linux (default: true; -Dio_uring=false selects epoll)") orelse true;
+    // C UBSan only (Zig has no ASAN). Off by default: vendored QuickJS is not
+    // UBSan-clean (see runtimeModule). Use it to debug C, never in releases.
+    const sanitize_c = b.option(bool, "sanitize-c", "Enable C UBSan for all C sources (vendored QuickJS trips it; debugging only)") orelse false;
+    const san: std.zig.SanitizeC = if (sanitize_c) .full else .off;
     const strip = b.option(bool, "strip", "Strip debug info from the executable (default: ReleaseFast/ReleaseSmall)") orelse
         (optimize == .ReleaseFast or optimize == .ReleaseSmall);
 
@@ -141,8 +146,8 @@ pub fn build(b: *std.Build) void {
         lib.root_module.addIncludePath(b.path("vendor/bearssl/inc"));
         lib.root_module.addIncludePath(b.path("vendor/bearssl/src"));
         lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/bearssl/src"), .files = files.items });
-        // Match the root module: no C UBSan for vendored C (see runtimeModule).
-        lib.root_module.sanitize_c = .off;
+        // Match the root module: C UBSan is opt-in (see runtimeModule).
+        lib.root_module.sanitize_c = san;
         bssl_lib = lib;
     }
 
@@ -196,8 +201,8 @@ pub fn build(b: *std.Build) void {
                 "-DHAVE_NETINET_IN_H",
             },
         });
-        // Match the root module: no C UBSan for vendored C (see runtimeModule).
-        lib.root_module.sanitize_c = .off;
+        // Match the root module: C UBSan is opt-in (see runtimeModule).
+        lib.root_module.sanitize_c = san;
         lib.installHeadersDirectory(b.path("vendor/nghttp2/includes"), "", .{});
         break :blk lib;
     };
@@ -238,8 +243,8 @@ pub fn build(b: *std.Build) void {
             "-DSQLITE_OMIT_UTF16=1",
         },
     });
-    // Match the root module: no C UBSan for vendored C (see runtimeModule).
-    mod_sqlite.sanitize_c = .off;
+    // Match the root module: C UBSan is opt-in (see runtimeModule).
+    mod_sqlite.sanitize_c = san;
 
     const sqlite_lib = b.addLibrary(.{
         .linkage = .static,
@@ -277,6 +282,7 @@ pub fn build(b: *std.Build) void {
         .qjs_flags = qjs_flags,
         .bearssl = bearssl,
         .ffi = ffi,
+        .sanitize_c = sanitize_c,
     };
 
     // ── Executable ──
@@ -290,8 +296,9 @@ pub fn build(b: *std.Build) void {
 
     // ── Fuzzers: deterministic, seed-driven parser fuzzers (src/fuzz_tests.zig).
     // Run: zig build fuzz -- <target|smoke> [seed] [--events-max=N]
-    // Always fuzz in ReleaseSafe so OOB/overflow checks fire:
-    //   zig build fuzz -Doptimize=ReleaseSafe -- smoke
+    // CI runs smoke in BOTH ReleaseSafe (traps on overflow/OOB) and
+    // ReleaseFast (the shipped mode — a safe-mode-only run proves nothing
+    // about the binary users get).
     const fuzz_exe = b.addExecutable(.{
         .name = "fuzz",
         .root_module = runtimeModule(b, "src/fuzz_tests.zig", target, optimize, libs),

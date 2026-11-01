@@ -4,8 +4,10 @@
 # scripts/ and the Makefile, so `make ci` on a laptop runs the same steps.
 #
 # Linux jobs build musl static (-Dffi=false), matching the release assets
-# and the Docker image. Native glibc builds are dropped from CI: fetch
-# hangs on the ubuntu-latest/Azure kernel (see README "Known issues").
+# and the Docker image. Native glibc builds are dropped from the
+# fetch-tests matrix: fetch hangs on the ubuntu-latest/Azure kernel
+# (see README "Known issues"). The valgrind job still builds glibc because
+# memcheck needs it — it runs parser fuzzers only, no network.
 name: CI
 
 permissions: {}
@@ -50,25 +52,34 @@ jobs:
           # so glibc is out of CI until that is root-caused. FFI is off on
           # musl (no system libffi); test/ffi.test.js self-skips, and macOS
           # still covers FFI fully.
+          # NOTE: tests run in the SAME optimize mode as the build. Before
+          # this, the ReleaseFast rows ran tests in Debug (no -Doptimize=),
+          # so the shipped mode's test pass was never exercised.
           - name: linux-musl-io_uring
             os: ubuntu-latest
             build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false"
-            test: "-Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false"
           - name: linux-musl-epoll
             os: ubuntu-latest
             build: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
-            test: "-Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
+            test: "-Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dffi=false -Dio_uring=false"
           # macOS backend is kqueue (native build, FFI enabled).
           - name: macos
             os: macos-latest
             build: "-Doptimize=ReleaseFast"
-            test: ""
+            test: "-Doptimize=ReleaseFast"
           # ReleaseSafe runs the SAME suite with safety checks on: several
           # parsers fail silently in ReleaseFast but panic here.
           - name: linux-musl-release-safe
             os: ubuntu-latest
             build: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
             test: "-Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false"
+          # Debug: debug allocator + full safety checks. Catches allocator
+          # misuse the optimized modes cannot.
+          - name: linux-musl-debug
+            os: ubuntu-latest
+            build: "-Doptimize=Debug -Dtarget=x86_64-linux-musl -Dffi=false"
+            test: "-Doptimize=Debug -Dtarget=x86_64-linux-musl -Dffi=false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -100,9 +111,58 @@ jobs:
         run: sh test/fixtures/build.sh && sh test/run.sh
 
   fuzz-smoke:
-    name: fuzz smoke (ReleaseSafe)
+    name: fuzz smoke (${{ matrix.opt }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # ReleaseSafe traps on overflow/OOB; ReleaseFast is what ships and
+        # is where "silent" corruption actually lives. Run both.
+        opt: [ReleaseSafe, ReleaseFast]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-${{ runner.arch }}-fuzz-${{ matrix.opt }}-zig-${{ hashFiles('build.zig.zon') }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor
+          key: ${{ runner.os }}-fuzz-${{ matrix.opt }}-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+
+      - name: Fetch C vendors
+        run: sh scripts/fetch-vendors.sh
+
+      - name: Fuzz smoke
+        run: zig build fuzz -Doptimize=${{ matrix.opt }} -Dtarget=x86_64-linux-musl -Dffi=false -- smoke
+
+      - name: Canary must fail
+        run: |
+          if zig build fuzz -Doptimize=${{ matrix.opt }} -Dtarget=x86_64-linux-musl -Dffi=false -- canary 1; then
+            echo "canary unexpectedly passed — fuzzer failures are not propagating"
+            exit 1
+          fi
+
+  valgrind:
+    name: valgrind memcheck (linux gnu, parser fuzzers)
+    # Why valgrind and not ASAN: Zig cannot instrument its own code with ASAN
+    # (only -fsanitize-c for C). The bug class that matters here is a Zig
+    # use-after-free of a C-owned buffer (QuickJS strings, SQLite rows) — read
+    # side, which DebugAllocator does not catch. memcheck does.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Advisory while the repo converges: flip to false once it runs clean.
+    continue-on-error: true
     permissions:
       contents: read
     steps:
@@ -116,25 +176,30 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/zig
-          key: ${{ runner.os }}-${{ runner.arch }}-fuzz-zig-${{ hashFiles('build.zig.zon') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-valgrind-zig-${{ hashFiles('build.zig.zon') }}
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor
-          key: ${{ runner.os }}-fuzz-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
+          key: ${{ runner.os }}-valgrind-vendors-${{ hashFiles('scripts/fetch-vendors.sh') }}
 
       - name: Fetch C vendors
         run: sh scripts/fetch-vendors.sh
 
-      - name: Fuzz smoke
-        run: zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- smoke
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
 
-      - name: Canary must fail
+      # Debug, not ReleaseFast: memcheck needs the line tables, and the extra
+      # safety checks make the second failure mode (an out-of-range index)
+      # visible instead of silent.
+      - name: Build fuzzers (gnu, Debug)
+        run: zig build fuzz:build -Doptimize=Debug -Dtarget=x86_64-linux-gnu -Dffi=false
+
+      - name: memcheck — parser smoke
         run: |
-          if zig build fuzz -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Dffi=false -- canary 1; then
-            echo "canary unexpectedly passed — fuzzer failures are not propagating"
-            exit 1
-          fi
+          valgrind --error-exitcode=1 --track-origins=yes \
+            --errors-for-leak-kinds=none \
+            ./zig-out/bin/fuzz smoke
 
   coverage:
     name: coverage (kcov, informational)
