@@ -520,6 +520,21 @@ test "net scopes match host, wildcard, and port" {
     try std.testing.expectEqual(Decision.denied, cfg.checkNet("internal", 8080));
 }
 
+test "a port suffix on a bare wildcard does not narrow the scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), &.{"--allow-net=*:443"});
+
+    // Documented behaviour (docs/concepts/permissions.md): `*` matches every
+    // host AND every port; a port suffix on `*` is ignored. This is
+    // deliberate: checkNet short-circuits the bare wildcard before the port
+    // comparison. Pinned so a future "fix" cannot silently change what an
+    // existing deployment granted.
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("example.com", 80));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("example.com", 443));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("127.0.0.1", 5432));
+}
+
 test "env and run scopes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
