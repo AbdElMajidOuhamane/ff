@@ -9,8 +9,12 @@ const gpa = std.heap.smp_allocator;
 
 pub var ws_client_class_id: c.ClassID = 0;
 
+// Handle, not a path into the slot table: the JS object outlives its
+// connection, and ws_client.releaseSlot() bumps the slot's generation. A stale
+// handle must not be able to send on the next occupant's connection.
 const WsClientData = struct {
     slot_id: u16,
+    gen: u16,
 };
 
 fn wsClientFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
@@ -22,6 +26,30 @@ fn wsClientFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 }
 
 const ParsedUrl = struct { host: []const u8, path: []const u8, port: u16, tls: bool };
+
+/// Authority charset: no controls, no space, no '@' (userinfo would make the
+/// string checkNet() sees differ from the host actually connected to), no
+/// path/query/fragment delimiters.
+fn validHost(h: []const u8) bool {
+    if (h.len == 0) return false;
+    for (h) |ch| {
+        if (ch <= 0x20 or ch == 0x7f) return false;
+        switch (ch) {
+            '@', '/', '?', '#', '\\' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Request-target charset. CR/LF here is a request-splitting primitive: the
+/// path is formatted straight into "GET {path} HTTP/1.1".
+fn validPath(p: []const u8) bool {
+    for (p) |ch| {
+        if (ch <= 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
 
 fn parseWsUrl(url: []const u8) ?ParsedUrl {
     var tls_flag = false;
@@ -45,12 +73,14 @@ fn parseWsUrl(url: []const u8) ?ParsedUrl {
         port = std.fmt.parseInt(u16, ps, 10) catch return null;
     }
     if (host.len > 255) return null;
+    if (!validHost(host)) return null;
     var path: []const u8 = "/";
     if (slash) |i| {
         path = rest[i..];
         if (std.mem.indexOfScalar(u8, path, '#')) |h| path = path[0..h];
         if (path.len == 0) path = "/";
         if (path.len > 512) return null;
+        if (!validPath(path)) return null;
     }
     return .{ .host = host, .path = path, .port = port, .tls = tls_flag };
 }
@@ -68,21 +98,16 @@ fn extractString(ctx: ?*c.Context, val: c.Value) ?[:0]const u8 {
     return buf;
 }
 
-fn slotFromThis(ctx: ?*c.Context, this_val: c.Value) ?usize {
+/// Resolve a JS receiver to a live handle, or null when its connection is gone.
+/// Silent null keeps a `for (const s of set) s.send(...)` loop from aborting on
+/// the first disconnected peer.
+fn liveHandle(ctx: ?*c.Context, this_val: c.Value) ?ws_client.Handle {
+    if (c.isObject(this_val) == 0) return null;
     const data_ptr = c.getOpaque2(ctx, this_val, ws_client_class_id) orelse return null;
     const data: *WsClientData = @ptrCast(@alignCast(data_ptr));
-    return data.slot_id;
-}
-
-fn slotFromArg(ctx: ?*c.Context, arg: c.Value) ?usize {
-    // Try opaque first
-    if (c.isObject(arg) != 0) {
-        if (c.getOpaque2(ctx, arg, ws_client_class_id)) |ptr| {
-            const data: *WsClientData = @ptrCast(@alignCast(ptr));
-            return data.slot_id;
-        }
-    }
-    return null;
+    const h = ws_client.Handle{ .slot = data.slot_id, .gen = data.gen };
+    if (!ws_client.isValid(h)) return null;
+    return h;
 }
 
 pub fn setup(ctx: ?*c.Context) void {
@@ -109,7 +134,6 @@ pub fn setup(ctx: ?*c.Context) void {
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
 
-    //const ctor = c.newCFunction(ctx, &wsConstructor, "WebSocket", 2);
     const ctor = c.newCFunction2(ctx, &wsConstructor, "WebSocket", 2, c.JS_CFUNC_constructor, 0);
     _ = c.definePropertyValueStr(ctx, global, "WebSocket", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     // Static constants
@@ -152,20 +176,20 @@ fn wsConstructor(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     _ = c.definePropertyValueStr(ctx, obj, "CLOSING", c.newInt32(ctx, 2), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, obj, "CLOSED", c.newInt32(ctx, 3), c.PROP_C_W_E);
 
-    const s = ws_client.submit(ctx, obj, parsed.host, parsed.path, parsed.port, parsed.tls) catch {
+    const h = ws_client.submit(ctx, obj, parsed.host, parsed.path, parsed.port, parsed.tls) catch {
         throwTypeError(ctx, "WebSocket: no connection slots available");
         return c.JS_EXCEPTION;
     };
 
     const data = gpa.create(WsClientData) catch return c.throwOutOfMemory(ctx);
-    data.* = .{ .slot_id = @intCast(s) };
+    data.* = .{ .slot_id = h.slot, .gen = h.gen };
     c.setOpaque(obj, data);
 
     return obj;
 }
 
 fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    const s = slotFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    const h = liveHandle(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 1) return c.JS_UNDEFINED;
     const arg = argv[0];
 
@@ -175,14 +199,14 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
         const len = std.mem.len(cstr);
         if (len == 0) return c.JS_UNDEFINED;
         const cap = @min(len, ws.WS_MSG_SIZE);
-        ws_client.sendBytes(s, cstr[0..cap], false);
+        ws_client.sendBytes(h, cstr[0..cap], false);
         return c.JS_UNDEFINED;
     }
     // ArrayBuffer
     var size: usize = 0;
     const p = c.getArrayBuffer(ctx, &size, arg);
     if (p != null and size > 0) {
-        ws_client.sendBytes(s, p[0..@min(size, ws.WS_MSG_SIZE)], true);
+        ws_client.sendBytes(h, p[0..@min(size, ws.WS_MSG_SIZE)], true);
         return c.JS_UNDEFINED;
     }
     // ArrayBufferView — try buffer property
@@ -202,14 +226,14 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
             _ = c.toInt32(ctx, &view_len, len_val);
             const start = @as(usize, @intCast(@max(offset, 0)));
             const end = @min(start + @as(usize, @intCast(@max(view_len, 0))), size);
-            if (end > start) ws_client.sendBytes(s, p2[start..end], true);
+            if (end > start) ws_client.sendBytes(h, p2[start..end], true);
         }
     }
     return c.JS_UNDEFINED;
 }
 
 fn wsClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    const s = slotFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    const h = liveHandle(ctx, this_val) orelse return c.JS_UNDEFINED;
 
     var code: u16 = 1000;
     if (argc >= 1) {
@@ -235,7 +259,7 @@ fn wsClose(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) 
 
     // readyState -> CLOSING (2) immediately
     setReadyState(ctx, this_val, 2);
-    ws_client.closeWs(s, code, reason);
+    ws_client.closeWs(h, code, reason);
     return c.JS_UNDEFINED;
 }
 

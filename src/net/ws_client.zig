@@ -111,6 +111,15 @@ var cmd_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var worker_started: bool = false; // guarded by poolLock (submit path only)
 var free_list: [MAX_WS]u16 = undefined;
 var free_count: usize = MAX_WS;
+// Incarnation counter per slot, bumped in releaseSlot(). Handles carry it so a
+// retained JS WebSocket cannot address a recycled slot and end up sending on
+// another peer's outbound connection. Mirrors udp_native's (slot, gen) rule.
+var gens: [MAX_WS]u16 = [_]u16{1} ** MAX_WS;
+
+/// Slot handle: index + incarnation. Minted by submit(), consumed by
+/// sendBytes/closeWs, validated by isValid().
+pub const Handle = struct { slot: u16, gen: u16 };
+
 var pool_lock: std.atomic.Mutex = .unlocked;
 const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
@@ -155,6 +164,11 @@ fn releaseSlot(s: usize) void {
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
     states[s].store(JOB_FREE, .release);
+    gens[s] +%= 1; // retire this incarnation: stale handles stop validating
+    // Unchecked cursor into a static column: a double release would write past
+    // free_list. Latent, but make it structural (same rule as http_native).
+    std.debug.assert(free_count < MAX_WS);
+    if (free_count >= MAX_WS) return;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
@@ -178,7 +192,7 @@ pub fn submit(
     path: []const u8,
     port: u16,
     tls_flag: bool,
-) !usize {
+) !Handle {
     poolLock();
     defer poolUnlock();
     const s = acquireSlot() orelse return error.NoConnectionAvailable;
@@ -219,7 +233,7 @@ pub fn submit(
     want_connect[s] = true;
     wakeWorker();
     ensureArmed();
-    return s;
+    return .{ .slot = @intCast(s), .gen = gens[s] };
 }
 
 fn makeCmdPipe() !void {
@@ -248,8 +262,21 @@ fn startWorkerOnce() !void {
     worker_started = true;
 }
 
-pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
-    if (states[s].load(.acquire) == JOB_FREE) return;
+/// True when this handle still names the live incarnation of its slot.
+pub fn isValid(h: Handle) bool {
+    const s: usize = h.slot;
+    if (s >= MAX_WS) return false;
+    if (gens[s] != h.gen) return false;
+    return states[s].load(.acquire) != JOB_FREE;
+}
+
+pub fn genOf(s: usize) u16 {
+    return gens[s];
+}
+
+pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) void {
+    if (!isValid(h)) return;
+    const s: usize = h.slot;
     if (!wflags[s].ws_open) return;
     if (bytes.len > WS_MSG_SIZE) return;
     if (tx_pending[s].load(.acquire)) return;
@@ -260,8 +287,9 @@ pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
     wakeWorker();
 }
 
-pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
-    if (states[s].load(.acquire) == JOB_FREE) return;
+pub fn closeWs(h: Handle, code: u16, reason: []const u8) void {
+    if (!isValid(h)) return;
+    const s: usize = h.slot;
     const rlen = @min(reason.len, @as(usize, CLOSE_REASON_MAX));
     @memcpy(tx_reason[s][0..rlen], reason[0..rlen]);
     tx_reason_len[s] = @intCast(rlen);
