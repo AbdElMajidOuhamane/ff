@@ -804,9 +804,13 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
             return;
         }
         if (st & tls_mod.ST_SENDREC != 0) {
+            // H2's pumpWrite already owns the single outstanding write.
+            // Arming here would double-push write_comps; let writeCb resume.
+            if (cflags[id].h2_active and http2_mod.isWriteArmed(id)) return;
             const out = tls_mod.sendRecReady(&tls_ctxs[id]);
             if (out.len > 0) {
                 states[id] = .writing;
+                if (cflags[id].h2_active) http2_mod.markWriteArmed(id);
                 fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
                 return;
             }
@@ -842,14 +846,35 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
                     }
                     continue;
                 }
-                if (buf_lens[id] + app.len > READ_BUF_SIZE) {
-                    closeConn(id);
+
+                // A single TLS record can carry more plaintext than the static
+                // request buffer. Fill what fits and parse it first: a large
+                // H1 body then enters req_spill instead of closing the socket.
+                const space = READ_BUF_SIZE - buf_lens[id];
+                const take = @min(space, app.len);
+                if (take > 0) {
+                    @memcpy(read_bufs[id][buf_lens[id]..][0..take], app[0..take]);
+                    buf_lens[id] += take;
+                    tls_mod.recvAppAck(&tls_ctxs[id], take);
+                }
+                if (take == app.len and buf_lens[id] < READ_BUF_SIZE) continue;
+
+                const before = buf_lens[id];
+                processPlaintext(id, l);
+
+                if (cflags[id].req_body_spill) continue; // drain remaining plaintext into the spill
+                if (cflags[id].h2_active) {
+                    if (buf_lens[id] == READ_BUF_SIZE and before == READ_BUF_SIZE) {
+                        closeConn(id); // no progress and no room
+                        return;
+                    }
+                    continue;
+                }
+                if (cflags[id].ws_open and buf_lens[id] >= READ_BUF_SIZE) {
+                    closeConn(id); // frame exceeds the static staging buffer
                     return;
                 }
-                @memcpy(read_bufs[id][buf_lens[id]..][0..app.len], app);
-                buf_lens[id] += app.len;
-                tls_mod.recvAppAck(&tls_ctxs[id], app.len);
-                continue;
+                return; // H1 response/write armed; leftovers drain on the next pump
             }
         }
         if (st & tls_mod.ST_SENDAPP != 0) {

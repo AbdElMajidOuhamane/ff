@@ -49,7 +49,7 @@ const MAX_METHOD = 16;
 // and ~65 KB. Oversized paths are REJECTED (400), never truncated — a
 // truncated path would dispatch to the wrong route.
 const MAX_PATH = 512;
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB per stream — matches http_native
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB per stream — over-cap → 413
 // Per-connection ceiling across all live streams. Without it the effective
 // cap is MAX_STREAMS × MAX_BODY_SIZE (up to 1 GB on one connection).
 // Exceeding it is a protocol-abuse signal: fail the session, don't buffer.
@@ -84,7 +84,8 @@ pub const StreamFlags = packed struct(u8) {
     complete: bool = false, // END_STREAM seen (full request received)
     dispatched: bool = false, // handed to the JS handler (or parked-pending)
     bad: bool = false, // malformed :method/:path/:authority → 400
-    _pad: u4 = 0,
+    too_large: bool = false, // body exceeded MAX_BODY_SIZE → 413
+    _pad: u3 = 0,
 };
 
 /// Cold payload: method/path bodies + response staging. Memory rules 2–3
@@ -145,6 +146,9 @@ pub const Slot = struct {
     }
     pub fn bad(s: Slot) bool {
         return s.f.bad;
+    }
+    pub fn tooLarge(s: Slot) bool {
+        return s.f.too_large;
     }
     pub fn setDispatched(s: Slot) void {
         s.f.dispatched = true;
@@ -235,6 +239,20 @@ var active_stream: [http_native.MAX_CONN]i32 = [_]i32{-1} ** http_native.MAX_CON
 
 pub fn getSession(slot_id: usize) ?*Session {
     return sessions[slot_id];
+}
+
+/// True while pumpWrite, onWriteComplete, or the TLS SENDREC path owns the
+/// slot's single outstanding write completion.
+pub fn isWriteArmed(slot_id: usize) bool {
+    const sess = getSession(slot_id) orelse return false;
+    return sess.out_armed;
+}
+
+/// Mark the write completion as outstanding before arming it from outside
+/// pumpWrite (the TLS SENDREC path in http_native.tlsPump).
+pub fn markWriteArmed(slot_id: usize) void {
+    const sess = getSession(slot_id) orelse return;
+    sess.out_armed = true;
 }
 
 pub fn removeSession(slot_id: usize) void {
@@ -371,7 +389,12 @@ pub fn dataChunkCb(
     const sess = getSession(slot) orelse return 0;
     const st = sess.findStream(stream_id) orelse return 0;
     if (st.dispatched()) return 0;
-    if (st.p.body.items.len + len > MAX_BODY_SIZE) return 0; // per-stream cap (v1)
+    if (st.p.body.items.len + len > MAX_BODY_SIZE) {
+        // Do not truncate silently: mark the stream and drop the overflow.
+        // Memory stays bounded; dispatchRequest answers 413 at END_STREAM.
+        st.f.too_large = true;
+        return 0;
+    }
     // Per-connection budget across all streams. Exceeding it means the peer
     // is opening many large streams to pin memory; fail the session (nghttp2
     // treats a non-zero callback return as a fatal session error) instead of
@@ -565,8 +588,11 @@ pub const WriteAction = enum { drained, more_pending };
 /// Write-completion continuation for H2 slots (called from writeCb).
 /// Advances the output cursor; re-writes partial TLS ciphertext or plain
 /// remainders directly. Returns .drained when the caller should rearm read.
-/// Clears out_armed first: this completion fired, so re-arming is legal.
-/// DEBUG: logs written bytes, TLS presence, and output cursor.
+///
+/// The fired completion is no longer outstanding, so out_armed is cleared at
+/// entry. Every direct re-arm below creates a NEW outstanding completion and
+/// must set out_armed again before returning .more_pending; otherwise
+/// isWriteArmed() would lie and the TLS SENDREC path could double-push.
 pub fn onWriteComplete(
     slot_id: usize,
     written: usize,
@@ -581,6 +607,8 @@ pub fn onWriteComplete(
         tls_mod.sendRecAck(tctx, written);
         const out = tls_mod.sendRecReady(tctx);
         if (out.len > 0) {
+            // Partial TLS record: this is a new outstanding write.
+            sess.out_armed = true;
             tcp.write(l, &http_native.write_comps[slot_id], .{ .slice = out }, u16, &http_native.slot_ids[slot_id], http_native.writeCb);
             return .more_pending;
         }
@@ -590,6 +618,8 @@ pub fn onWriteComplete(
     }
     http_native.write_offsets[slot_id] += written;
     if (http_native.write_offsets[slot_id] < http_native.write_lens[slot_id]) {
+        // Partial plaintext write: this is a new outstanding write.
+        sess.out_armed = true;
         tcp.write(
             l,
             &http_native.write_comps[slot_id],
@@ -611,6 +641,14 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     const sess = getSession(slot_id) orelse return;
     const st = sess.findStream(stream_id) orelse return;
     if (st.dispatched() or !st.complete()) return;
+    // Over-cap bodies were dropped in dataChunkCb; answer 413 instead of
+    // silently dispatching the truncated prefix. This is a cold path.
+    if (st.tooLarge()) {
+        st.setDispatched();
+        active_stream[slot_id] = stream_id;
+        respondErrorH2(slot_id, 413);
+        return;
+    }
     // Malformed pseudo-headers are rejected here, at dispatch, so they never
     // reach the JS handler and never influence routing.
     if (st.bad()) {

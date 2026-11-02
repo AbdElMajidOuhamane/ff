@@ -96,7 +96,8 @@ fn chdirCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 // C3 FIX: expose the TB §5 spill/reuse counters to JS (works in Release
 // too — the Debug stderr dumps don't). Key names match what
 // bench/fetch_spill.js expects: fetch.bodyHeap, fetch.hdrSpill,
-// fetch.decompressHeap, http.bodySpill, http.bodySpillReuse, pg.*.
+// fetch.decompressHeap, http.bodySpill, http.bodySpillReuse,
+// http.reqSpill, http.reqSpillReuse, pg.*.
 // JS_NewInt64 takes i64: the u64 counters need @intCast (same-width
 // signed/unsigned does not coerce); pg's u32 counters widen implicitly.
 fn statsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
