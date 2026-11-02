@@ -14,7 +14,7 @@ Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS.
 
 - Cold start matters (CLI tools, edge functions, short-lived jobs)
 - Memory is capped (strict container limits)
-- You want the whole runtime to fit in your head (~32k lines of Zig across 68 files)
+- You want the whole runtime to fit in your head (~32k lines of Zig across 73 files)
 
 ## When NOT to use Fairyfly
 

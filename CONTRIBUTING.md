@@ -202,8 +202,8 @@ uncovered; if that noise dominates, use the Zig-aware fork
   | Concurrent fetch slots | 16 (methods are exact-case: `POST`, not `post`) |
   | Timers | 128 live |
   | Workers | 8 (4 MB/message) |
-  | Request headers | 4 KB |
-  | Request body | 1 MB (4 KB static fast path; spills to heap up to 1 MB) |
+  | Request headers (HTTP/1.1) | 4 KB |
+  | Request body (HTTP/1.1 / HTTP/2) | 1 MB (4 KB static fast path + heap spill) / 10 MB per stream (16 MB per session) |
   | Response body | 10 MB |
 
 ## Working on the runtime

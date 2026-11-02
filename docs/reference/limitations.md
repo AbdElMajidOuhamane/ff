@@ -37,8 +37,8 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Request headers | 4 KB | Beyond → `431 Request Header Fields Too Large` |
-| Request body | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
+| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
 | Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
 | Response headers | 2048 bytes | Headers beyond the cap are dropped |
 | Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
@@ -47,7 +47,7 @@ boundary for hostile code.
 | Response status | 100..999 | Clamped/validated to 100..999 |
 | Bind address | Always `0.0.0.0` | No host option, no `FF_PORT`; the net scope must be `0.0.0.0:<port>` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
-| HTTP/2 | TLS + ALPN only (nghttp2); pseudo-headers validated; 10 MB connection body cap | Plain sockets stay HTTP/1.1 |
+| HTTP/2 | TLS + ALPN only (nghttp2); pseudo-headers validated (`:path` ≤ 512 B, `:method` ≤ 16 B); request body ≤ 10 MB/stream and ≤ 16 MB/session | Plain sockets stay HTTP/1.1 |
 | `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
 
 ## Fetch (client)

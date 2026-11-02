@@ -268,8 +268,8 @@ needs the listener grant.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Request headers | 4 KB | Beyond → `431 Request Header Fields Too Large` |
-| Request body | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
+| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` (HTTP/2 allows 10 MB/stream, 16 MB/session) |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
 | Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
