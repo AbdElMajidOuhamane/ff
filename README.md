@@ -98,10 +98,10 @@ toggle.
 
 | Flag | Grants | Scope |
 |---|---|---|
-| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve` | paths |
+| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
 | `--allow-net` | `fetch`, WebSocket, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
-| `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` for the global `sql` | exact names |
+| `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` / `PGSSL*` for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | bare flag only |
 | `--allow-all` | every category above, including FFI | bare flag only |
@@ -141,7 +141,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~24k lines of Zig across 54 files
+- **The whole codebase should fit in your head** — ~32k lines of Zig across 68 files
 
 It's *not* aimed at:
 
@@ -239,18 +239,18 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | Global | What to know |
 |---|---|
 | `console` | Prints **every** argument, joined with spaces — to **stderr** |
-| `fetch` | 16 slots, HTTP/1.1; needs `--allow-net` on the target `host:port`; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
+| `fetch` | 16 slots, HTTP/1.1, 16 MB response cap; needs `--allow-net` on target `host:port`; strips credentials on cross-origin redirects; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
 | `http.serve` | `(url, method, body)` handler, all strings; needs `--allow-net=0.0.0.0:<port>`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
-| `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
+| `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); status bounded to `100`–`999`; `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
 | `Database` | `Database.open(path)`; needs `--allow-read` + `--allow-write` on the file and `--allow-write` on the parent; synchronous; SQL failures throw plain strings |
-| `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
-| `fs` | Sync calls return `undefined` on I/O failure; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
+| `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port, `--allow-read` on `sslrootcert` when TLS (`sslmode=verify-full`) is enabled, and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
+| `fs` | Sync calls return `undefined` on I/O failure; writes > 10 MB throw/reject instead of truncating; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
 | `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; inherits the parent's permissions |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; needs `--allow-run`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
-| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `chdir` is read-gated and throws on denial; exit codes clamp to 0–255 |
+| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `chdir` is read-gated and throws on denial; `memoryUsage()` and `stats()` are ungated; exit codes clamp to 0–255 |
 | `TextEncoder` / `TextDecoder` | UTF-8 string ↔ bytes |
 | `WebSocket` | Client with `send` / `sendBinary` / `close`; needs `--allow-net`; sync mistakes throw `TypeError: WebSocket: …` |
 | `udp` | Datagram sockets with `bind` / `sendto` / `recvfrom`; needs `--allow-net` on the address |
@@ -367,6 +367,8 @@ zig build -Doptimize=ReleaseFast   # default for `make build`
 zig build -Dbearssl=false          # drop TLS support entirely
 zig build -Dio_uring=false         # Linux: epoll backend instead of io_uring
 zig build -Dffi=false              # keep the `ffi` global, but `dlopen`/`callback` throw (needs `--allow-ffi` at runtime regardless)
+zig build -Dstrip=false            # keep debug symbols in ReleaseFast/ReleaseSmall builds
+zig build -Dsanitize-c=true        # enable C UBSan for debugging C sources
 zig build -Dversion=1.2.3          # version reported by `ff --version`
 zig build test                     # Zig unit tests
 make fmt                           # zig fmt --check build.zig src/ (CI tidy job)
@@ -437,9 +439,10 @@ is `undefined`.
 
 Database:
 
-- `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` —
-  configure the global `sql`; grant each name with `--allow-env` and the
-  resolved host with `--allow-net`
+- `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+  `PGSSLMODE`, `PGSSLROOTCERT` — configure the global `sql`; grant each name
+  with `--allow-env`, the resolved host with `--allow-net`, and `sslrootcert`
+  with `--allow-read` when TLS is used
 - `PG_TEST_DSN` — used by the Postgres test files (they self-skip if unset);
   grant it to the test command
 
@@ -466,21 +469,23 @@ Database:
 
 **HTTP**
 
-- HTTP/2 accepted by the server (TLS + ALPN); outbound clients are HTTP/1.1 only
+- HTTP/2 accepted by the server (TLS + ALPN; validates pseudo-headers and caps per-connection request bodies at 10 MB); outbound clients are HTTP/1.1 only
+- Server TLS requires TLS 1.2 minimum (TLS 1.0 and 1.1 rejected; no TLS 1.3 in BearSSL)
 - Max **512** concurrent HTTP connections
-- Request bodies: ~4 KB (headers + body share a 4 KB buffer; beyond → `413`)
+- Request bodies: ~4 KB on HTTP/1.1 (headers + body share a 4 KB buffer; beyond → `413`)
 - Response bodies: buffered, hard cap **10 MB** (64 KB static stage buffer,
   larger bodies spill to the heap; beyond 10 MB → `500`)
-- Response headers capped at 2048 bytes; server-computed
-  `Content-Length` / `Transfer-Encoding` / `Connection` are not overridable
+- Response status bounded to `100`–`999`; response headers capped at 2048 bytes;
+  server-computed `Content-Length` / `Transfer-Encoding` / `Connection` are not overridable
+- Strict HTTP/1.1 framing: duplicate/ambiguous `Content-Length`, `Transfer-Encoding`, obs-fold, or BWS rejected with `400 Bad Request`
 - No `Expect: 100-continue`, no chunked **request** bodies
-- No idle/keep-alive timeout — only hung handlers are reaped (504 after 30 s)
+- 30 s read deadline for incomplete headers/bodies and 30 s hung-handler watchdog (`504`)
 
 **Outbound**
 
-- `fetch`: **16** concurrent slots, HTTP/1.1, 30 s I/O timeout, max 5 redirects
+- `fetch`: **16** concurrent slots, HTTP/1.1, **16 MB** response body cap (declared `Content-Length` and decompression), 30 s I/O timeout, max 5 redirects (cross-origin redirects strip `authorization`, `cookie`, `x-api-key`), RFC 7230 header validation
 - No `AbortController` / `signal` / `timeout` / `redirect` init keys
-- WebSocket client: **64** sockets, 16384-byte messages (larger sends truncate)
+- WebSocket: **64** client sockets, 16384-byte messages (larger sends truncate), RFC 6455 client masking required, max 125-byte control frames, strict UTF-8 validation on text frames, generation-tagged `{slot, gen}` socket handles
 - Outbound TLS connection pool: **64**
 - Proxies: HTTP proxies only (no SOCKS), configured via `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
 
@@ -522,8 +527,9 @@ Database:
 
 **Postgres**
 
-- No TLS (`sslmode`), no connection/socket timeouts, no keepalive
-- Pool caps at 10 connections
+- TLS via BearSSL: `sslmode=verify-full` (requires `sslrootcert` PEM CA bundle and `--allow-read`) and `sslmode=disable` supported; libpq's `require` / `prefer` / `verify-ca` are rejected
+- No connection/socket timeouts, no keepalive
+- Pool caps at 10 connections (or configured `max`)
 - `rowCount` reflects returned rows only (INSERT/UPDATE row counts are not reported)
 - No COPY support
 
@@ -533,7 +539,7 @@ Database:
   disallowed names are `undefined`; assigning does not affect the OS environment
 - No `stdout`/`stdin` streams, no `hrtime`, no `kill`
 - `process.chdir` needs `--allow-read` on the target; denial throws
-  `PermissionDenied`, and an OS failure throws `chdir failed`
+  `PermissionDenied`
 - Exit codes clamp to 0–255 (no mod-256 wrap)
 - No interrupt/watchdog for runaway JS — an infinite loop hangs the process
 
@@ -541,6 +547,9 @@ Database:
 
 - `ff imprint` installs **pure-JS ESM** packages only; anything using
   `require(`, `module.exports`, or `node:` imports is rejected
+- Strict package directory containment: manifest targets (`main`, `module`,
+  `exports`) and bare subpaths containing `..` or escaping the package root are
+  rejected
 - One flat `node_modules` — a conflicting transitive version is a hard error
 - Direct sources (`github:`, `codeberg:`, `.tar.gz`) must be public HTTPS
   single-package archives with `package.json` at the root; no auth, monorepo

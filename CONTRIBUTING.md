@@ -89,6 +89,8 @@ Useful build options:
     zig build -Dbearssl=false          # drop TLS (https/wss) support
     zig build -Dio_uring=false         # Linux: epoll backend instead of io_uring
     zig build -Dffi=false              # compile ffi.dlopen stubs instead of libffi
+    zig build -Dstrip=false            # keep debug symbols in ReleaseFast/ReleaseSmall builds
+    zig build -Dsanitize-c=true        # enable C UBSan for debugging C sources
     zig build -Dversion=1.2.3          # version reported by `ff --version`
 
 Quick smoke check after building:
@@ -103,8 +105,8 @@ GitHub Actions workflow (per `.github/workflows/ci.yml`):
 
     make ci
 
-`make ci` = `make build` + FFI C fixture + `zig build test` + `sh test/run.sh`
-+ fuzz smoke.
+`make ci` = `make fmt` + `make build` + FFI C fixture + `zig build test`
++ `sh test/run.sh` + fuzz smoke.
 
 Pieces, if you need only one:
 

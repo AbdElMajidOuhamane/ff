@@ -24,6 +24,11 @@ const gpa = std.heap.smp_allocator;
 
 pub const MAX_CONN = 512;
 const READ_BUF_SIZE = 4096;
+// H1 request-body spill (cold path). The static buffer above stays the fast
+// path; only requests that do not fit ever touch the allocator.
+const REQ_BODY_MAX = 1 * 1024 * 1024; // per-request hard cap
+const REQ_SPILL_RETAIN_MAX = 64 * 1024; // retained per idle slot
+const REQ_SPILL_GLOBAL_MAX = 64 * 1024 * 1024; // in-flight spill budget
 pub const WRITE_BUF_SIZE = 16384;
 const ACCEPT_BATCH = 8;
 
@@ -46,7 +51,9 @@ const ConnFlags = packed struct(u16) {
     // to stay in lockstep with two independent columns, and a retained spill
     // outlives its response.
     body_from_heap: bool = false,
-    _pad: u3 = 0,
+    // Which column the staged request body lives in (req_spill vs read_bufs).
+    req_body_spill: bool = false,
+    _pad: u2 = 0,
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
@@ -125,6 +132,18 @@ var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // Spill telemetry for the >64KB response path (mirrors async_fetch stat_*).
 pub var stat_body_spill: std.atomic.Value(u64) = .{ .raw = 0 };
 pub var stat_body_spill_reuse: std.atomic.Value(u64) = .{ .raw = 0 };
+// ── H1 request-body spill (cold path) ─────────────────────────────
+// Null until a request's headers+body exceed READ_BUF_SIZE. Layout:
+//   [0..req_hdr_end]  private copy of the headers (ParsedRequest slices)
+//   [req_hdr_end..]   body
+// One dense pointer column plus scalar columns; no per-request object.
+var req_spill: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN;
+var req_spill_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var req_spill_want: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var req_hdr_end: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var req_spill_bytes: std.atomic.Value(usize) = .{ .raw = 0 };
+pub var stat_req_spill: std.atomic.Value(u64) = .{ .raw = 0 };
+pub var stat_req_spill_reuse: std.atomic.Value(u64) = .{ .raw = 0 };
 // ── TLS (https/wss): per-slot BearSSL engine + bidirectional iobuf ──
 var tls_ctxs: [MAX_CONN]tls_mod.Ctx = undefined;
 var tls_iobufs: [MAX_CONN][tls_mod.IOBUF_LEN]u8 = undefined;
@@ -170,11 +189,12 @@ var initialized: bool = false;
 // Gap-7 fix: largest→smallest field order (56B, still ≤64 assert).
 // Stack transient only — never stored in a large array.
 //
-// INVARIANT (security-critical): content_length is CLAMPED TO READ_BUF_SIZE at
+// INVARIANT (security-critical): content_length is bounded by REQ_BODY_MAX at
 // parse time. Every downstream `headers_end + content_length` is then
-// provably in range, which is what bounds tryUpgrade and processPlaintext
-// without checked adds on the hot path. ws_key is non-empty only for a fully
-// validated RFC 6455 handshake; ws_bad marks "key seen, handshake invalid".
+// provably in range (and content_length ≤ REQ_BODY_MAX), which is what bounds
+// tryUpgrade and processPlaintext without checked adds on the hot path.
+// ws_key is non-empty only for a fully validated RFC 6455 handshake; ws_bad
+// marks "key seen, handshake invalid".
 pub const ParsedRequest = struct {
     method: []const u8,
     url: []const u8,
@@ -184,6 +204,9 @@ pub const ParsedRequest = struct {
     keep_alive: bool,
     framing_ok: bool,
     ws_bad: bool,
+    // Content-Length exceeded REQ_BODY_MAX: framing is invalid, but the
+    // processPlaintext caller answers 413 instead of 400.
+    too_large: bool,
 };
 
 // ---- SIMD/CI helpers (unchanged) ----
@@ -340,7 +363,7 @@ fn validWsKey(k: []const u8) bool {
 }
 /// Strict request parse. Security-relevant rules, all enforced here so the
 /// hot path never has to re-check them:
-///   * Content-Length: digits only, single occurrence, clamped ≤ READ_BUF_SIZE
+///   * Content-Length: digits only, single occurrence, ≤ REQ_BODY_MAX
 ///   * Transfer-Encoding: refused (chunked is not implemented — accepting
 ///     one framing while a proxy accepts another is request smuggling)
 ///   * obs-fold, whitespace-before-colon, colon-less lines: refused
@@ -355,6 +378,7 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
         .keep_alive = true,
         .framing_ok = true,
         .ws_bad = false,
+        .too_large = false,
     };
     const region = buf[0..headers_end];
     if (region.len < 10) return pr;
@@ -436,9 +460,10 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
                     if (!all_digits) {
                         pr.framing_ok = false;
                     } else if (std.fmt.parseInt(usize, value, 10)) |n| {
-                        // Clamp at ingest: nothing downstream may see a length
-                        // that cannot fit the read buffer.
-                        if (n > READ_BUF_SIZE) {
+                        // Bodies above the static buffer spill to req_spill;
+                        // only REQ_BODY_MAX is a hard framing rejection.
+                        if (n > REQ_BODY_MAX) {
+                            pr.too_large = true;
                             pr.framing_ok = false;
                         } else {
                             pr.content_length = n;
@@ -492,6 +517,7 @@ fn statusReason(status: u16) []const u8 {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -567,9 +593,152 @@ fn rejectWith(id: usize, l: *xev.Loop, status: u16, body: []const u8) void {
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     cflags[id].body_from_heap = false;
+    resetReqSpill(id);
     buildResponse(id, status, body);
     states[id] = .writing;
     armWrite(id, l);
+}
+
+// ── H1 request-body spill helpers ─────────────────────────────────
+// The global budget bounds 512 slots: retained buffers are capped per slot,
+// and in-flight growth is capped process-wide. Both are cold-path only.
+
+fn reqSpillReserve(delta: usize) bool {
+    var cur = req_spill_bytes.load(.monotonic);
+    while (true) {
+        if (cur > REQ_SPILL_GLOBAL_MAX or delta > REQ_SPILL_GLOBAL_MAX - cur) return false;
+        if (req_spill_bytes.cmpxchgStrong(cur, cur + delta, .acq_rel, .acquire) == null) return true;
+        cur = req_spill_bytes.load(.acquire);
+    }
+}
+
+fn reqSpillRelease(n: usize) void {
+    _ = req_spill_bytes.fetchSub(n, .monotonic);
+}
+
+fn ensureReqSpill(id: usize, need: usize) ?[]u8 {
+    if (req_spill[id]) |old| {
+        if (old.len >= need) {
+            _ = stat_req_spill_reuse.fetchAdd(1, .release);
+            return old[0..need];
+        }
+        const delta = need - old.len;
+        if (!reqSpillReserve(delta)) return null;
+        const grown = gpa.realloc(old, need) catch {
+            reqSpillRelease(delta);
+            return null;
+        };
+        req_spill[id] = grown;
+        return grown[0..need];
+    }
+    _ = stat_req_spill.fetchAdd(1, .release);
+    if (!reqSpillReserve(need)) return null;
+    const buf = gpa.alloc(u8, need) catch {
+        reqSpillRelease(need);
+        return null;
+    };
+    req_spill[id] = buf;
+    return buf[0..need];
+}
+
+fn releaseReqSpillIfOversized(id: usize) void {
+    if (req_spill[id]) |old| {
+        if (old.len > REQ_SPILL_RETAIN_MAX) {
+            reqSpillRelease(old.len);
+            gpa.free(old);
+            req_spill[id] = null;
+        }
+    }
+}
+
+/// Retire a completed request; keep a small retained capacity for reuse.
+fn resetReqSpill(id: usize) void {
+    releaseReqSpillIfOversized(id);
+    req_spill_len[id] = 0;
+    req_spill_want[id] = 0;
+    req_hdr_end[id] = 0;
+    cflags[id].req_body_spill = false;
+}
+
+/// Slot teardown: the slot will be handed to another peer.
+fn destroyReqSpill(id: usize) void {
+    if (req_spill[id]) |old| {
+        reqSpillRelease(old.len);
+        gpa.free(old);
+        req_spill[id] = null;
+    }
+    req_spill_len[id] = 0;
+    req_spill_want[id] = 0;
+    req_hdr_end[id] = 0;
+    cflags[id].req_body_spill = false;
+}
+
+fn armReadReqSpill(id: usize, l: *xev.Loop) void {
+    if (tls_on and cflags[id].tls) {
+        // TLS plaintext always lands in read_bufs; tlsPump drains it into
+        // the spill in chunks (BearSSL records can be ~32 KB).
+        armRead(id, l);
+        return;
+    }
+    const need = req_spill_want[id] - req_spill_len[id];
+    states[id] = .reading;
+    fds[id].read(
+        l,
+        &read_comps[id],
+        .{ .slice = req_spill[id].?[req_spill_len[id]..][0..need] },
+        u16,
+        &slot_ids[id],
+        readCb,
+    );
+}
+
+fn continueReqSpill(id: usize, l: *xev.Loop) void {
+    if (req_spill_len[id] < req_spill_want[id]) {
+        armReadReqSpill(id, l);
+        return;
+    }
+    finishReqSpill(id, l);
+}
+
+fn finishReqSpill(id: usize, l: *xev.Loop) void {
+    const hdr_end = req_hdr_end[id];
+    const total = req_spill_want[id];
+    const buf = req_spill[id].?;
+    const pr = parseRequest(buf[0..hdr_end], hdr_end);
+    methods[id] = pr.method_tag;
+
+    if (pr.method.len == 0 or !pr.framing_ok or
+        pr.content_length != total - hdr_end)
+    {
+        resetReqSpill(id);
+        rejectWith(id, l, 400, "Bad Request");
+        return;
+    }
+
+    cflags[id].keep_alive = pr.keep_alive;
+    // read_bufs, if non-empty here (TLS over-read), is entirely the next
+    // request's bytes: consume none of it.
+    req_consumed[id] = 0;
+    cflags[id].req_body_spill = false;
+
+    const body = buf[hdr_end..total];
+    if (native_echo) {
+        buildResponse(id, 200, "{\"message\":\"ok\"}");
+    } else {
+        callHandler(id, &pr, body); // copies body into a JS string
+    }
+    resetReqSpill(id);
+
+    if (cflags[id].h2_active) {
+        http2_mod.flushNow(id, l);
+        return;
+    }
+    if (!cflags[id].handler_parked) {
+        states[id] = .writing;
+        armWrite(id, l);
+    } else {
+        states[id] = .reading;
+    }
 }
 
 // ── TLS (https/wss) helpers ─────────────────────────────────────────
@@ -656,6 +825,23 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
             }
             const app = tls_mod.recvAppReady(&tls_ctxs[id]);
             if (app.len > 0) {
+                if (cflags[id].req_body_spill) {
+                    // BearSSL can hand us ~32 KB at once; the spill buffer is
+                    // the destination, so large TLS uploads never touch
+                    // read_bufs.
+                    const need = req_spill_want[id] - req_spill_len[id];
+                    const take = @min(need, app.len);
+                    if (take > 0) {
+                        @memcpy(req_spill[id].?[req_spill_len[id]..][0..take], app[0..take]);
+                        req_spill_len[id] += take;
+                        tls_mod.recvAppAck(&tls_ctxs[id], take);
+                    }
+                    if (req_spill_len[id] == req_spill_want[id]) {
+                        finishReqSpill(id, l); // write armed
+                        return; // unacked plaintext stays for the next pump
+                    }
+                    continue;
+                }
                 if (buf_lens[id] + app.len > READ_BUF_SIZE) {
                     closeConn(id);
                     return;
@@ -1017,7 +1203,7 @@ var park_seq: u16 = 0; // 15-bit, 0 reserved for "no token"
 var park_token: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
 
 fn claimParkedSlot(magic: c_int) ?usize {
-    const token: u16 = @intCast(@as(u32, @bitCast(magic)) & 0x7FFF);
+    const token: u16 = @intCast(@as(c_uint, @bitCast(magic)) & 0x7FFF);
     if (token == 0) return null;
     for (0..MAX_CONN) |id| {
         if (park_token[id] != token) continue;
@@ -1258,7 +1444,6 @@ fn wsNotifyMessage(id: usize, msg: []const u8, binary: bool) void {
 /// legal maximum of 16374, buf[MAX_HDR..] landed 2 bytes past the column and
 /// into the neighbouring slot's buffer.
 fn wsReserve(id: usize, n: usize) ?[]u8 {
-    if (n > WRITE_BUF_SIZE) return null;
     const tail = write_lens[id];
     if (tail > WRITE_BUF_SIZE - n) return null;
     return write_bufs[id][tail..][0..n];
@@ -1550,6 +1735,7 @@ fn closeConn(id: usize) void {
         gpa.free(old);
         body_heap[id] = null;
     } // ← FIX
+    destroyReqSpill(id);
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1669,6 +1855,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
         gpa.free(old);
         body_heap[id] = null;
     } // ← FIX
+    destroyReqSpill(id);
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
@@ -1747,6 +1934,12 @@ fn readCb(
         tlsPump(id, l);
         return .disarm;
     }
+    if (cflags[id].req_body_spill) {
+        // Plain sockets were armed to read straight into the spill tail.
+        req_spill_len[id] += n;
+        continueReqSpill(id, l);
+        return .disarm;
+    }
     buf_lens[id] += n;
     processPlaintext(id, l);
     return .disarm;
@@ -1798,7 +1991,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
     if (he_found == null) {
         hdr_scan_off[id] = buf_lens[id];
         if (buf_lens[id] >= READ_BUF_SIZE) {
-            closeConn(id);
+            rejectWith(id, l, 431, "Request Header Fields Too Large");
             return;
         }
         armRead(id, l);
@@ -1812,7 +2005,11 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
     // Framing first: an ambiguous message (dup CL, TE, obs-fold, BWS) must
     // never reach a handler, and it must not be reparsed by keep-alive.
     if (!pr.framing_ok) {
-        rejectWith(id, l, 400, "Bad Request");
+        if (pr.too_large) {
+            rejectWith(id, l, 413, "Payload Too Large");
+        } else {
+            rejectWith(id, l, 400, "Bad Request");
+        }
         return;
     }
     if (ws_enabled) {
@@ -1832,11 +2029,26 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         rejectWith(id, l, 400, "Bad Request");
         return;
     }
-    // Both terms are bounded by READ_BUF_SIZE (content_length is clamped at
-    // parse), so this add cannot wrap.
+    // Both terms are bounded by READ_BUF_SIZE/REQ_BODY_MAX, so this add
+    // cannot wrap.
     const expect = headers_end + pr.content_length;
     if (expect > READ_BUF_SIZE) {
-        rejectWith(id, l, 413, "Payload Too Large");
+        const buf = ensureReqSpill(id, expect) orelse {
+            rejectWith(id, l, 503, "Service Unavailable");
+            return;
+        };
+        // Copy headers + any body already read. buf_lens <= READ_BUF_SIZE <
+        // expect, so this cannot include a pipelined next request.
+        @memcpy(buf[0..buf_lens[id]], read_bufs[id][0..buf_lens[id]]);
+        req_hdr_end[id] = headers_end;
+        req_spill_len[id] = buf_lens[id];
+        req_spill_want[id] = expect;
+        cflags[id].req_body_spill = true;
+        cflags[id].keep_alive = pr.keep_alive;
+        methods[id] = pr.method_tag;
+        hdr_scan_off[id] = 0;
+        buf_lens[id] = 0;
+        continueReqSpill(id, l);
         return;
     }
     req_consumed[id] = expect; // F4: remember the consumed span for keep-alive
@@ -2297,12 +2509,12 @@ test "stageLargeResponse retains spill for reuse and routes by discriminant" {
 
 test "statusReason covers every status code" {
     const cases = .{
-        .{ 200, "OK" },                 .{ 201, "Created" },             .{ 204, "No Content" },
-        .{ 301, "Moved Permanently" },  .{ 304, "Not Modified" },        .{ 400, "Bad Request" },
-        .{ 401, "Unauthorized" },       .{ 403, "Forbidden" },           .{ 404, "Not Found" },
-        .{ 405, "Method Not Allowed" }, .{ 413, "Payload Too Large" },   .{ 500, "Internal Server Error" },
-        .{ 502, "Bad Gateway" },        .{ 503, "Service Unavailable" }, .{ 418, "Unknown" },
-        .{ 999, "Unknown" },
+        .{ 200, "OK" },                    .{ 201, "Created" },           .{ 204, "No Content" },
+        .{ 301, "Moved Permanently" },     .{ 304, "Not Modified" },      .{ 400, "Bad Request" },
+        .{ 401, "Unauthorized" },          .{ 403, "Forbidden" },         .{ 404, "Not Found" },
+        .{ 405, "Method Not Allowed" },    .{ 413, "Payload Too Large" }, .{ 431, "Request Header Fields Too Large" },
+        .{ 500, "Internal Server Error" }, .{ 502, "Bad Gateway" },       .{ 503, "Service Unavailable" },
+        .{ 418, "Unknown" },               .{ 999, "Unknown" },
     };
     inline for (cases) |case| {
         try std.testing.expectEqualStrings(case[1], statusReason(case[0]));
@@ -2365,6 +2577,7 @@ test "callHandler without a runtime answers 500" {
         .keep_alive = true,
         .framing_ok = true,
         .ws_bad = false,
+        .too_large = false,
     };
     callHandler(id, &pr, "");
     try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 500 Internal Server Error\r\n") != null);
@@ -2390,6 +2603,25 @@ test "parseRequest rejects ambiguous framing" {
         const pr = parseRequest(raw, he + 4);
         try std.testing.expect(!pr.framing_ok);
     }
+}
+
+test "parseRequest accepts CL above READ_BUF_SIZE up to REQ_BODY_MAX" {
+    var buf: [512]u8 = undefined;
+    const req = "POST / HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+    @memcpy(buf[0..req.len], req);
+    const pr = parseRequest(buf[0..req.len], req.len);
+    try std.testing.expect(pr.framing_ok);
+    try std.testing.expect(!pr.too_large);
+    try std.testing.expectEqual(@as(usize, 65536), pr.content_length);
+}
+
+test "parseRequest marks CL above REQ_BODY_MAX too_large" {
+    var buf: [512]u8 = undefined;
+    const req = "POST / HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n";
+    @memcpy(buf[0..req.len], req);
+    const pr = parseRequest(buf[0..req.len], req.len);
+    try std.testing.expect(!pr.framing_ok);
+    try std.testing.expect(pr.too_large);
 }
 
 // ── Handshake regression: only a complete RFC 6455 upgrade may 101 ──

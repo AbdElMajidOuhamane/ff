@@ -54,10 +54,10 @@ launch command grants it with a `--allow-*` flag.
 
 | Flag | Grants |
 |------|--------|
-| `--allow-read` | Filesystem reads, `process.chdir`, TLS file paths in `http.serve` |
+| `--allow-read` | Filesystem reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` |
 | `--allow-write` | Filesystem writes, SQLite database files and their parent directory |
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres |
-| `--allow-env` | `process.env`, Postgres DSN environment variables |
+| `--allow-env` | `process.env`, Postgres DSN and TLS environment variables (`PG*`, `DATABASE_URL`, `PGSSL*`) |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` |
 | `--allow-ffi` | All `ffi` entry points except `ffi.allowed` |
 | `--allow-all` | All of the above, including FFI |

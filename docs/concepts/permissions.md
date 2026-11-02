@@ -28,10 +28,10 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 
 | Flag | Grants | Scope |
 |---|---|---|
-| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve` | paths |
+| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
-| `--allow-env` | `process.env`, Postgres DSN variables for the global `sql` | exact names |
+| `--allow-env` | `process.env`, Postgres DSN and TLS variables (`PG*`, `DATABASE_URL`, `PGSSL*`) for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | none — bare only |
 | `--allow-all` | every category above, **including FFI** | none |

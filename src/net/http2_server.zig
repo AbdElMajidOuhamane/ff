@@ -629,8 +629,8 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     active_stream[slot_id] = stream_id;
     // content_length stays 0: H2 has already buffered the whole body, so no
     // caller derives an offset from this field. Keeping it 0 preserves the
-    // "content_length ≤ READ_BUF_SIZE" invariant that the H1 framing path
-    // relies on for its unchecked `headers_end + content_length` add.
+    // content_length invariant that the H1 framing path relies on for its
+    // unchecked `headers_end + content_length` add.
     const pr = http_native.ParsedRequest{
         .method = st.method(),
         .url = st.path(),
@@ -640,6 +640,7 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
         .keep_alive = false, // H2 connections are persistent by design
         .framing_ok = true, // nghttp2 already rejected malformed frames
         .ws_bad = false,
+        .too_large = false,
     };
     http_native.callHandler(slot_id, &pr, st.p.body.items);
 }

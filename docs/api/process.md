@@ -177,17 +177,24 @@ console.log(`RSS: ${(rss / 1024 / 1024).toFixed(1)} MB`);
 
 ### `process.stats()`
 
-Returns internal runtime counters tracking heap spills and buffer reuse (useful for benchmarking and performance tuning):
+Returns internal runtime counters tracking heap spills, buffer reuse, and pool activity grouped by subsystem (`fetch`, `http`, `pg`, `child`):
 
 ```js
 console.log(process.stats());
 // {
-//   "fetch.bodyHeap": 0,
-//   "fetch.hdrSpill": 0,
-//   "fetch.decompressHeap": 0,
-//   "http.bodySpill": 0,
-//   "http.bodySpillReuse": 0,
-//   ...
+//   fetch: { bodyHeap: 0, hdrSpill: 0, decompressHeap: 0 },
+//   http: { bodySpill: 0, bodySpillReuse: 0 },
+//   pg: {
+//     submit: 0,
+//     jobReuse: 0,
+//     jobFresh: 0,
+//     wqueueGrow: 0,
+//     wqueueShrink: 0,
+//     waitEnqueue: 0,
+//     arenaResetFail: 0,
+//     freelistDestroy: 0
+//   },
+//   child: { spawned: 0, truncated: 0, outHeap: 0 }
 // }
 ```
 

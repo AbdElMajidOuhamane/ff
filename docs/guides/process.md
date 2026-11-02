@@ -38,6 +38,8 @@ ff info.js hello --allow-env=HOME
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+| `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
+| `process.stats()` | `() => object` | Internal allocator, spill, and pool counters (`fetch`, `http`, `pg`, `child`) |
 
 > **Permissions:** `process.env` needs `--allow-env`; `process.chdir` needs
 > `--allow-read` on the target. Everything else in this table is ungated. See
