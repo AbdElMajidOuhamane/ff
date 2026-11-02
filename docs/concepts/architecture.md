@@ -74,9 +74,10 @@ the full inventory.
 - **SoA connection table** — 512 slots stored as parallel arrays with packed
   2-byte flags (`ConnFlags` is a `packed struct(u16)`), so the hot loop
   touches cache lines, not objects.
-- **Static per-slot buffers** — 64 KB response staging per connection;
-  bodies above that spill to the heap (capped at 10 MB), and spills up to
-  256 KB are retained for reuse instead of re-allocated.
+- **Static per-slot buffers** — 4 KB request read buffer (spills to the
+  heap up to 1 MB per request, retaining up to 64 KB per slot within a 64 MB
+  global budget) and 64 KB response staging per connection (spills to the
+  heap up to 10 MB, retaining up to 256 KB for reuse).
 - **`HeadersData` refcount** — one heap object with an atomic refcount,
   shared by `Request` / `Response` / `Headers` across thread boundaries.
 - **Zero-copy URLs** — one allocation per URL; components are pooled slices.

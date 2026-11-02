@@ -202,7 +202,8 @@ uncovered; if that noise dominates, use the Zig-aware fork
   | Concurrent fetch slots | 16 (methods are exact-case: `POST`, not `post`) |
   | Timers | 128 live |
   | Workers | 8 (4 MB/message) |
-  | Request body | ~4 KB |
+  | Request headers | 4 KB |
+  | Request body | 1 MB (4 KB static fast path; spills to heap up to 1 MB) |
   | Response body | 10 MB |
 
 ## Working on the runtime

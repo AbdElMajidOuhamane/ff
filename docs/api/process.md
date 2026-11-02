@@ -183,7 +183,7 @@ Returns internal runtime counters tracking heap spills, buffer reuse, and pool a
 console.log(process.stats());
 // {
 //   fetch: { bodyHeap: 0, hdrSpill: 0, decompressHeap: 0 },
-//   http: { bodySpill: 0, bodySpillReuse: 0 },
+//   http: { bodySpill: 0, bodySpillReuse: 0, reqSpill: 0, reqSpillReuse: 0 },
 //   pg: {
 //     submit: 0,
 //     jobReuse: 0,

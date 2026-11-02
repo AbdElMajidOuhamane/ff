@@ -258,7 +258,7 @@ the permission check. See the [env guide](/docs/guides/env#ff_echo-smoke-mode).
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s read deadline (incomplete requests terminated), 30s handler watchdog (→ `504`), strict HTTP framing (ambiguous Content-Length/Transfer-Encoding, obs-fold, or BWS rejected with 400 Bad Request), Response status clamped to 100..999, plain listeners speak HTTP/1.1 (HTTP/2 needs TLS), bind is always `0.0.0.0`.
+Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 4 KB max request headers (→ `431`), 1 MB max HTTP/1.1 request body (4 KB static buffer spills to the heap, 64 MB global spill budget; → `413` / `503`), 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s read deadline (incomplete requests terminated), 30s handler watchdog (→ `504`), strict HTTP framing (ambiguous Content-Length/Transfer-Encoding, obs-fold, or BWS rejected with 400 Bad Request), Response status clamped to 100..999, plain listeners speak HTTP/1.1 (HTTP/2 needs TLS), bind is always `0.0.0.0`.
 
 ## See also
 

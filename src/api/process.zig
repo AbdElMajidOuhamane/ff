@@ -114,6 +114,8 @@ fn statsCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     const http_obj = c.newObject(ctx);
     _ = c.definePropertyValueStr(ctx, http_obj, "bodySpill", c.newInt64(ctx, @intCast(http_native.stat_body_spill.load(.monotonic))), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, http_obj, "bodySpillReuse", c.newInt64(ctx, @intCast(http_native.stat_body_spill_reuse.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, http_obj, "reqSpill", c.newInt64(ctx, @intCast(http_native.stat_req_spill.load(.monotonic))), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, http_obj, "reqSpillReuse", c.newInt64(ctx, @intCast(http_native.stat_req_spill_reuse.load(.monotonic))), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, root, "http", http_obj, c.PROP_C_W_E);
 
     const pg_obj = c.newObject(ctx);

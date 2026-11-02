@@ -472,7 +472,8 @@ Database:
 - HTTP/2 accepted by the server (TLS + ALPN; validates pseudo-headers and caps per-connection request bodies at 10 MB); outbound clients are HTTP/1.1 only
 - Server TLS requires TLS 1.2 minimum (TLS 1.0 and 1.1 rejected; no TLS 1.3 in BearSSL)
 - Max **512** concurrent HTTP connections
-- Request bodies: ~4 KB on HTTP/1.1 (headers + body share a 4 KB buffer; beyond → `413`)
+- Request headers: capped at **4 KB** (`431 Request Header Fields Too Large`)
+- Request bodies: **1 MB** hard cap on HTTP/1.1 (requests up to 4 KB total stay in the static buffer; larger bodies spill to the heap up to 1 MB with 64 KB retained per idle slot and a 64 MB global in-flight cap; beyond 1 MB → `413`, global budget exhausted → `503`)
 - Response bodies: buffered, hard cap **10 MB** (64 KB static stage buffer,
   larger bodies spill to the heap; beyond 10 MB → `500`)
 - Response status bounded to `100`–`999`; response headers capped at 2048 bytes;

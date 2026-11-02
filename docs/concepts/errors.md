@@ -140,7 +140,9 @@ Permission denial is different:
 | Handler throws or its Promise rejects | `500 Internal Server Error` |
 | Handler never settles | `504 Gateway Timeout` after 30 s |
 | Response body over 10 MB | `500` |
-| Request body over the 4 KB read buffer | `413 Payload Too Large` |
+| Request headers over 4 KB | `431 Request Header Fields Too Large` |
+| Request body over 1 MB (HTTP/1.1) | `413 Payload Too Large` |
+| Request body spill exceeds 64 MB global budget | `503 Service Unavailable` |
 
 A permission denial is not a handler failure: `http.serve` checks its bind scope
 when the server starts, and `fs` / `fetch` denials inside a handler are thrown

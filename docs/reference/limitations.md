@@ -37,7 +37,8 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Request body | ~4 KB (shares the 4 KB read buffer) | Beyond → `413 Payload Too Large` |
+| Request headers | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request body | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
 | Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
 | Response headers | 2048 bytes | Headers beyond the cap are dropped |
 | Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
