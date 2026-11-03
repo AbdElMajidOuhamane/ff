@@ -43,6 +43,9 @@ const JOB_CLAIMED: u8 = 3;
 // Hot path touches only `states` + `pending` + ring indices.
 // Payload columns below are cold per-job data, never scanned in drains.
 var states: [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
+var slot_gens: [MAX_FETCH]std.atomic.Value(u16) = [_]std.atomic.Value(u16){.{ .raw = 0 }} ** MAX_FETCH;
+var aborted: [MAX_FETCH]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_FETCH;
+var active_fds: [MAX_FETCH]std.atomic.Value(i32) = [_]std.atomic.Value(i32){.{ .raw = -1 }} ** MAX_FETCH;
 var resolve_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var reject_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var results: [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
@@ -123,6 +126,9 @@ fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
     const s: usize = free_list[free_count];
+    _ = slot_gens[s].fetchAdd(1, .acq_rel);
+    aborted[s].store(false, .release);
+    active_fds[s].store(-1, .release);
     states[s].store(JOB_BUSY, .release);
     return s;
 }
@@ -262,6 +268,11 @@ fn workerLoop() void {
         if (stop) return;
     }
 }
+pub const SubmitToken = struct {
+    slot: u16,
+    gen: u16,
+};
+
 pub fn submit(
     ctx: ?*c.Context,
     resolve_func: c.Value,
@@ -271,7 +282,7 @@ pub fn submit(
     method: http.Method,
     headers_ptr: *headers_mod.HeadersData,
     body: ?[]const u8, // ◀ FIX-4: BORROWED (was caller-owned heap [:0])
-) !void {
+) !SubmitToken {
     poolLock();
     defer poolUnlock();
     const s = acquireSlot() orelse {
@@ -342,6 +353,24 @@ pub fn submit(
     ringUnlock();
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
     ensureArmed();
+    return .{ .slot = @intCast(s), .gen = slot_gens[s].load(.acquire) };
+}
+
+pub fn abortSlot(ctx: ?*c.Context, s: usize, gen: u16, reason: c.Value) void {
+    if (s >= MAX_FETCH) return;
+    if (slot_gens[s].load(.acquire) != gen) return;
+    if (states[s].load(.acquire) == JOB_FREE) return;
+    aborted[s].store(true, .seq_cst);
+    const fd = active_fds[s].load(.seq_cst);
+    if (fd >= 0) {
+        _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
+    }
+    if (reject_funcs[s]) |reject| {
+        var args = [_]c.Value{reason};
+        const ret = c.call(ctx, reject, c.JS_UNDEFINED, 1, &args);
+        c.freeValue(ctx, ret);
+    }
+    freeResolvers(s);
 }
 fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]const u8 {
     const scheme_sep = std.mem.indexOf(u8, current_url, "://") orelse return null;
@@ -451,6 +480,10 @@ fn runJob(slot_id: u16) void {
     var cross_origin_hdrs: ?[]http.Header = null;
 
     hop: while (true) {
+        if (aborted[s].load(.acquire)) {
+            failSlot(s, "The operation was aborted");
+            return;
+        }
         const current_uri = std.Uri.parse(current_url) catch {
             failSlot(s, "Invalid URL");
             return;
@@ -547,8 +580,21 @@ fn runJob(slot_id: u16) void {
         req.redirect_behavior = .unhandled;
         defer req.deinit();
         var slot: ?usize = null;
-        if (req.connection) |cn| slot = tls.attach(cn);
+        if (req.connection) |cn| {
+            slot = tls.attach(cn);
+            active_fds[s].store(@intCast(cn.stream_reader.stream.socket.handle), .seq_cst);
+        }
         defer if (slot) |sl| tls.detach(sl);
+        defer {
+            active_fds[s].store(-1, .seq_cst);
+            if (aborted[s].load(.acquire)) {
+                if (req.connection) |cn| cn.closing = true;
+            }
+        }
+        if (aborted[s].load(.seq_cst)) {
+            failSlot(s, "The operation was aborted");
+            return;
+        }
         if (current_body) |payload| {
             req.transfer_encoding = .{ .content_length = payload.len };
             var body_writer = req.sendBodyUnflushed(&.{}) catch {

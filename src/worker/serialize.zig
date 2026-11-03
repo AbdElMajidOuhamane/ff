@@ -47,6 +47,10 @@ pub const View = struct {
 /// Serialize into an engine-owned buffer (no Zig gpa copy).
 /// On failure a TypeError is left pending — same contract as stringify.
 pub fn stringifyView(ctx: ?*qjs.Context, val: qjs.Value) !View {
+    return stringifyViewImpl(ctx, val, true);
+}
+
+fn stringifyViewImpl(ctx: ?*qjs.Context, val: qjs.Value, log_stderr: bool) !View {
     var owned: ?qjs.Value = null;
     const src = if (qjs.isError(ctx, val) != 0) blk: {
         owned = errorToPlain(ctx, val) catch return error.NotSerializable;
@@ -59,7 +63,7 @@ pub fn stringifyView(ctx: ?*qjs.Context, val: qjs.Value) !View {
     var out_len: usize = 0;
     const buf = qjs.writeObject(ctx, &out_len, src, qjs.WRITE_OBJ_REFERENCE);
     if (buf == null) {
-        rethrowAsCloneError(ctx);
+        rethrowAsCloneError(ctx, log_stderr);
         return error.NotSerializable;
     }
     if (out_len == 0 or out_len > MAX_FRAME) {
@@ -90,16 +94,44 @@ pub fn parse(ctx: ?*qjs.Context, blob: []const u8) !qjs.Value {
     return val;
 }
 
-fn rethrowAsCloneError(ctx: ?*qjs.Context) void {
+fn structuredCloneCallback(
+    ctx: ?*qjs.Context,
+    _: qjs.Value,
+    argc: c_int,
+    argv: [*c]qjs.Value,
+) callconv(.c) qjs.Value {
+    if (argc < 1) {
+        return qjs.throwTypeError(ctx, "structuredClone requires at least 1 argument");
+    }
+    const view = stringifyViewImpl(ctx, argv[0], false) catch |err| switch (err) {
+        error.FrameTooLarge => return qjs.throwTypeError(ctx, "structuredClone: value exceeds 4 MB limit"),
+        error.NotSerializable => return qjs.JS_EXCEPTION,
+    };
+    defer view.deinit();
+    return parse(ctx, view.slice()) catch {
+        return qjs.throwTypeError(ctx, "value could not be cloned");
+    };
+}
+
+pub fn setup(ctx: ?*qjs.Context) void {
+    const global = qjs.getGlobalObject(ctx);
+    defer qjs.freeValue(ctx, global);
+    const fn_val = qjs.newCFunction(ctx, structuredCloneCallback, "structuredClone", 1);
+    _ = qjs.definePropertyValueStr(ctx, global, "structuredClone", fn_val, qjs.PROP_C_W_E);
+}
+
+fn rethrowAsCloneError(ctx: ?*qjs.Context, log_stderr: bool) void {
     // The writer left a specific TypeError pending ("unsupported object
     // class", "only value properties are supported", ...). Fold it into a
-    // browser-style message; keep the detail on stderr.
+    // browser-style message; keep the detail on stderr for Worker sends.
     const exc = qjs.getException(ctx); // clears the pending slot
     defer qjs.freeValue(ctx, exc);
-    const m = qjs.toCString(ctx, exc);
-    if (m) |s| {
-        defer qjs.freeCString(ctx, s);
-        std.debug.print("[worker] value could not be cloned: {s}\n", .{std.mem.span(s)});
+    if (log_stderr) {
+        const m = qjs.toCString(ctx, exc);
+        if (m) |s| {
+            defer qjs.freeCString(ctx, s);
+            std.debug.print("[worker] value could not be cloned: {s}\n", .{std.mem.span(s)});
+        }
     }
     _ = qjs.throwTypeError(ctx, "value could not be cloned");
 }

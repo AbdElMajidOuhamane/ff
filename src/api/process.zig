@@ -1,8 +1,10 @@
 const std = @import("std");
+const xev = @import("xev");
 const c = @import("../c.zig").c;
 const builtin = @import("builtin");
 const perm = @import("../security/permissions.zig");
 const deny = @import("../security/deny.zig");
+const microtasks = @import("../event/microtasks.zig");
 // C3: stat counters live in the net modules (verified: nothing in their
 // import closures references api/process, so no cycle).
 const async_fetch = @import("../net/async_fetch.zig");
@@ -13,6 +15,279 @@ const child_process = @import("child_process.zig");
 const Io = std.Io;
 
 const gpa = std.heap.smp_allocator;
+
+// ── Signal handling (SoA, static caps, async-signal-safe wakeup) ────
+const NUM_SIGNALS = 5;
+const MAX_SIG_LISTENERS = 8;
+
+const sig_names = [NUM_SIGNALS][]const u8{
+    "SIGINT",
+    "SIGTERM",
+    "SIGHUP",
+    "SIGUSR1",
+    "SIGUSR2",
+};
+
+const sig_codes = [NUM_SIGNALS]std.posix.SIG{
+    .INT,
+    .TERM,
+    .HUP,
+    .USR1,
+    .USR2,
+};
+
+var sig_listeners: [NUM_SIGNALS][MAX_SIG_LISTENERS]c.Value =
+    [_][MAX_SIG_LISTENERS]c.Value{[_]c.Value{c.JS_UNDEFINED} ** MAX_SIG_LISTENERS} ** NUM_SIGNALS;
+var sig_once: [NUM_SIGNALS][MAX_SIG_LISTENERS]bool =
+    [_][MAX_SIG_LISTENERS]bool{[_]bool{false} ** MAX_SIG_LISTENERS} ** NUM_SIGNALS;
+var sig_count: [NUM_SIGNALS]u8 = [_]u8{0} ** NUM_SIGNALS;
+var sig_installed: [NUM_SIGNALS]bool = [_]bool{false} ** NUM_SIGNALS;
+
+var pending_signals: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var sig_async: xev.Async = undefined;
+var sig_async_inited: bool = false;
+var sig_async_armed: bool = false;
+var sig_async_comp: xev.Completion = .{};
+var g_loop: ?*xev.Loop = null;
+
+fn signalIndexFromName(name: []const u8) ?usize {
+    for (sig_names, 0..) |sn, i| {
+        if (std.mem.eql(u8, name, sn)) return i;
+    }
+    return null;
+}
+
+fn posixSignalHandler(sig: std.posix.SIG) callconv(.c) void {
+    for (sig_codes, 0..) |sc, i| {
+        if (sig == sc) {
+            _ = pending_signals.fetchOr(@as(u32, 1) << @intCast(i), .release);
+            break;
+        }
+    }
+    if (sig_async_inited) {
+        sig_async.notify() catch {};
+    }
+}
+
+fn sigAsyncCb(
+    _: ?*void,
+    l: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch {
+        sig_async_armed = false;
+        return .disarm;
+    };
+    sig_async.wait(l, &sig_async_comp, void, null, sigAsyncCb);
+    sig_async_armed = true;
+    return .disarm;
+}
+
+fn ensureSignalWatcher() void {
+    const l = g_loop orelse return;
+    if (!sig_async_inited) {
+        sig_async = xev.Async.init() catch return;
+        sig_async_inited = true;
+    }
+    if (!sig_async_armed) {
+        sig_async_armed = true;
+        sig_async.wait(l, &sig_async_comp, void, null, sigAsyncCb);
+    }
+}
+
+fn installSignalIdx(idx: usize) void {
+    ensureSignalWatcher();
+    if (sig_installed[idx]) return;
+    sig_installed[idx] = true;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = posixSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(sig_codes[idx], &act, null);
+}
+
+pub fn setLoop(l: *xev.Loop) void {
+    g_loop = l;
+}
+
+/// Armed automatically by `http.serve` so SIGINT/SIGTERM trigger graceful drain
+/// even when the script did not explicitly call `process.on('SIGTERM', ...)`.
+pub fn enableServerSignalTrap() void {
+    installSignalIdx(0); // SIGINT
+    installSignalIdx(1); // SIGTERM
+}
+
+/// Included in loop.zig's `unrefArmed()` so the signal watcher does not hold
+/// the event loop open once all servers, timers, and I/O have finished.
+pub inline fn unrefSignalCount() usize {
+    if (sig_async_armed and pending_signals.load(.acquire) == 0) return 1;
+    return 0;
+}
+
+pub fn drainSignals(ctx: *c.Context) void {
+    const bits = pending_signals.swap(0, .acq_rel);
+    if (bits == 0) return;
+
+    for (0..NUM_SIGNALS) |idx| {
+        if ((bits & (@as(u32, 1) << @intCast(idx))) == 0) continue;
+
+        const cnt = sig_count[idx];
+        if (cnt == 0) {
+            // Default signal-driven graceful shutdown for SIGINT / SIGTERM.
+            if (idx == 0 or idx == 1) {
+                if (http_native.isRunning()) {
+                    http_native.closeServer();
+                } else {
+                    std.process.exit(if (idx == 0) 130 else 143);
+                }
+            }
+            continue;
+        }
+
+        // Snapshot listeners in case a listener mutates the array via off/once.
+        var fns: [MAX_SIG_LISTENERS]c.Value = undefined;
+        var n_call: usize = 0;
+        var write_i: usize = 0;
+        for (0..cnt) |i| {
+            const fn_val = sig_listeners[idx][i];
+            fns[n_call] = c.dupValue(ctx, fn_val);
+            n_call += 1;
+            if (sig_once[idx][i]) {
+                c.freeValue(ctx, fn_val);
+            } else {
+                sig_listeners[idx][write_i] = fn_val;
+                sig_once[idx][write_i] = false;
+                write_i += 1;
+            }
+        }
+        sig_count[idx] = @intCast(write_i);
+
+        var sig_str = zigStringToVal(ctx, sig_names[idx]);
+        defer c.freeValue(ctx, sig_str);
+
+        for (fns[0..n_call]) |fn_val| {
+            const ret = c.call(ctx, fn_val, c.JS_UNDEFINED, 1, @ptrCast(&sig_str));
+            c.freeValue(ctx, fn_val);
+            if (c.isException(ret) != 0) {
+                microtasks.reportUncaught(ctx, "signal handler error");
+            } else {
+                c.freeValue(ctx, ret);
+            }
+        }
+        microtasks.pumpMicrotasks(ctx);
+    }
+}
+
+pub fn deinit(ctx: *c.Context) void {
+    for (0..NUM_SIGNALS) |idx| {
+        for (0..sig_count[idx]) |i| {
+            c.freeValue(ctx, sig_listeners[idx][i]);
+            sig_listeners[idx][i] = c.JS_UNDEFINED;
+            sig_once[idx][i] = false;
+        }
+        sig_count[idx] = 0;
+    }
+    _ = pending_signals.store(0, .release);
+    sig_async_armed = false;
+    g_loop = null;
+}
+
+fn addSignalListener(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value, once: bool) c.Value {
+    if (argc < 2 or c.isString(argv[0]) == 0 or c.isFunction(ctx, argv[1]) == 0) {
+        _ = c.throwTypeError(ctx, "process.on requires (signalName, callback)");
+        return c.JS_EXCEPTION;
+    }
+    var len: usize = 0;
+    const cstr = c.toCStringLen(ctx, &len, argv[0]) orelse return c.JS_EXCEPTION;
+    defer c.freeCString(ctx, cstr);
+    const idx = signalIndexFromName(cstr[0..len]) orelse {
+        _ = c.throwRangeError(ctx, "Unsupported signal (supported: SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2)");
+        return c.JS_EXCEPTION;
+    };
+    const cnt = sig_count[idx];
+    if (cnt >= MAX_SIG_LISTENERS) {
+        _ = c.throwRangeError(ctx, "Max signal listeners (8) exceeded");
+        return c.JS_EXCEPTION;
+    }
+    installSignalIdx(idx);
+    sig_listeners[idx][cnt] = c.dupValue(ctx, argv[1]);
+    sig_once[idx][cnt] = once;
+    sig_count[idx] = cnt + 1;
+    return c.dupValue(ctx, this_val);
+}
+
+fn processOnCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    return addSignalListener(ctx, this_val, argc, argv, false);
+}
+
+fn processOnceCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    return addSignalListener(ctx, this_val, argc, argv, true);
+}
+
+fn processOffCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 2 or c.isString(argv[0]) == 0) return c.dupValue(ctx, this_val);
+    var len: usize = 0;
+    const cstr = c.toCStringLen(ctx, &len, argv[0]) orelse return c.dupValue(ctx, this_val);
+    defer c.freeCString(ctx, cstr);
+    const idx = signalIndexFromName(cstr[0..len]) orelse return c.dupValue(ctx, this_val);
+    const target = argv[1];
+    const cnt = sig_count[idx];
+    for (0..cnt) |i| {
+        if (sig_listeners[idx][i].u.ptr == target.u.ptr and sig_listeners[idx][i].tag == target.tag) {
+            c.freeValue(ctx, sig_listeners[idx][i]);
+            var j: usize = i;
+            while (j + 1 < cnt) : (j += 1) {
+                sig_listeners[idx][j] = sig_listeners[idx][j + 1];
+                sig_once[idx][j] = sig_once[idx][j + 1];
+            }
+            sig_count[idx] = cnt - 1;
+            break;
+        }
+    }
+    return c.dupValue(ctx, this_val);
+}
+
+fn processKillCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1) {
+        _ = c.throwTypeError(ctx, "process.kill requires a pid");
+        return c.JS_EXCEPTION;
+    }
+    var pid_i64: i64 = 0;
+    if (c.toInt64(ctx, &pid_i64, argv[0]) != 0 or pid_i64 <= 0) {
+        _ = c.throwRangeError(ctx, "process.kill: invalid pid");
+        return c.JS_EXCEPTION;
+    }
+    const target_pid: std.posix.pid_t = @intCast(pid_i64);
+    if (target_pid != std.c.getpid()) {
+        if (perm.global().checkRun("kill") == .denied) {
+            return deny.throw(ctx, "process.kill", .run, "kill");
+        }
+    }
+    var sig: std.posix.SIG = .TERM;
+    if (argc >= 2 and c.isUndefined(argv[1]) == 0) {
+        if (c.isString(argv[1]) != 0) {
+            var slen: usize = 0;
+            const scstr = c.toCStringLen(ctx, &slen, argv[1]) orelse return c.JS_EXCEPTION;
+            defer c.freeCString(ctx, scstr);
+            const idx = signalIndexFromName(scstr[0..slen]) orelse {
+                _ = c.throwRangeError(ctx, "process.kill: unknown signal");
+                return c.JS_EXCEPTION;
+            };
+            sig = sig_codes[idx];
+        } else {
+            var sig_num: i32 = 15;
+            _ = c.toInt32(ctx, &sig_num, argv[1]);
+            sig = @enumFromInt(sig_num);
+        }
+    }
+    std.posix.kill(target_pid, sig) catch {
+        _ = c.throwTypeError(ctx, "process.kill failed");
+        return c.JS_EXCEPTION;
+    };
+    return c.JS_TRUE;
+}
 
 fn getIo() Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -176,6 +451,17 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
 
     const memory_usage_fn = c.newCFunction(ctx, memoryUsageCallback, "memoryUsage", 0);
     _ = c.definePropertyValueStr(ctx, process_obj, "memoryUsage", memory_usage_fn, c.PROP_C_W_E);
+
+    const on_fn = c.newCFunction(ctx, processOnCallback, "on", 2);
+    _ = c.definePropertyValueStr(ctx, process_obj, "on", on_fn, c.PROP_C_W_E);
+    const once_fn = c.newCFunction(ctx, processOnceCallback, "once", 2);
+    _ = c.definePropertyValueStr(ctx, process_obj, "once", once_fn, c.PROP_C_W_E);
+    const off_fn = c.newCFunction(ctx, processOffCallback, "off", 2);
+    _ = c.definePropertyValueStr(ctx, process_obj, "off", off_fn, c.PROP_C_W_E);
+    const rm_fn = c.newCFunction(ctx, processOffCallback, "removeListener", 2);
+    _ = c.definePropertyValueStr(ctx, process_obj, "removeListener", rm_fn, c.PROP_C_W_E);
+    const kill_fn = c.newCFunction(ctx, processKillCallback, "kill", 2);
+    _ = c.definePropertyValueStr(ctx, process_obj, "kill", kill_fn, c.PROP_C_W_E);
 
     const pid_val = c.newInt64(ctx, @intCast(@as(i64, std.c.getpid())));
     _ = c.definePropertyValueStr(ctx, process_obj, "pid", pid_val, c.PROP_C_W_E);

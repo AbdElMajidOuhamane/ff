@@ -38,6 +38,10 @@ pub const TimerManager = struct {
     free_head: u8 = 0,
     next_free: [MAX_TIMERS]u8 = undefined,
     // ── cold ──
+    // Slot generation: incremented on every allocSlot. AbortSignal uses it to
+    // prove a timer slot still belongs to the timer it was attached to, so an
+    // abort cannot clear a later timer that recycled the same slot.
+    gen: [MAX_TIMERS]u32 = [_]u32{0} ** MAX_TIMERS,
     timers: [MAX_TIMERS]xev.Timer = undefined,
     ctx: [MAX_TIMERS]?*c.Context = [_]?*c.Context{null} ** MAX_TIMERS,
     callbacks: [MAX_TIMERS]?c.Value = [_]?c.Value{null} ** MAX_TIMERS,
@@ -74,6 +78,13 @@ pub const TimerManager = struct {
     }
     inline fn isScheduled(self: *const TimerManager, idx: u8) bool {
         return bitGet(&self.sched_bits, idx);
+    }
+
+    /// Monotonic per-slot generation. AbortSignal stores it at attach time and
+    /// compares before clearing: a recycled slot has a new generation, so a
+    /// stale abort cannot cancel an unrelated timer.
+    pub fn generation(self: *const TimerManager, idx: u8) u32 {
+        return self.gen[idx];
     }
 
     pub fn hasReferencedTimers(self: *const TimerManager) bool {
@@ -127,6 +138,7 @@ pub const TimerManager = struct {
     }
     fn allocSlot(self: *TimerManager, ctx: *c.Context, callback: c.Value, args: []const c.Value) !u8 {
         const idx = self.popFree() orelse return error.NoSlotsAvailable;
+        self.gen[idx] +%= 1;
         self.setActive(idx);
         bitOp(&self.ref_bits, idx, true); // referenced by default (Node parity)
         bitOp(&self.zombie_bits, idx, false); // reset: stale marks must not leak across lifecycles

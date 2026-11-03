@@ -6,10 +6,24 @@ const tls_server = @import("tls_server.zig");
 const tls = @import("tls.zig");
 const engine = @import("../engine/engine.zig");
 const api_ws = @import("../api/websocket.zig");
+const fetch_api = @import("../api/fetch.zig");
+const process_api = @import("../api/process.zig");
 const perm = @import("../security/permissions.zig");
 const deny = @import("../security/deny.zig");
 
-pub var server_running = std.atomic.Value(bool).init(false);
+pub const server_running = &http_native.server_running;
+
+fn serverCloseCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return c.JS_EXCEPTION;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+    const cb_val = if (argc >= 1) argv[0] else c.JS_UNDEFINED;
+    http_native.registerCloseWaiter(ctx, cap[0], cb_val);
+    http_native.closeServer();
+    return promise;
+}
 
 fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
     _ = c.throwTypeError(ctx, "http.serve: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
@@ -56,6 +70,7 @@ fn resolvePem(owned: []u8) ?[]u8 {
 fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     // Cheap probe first so the no-tls path stays allocation-free.
     const probe = c.getPropertyStr(ctx, opts_val, "tls");
+    defer c.freeValue(ctx, probe);
     if (c.isObject(probe) == 0) return true; // no tls requested — plain http
     if (!tls_server.available) {
         throwTypeError(ctx, "built without TLS (rebuild without -Dbearssl=false)");
@@ -63,7 +78,9 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     }
 
     const cert_val = c.getPropertyStr(ctx, probe, "cert");
+    defer c.freeValue(ctx, cert_val);
     const key_val = c.getPropertyStr(ctx, probe, "key");
+    defer c.freeValue(ctx, key_val);
     if (c.isString(cert_val) == 0 or c.isString(key_val) == 0) {
         throwTypeError(ctx, "tls.cert and tls.key must be strings (PEM content or file path)");
         return false;
@@ -139,17 +156,21 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
 
         const ws_obj_val = c.getPropertyStr(ctx, opts_val, "websocket");
+        defer c.freeValue(ctx, ws_obj_val);
         if (c.isObject(ws_obj_val) != 0) {
             http_native.ws_enabled = true;
             const open_val = c.getPropertyStr(ctx, ws_obj_val, "open");
+            defer c.freeValue(ctx, open_val);
             if (c.isFunction(ctx, open_val) != 0) {
                 http_native.ws_on_open = c.dupValue(ctx, open_val);
             }
             const msg_val = c.getPropertyStr(ctx, ws_obj_val, "message");
+            defer c.freeValue(ctx, msg_val);
             if (c.isFunction(ctx, msg_val) != 0) {
                 http_native.ws_on_message = c.dupValue(ctx, msg_val);
             }
             const close_val = c.getPropertyStr(ctx, ws_obj_val, "close");
+            defer c.freeValue(ctx, close_val);
             if (c.isFunction(ctx, close_val) != 0) {
                 http_native.ws_on_close = c.dupValue(ctx, close_val);
             }
@@ -186,9 +207,20 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return c.JS_EXCEPTION;
     };
 
-    server_running.store(true, .release);
+    process_api.enableServerSignalTrap();
 
-    return c.JS_UNDEFINED;
+    if (c.isObject(opts_val) != 0) {
+        const sig_val = c.getPropertyStr(ctx, opts_val, "signal");
+        defer c.freeValue(ctx, sig_val);
+        if (fetch_api.getAbortSignalData(ctx, sig_val) != null) {
+            _ = fetch_api.attachServerToSignal(ctx, sig_val);
+        }
+    }
+
+    const server_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, server_obj, "port", c.newInt32(ctx, @intCast(http_native.bound_port)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, server_obj, "close", c.newCFunction(ctx, serverCloseCallback, "close", 1), c.PROP_C_W_E);
+    return server_obj;
 }
 
 pub fn setup(ctx: ?*c.Context) void {

@@ -74,6 +74,16 @@ pub var write_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 pub var write_offsets: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 var methods: [MAX_CONN]Method = [_]Method{.none} ** MAX_CONN;
 var read_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
+var read_cancel_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
+var read_armed_bits: [MAX_CONN / 64]u64 = [_]u64{0} ** (MAX_CONN / 64);
+inline fn isReadArmed(id: usize) bool {
+    return (read_armed_bits[id >> 6] >> @intCast(id & 63)) & 1 == 1;
+}
+inline fn setReadArmed(id: usize, armed: bool) void {
+    const w = &read_armed_bits[id >> 6];
+    const bit: u64 = @as(u64, 1) << @intCast(id & 63);
+    if (armed) w.* |= bit else w.* &= ~bit;
+}
 pub var write_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
 var close_comps: [MAX_CONN]xev.Completion = [_]xev.Completion{.{}} ** MAX_CONN;
 var hdr_scan_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
@@ -165,6 +175,10 @@ var then_atom: c.Atom = 0; // ◀ FIX-3
 const HDR_MAX = 2048;
 const HANDLER_TIMEOUT_MS: u64 = 30_000;
 const WATCHDOG_INTERVAL_MS: u64 = 1000;
+// Bounded drain: server.close() waits this long for in-flight work, then
+// hard-closes the remaining slots. Independent of the watchdog so the
+// deadline still fires if the watchdog is stopped early.
+const SHUTDOWN_DRAIN_MS: u64 = 5000;
 // Header/body/idle read deadline (slowloris defence). One u64 column swept by
 // the existing watchdogCb — no per-connection timer, no hot-path allocation.
 // DOD §7: one pass over a dense column, batch API, zero per-conn objects.
@@ -172,8 +186,15 @@ const CONN_TIMEOUT_MS: u64 = 30_000;
 var deadline_ms: [MAX_CONN]u64 = [_]u64{0} ** MAX_CONN;
 var watchdog_timer: xev.Timer = undefined;
 var watchdog_comp: xev.Completion = .{};
+var watchdog_cancel_comp: xev.Completion = .{};
 var watchdog_started = false;
+var shutdown_timer: xev.Timer = undefined;
+var shutdown_comp: xev.Completion = .{};
+var shutdown_cancel_comp: xev.Completion = .{};
+var shutdown_timer_started = false;
 
+pub var server_running = std.atomic.Value(bool).init(false);
+pub var bound_port: u16 = 0;
 pub var handler_fn: ?c.Value = null;
 pub var handler_ctx: ?*c.Context = null;
 pub var ws_enabled: bool = false;
@@ -183,6 +204,14 @@ pub var ws_on_close: ?c.Value = null;
 var native_echo: bool = false;
 var listener_tcp: xev.TCP = undefined;
 var accept_comp: xev.Completion = .{};
+var accept_cancel_comp: xev.Completion = .{};
+var listener_close_comp: xev.Completion = .{};
+var accept_armed: bool = false;
+var listener_closed: bool = false;
+var closing_server: bool = false;
+var shutdown_deadline_ms: u64 = 0;
+var close_resolve: ?c.Value = null;
+var close_cb_fn: ?c.Value = null;
 var g_loop: ?*xev.Loop = null;
 var initialized: bool = false;
 
@@ -682,6 +711,7 @@ fn armReadReqSpill(id: usize, l: *xev.Loop) void {
     }
     const need = req_spill_want[id] - req_spill_len[id];
     states[id] = .reading;
+    setReadArmed(id, true);
     fds[id].read(
         l,
         &read_comps[id],
@@ -715,7 +745,7 @@ fn finishReqSpill(id: usize, l: *xev.Loop) void {
         return;
     }
 
-    cflags[id].keep_alive = pr.keep_alive;
+    cflags[id].keep_alive = pr.keep_alive and !closing_server;
     // read_bufs, if non-empty here (TLS over-read), is entirely the next
     // request's bytes: consume none of it.
     req_consumed[id] = 0;
@@ -756,10 +786,12 @@ fn armRead(id: usize, l: *xev.Loop) void {
         if (sp.len == 0) return;
         states[id] = .reading;
         cflags[id].tls_read_armed = true;
+        setReadArmed(id, true);
         fds[id].read(l, &read_comps[id], .{ .slice = sp }, u16, &slot_ids[id], readCb);
         return;
     }
     states[id] = .reading;
+    setReadArmed(id, true);
     fds[id].read(l, &read_comps[id], .{ .slice = read_bufs[id][buf_lens[id]..] }, u16, &slot_ids[id], readCb);
 }
 
@@ -907,13 +939,32 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
     }
 }
 
+fn noopCancelCb(
+    _: ?*anyopaque,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.Result,
+) xev.CallbackAction {
+    return .disarm;
+}
+
 fn hardClose(id: usize) void {
     states[id] = .closing;
     const loop = g_loop orelse {
+        setReadArmed(id, false);
         states[id] = .idle;
         freePush(id);
         return;
     };
+    if (isReadArmed(id)) {
+        setReadArmed(id, false);
+        read_cancel_comps[id] = .{
+            .op = .{ .cancel = .{ .c = &read_comps[id] } },
+            .userdata = null,
+            .callback = noopCancelCb,
+        };
+        loop.add(&read_cancel_comps[id]);
+    }
     fds[id].close(loop, &close_comps[id], u16, &slot_ids[id], closeCb);
 }
 
@@ -1091,7 +1142,11 @@ fn formatHead(
         appendUInt(w, &pos, body_len);
         pushStr(w, &pos, "\r\n");
     }
-    if (cflags[id].keep_alive) pushStr(w, &pos, "Connection: keep-alive\r\n");
+    if (cflags[id].keep_alive) {
+        pushStr(w, &pos, "Connection: keep-alive\r\n");
+    } else if (closing_server) {
+        pushStr(w, &pos, "Connection: close\r\n");
+    }
     pushStr(w, &pos, "\r\n");
     return pos;
 }
@@ -1244,6 +1299,7 @@ fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) 
     cflags[id].handler_parked = false;
     park_token[id] = 0;
     parked_since_ms[id] = 0;
+    if (closing_server) cflags[id].keep_alive = false;
 
     const val: c.Value = if (argc > 0) argv[0] else c.JS_UNDEFINED;
     if (rejected) {
@@ -1802,6 +1858,48 @@ fn closeCb(
     states[id] = .idle;
     deadline_ms[id] = 0;
     freePush(id);
+    _ = checkDrainComplete();
+    return .disarm;
+}
+
+fn watchdogCancelCb(
+    _: ?*void,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.CancelError!void,
+) xev.CallbackAction {
+    _ = r catch {};
+    return .disarm;
+}
+
+fn shutdownCancelCb(
+    _: ?*void,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.CancelError!void,
+) xev.CallbackAction {
+    _ = r catch {};
+    return .disarm;
+}
+
+/// Independent hard deadline. Unlike the watchdog this cannot be stopped by a
+/// partial drain, so a stuck H2 stream or slow H1 request cannot keep
+/// server.close() pending forever.
+fn shutdownDeadlineCb(
+    _: ?*void,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch {};
+    shutdown_timer_started = false;
+    if (!closing_server) return .disarm;
+    for (0..MAX_CONN) |id| {
+        if (states[id] != .idle) {
+            hardClose(id);
+        }
+    }
+    _ = checkDrainComplete();
     return .disarm;
 }
 
@@ -1816,6 +1914,11 @@ fn watchdogCb(
     r: xev.Timer.RunError!void,
 ) xev.CallbackAction {
     _ = r catch return .disarm;
+    if (closing_server and free_count == MAX_CONN and listener_closed) {
+        watchdog_started = false;
+        _ = checkDrainComplete();
+        return .disarm;
+    }
     const now = nowMs();
 
     // Pass 1 — slowloris / idle keep-alive. Only connections WAITING for
@@ -1844,6 +1947,31 @@ fn watchdogCb(
         }
         states[id] = .writing;
         armWrite(id, l);
+    }
+    if (closing_server) {
+        // H2 sessions may finish their last stream after GOAWAY was sent.
+        // Nothing else will necessarily write again, so sweep them here.
+        // Skip sessions with an armed write: writeCb closes them after the
+        // outstanding completion drains, avoiding a double-push of
+        // write_comps.
+        for (0..MAX_CONN) |id| {
+            if (cflags[id].h2_active and
+                http2_mod.isShouldClose(id) and
+                !http2_mod.isWriteArmed(id))
+            {
+                closeConn(id);
+            }
+        }
+        if (shutdown_deadline_ms != 0 and now >= shutdown_deadline_ms) {
+            for (0..MAX_CONN) |id| {
+                if (states[id] != .idle) hardClose(id);
+            }
+        }
+    }
+    if (closing_server and free_count == MAX_CONN and listener_closed) {
+        watchdog_started = false;
+        _ = checkDrainComplete();
+        return .disarm;
     }
     watchdog_timer.run(l, &watchdog_comp, WATCHDOG_INTERVAL_MS, void, null, watchdogCb);
     return .disarm;
@@ -1884,7 +2012,8 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
-    cflags[id] = .{ .keep_alive = true, .ws_read_armed = true, .tls = tls_active };
+    setReadArmed(id, false);
+    cflags[id] = .{ .keep_alive = !closing_server, .ws_read_armed = true, .tls = tls_active };
     http2_mod.resetSlot(id);
     ws_partial_len[id] = 0;
     wsSetPartialBinary(id, false);
@@ -1900,7 +2029,20 @@ fn acceptCb(
     _: *xev.Completion,
     r: xev.AcceptError!xev.TCP,
 ) xev.CallbackAction {
+    if (closing_server or !initialized) {
+        accept_armed = false;
+        if (r) |tcp| {
+            _ = std.c.close(tcp.fd);
+        } else |_| {}
+        _ = checkDrainComplete();
+        return .disarm;
+    }
     const first = r catch |err| {
+        if (closing_server or !initialized) {
+            accept_armed = false;
+            _ = checkDrainComplete();
+            return .disarm;
+        }
         // Never silently re-arm: a persistent accept failure with no log
         // looks exactly like a backend stall (see io_uring accept-drain bug).
         if (builtin.mode == .Debug)
@@ -1926,6 +2068,11 @@ fn acceptCb(
     } else {
         _ = setupSlot(l, first);
     }
+    if (closing_server or !initialized) {
+        accept_armed = false;
+        _ = checkDrainComplete();
+        return .disarm;
+    }
     listener_tcp.accept(l, &accept_comp, void, null, acceptCb);
     return .disarm;
 }
@@ -1940,8 +2087,10 @@ fn readCb(
 ) xev.CallbackAction {
     const raw = ud orelse return .disarm;
     const id: usize = @intCast(raw.*);
+    setReadArmed(id, false);
     cflags[id].ws_read_armed = false;
     cflags[id].tls_read_armed = false;
+    if (states[id] == .closing or states[id] == .idle) return .disarm;
     const n = r catch {
         closeConn(id);
         return .disarm;
@@ -2069,7 +2218,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         req_spill_len[id] = buf_lens[id];
         req_spill_want[id] = expect;
         cflags[id].req_body_spill = true;
-        cflags[id].keep_alive = pr.keep_alive;
+        cflags[id].keep_alive = pr.keep_alive and !closing_server;
         methods[id] = pr.method_tag;
         hdr_scan_off[id] = 0;
         buf_lens[id] = 0;
@@ -2081,7 +2230,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         armRead(id, l);
         return;
     }
-    cflags[id].keep_alive = pr.keep_alive;
+    cflags[id].keep_alive = pr.keep_alive and !closing_server;
     if (native_echo) {
         buildResponse(id, 200, "{\"message\":\"ok\"}");
     } else {
@@ -2151,6 +2300,10 @@ pub fn writeCb(
         const tls_ctx_ptr = if (tls_on and cflags[id].tls) &tls_ctxs[id] else null;
         switch (http2_mod.onWriteComplete(id, written, tcp, l, tls_ctx_ptr)) {
             .drained => {
+                if (http2_mod.isShouldClose(id) or (closing_server and !http2_mod.hasActiveStreams(id) and !cflags[id].handler_parked)) {
+                    closeConn(id);
+                    return .disarm;
+                }
                 states[id] = .reading;
                 if (tls_on and cflags[id].tls) tlsPump(id, l) else armRead(id, l);
             },
@@ -2352,34 +2505,253 @@ fn armReadId(id: usize, l: *xev.Loop) void {
     armRead(id, l);
 }
 
+fn listenerCloseCb(
+    _: ?*void,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.TCP,
+    r: xev.CloseError!void,
+) xev.CallbackAction {
+    _ = r catch {};
+    listener_closed = true;
+    _ = checkDrainComplete();
+    return .disarm;
+}
+
+fn fireCloseCallbacks() void {
+    if (handler_ctx) |ctx| {
+        if (close_cb_fn) |cb| {
+            close_cb_fn = null;
+            const ret = c.call(ctx, cb, c.JS_UNDEFINED, 0, null);
+            c.freeValue(ctx, cb);
+            if (c.isException(ret) != 0) {
+                microtasks.reportUncaught(ctx, "server.close callback error");
+            } else {
+                c.freeValue(ctx, ret);
+            }
+        }
+        if (close_resolve) |res| {
+            close_resolve = null;
+            var undef = c.JS_UNDEFINED;
+            const ret = c.call(ctx, res, c.JS_UNDEFINED, 1, @ptrCast(&undef));
+            c.freeValue(ctx, res);
+            c.freeValue(ctx, ret);
+        }
+        microtasks.pumpMicrotasks(ctx);
+    }
+}
+
+fn checkDrainComplete() bool {
+    if (!closing_server) return false;
+    if (free_count != MAX_CONN) return false;
+    if (!listener_closed) return false;
+
+    shutdown_deadline_ms = 0;
+    if (shutdown_timer_started) {
+        shutdown_timer_started = false;
+        if (g_loop) |l| {
+            shutdown_timer.cancel(l, &shutdown_comp, &shutdown_cancel_comp, void, null, shutdownCancelCb);
+        }
+    }
+    if (watchdog_started) {
+        watchdog_started = false;
+        if (g_loop) |l| {
+            watchdog_timer.cancel(l, &watchdog_comp, &watchdog_cancel_comp, void, null, watchdogCancelCb);
+        }
+    }
+    initialized = false;
+    closing_server = false;
+    server_running.store(false, .release);
+
+    if (handler_fn) |v| {
+        c.freeValue(handler_ctx, v);
+        handler_fn = null;
+    }
+    if (ws_on_open) |v| {
+        c.freeValue(handler_ctx, v);
+        ws_on_open = null;
+    }
+    if (ws_on_message) |v| {
+        c.freeValue(handler_ctx, v);
+        ws_on_message = null;
+    }
+    if (ws_on_close) |v| {
+        c.freeValue(handler_ctx, v);
+        ws_on_close = null;
+    }
+    for (&ws_sockets) |*s| {
+        if (s.*) |v| {
+            c.freeValue(handler_ctx, v);
+            s.* = null;
+        }
+    }
+    fireCloseCallbacks();
+    return true;
+}
+
+pub fn isRunning() bool {
+    return initialized and !closing_server;
+}
+
+pub fn isClosingServer() bool {
+    return closing_server;
+}
+
+/// Called by http2_server after a parked H2 response has been flushed, or
+/// after a stream closes. Safe because it runs outside nghttp2 callbacks.
+pub fn closeH2Slot(id: usize) void {
+    if (id >= MAX_CONN) return;
+    // flushNow() may have just armed the H2 response write. Do not arm the
+    // TLS shutdown write on the same completion; writeCb checks
+    // isShouldClose() after the outstanding write drains.
+    if (http2_mod.isWriteArmed(id)) return;
+    closeConn(id);
+}
+
+pub fn registerCloseWaiter(ctx: ?*c.Context, resolve_val: c.Value, cb_val: c.Value) void {
+    if (!initialized) {
+        if (c.isFunction(ctx, cb_val) != 0) {
+            const ret = c.call(ctx, cb_val, c.JS_UNDEFINED, 0, null);
+            if (c.isException(ret) != 0) {
+                if (ctx) |jc| microtasks.reportUncaught(jc, "server.close callback error");
+            } else {
+                c.freeValue(ctx, ret);
+            }
+        }
+        if (c.isFunction(ctx, resolve_val) != 0) {
+            var undef = c.JS_UNDEFINED;
+            const ret = c.call(ctx, resolve_val, c.JS_UNDEFINED, 1, @ptrCast(&undef));
+            c.freeValue(ctx, ret);
+        }
+        return;
+    }
+    if (c.isFunction(ctx, resolve_val) != 0) {
+        if (close_resolve) |old| c.freeValue(ctx, old);
+        close_resolve = c.dupValue(ctx, resolve_val);
+    }
+    if (c.isFunction(ctx, cb_val) != 0) {
+        if (close_cb_fn) |old| c.freeValue(ctx, old);
+        close_cb_fn = c.dupValue(ctx, cb_val);
+    }
+}
+
+/// Initiate graceful server drain:
+/// 1. Cancel accept watcher and close listener socket.
+/// 2. Close idle keep-alive connections immediately; mark in-flight connections
+///    keep_alive = false so they close right after flushing their response.
+/// 3. Send HTTP/2 GOAWAY on active H2 sessions.
+/// 4. When all 512 slots return to free_list, disarm timers and settle close().
+/// 5. An independent timer hard-closes anything still active after 5 s.
+pub fn closeServer() void {
+    if (!initialized) {
+        fireCloseCallbacks();
+        return;
+    }
+    if (closing_server) return;
+    closing_server = true;
+    shutdown_deadline_ms = nowMs() + SHUTDOWN_DRAIN_MS;
+
+    if (g_loop) |l| {
+        if (!shutdown_timer_started) {
+            shutdown_timer.run(l, &shutdown_comp, SHUTDOWN_DRAIN_MS, void, null, shutdownDeadlineCb);
+            shutdown_timer_started = true;
+        }
+        if (accept_armed) {
+            accept_armed = false;
+            accept_cancel_comp = .{
+                .op = .{ .cancel = .{ .c = &accept_comp } },
+                .userdata = null,
+                .callback = noopCancelCb,
+            };
+            l.add(&accept_cancel_comp);
+        }
+        if (!listener_closed) {
+            listener_tcp.close(l, &listener_close_comp, void, null, listenerCloseCb);
+        }
+    } else {
+        accept_armed = false;
+        listener_closed = true;
+    }
+
+    for (0..MAX_CONN) |id| {
+        if (states[id] == .idle or states[id] == .closing) continue;
+        cflags[id].keep_alive = false;
+        if (cflags[id].ws_open) {
+            closeConn(id);
+        } else if (cflags[id].h2_active) {
+            if (!http2_mod.hasActiveStreams(id) and !cflags[id].handler_parked) {
+                closeConn(id);
+            } else if (g_loop) |l| {
+                http2_mod.submitGoaway(id, l);
+            }
+        } else {
+            if (states[id] == .reading and !cflags[id].handler_parked and buf_lens[id] == 0 and !cflags[id].req_body_spill) {
+                closeConn(id);
+            }
+        }
+    }
+    _ = checkDrainComplete();
+}
+
 pub fn init(loop: *xev.Loop, port: u16) !void {
     if (initialized) return;
     g_loop = loop;
+    closing_server = false;
+    listener_closed = false;
+    accept_armed = true;
+    shutdown_deadline_ms = 0;
+    shutdown_timer_started = false;
     if (std.c.getenv("FF_ECHO") != null) native_echo = true;
     for (0..MAX_CONN) |i| {
         slot_ids[i] = @intCast(i);
         free_list[i] = @intCast(i);
     }
     free_count = MAX_CONN;
+    read_armed_bits = [_]u64{0} ** 8;
     const addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", port) catch unreachable;
     listener_tcp = try xev.TCP.init(addr);
     try listener_tcp.bind(addr);
     try listener_tcp.listen(128);
+    var sin: std.posix.sockaddr.in = undefined;
+    var slen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.c.getsockname(listener_tcp.fd, @ptrCast(&sin), &slen) == 0) {
+        bound_port = std.mem.bigToNative(u16, sin.port);
+    } else {
+        bound_port = port;
+    }
     listener_tcp.accept(loop, &accept_comp, void, null, acceptCb);
     if (!watchdog_started) { // NEW
         watchdog_timer = xev.Timer.init() catch unreachable;
         watchdog_timer.run(loop, &watchdog_comp, WATCHDOG_INTERVAL_MS, void, null, watchdogCb);
         watchdog_started = true;
     }
+    shutdown_timer = xev.Timer.init() catch unreachable;
     initialized = true;
+    server_running.store(true, .release);
     const scheme: []const u8 = if (tls_active) "https" else "http";
-    cli.ok("server listening on {s}://localhost:{d}", .{ scheme, port });
+    cli.ok("server listening on {s}://localhost:{d}", .{ scheme, bound_port });
     if (ws_enabled) cli.bullet("websocket support enabled", .{});
 }
 
 pub fn deinit() void {
+    if (handler_ctx) |ctx| {
+        if (close_resolve) |v| {
+            c.freeValue(ctx, v);
+            close_resolve = null;
+        }
+        if (close_cb_fn) |v| {
+            c.freeValue(ctx, v);
+            close_cb_fn = null;
+        }
+    }
     if (!initialized) return;
     initialized = false;
+    closing_server = false;
+    accept_armed = false;
+    listener_closed = true;
+    shutdown_deadline_ms = 0;
+    shutdown_timer_started = false;
+    server_running.store(false, .release);
     watchdog_started = false; // NEW
     for (&states, 0..) |*s, i| {
         if (s.* != .idle) {

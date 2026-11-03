@@ -4,12 +4,17 @@ import { check, done } from "./lib.mjs";
 // a busy port fails over instead of flaking (serve throws on bind failure).
 const PORTS = [39871, 39872, 39873];
 let base = null;
+let server = null;
 for (const port of PORTS) {
   try {
-    http.serve({ port }, (url, method) => {
+    server = http.serve({ port }, async (url, method) => {
       const path = url.split("?")[0];
       if (path === "/health") return { status: 200, body: "ok" };
       if (path === "/echo" && method === "POST") return { status: 201, body: "created" };
+      if (path === "/slow") {
+        await new Promise((r) => setTimeout(r, 250));
+        return { status: 200, body: "slow" };
+      }
       return { status: 404, body: "not found" };
     });
     base = "http://127.0.0.1:" + port;
@@ -18,6 +23,8 @@ for (const port of PORTS) {
 }
 if (base === null) throw new Error("http test: could not bind any candidate port");
 
+check("server handle port", typeof server?.port === "number" && typeof server?.close === "function");
+
 const r = await fetch(base + "/health");
 check("status 200", r.status === 200);
 check("body ok", (await r.text()) === "ok");
@@ -25,5 +32,87 @@ check("body ok", (await r.text()) === "ok");
 const n = await fetch(base + "/nope");
 check("404 route", n.status === 404);
 check("404 body", (await n.text()) === "not found");
+
+// structuredClone global
+const srcObj = {
+  n: 42,
+  arr: [1, 2, 3],
+  bytes: new Uint8Array([10, 20]),
+  map: new Map([["a", 1]]),
+  set: new Set(["x"]),
+};
+const cloned = structuredClone(srcObj);
+srcObj.arr.push(4);
+srcObj.bytes[0] = 99;
+check(
+  "structuredClone deep copy",
+  cloned.n === 42 &&
+    cloned.arr.length === 3 &&
+    cloned.bytes[0] === 10 &&
+    cloned.map.get("a") === 1 &&
+    cloned.set.has("x"),
+);
+
+// AbortController / AbortSignal with timers, Request, and in-flight fetch
+const timerAc = new AbortController();
+let timerFired = false;
+let onabortFired = false;
+timerAc.signal.onabort = () => {
+  onabortFired = true;
+};
+setTimeout(() => {
+  timerFired = true;
+}, 40, { signal: timerAc.signal });
+timerAc.abort("cancelled-timer");
+await new Promise((res) => setTimeout(res, 60));
+check("AbortController cancels setTimeout & fires onabort", !timerFired && onabortFired && timerAc.signal.reason === "cancelled-timer");
+
+const preAborted = AbortSignal.abort("already");
+let throwIfAbortedThrew = false;
+try {
+  preAborted.throwIfAborted();
+} catch (e) {
+  throwIfAbortedThrew = e === "already";
+}
+check("AbortSignal.abort + throwIfAborted", preAborted.aborted && throwIfAbortedThrew);
+
+const reqWithSig = new Request(base + "/health", { signal: preAborted });
+check("Request preserves signal & clone", reqWithSig.signal === preAborted && reqWithSig.clone().signal === preAborted);
+
+let preFetchThrew = false;
+try {
+  await fetch(reqWithSig);
+} catch {
+  preFetchThrew = true;
+}
+check("fetch with pre-aborted Request rejects immediately", preFetchThrew);
+
+const fetchAc = new AbortController();
+setTimeout(() => fetchAc.abort("stop-slow"), 30);
+let inflightAborted = false;
+const t0 = performance.now();
+try {
+  await fetch(base + "/slow", { signal: fetchAc.signal });
+} catch {
+  inflightAborted = true;
+}
+const elapsed = performance.now() - t0;
+check("in-flight fetch aborted before server delay", inflightAborted && elapsed < 200);
+
+// process.on / once / kill signal delivery
+let sigReceived = false;
+process.once("SIGUSR1", (sig) => {
+  if (sig === "SIGUSR1") sigReceived = true;
+});
+process.kill(process.pid, "SIGUSR1");
+await new Promise((res) => setTimeout(res, 20));
+check("process.once + process.kill SIGUSR1", sigReceived);
+
+// server.close() graceful shutdown
+let closeCbCalled = false;
+await server.close(() => {
+  closeCbCalled = true;
+});
+check("server.close() resolves and invokes callback", closeCbCalled);
 
 done("http");

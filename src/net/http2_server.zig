@@ -264,6 +264,35 @@ pub fn removeSession(slot_id: usize) void {
     active_stream[slot_id] = -1;
 }
 
+pub fn hasActiveStreams(slot_id: usize) bool {
+    const sess = getSession(slot_id) orelse return false;
+    for (0..MAX_STREAMS) |i| {
+        if (sess.stream_flags[i].in_use) return true;
+    }
+    return false;
+}
+
+pub fn isShouldClose(slot_id: usize) bool {
+    const sess = getSession(slot_id) orelse return false;
+    return sess.going_away and !hasActiveStreams(slot_id);
+}
+
+pub fn submitGoaway(slot_id: usize, l: *xev.Loop) void {
+    const sess = getSession(slot_id) orelse return;
+    if (sess.going_away) return;
+    sess.going_away = true;
+    if (sess.ng) |ng| {
+        var max_id: i32 = 0;
+        for (0..MAX_STREAMS) |i| {
+            if (sess.stream_flags[i].in_use and sess.stream_ids[i] > max_id) {
+                max_id = sess.stream_ids[i];
+            }
+        }
+        _ = h2.nghttp2_submit_goaway(ng, h2.FLAG_NONE, max_id, h2.NO_ERROR, null, 0);
+        flushNow(slot_id, l);
+    }
+}
+
 /// Defensive reset for slot reuse (called from setupSlot).
 pub fn resetSlot(slot_id: usize) void {
     removeSession(slot_id);
@@ -941,13 +970,23 @@ pub fn respondErrorH2(slot_id: usize, status: u16) void {
 /// Parked-promise settlement for H2 slots. The response was already queued
 /// by the stageHandlerResponse/buildResponse H2 branches, so flush it,
 /// chain any pending multiplexed stream, and flush again if the chained
-/// dispatch answered synchronously. Re-entrant flushes are safe: pumpWrite
-/// buffers while a write is outstanding (out_armed guard).
+/// dispatch answered synchronously.
+///
+/// If the server is draining, the last stream may close during flushNow and
+/// no later write completion will necessarily run to observe that. Close the
+/// session here, outside nghttp2 callbacks, so `server.close()` can settle.
 pub fn completeParkedH2(slot_id: usize, l: *xev.Loop) void {
     flushNow(slot_id, l);
+    if (http_native.isClosingServer() and isShouldClose(slot_id)) {
+        http_native.closeH2Slot(slot_id);
+        return;
+    }
     if (!http_native.isHandlerParked(slot_id)) {
         drainPending(slot_id);
         flushNow(slot_id, l);
+        if (http_native.isClosingServer() and isShouldClose(slot_id)) {
+            http_native.closeH2Slot(slot_id);
+        }
     }
 }
 

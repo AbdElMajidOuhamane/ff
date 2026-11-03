@@ -72,6 +72,7 @@ pub fn setup(ctx: ?*qjs.Context) void {
     const global = qjs.getGlobalObject(ctx);
     defer qjs.freeValue(ctx, global);
     _ = qjs.definePropertyValueStr(ctx, global, "Worker", ctor, qjs.PROP_C_W_E);
+    serialize.setup(ctx);
 }
 
 fn slotFromOpaque(ptr: ?*anyopaque) ?u16 {
@@ -396,6 +397,7 @@ fn setupWorkerGlobals(ctx: *qjs.Context, initial_payload: ?[]u8) void {
     const now_fn = qjs.newCFunction(ctx, wPerformanceNow, "now", 0);
     _ = qjs.definePropertyValueStr(ctx, perf, "now", now_fn, qjs.PROP_C_W_E);
     _ = qjs.definePropertyValueStr(ctx, global, "performance", perf, qjs.PROP_C_W_E);
+    serialize.setup(ctx);
 }
 
 fn jsWorkerPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {

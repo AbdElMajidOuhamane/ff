@@ -260,6 +260,7 @@ pub const Runtime = struct {
         ffi_api.setLoop(&loop_ptr.loop);
         fs_api.setLoop(&loop_ptr.loop);
         child_process_api.setLoop(&loop_ptr.loop);
+        process_api.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{
@@ -327,6 +328,32 @@ pub const Runtime = struct {
             }
         }
         const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        var sig_val: qjs.Value = qjs.JS_UNDEFINED;
+        var sig_owned = false;
+        if (argc >= 3 and qjs.isObject(argv[2]) != 0) {
+            if (fetch_api.getAbortSignalData(ctx, argv[2]) != null) {
+                sig_val = argv[2];
+            } else {
+                const prop = qjs.getPropertyStr(ctx, argv[2], "signal");
+                if (fetch_api.getAbortSignalData(ctx, prop) != null) {
+                    sig_val = prop;
+                    sig_owned = true;
+                } else {
+                    qjs.freeValue(ctx, prop);
+                }
+            }
+        }
+        defer if (sig_owned) qjs.freeValue(ctx, sig_val);
+
+        if (fetch_api.getAbortSignalData(ctx, sig_val)) |sd| {
+            if (sd.aborted) {
+                if (as_object) {
+                    return makeTimeout(ctx, 128) orelse qjs.throwOutOfMemory(ctx);
+                }
+                return qjs.newInt32(ctx, -1);
+            }
+        }
+
         const args_slice: []const qjs.Value = if (nargs > 0) argv[2..][0..nargs] else &.{};
         const id = if (interval)
             rt.timer_manager.setInterval(ctx.?, argv[0], @intCast(ms), args_slice)
@@ -337,6 +364,7 @@ pub const Runtime = struct {
             _ = qjs.throwTypeError(ctx, "too many timers (max 128)");
             return qjs.JS_EXCEPTION;
         };
+        _ = fetch_api.attachTimerToSignal(ctx, sig_val, slot);
         if (as_object) {
             return makeTimeout(ctx, slot) orelse qjs.throwOutOfMemory(ctx);
         }
@@ -459,6 +487,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         fetch_api.deinitClient();
+        process_api.deinit(self.ctx);
         self.timer_manager.cancelAll();
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
