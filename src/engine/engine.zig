@@ -42,6 +42,8 @@ pub fn getEventLoop() ?*EventLoop {
 
 pub fn deinitNetwork() void {
     http_native.deinit();
+    ws_client.deinit();
+    worker_mod.deinit();
     sql_api.deinit();
 }
 
@@ -261,6 +263,7 @@ pub const Runtime = struct {
         fs_api.setLoop(&loop_ptr.loop);
         child_process_api.setLoop(&loop_ptr.loop);
         process_api.setLoop(&loop_ptr.loop);
+        worker_mod.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{

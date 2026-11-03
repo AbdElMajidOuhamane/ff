@@ -17,6 +17,11 @@ const POLL_QUANTUM_MS: i32 = 5;
 
 var worker_class_id: qjs.ClassID = 0;
 var g_parent_ctx: ?*qjs.Context = null;
+var async_h: xev.Async = undefined;
+var async_inited: bool = false;
+var async_comp: xev.Completion = .{};
+var async_armed: bool = false;
+var g_loop: ?*xev.Loop = null;
 
 const Slot = struct {
     state: enum { free, alive } = .free,
@@ -53,6 +58,11 @@ fn fileExists(path: []const u8) bool {
 
 pub fn setup(ctx: ?*qjs.Context) void {
     g_parent_ctx = ctx;
+    if (!async_inited) {
+        async_h = xev.Async.init() catch unreachable;
+        async_inited = true;
+        async_armed = false;
+    }
     const rt = qjs.getRuntime(ctx);
     _ = qjs.newClassID(rt, &worker_class_id);
     var def = qjs.ClassDef{ .class_name = "Worker", .finalizer = workerFinalizer };
@@ -147,6 +157,7 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
     };
     slots[slot].port = ch.parent;
     slots[slot].state = .alive;
+    ensureArmed();
 
     const obj = qjs.newObjectClass(ctx, worker_class_id);
     qjs.setOpaque(obj, @ptrFromInt(slot + 1));
@@ -236,6 +247,71 @@ fn terminateSlot(slot: u16) void {
         if (g_parent_ctx) |pctx| qjs.freeValue(pctx, o);
         slots[slot].js_obj = null;
     }
+    if (liveCount() == 0 and async_armed and async_inited) {
+        async_h.notify() catch {};
+    }
+}
+
+pub fn setLoop(l: *xev.Loop) void {
+    g_loop = l;
+}
+
+pub fn arm(l: *xev.Loop) void {
+    if (!async_inited or async_armed) return;
+    async_armed = true;
+    g_loop = l;
+    async_h.wait(l, &async_comp, void, null, asyncCb);
+}
+
+pub fn ensureArmed() void {
+    if (async_armed) return;
+    if (g_loop) |l| arm(l);
+}
+
+/// Included in loop.zig's `unrefArmed()` so a lingering armed async handle
+/// after the last worker terminates does not keep `loop.active -| unrefArmed() > 0`.
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and liveCount() == 0) return 1;
+    return 0;
+}
+
+fn asyncCb(
+    _: ?*void,
+    l: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
+    if (g_parent_ctx) |ctx| {
+        drainCompleted(ctx);
+        microtasks.pumpMicrotasks(ctx);
+    }
+    if (liveCount() > 0) {
+        async_armed = true;
+        async_h.wait(l, &async_comp, void, null, asyncCb);
+    } else {
+        async_armed = false;
+    }
+    return .disarm;
+}
+
+fn notifyParent() void {
+    if (async_inited) {
+        async_h.notify() catch {};
+    }
+}
+
+pub fn deinit() void {
+    for (0..MAX_WORKERS) |i| {
+        if (slots[i].state == .alive) {
+            terminateSlot(@intCast(i));
+        }
+    }
+    async_armed = false;
+    g_loop = null;
 }
 
 fn resolveWorkerPath(path: []const u8) ![:0]u8 {
@@ -327,6 +403,16 @@ fn workerMain(data: *WorkerData) void {
     const ctx = qjs.newContext(rt) orelse return;
     defer qjs.freeContext(ctx);
 
+    var loop = xev.Loop.init(.{}) catch return;
+    defer loop.deinit();
+    var tm = timers_mod.TimerManager.init(&loop);
+    tm.on_error = onWorkerTimerError;
+    tls_tm = &tm;
+    defer {
+        tm.cancelAll();
+        tls_tm = null;
+    }
+
     console_api.setup(ctx);
     setupWorkerGlobals(ctx, data.initial_payload);
 
@@ -358,12 +444,25 @@ fn workerMain(data: *WorkerData) void {
     qjs.freeValue(ctx, res);
     microtasks.pumpMicrotasks(ctx);
 
-    runWorkerLoop(ctx, &data.channel);
+    runWorkerLoop(ctx, &loop, &data.channel);
+}
+
+fn onWorkerTimerError(ctx: *qjs.Context) void {
+    const exc = qjs.getException(ctx);
+    defer qjs.freeValue(ctx, exc);
+    const m = qjs.toCString(ctx, exc);
+    if (m) |s| {
+        defer qjs.freeCString(ctx, s);
+        const span = std.mem.span(s);
+        sendErrorToParent(span);
+        std.debug.print("[worker] timer error: {s}\n", .{span});
+    }
 }
 
 fn sendErrorToParent(msg: []const u8) void {
     if (tls_port) |*p| {
         p.sendError(msg) catch {};
+        notifyParent();
     }
 }
 
@@ -420,6 +519,7 @@ fn jsWorkerPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, arg
         _ = qjs.throwInternalError(ctx, "failed to send message to parent");
         return qjs.JS_EXCEPTION;
     };
+    notifyParent();
     return qjs.JS_UNDEFINED;
 }
 
@@ -493,7 +593,11 @@ fn wMicrotaskJob(ctx: ?*qjs.Context, argc: c_int, argv: [*c]qjs.Value) callconv(
         const msg = qjs.toCString(ctx, exc);
         if (msg) |m| {
             defer qjs.freeCString(ctx, m);
-            std.debug.print("queueMicrotask error: {s}\n", .{m});
+            const span = std.mem.span(s: {
+                break :s m;
+            });
+            sendErrorToParent(span);
+            std.debug.print("queueMicrotask error: {s}\n", .{span});
         }
         return qjs.JS_UNDEFINED;
     }
@@ -530,14 +634,7 @@ fn wPerformanceNow(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [
 // terminate()). There is deliberately no idle-exit: the worker lives
 // until terminate(), so late postMessage calls still get delivered.
 
-fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
-    var pool = xev.ThreadPool.init(.{ .max_threads = 2 });
-    var loop = xev.Loop.init(.{ .thread_pool = &pool }) catch return;
-    defer loop.deinit();
-    var tm = timers_mod.TimerManager.init(&loop);
-    tls_tm = &tm;
-    defer tls_tm = null;
-
+fn runWorkerLoop(ctx: *qjs.Context, loop: *xev.Loop, port: *const port_mod.MessagePort) void {
     // A4 FIX: drain queued frames per wake (was 1 frame per poll — N queued
     // frames cost N polls + N xev ticks), capped at 64 per wake so a message
     // flood can't starve timers/microtasks. EOF still breaks out (parent
@@ -556,7 +653,6 @@ fn runWorkerLoop(ctx: *qjs.Context, port: *const port_mod.MessagePort) void {
         loop.run(.no_wait) catch {};
         microtasks.pumpMicrotasks(ctx);
     }
-    tm.cancelAll();
 }
 
 fn deliverToWorker(ctx: *qjs.Context, fr: port_mod.Frame) void {

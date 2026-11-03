@@ -31,7 +31,7 @@ fn timersAlive() bool {
 // legitimately lead active by one.
 inline fn unrefArmed() usize {
     const tm_unref = if (timer_mgr) |tm| tm.unrefScheduledCount() else 0;
-    return tm_unref + process_api.unrefSignalCount();
+    return tm_unref + process_api.unrefSignalCount() + worker_mod.unrefAsyncCount();
 }
 
 pub const EventLoop = struct {
@@ -176,6 +176,9 @@ pub const EventLoop = struct {
                 fs_mod.ensureArmed();
             }
             fs_mod.drainCompleted(ctx);
+            if (worker_mod.liveCount() > 0) {
+                worker_mod.arm(&self.loop);
+            }
             worker_mod.drainCompleted(ctx);
             child_process.drainCompleted(ctx);
             process_api.drainSignals(ctx);

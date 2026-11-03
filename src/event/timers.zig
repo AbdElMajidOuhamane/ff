@@ -47,6 +47,7 @@ pub const TimerManager = struct {
     callbacks: [MAX_TIMERS]?c.Value = [_]?c.Value{null} ** MAX_TIMERS,
     nargs: [MAX_TIMERS]u8 = [_]u8{0} ** MAX_TIMERS,
     args: [MAX_TIMERS][MAX_TIMER_ARGS]c.Value = [_][MAX_TIMER_ARGS]c.Value{[_]c.Value{c.JS_UNDEFINED} ** MAX_TIMER_ARGS} ** MAX_TIMERS,
+    on_error: ?*const fn (ctx: *c.Context) void = null,
 
     comptime {
         // 128 active flags must fit in 16 bytes, not 128.
@@ -283,7 +284,11 @@ fn timerCallback(
             // Surface timer exceptions like microtaskJob does; free the
             // (previously leaked) non-exception return value here.
             if (c.isException(ret) != 0) {
-                microtasks.reportUncaught(ctx, "timer error");
+                if (tm.on_error) |err_fn| {
+                    err_fn(ctx);
+                } else {
+                    microtasks.reportUncaught(ctx, "timer error");
+                }
             } else {
                 c.freeValue(ctx, ret);
             }

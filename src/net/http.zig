@@ -132,8 +132,8 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     // Best-effort: when the cert came from a path, also make the runtime's own
     // fetch/wss client trust it (same as --cert). Process-lifetime by design.
     // (Skipped for inline PEM content.)
-    if (cert_pem.ptr != cert_str.ptr and tls.ca_file == null) {
-        tls.ca_file = std.heap.page_allocator.dupe(u8, cert_str) catch null;
+    if (cert_pem.ptr != cert_str.ptr) {
+        tls.addCaFile(cert_str);
     }
 
     http_native.enableTls();

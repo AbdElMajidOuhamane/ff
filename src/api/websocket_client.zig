@@ -123,6 +123,7 @@ pub fn setup(ctx: ?*c.Context) void {
     const proto = c.newObject(ctx);
     const methods = [_]struct { name: [*:0]const u8, func: *const c.CFunction, len: c_int }{
         .{ .name = "send", .func = &wsSend, .len = 1 },
+        .{ .name = "sendBinary", .func = &wsSendBinary, .len = 1 },
         .{ .name = "close", .func = &wsClose, .len = 0 },
     };
     for (methods) |m| {
@@ -199,14 +200,16 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
         const len = std.mem.len(cstr);
         if (len == 0) return c.JS_UNDEFINED;
         const cap = @min(len, ws.WS_MSG_SIZE);
-        ws_client.sendBytes(h, cstr[0..cap], false);
+        if (!ws_client.sendBytes(h, cstr[0..cap], false))
+            return c.throwTypeError(ctx, "WebSocket: send buffer full");
         return c.JS_UNDEFINED;
     }
     // ArrayBuffer
     var size: usize = 0;
     const p = c.getArrayBuffer(ctx, &size, arg);
     if (p != null and size > 0) {
-        ws_client.sendBytes(h, p[0..@min(size, ws.WS_MSG_SIZE)], true);
+        if (!ws_client.sendBytes(h, p[0..@min(size, ws.WS_MSG_SIZE)], true))
+            return c.throwTypeError(ctx, "WebSocket: send buffer full");
         return c.JS_UNDEFINED;
     }
     // ArrayBufferView — try buffer property
@@ -226,7 +229,47 @@ fn wsSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
             _ = c.toInt32(ctx, &view_len, len_val);
             const start = @as(usize, @intCast(@max(offset, 0)));
             const end = @min(start + @as(usize, @intCast(@max(view_len, 0))), size);
-            if (end > start) ws_client.sendBytes(h, p2[start..end], true);
+            if (end > start) {
+                if (!ws_client.sendBytes(h, p2[start..@min(end, start + ws.WS_MSG_SIZE)], true))
+                    return c.throwTypeError(ctx, "WebSocket: send buffer full");
+            }
+        }
+    }
+    return c.JS_UNDEFINED;
+}
+
+fn wsSendBinary(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    const h = liveHandle(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (argc < 1) return c.JS_UNDEFINED;
+    const arg = argv[0];
+    // Raw ArrayBuffer
+    var size: usize = 0;
+    const p = c.getArrayBuffer(ctx, &size, arg);
+    if (p != null and size > 0) {
+        if (!ws_client.sendBytes(h, p[0..@min(size, ws.WS_MSG_SIZE)], true))
+            return c.throwTypeError(ctx, "WebSocket: send buffer full");
+        return c.JS_UNDEFINED;
+    }
+    // TypedArray / DataView (buffer property)
+    const buf_val = c.getPropertyStr(ctx, arg, "buffer");
+    defer c.freeValue(ctx, buf_val);
+    if (c.isObject(buf_val) != 0) {
+        const p2 = c.getArrayBuffer(ctx, &size, buf_val);
+        if (p2 != null and size > 0) {
+            const offset_val = c.getPropertyStr(ctx, arg, "byteOffset");
+            defer c.freeValue(ctx, offset_val);
+            var offset: i32 = 0;
+            _ = c.toInt32(ctx, &offset, offset_val);
+            const len_val = c.getPropertyStr(ctx, arg, "byteLength");
+            defer c.freeValue(ctx, len_val);
+            var view_len: i32 = 0;
+            _ = c.toInt32(ctx, &view_len, len_val);
+            const start = @as(usize, @intCast(@max(offset, 0)));
+            const end = @min(start + @as(usize, @intCast(@max(view_len, 0))), size);
+            if (end > start) {
+                if (!ws_client.sendBytes(h, p2[start..@min(end, start + ws.WS_MSG_SIZE)], true))
+                    return c.throwTypeError(ctx, "WebSocket: send buffer full");
+            }
         }
     }
     return c.JS_UNDEFINED;

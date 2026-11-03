@@ -561,7 +561,13 @@ fn runJob(slot_id: u16) void {
                     failSlot(s, "Network error");
                     return;
                 };
-            }
+            } else if (std.Io.net.IpAddress.parse(hop_host.bytes, 0)) |_| {
+                tunnel_conn = tls_tunnel.connectDirect(req_client, hop_host, hop_port) catch |err| {
+                    std.debug.print("[fetch] TLS connect failed: {s} url={s}\n", .{ @errorName(err), current_url });
+                    failSlot(s, "Network error");
+                    return;
+                };
+            } else |_| {}
         }
         var req = req_client.request(current_method, current_uri, .{
             .extra_headers = hop_hdrs,
@@ -861,14 +867,6 @@ fn runJob(slot_id: u16) void {
                     }
                 }
             }
-            if (compressed) {
-                var plain_reader = response.reader(&transfer_buf);
-                var drain: [2048]u8 = undefined;
-                while (true) {
-                    const n = plain_reader.readSliceShort(drain[0..]) catch break;
-                    if (n == 0) break;
-                }
-            }
             if (body_incomplete) {
                 req.connection.?.closing = true;
             }
@@ -898,9 +896,10 @@ fn runJob(slot_id: u16) void {
                 job_counter.alloc_count -| job_counter.free_count,
             });
             // C1 FIX: pooled ResponseData shells are reused, not freed —
-            // per-job balance holds modulo ≤1 shell transfer (was: exact).
+            // per-job balance holds modulo transferred buffers (pool + optional owned_body).
+            const max_transferred: usize = if (resp_data.owned_body != null) 2 else 1;
             std.debug.assert(job_counter.alloc_count >= job_counter.free_count);
-            std.debug.assert(job_counter.alloc_count - job_counter.free_count <= 1);
+            std.debug.assert(job_counter.alloc_count - job_counter.free_count <= max_transferred);
         }
         resp_kept = true;
         okSlot(s, resp_data);

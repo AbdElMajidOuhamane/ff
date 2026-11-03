@@ -388,16 +388,19 @@ fn subtleImportKeyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, arg
         return c.JS_EXCEPTION;
     }
 
-    if (c.isObject(argv[2]) == 0 or !checkHmacAlgo(ctx, argv[2])) {
-        _ = c.throwTypeError(ctx, "subtle.importKey: algorithm must be { name: 'HMAC', hash: 'SHA-...' }");
+    if (!checkHmacAlgo(ctx, argv[2])) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: algorithm must be 'HMAC' or { name: 'HMAC', hash: 'SHA-...' }");
         return c.JS_EXCEPTION;
     }
-    const hash_prop = c.getPropertyStr(ctx, argv[2], "hash");
-    defer c.freeValue(ctx, hash_prop);
-    const hash = parseHashAlgoVal(ctx, hash_prop) orelse {
-        _ = c.throwTypeError(ctx, "subtle.importKey: unsupported HMAC hash (SHA-1/SHA-256/SHA-384/SHA-512)");
-        return c.JS_EXCEPTION;
-    };
+    const hash: HashAlgo = if (c.isObject(argv[2]) != 0) blk: {
+        const hash_prop = c.getPropertyStr(ctx, argv[2], "hash");
+        defer c.freeValue(ctx, hash_prop);
+        if (c.isUndefined(hash_prop) != 0) break :blk .sha256;
+        break :blk parseHashAlgoVal(ctx, hash_prop) orelse {
+            _ = c.throwTypeError(ctx, "subtle.importKey: unsupported HMAC hash (SHA-1/SHA-256/SHA-384/SHA-512)");
+            return c.JS_EXCEPTION;
+        };
+    } else .sha256;
 
     const extractable = c.toBool(ctx, argv[3]) > 0;
 
