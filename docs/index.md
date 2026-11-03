@@ -72,10 +72,10 @@ open while you build; it explains *why* the runtime behaves the way it does.
 | [`udp`](/docs/api/udp) | Datagram sockets — bind, sendto, recvfrom, connected send/recv |
 | [`fs`](/docs/api/fs) | Sync and Promise-based filesystem calls |
 | [`console`](/docs/api/console) | Every method, aliases, `time`/`timeLog`/`timeEnd` |
-| [`process`](/docs/api/process) | `argv`, `env`, `pid`, `memoryUsage`, `stats` |
+| [`process`](/docs/api/process) | `argv`, `env`, `pid`, `on`/`kill`, `memoryUsage`, `stats` |
 | [`child_process`](/docs/api/child-process) | `spawn` / `exec` / `execSync`, output capture, signals |
 | [`URL`](/docs/api/url) | `URL`, `URLSearchParams`, `URL.parse`, `URL.canParse` |
-| [`crypto`](/docs/api/crypto) | `randomUUID`, `getRandomValues`, `subtle.digest`, `btoa`/`atob` |
+| [`crypto`](/docs/api/crypto) | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), `btoa`/`atob` |
 | [Text encoding](/docs/api/text-encoding) | `TextEncoder` / `TextDecoder` |
 | [`performance`](/docs/api/performance) | `performance.now()` |
 | [`Worker`](/docs/api/worker) | `postMessage`, `terminate`, worker-side globals |

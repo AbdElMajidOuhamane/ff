@@ -69,12 +69,12 @@ ff client.js --allow-net=example.com:443
 
 ## Modules vs scripts
 
-`ff` treats a file as an ES module only when its name ends in `.mjs` or
-its first code is `import`/`export`. A plain `.js` file runs as a classic
-script, where top-level `await` is a syntax error — so the runnable
-examples on this page wrap async code in `(async () => { ... })()`. Save
-any of them with a `.mjs` extension if you'd rather use top-level `await`
-as written.
+`ff` forces ES module evaluation when a file ends in `.mjs`. For `.js` files,
+`ff` tries classic-script compilation first and automatically falls back to ES
+module evaluation when the file contains `import`, `export`, or top-level
+`await` anywhere in the source. The runnable examples on this page wrap async
+code in `(async () => { ... })()` so they also work when pasted into classic-script
+contexts.
 
 ## `fetch(url, init?)`
 
@@ -85,17 +85,50 @@ await fetch("https://example.com/items", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ text: "hi" }),
+  signal: AbortSignal.timeout(5000),
 });
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `url` | `string` | Request target. `http://` and `https://` only |
+| `url` | `string \| Request` | Request target. `http://` and `https://` only |
 | `init.method` | `string` | Default `"GET"` — exact-case token only (see Gotchas) |
 | `init.headers` | object / `Headers` | Header pairs, case-insensitive |
 | `init.body` | `string \| ArrayBuffer \| Uint8Array \| Blob \| FormData \| URLSearchParams` | Default none — only strings (and `URLSearchParams`) survive intact (see Gotchas) |
+| `init.signal` | `AbortSignal` | Cancels the request if already aborted or aborted while in flight |
 
-Only `method` / `headers` / `body` are read. These init keys are **ignored**: `signal`, `timeout`, `redirect`, `credentials`, `cache`, `mode`.
+Only `method`, `headers`, `body`, and `signal` are read. These init keys are **ignored**: `timeout`, `redirect`, `credentials`, `cache`, `mode`.
+
+## Cancellation: `AbortController` and `AbortSignal`
+
+Use `AbortController` or `AbortSignal.timeout(ms)` to cancel a `fetch` before or
+during an in-flight request. Aborting closes the underlying socket immediately
+and rejects the `fetch` promise with `signal.reason`:
+
+```js
+const ac = new AbortController();
+setTimeout(() => ac.abort(new Error("timed out")), 2000);
+
+try {
+  const res = await fetch("https://example.com/slow", { signal: ac.signal });
+} catch (err) {
+  console.error("aborted:", err);
+}
+
+// Or use the built-in timeout helper:
+const res = await fetch("https://example.com/api", {
+  signal: AbortSignal.timeout(3000),
+});
+```
+
+| Member | Description |
+|--------|-------------|
+| `new AbortController()` | Creates `{ signal, abort(reason?) }` |
+| `AbortSignal.abort(reason?)` | Returns an already-aborted `AbortSignal` |
+| `AbortSignal.timeout(ms)` | Returns an `AbortSignal` that aborts with a `"TimeoutError"` after `ms` |
+| `signal.aborted` / `signal.reason` | Boolean state and rejection reason (defaults to `"AbortError"`) |
+| `signal.throwIfAborted()` | Throws `signal.reason` if `signal.aborted` is `true` |
+| `signal.onabort` / `addEventListener("abort", fn, { once? })` / `removeEventListener("abort", fn)` | Abort event listeners |
 
 ## `Response` reference
 
@@ -151,7 +184,7 @@ console.log(await res.json());
 
 | Member | Description |
 |--------|-------------|
-| `method` / `url` / `headers` | As passed to the constructor |
+| `method` / `url` / `headers` / `signal` | As passed to the constructor |
 | `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; single-read |
 
 `fetch(req)` applies the same `--allow-net` check to `req.url` as it does to a
@@ -264,7 +297,7 @@ ff client.js --allow-net=api.example.com:443
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `x-api-key`), RFC 7230 header validation, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `x-api-key`), RFC 7230 header validation, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
 

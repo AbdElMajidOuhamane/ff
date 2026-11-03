@@ -177,7 +177,7 @@ Strings you'll see in practice — useful for assertions in tests:
 | `queueMicrotask requires a function argument` | microtasks |
 | `too many workers (max 8)` | `new Worker` |
 | `Worker requires a module path` | `new Worker` |
-| `value could not be cloned` | `postMessage` with a function/WeakMap/… |
+| `value could not be cloned` | `postMessage` / `structuredClone` with a function/WeakMap/… |
 | `Database.open requires a file path` | SQLite |
 | `exec requires a SQL string` / `exec: invalid database` | SQLite |
 | `transaction requires a function argument` | SQLite |
@@ -201,6 +201,7 @@ Strings you'll see in practice — useful for assertions in tests:
 | `http.serve requires --allow-net for '0.0.0.0:<port>'` | `http.serve` — `PermissionDenied` |
 | `Database.open requires --allow-read for '<path>'` | SQLite — `PermissionDenied` |
 | `child_process requires --allow-run for '<program>'` | `child_process` — `PermissionDenied` |
+| `process.kill requires --allow-run for 'kill'` | `process.kill` (external PID) — `PermissionDenied` |
 | `ffi.dlopen requires --allow-ffi` | `ffi` — `PermissionDenied`, no scope suffix |
 | `PermissionDenied: fetch requires --allow-net` | `fetch` redirect — plain string |
 

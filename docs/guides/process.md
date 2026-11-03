@@ -38,11 +38,14 @@ ff info.js hello --allow-env=HOME
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+| `process.on(signal, fn)` / `once` / `off` | `(string, Function) => process` | Register or remove a signal listener (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`) |
+| `process.kill(pid, signal?)` | `(number, string?) => boolean` | Send a signal (default `"SIGTERM"`). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
 | `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
 | `process.stats()` | `() => object` | Internal allocator, spill, and pool counters (`fetch`, `http`, `pg`, `child`) |
 
 > **Permissions:** `process.env` needs `--allow-env`; `process.chdir` needs
-> `--allow-read` on the target. Everything else in this table is ungated. See
+> `--allow-read` on the target; `process.kill` to a PID other than `process.pid`
+> needs `--allow-run=kill`. Everything else in this table is ungated. See
 > [Permissions](/docs/concepts/permissions).
 
 ## Arguments: `argv`
@@ -149,7 +152,7 @@ if (badConfig) {
 - Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
 - An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
-Graceful shutdown: there is no signal-handling API — stop servers with `Ctrl-C` from the terminal, or call `process.exit(0)` for programmatic shutdown.
+Graceful shutdown: use `process.on("SIGTERM", ...)` / `process.once("SIGINT", ...)` together with `await server.close()` to drain active HTTP connections before exiting. When `http.serve` is running and no custom listener is registered for `SIGINT` or `SIGTERM`, the runtime drains the server automatically on those signals.
 
 ## Practical example: CLI with subcommands
 
@@ -184,7 +187,6 @@ should read `PORT`.
 | `spawn` / `exec` / `execFile` | Separate global: [child_process](/docs/api/child-process) — `spawn`, `exec`, `execSync` |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
-| `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
 | `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
 
 (`process.memoryUsage()` does exist — its `rss` is a peak counter from

@@ -6,7 +6,7 @@ order: 2
 
 # Fetch Client
 
-`fetch` is global. It reads `method` / `headers` / `body` from the init object and returns a `Promise<Response>`. Everything else in init (`signal`, `timeout`, `redirect`) is ignored. Method names are exact-case standard tokens — lowercase `"post"` is sent as `GET` (see Troubleshooting).
+`fetch` is global. It reads `method` / `headers` / `body` / `signal` from the init object and returns a `Promise<Response>`. Everything else in init (`timeout`, `redirect`) is ignored. Method names are exact-case standard tokens — lowercase `"post"` is sent as `GET` (see Troubleshooting).
 
 ## Permissions
 
@@ -63,12 +63,12 @@ ff client.js --allow-net=example.com:443
 
 ## Modules vs scripts
 
-`ff` treats a file as an ES module only when its name ends in `.mjs` or
-its first code is `import`/`export`. A plain `.js` file runs as a classic
-script, where top-level `await` is a syntax error — so the runnable
-examples on this page wrap async code in `(async () => { ... })()`. Save
-any of them with a `.mjs` extension if you'd rather use top-level `await`
-as written.
+`ff` forces ES module evaluation when a file ends in `.mjs`. For `.js` files,
+`ff` tries classic-script compilation first and automatically falls back to ES
+module evaluation when the file contains `import`, `export`, or top-level
+`await` anywhere in the source. The runnable examples on this page wrap async
+code in `(async () => { ... })()` so they also work when pasted into classic-script
+contexts.
 
 ## GET with headers
 
@@ -239,7 +239,7 @@ two apex domains.
 | Redirects | 5 hops max, each re-checked | Throws `Too many redirects` or rejects with a permission string |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
 | Header validation | RFC 7230 character validation | CRLF or invalid header characters reject before sending |
-| Abort | Not supported | `signal` / `timeout` init keys ignored |
+| Abort | `AbortController` / `AbortSignal` (`signal` init key) | Rejects with `signal.reason` and closes the socket |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 
 ## Troubleshooting

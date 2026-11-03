@@ -141,6 +141,7 @@ new Request(otherRequest);                 // clone
 | `bodyUsed` | `boolean` | Consumed flag |
 | `cache`, `credentials`, `mode`, `redirect`, `integrity` | `string` | Standard init fields, stored as given |
 | `keepalive` | `boolean` | |
+| `signal` | `AbortSignal \| undefined` | Abort signal passed via `init.signal` (preserved across `clone()`) |
 
 ### Methods
 
@@ -202,7 +203,6 @@ res.headers.forEach((v, k) => console.log(k, v));
 - `new Response(body)` copies the bytes; mutating the original afterwards
   does not change the response.
 - `Response.redirect(url)` without a URL **throws** — and with one it still sends no `Location` header, so clients never follow it.
-- `Request` has no `signal` — there is no `AbortController` in Fairyfly.
 - In a handler, the third argument (`body`) is already a **string** — you
   don't call `.text()` on it.
 

@@ -1,12 +1,12 @@
 ---
 title: Process
-description: argv, env, cwd, exit, pid — what process gives you, and what's missing on purpose.
+description: argv, env, cwd, exit, pid, signals (on/once/off/kill) — what process gives you, and what's missing on purpose.
 order: 13
 ---
 
 # Process
 
-`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, and exit. Subprocesses live on the separate [child_process](/docs/api/child-process) global.
+`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, signals, and exit. Subprocesses live on the separate [child_process](/docs/api/child-process) global.
 
 ## Quick look
 
@@ -38,21 +38,26 @@ ff info.js hello --allow-env=HOME
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+| `process.on(signal, fn)` | `(string, (sig) => void) => process` | Register a signal listener (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`; max 8 per signal) |
+| `process.once(signal, fn)` | `(string, (sig) => void) => process` | Register a one-shot signal listener |
+| `process.off(signal, fn)` / `process.removeListener(signal, fn)` | `(string, Function) => process` | Remove a registered signal listener |
+| `process.kill(pid, signal?)` | `(number, string?) => boolean` | Send a signal (default `"SIGTERM"`). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
 | `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
 | `process.stats()` | `() => object` | Internal allocator, spill, and pool counters |
 
 ## Permissions
 
-Only two members are gated:
+Only three members are gated:
 
 | Member | Flag | Notes |
 |--------|------|-------|
 | `process.env` | `--allow-env=NAME,…` | Built once at startup; disallowed keys are absent |
 | `process.chdir(path)` | `--allow-read=<target>` | The target must be inside a read scope |
+| `process.kill(pid, sig?)` | `--allow-run=kill` | Only checked when `pid !== process.pid`; self-signaling is always allowed |
 
 Everything else — `argv`, `cwd`, `exit`, `pid`, `platform`, `arch`,
-`memoryUsage`, `stats` — is always available. `process.exit()` works even when
-every category is denied.
+`on`, `once`, `off`, `removeListener`, `memoryUsage`, `stats` — is always
+available. `process.exit()` works even when every category is denied.
 
 ## Arguments: `argv`
 
@@ -162,7 +167,24 @@ if (badConfig) {
 - Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
 - An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
-> **Note:** There is no signal-handling API. Stop servers with `Ctrl-C` from the terminal, or `process.exit(0)` for programmatic shutdown.
+## Signals and graceful shutdown: `on`, `once`, `off`, `kill`
+
+Listen for POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`)
+to drain servers or clean up resources before exiting:
+
+```js
+const server = http.serve({ port: 3000 }, () => new Response("ok"));
+
+process.once("SIGTERM", async (sig) => {
+  console.log("received", sig, "— draining");
+  await server.close();
+});
+```
+
+- Up to **8** listeners can be attached per signal.
+- Signal handlers run asynchronously on the event loop tick after the OS signal arrives.
+- When `http.serve` is running and no user listener is registered for `SIGINT` / `SIGTERM`, the runtime automatically triggers `server.close()` on those signals.
+- `process.kill(pid, signal?)` sends a signal (`"SIGTERM"` when omitted). Signaling `process.pid` needs no permission flag; signaling another process requires `--allow-run=kill` (or bare `--allow-run`).
 
 ## Memory and allocator introspection
 
@@ -233,7 +255,6 @@ should read `PORT`.
 | `spawn` / `exec` / `execFile` | Provided on the separate [child_process](/docs/api/child-process) global |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
-| `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
 | `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
 
 (`process.memoryUsage()` does exist — its `rss` is a peak counter from `getrusage`, see the [API page](/docs/api/process).)

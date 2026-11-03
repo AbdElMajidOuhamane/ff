@@ -71,6 +71,7 @@ Globals available inside the worker file:
 | `console` | Same `console` as the parent, same stderr |
 | `setTimeout` / `setInterval` / clear\* | Timers work |
 | `queueMicrotask` | |
+| `structuredClone` | Deep binary structured clone (max 4 MB) |
 | `performance` | `performance.now()` — **own** origin |
 
 Not available: `fetch`, `fs`, `http`, `Database`, `sql`, `process`,
@@ -159,7 +160,8 @@ w.terminate();
   top-level `await`.
 - No shared memory: `SharedArrayBuffer` exists as a global but Workers
   don't share one — messages are the contract.
-- `structuredClone` is not a global; message passing *is* your clone.
+- `structuredClone(value)` uses the same binary serializer (max 4 MB) on both
+  the main thread and inside Workers.
 - 4 MB messages are expensive — send indices, not payloads.
 - `console` in a worker writes to the **same stderr** — prefix it
   (`console.log("[w" + workerData.id + "]")`).

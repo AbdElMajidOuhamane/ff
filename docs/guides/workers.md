@@ -168,7 +168,7 @@ The handler returns a `Promise`, so the connection parks while the worker crunch
 | Area | Limit / rule |
 |------|--------------|
 | Max workers | 8 — the 9th throws `too many workers (max 8)` |
-| Worker scope | `console` + timers + `postMessage`/`onmessage`/`workerData` — no `http.serve` in workers, keep servers on the main thread |
+| Worker scope | `console` + timers + `structuredClone` + `postMessage`/`onmessage`/`workerData` — no `http.serve` in workers, keep servers on the main thread |
 | Nested workers | Not supported — spawning from inside a worker fails |
 | Shutdown | Only via `terminate()`; process exits once all workers terminate |
 | Module size | Worker file capped at 10MB on load |

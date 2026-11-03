@@ -91,8 +91,8 @@ w.postMessage({ password: "hunter2" });
 
 Workers have their **own** JS runtime and event loop. They share no state
 and talk only by messages (structured clone). The worker scope has
-`console`, timers, `postMessage`, `workerData`, and `performance` — no
-`fs`, no `fetch`, no `http.serve`.
+`console`, timers, `structuredClone`, `postMessage`, `workerData`, and
+`performance` — no `fs`, no `fetch`, no `http.serve`.
 
 ## Limits worth memorising
 

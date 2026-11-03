@@ -14,9 +14,9 @@ This page is the gap list.
 
 Every global in `Object.getOwnPropertyNames(globalThis)`:
 
-**Web standard:** `fetch` · `Request` · `Response` · `Headers` · `URL` ·
+**Web standard:** `fetch` · `Request` · `Response` · `Headers` · `AbortController` · `AbortSignal` · `structuredClone` · `URL` ·
 `URLSearchParams` · `Blob` · `FormData` · `TextEncoder` · `TextDecoder` ·
-`WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`)
+`WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`, `subtle.importKey`, `subtle.sign`, `subtle.verify`, `subtle.exportKey`)
 · `btoa` · `atob` · `performance` · `queueMicrotask` · `DOMException`
 
 **Fairyfly:** `http` · `udp` · `fs` · `process` · `child_process` · `Database` ·
@@ -57,9 +57,9 @@ The escape hatch is `--allow-all`. Program loading (`import`,
 | `process.nextTick` | absent | `queueMicrotask(fn)` |
 | `process.stdout.write` | absent | `console.log` → **stderr** |
 | `process.exitCode` | absent | `process.exit(n)` |
-| `process.on("exit"…)` | absent | nothing to subscribe to |
+| `process.on("exit"…)` | partial | `process.on` / `once` / `off` support POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`), not `"exit"` |
 | `setImmediate` | absent | `setTimeout(fn, 0)` |
-| `structuredClone` | absent as global | clone via `postMessage` |
+| `structuredClone` | **present** | Deep binary structured clone (max 4 MB) |
 | `path` / `os` / `util` / `events` | absent | string ops, `URL`, arrays |
 | `stream` | absent | arrays, `Response.text()` |
 | `child_process` | partial | `spawn` / `exec` / `execSync` — no streams, stdin, or fork |
@@ -67,8 +67,8 @@ The escape hatch is `--allow-all`. Program loading (`import`,
 | `worker_threads` | absent | global `Worker` |
 | `zlib` | absent | `crypto.subtle.digest` won't help — use `ffi` |
 | `fs.promises` | absent | `fs.readFileAsync()` and friends |
-| `crypto.createHash` / `createHmac` | absent | `crypto.subtle.digest` |
-| `AbortController` / `signal` | absent | not supported by `fetch` |
+| `crypto.createHash` / `createHmac` | absent | `crypto.subtle.digest` / `crypto.subtle.sign` (HMAC) |
+| `AbortController` / `AbortSignal` | **present** | Supported by `fetch`, `Request`, `setTimeout`, `setInterval`, and `http.serve` |
 | `setTimeout().unref()` (Node Timer) | partial | returns a `Timeout` **object**: `t.unref()`, `t.refresh()`, `t.hasRef()` |
 | `DOMException` | **present** | (QuickJS builtin) |
 
@@ -77,15 +77,15 @@ The escape hatch is `--allow-all`. Program loading (`import`,
 | Browser API | Status | Use instead |
 |---|---|---|
 | `window`, `document`, DOM | absent | backend runtime |
-| `addEventListener` | absent | `on…` properties (`ws.onmessage = …`) |
+| `addEventListener` | partial | Present on `AbortSignal`; use `on…` properties on `WebSocket` / `Worker` (`ws.onmessage = …`) |
 | `localStorage` / `sessionStorage` | absent | `fs` or SQLite |
 | `ReadableStream` / `WritableStream` | absent | `arrayBuffer()` / `text()` |
 | `TextEncoder#encodeInto` | absent | `encode()` |
 | `EventSource` (SSE) | absent | raw `http.serve` with `content-type: text/event-stream` |
-| `structuredClone` | absent | `postMessage` |
+| `structuredClone` | **present** | |
 | `URL.canParse` / `URL.parse` | **present** | |
 | `Response.json` / `Response.redirect` | **present** | |
-| `fetch` `signal` | absent | timeouts: `Promise.race` |
+| `fetch` `signal` | **present** | `AbortController` / `AbortSignal.timeout(ms)` |
 
 ## Behavioural deviations
 

@@ -61,7 +61,7 @@ boundary for hostile code.
 | Redirects | Followed, max 5 hops | Throws `Too many redirects`; every hop is re-checked against `--allow-net` |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
 | Header validation | RFC 7230 character validation | CRLF or invalid header names/values reject before sending |
-| Abort / `signal` | Not supported | `signal` / `timeout` / `redirect` init keys are ignored |
+| Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (use `AbortSignal.timeout(ms)`) |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 | Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
 
@@ -162,8 +162,10 @@ queueMicrotask(fn);
 |------|-------|----------|
 | `process.env` | Filtered snapshot at boot | Only `--allow-env` names are present; assigning to it does not affect the OS environment |
 | `process.chdir` | Needs `read` on the target | Outside the scope it throws `PermissionDenied`; an allowed missing path is still a silent no-op |
+| Signals (`process.on` / `once` / `off`) | `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` (max 8 listeners per signal) | Unsupported signal names or > 8 listeners throw `TypeError` |
+| `process.kill(pid, sig?)` | Needs `--allow-run=kill` when `pid !== process.pid` | Self-signaling `process.pid` is ungated |
 | stdout/stdin streams | Missing | No `process.stdout.write` or stdin reads |
-| `hrtime`, `kill` | Missing | — |
+| `hrtime` | Missing | Use `performance.now()` |
 | Runaway JS watchdog | None | An infinite loop hangs the process |
 
 ## child_process
@@ -207,5 +209,5 @@ queueMicrotask(fn);
 - Port shorthand `http.serve(3000, handler)` **works**; the default port is `3000`.
 - `make install` targets **`~/.local/bin/ff`**, not `/usr/local/bin`.
 - `import` and `new Worker(path)` do **not** need `--allow-read`; program loading is a carve-out.
-- `process.argv`, `cwd`, `exit`, `pid`, `platform`, `arch`, `memoryUsage`, and `stats` are **not** permission-gated.
+- `process.argv`, `cwd`, `exit`, `pid`, `platform`, `arch`, `on`, `once`, `off`, `memoryUsage`, and `stats` are **not** permission-gated (`process.kill` is ungated for `process.pid`).
 - `ff imprint`, `ff fmt`, `ff upgrade`, and `ff compile` are CLI operations, not runtime APIs, and are **not** gated by `--allow-*`.

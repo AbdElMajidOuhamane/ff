@@ -296,7 +296,7 @@ pass inline PEM, which needs no file grant.
 
 **`id` comes back wrong in JSON** — you wrote `db.lastInsertRowId` without calling it. Always `db.lastInsertRowId()`.
 
-**Stopping the server** — there is no `server.stop()` API. Stop the process with `Ctrl-C`, or call `process.exit(0)` from your code for programmatic shutdown.
+**Stopping the server** — `http.serve` returns `{ port, close }`. Call `await server.close()` (or pass `{ signal }` to `http.serve`) to stop accepting new connections and drain active requests cleanly. `SIGINT` and `SIGTERM` also trigger `server.close()` automatically when no custom listener is registered for that signal.
 
 ## See also
 

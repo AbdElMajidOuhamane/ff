@@ -27,6 +27,8 @@ flag a global needs; `—` means it is always available. Full model:
 | `Headers` | Case-insensitive header collection | — | [Request/Response](/docs/api/request-response) |
 | `Request` | Fetch request object | — | [Request/Response](/docs/api/request-response) |
 | `Response` | Fetch response object + `json`/`redirect`/`error` | — | [Request/Response](/docs/api/request-response) |
+| `AbortController`, `AbortSignal` | Cancellation controller + signal (`abort()`, `timeout(ms)`) | — | [fetch](/docs/api/fetch) |
+| `structuredClone` | Deep binary structured clone (max 4 MB) | — | [Worker](/docs/api/worker) |
 | `Blob` | Immutable binary blob | — | [Blob/FormData](/docs/api/blobs-formdata) |
 | `FormData` | `multipart/form-data` container | — | [Blob/FormData](/docs/api/blobs-formdata) |
 | `TextEncoder`, `TextDecoder` | UTF-8 string ↔ bytes | — | [Text encoding](/docs/api/text-encoding) |
@@ -36,9 +38,9 @@ flag a global needs; `—` means it is always available. Full model:
 | `http` | `http.serve(options, handler)` | `net` (+ `read` for TLS files) | [http](/docs/api/http) |
 | `udp` | Datagram sockets (`udp.socket`, max 64) | `net` | [udp](/docs/api/udp) |
 | `fs` | Sync + Promise filesystem calls | `read` / `write` | [fs](/docs/api/fs) |
-| `process` | `argv`, `env`, `exit`, `pid`, `memoryUsage`… | `env`; `read` for `chdir` | [process](/docs/api/process) |
+| `process` | `argv`, `env`, `exit`, `pid`, `on`, `kill`, `memoryUsage`… | `env`; `read` for `chdir`; `run` for external `kill` | [process](/docs/api/process) |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | `run` | [child_process](/docs/api/child-process) |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | — | [crypto](/docs/api/crypto) |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`) | — | [crypto](/docs/api/crypto) |
 | `btoa`, `atob` | Base64 encode / decode | — | [crypto](/docs/api/crypto) |
 | `Database` | SQLite (`Database.open(path)`) | `read` + `write` | [SQLite](/docs/api/sqlite) |
 | `sql`, `SQL` | Postgres tagged templates + pool | `net` (+ `read` for `sslrootcert`); global `sql` also `env` | [Postgres](/docs/api/postgres) |
@@ -48,9 +50,10 @@ flag a global needs; `—` means it is always available. Full model:
 
 Notes:
 
-- `process.argv`, `pid`, `cwd`, `exit`, `memoryUsage`, and `stats` are not
-  gated. Only `process.env` (`env`) and `process.chdir` (`read` on the target)
-  need a flag.
+- `process.argv`, `pid`, `cwd`, `exit`, `on`, `once`, `off`, `memoryUsage`, and
+  `stats` are not gated. Only `process.env` (`env`), `process.chdir` (`read` on
+  the target), and `process.kill` to a PID other than `process.pid` (`run` for
+  `"kill"`) need a flag.
 - `Worker` loading is a program-loading carve-out: `new Worker(path)` does not
   need `read`. The worker inherits the process policy for everything it calls.
 - `http` always needs `net` for its `0.0.0.0:<port>` bind. `read` is only
@@ -139,8 +142,6 @@ use instead:
 | `require()` / CommonJS | `import` / `export` |
 | `process.nextTick` | `queueMicrotask(fn)` |
 | `setImmediate` | `setTimeout(fn, 0)` |
-| `structuredClone` | built into `postMessage`; clone by messaging yourself |
-| `AbortController` / `signal` | not supported by `fetch` |
 | `addEventListener` on `WebSocket` | `ws.onopen = …` style handlers |
 | `TextEncoder#encodeInto` | `encode()` |
 | `process.stdout.write` | `console.log` (goes to **stderr**) |

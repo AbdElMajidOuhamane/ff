@@ -75,19 +75,20 @@ curl http://127.0.0.1:3000/
 
 ## `http.serve(signatures)`
 
-Two call shapes are accepted:
+Two call shapes are accepted, and both return a server handle (`{ port, close }`):
 
 ```js
-http.serve(3000, handler);           // port shorthand
-http.serve({ port: 4242 }, handler); // options object
+const srv = http.serve(3000, handler);           // port shorthand
+const srv = http.serve({ port: 4242 }, handler); // options object
 ```
 
-| Signature | Port used |
-|-----------|-----------|
-| `http.serve(port, handler)` | `port` |
-| `http.serve(options, handler)` | `options.port`, or `3000` when omitted |
+| Signature | Port used | Returns |
+|-----------|-----------|---------|
+| `http.serve(port, handler)` | `port` (`0` picks an ephemeral OS port) | `{ port: number, close(callback?): Promise<void> }` |
+| `http.serve(options, handler)` | `options.port`, or `3000` when omitted | `{ port: number, close(callback?): Promise<void> }` |
 
-The server binds to `0.0.0.0`. There is no host option.
+The server binds to `0.0.0.0`. There is no host option. When `port: 0` is
+passed, `srv.port` contains the actual bound port assigned by the OS.
 
 > **Note:** the one-argument form `http.serve(handler)` is **not** supported by
 > the current runtime — it throws `TypeError: http.serve requires (options, handler)`.
@@ -96,9 +97,10 @@ The server binds to `0.0.0.0`. There is no host option.
 ## Options reference
 
 ```js
-http.serve(
+const server = http.serve(
   {
-    port: 3000,                       // default 3000
+    port: 3000,                       // default 3000 (0 for ephemeral port)
+    signal: ac.signal,                // optional — AbortSignal that calls server.close()
     tls: { cert: "...", key: "..." }, // optional — enables HTTPS/WSS on the same port
     websocket: {                      // optional — enables WebSocket upgrades
       open: (socket) => {},
@@ -112,11 +114,39 @@ http.serve(
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `port` | `number` | `3000` | Listen port |
+| `port` | `number` | `3000` | Listen port (`0` lets the OS pick an available port) |
+| `signal` | `AbortSignal` | none | Aborting the signal triggers `server.close()` |
 | `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN `) or a file path. Cert max 512KB, key max 256KB. Enables HTTPS and WSS alongside plain HTTP/WS |
 | `websocket.open` | `(socket) => void` | none | Fires when a client completes the upgrade |
 | `websocket.message` | `(socket, data) => void` | none | Fires per frame; `data` is a string (text) or `Uint8Array` (binary) |
 | `websocket.close` | `(socket) => void` | none | Fires when a client disconnects |
+
+## Graceful shutdown: `server.close()` and signals
+
+`server.close(callback?)` stops accepting new connections and drains existing
+ones cleanly:
+
+- Closes the listening socket immediately so new connections are refused.
+- Closes idle HTTP/1.1 keep-alive sockets and active WebSocket connections.
+- Marks in-flight HTTP/1.1 requests with `Connection: close` so each socket
+  closes as soon as its response finishes flushing.
+- Sends HTTP/2 `GOAWAY` on active H2 sessions and closes them once active
+  streams complete.
+- Resolves the returned `Promise<void>` (and invokes optional `callback`) once
+  all 512 connection slots are free, allowing the event loop to exit naturally.
+
+```js
+const server = http.serve({ port: 3000 }, handler);
+
+process.once("SIGTERM", async () => {
+  await server.close();
+  console.log("drained cleanly");
+});
+```
+
+If you do **not** register your own `SIGINT` or `SIGTERM` listener via
+`process.on` / `process.once`, `http.serve` automatically traps `SIGINT` and
+`SIGTERM` and calls `server.close()` for you.
 
 When the `websocket` block is present, any request carrying
 `Connection: Upgrade`, `Upgrade: websocket`, and `Sec-WebSocket-Key` is

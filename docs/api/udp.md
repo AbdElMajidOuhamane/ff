@@ -94,11 +94,12 @@ ff echo.js --allow-net=127.0.0.1
 
 ## Modules vs scripts
 
-`ff` treats a file as an ES module only when its name ends in `.mjs` or
-its first code is `import`/`export`. A plain `.js` file runs as a classic
-script, where top-level `await` is a syntax error — so the examples on
-this page wrap async code in `(async () => { ... })()`. Save any of them
-with a `.mjs` extension if you'd rather use top-level `await` as written.
+`ff` forces ES module evaluation when a file ends in `.mjs`. For `.js` files,
+`ff` tries classic-script compilation first and automatically falls back to ES
+module evaluation when the file contains `import`, `export`, or top-level
+`await` anywhere in the source. The examples on this page wrap async code in
+`(async () => { ... })()` so they also work when pasted into classic-script
+contexts.
 
 ## `udp.socket(family?)`
 

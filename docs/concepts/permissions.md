@@ -32,7 +32,7 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, Postgres DSN and TLS variables (`PG*`, `DATABASE_URL`, `PGSSL*`) for the global `sql` | exact names |
-| `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
+| `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` (external PIDs) | basenames or absolute paths (`kill` for `process.kill`) |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | none — bare only |
 | `--allow-all` | every category above, **including FFI** | none |
 
@@ -154,6 +154,7 @@ Rules:
 | `new SQL(dsn \| options)` | `net` on host/port, plus `read` on `sslrootcert` if TLS is enabled | before the pool is created |
 | global `sql` | `net`, `read` on `sslrootcert` (if TLS enabled), plus `env` for `PG_*` / `DATABASE_URL` / `PGSSL*` | before the first query |
 | `child_process.spawn` / `exec` / `execSync` | `run` on `argv[0]` | before the child is created |
+| `process.kill(pid, sig?)` | `run` on `"kill"` (when `pid !== process.pid`) | before the signal is sent |
 | `ffi.dlopen` / `ffi.callback` / `ffi.*` memory helpers | `ffi` | before `dlopen`, closure creation, pointer creation, or memory access |
 
 `Database.open(":memory:")` is exempt from all path checks. Inline PEM passed to

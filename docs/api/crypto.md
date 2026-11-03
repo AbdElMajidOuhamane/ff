@@ -1,13 +1,14 @@
 ---
 title: crypto
-description: randomUUID, getRandomValues, subtle.digest — and btoa/atob, with their deviations.
+description: randomUUID, getRandomValues, subtle (digest, HMAC importKey/sign/verify/exportKey) — and btoa/atob, with their deviations.
 order: 11
 ---
 
 # `crypto`
 
-Random values, digests, and base64. Everything is synchronous except
-`subtle.digest`, which returns a Promise (resolved immediately).
+Random values, digests, HMAC signing/verification, and base64. Everything is
+synchronous except `crypto.subtle` methods, which return Promises (resolved
+immediately).
 
 ```js
 const id = crypto.randomUUID();           // "3f8a1c2e-…"
@@ -59,7 +60,7 @@ crypto.getRandomValues("nope");
 
 | | |
 |---|---|
-| Signature | `(string, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` |
+| Signature | `(string \| { name: string }, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` |
 | Algorithms | `SHA-1`, `SHA-256`, `SHA-384`, `SHA-512` (case-insensitive) |
 
 ```js
@@ -89,9 +90,37 @@ async function sha256Hex(chunks) {
 }
 ```
 
-> There is no `SubtleCrypto.sign`, `verify`, `encrypt`, `decrypt`,
-> `generateKey`, or `importKey`. For signatures and key exchange, use
-> [`ffi`](/docs/api/ffi) with a native library.
+## `crypto.subtle` HMAC (`importKey`, `sign`, `verify`, `exportKey`)
+
+`crypto.subtle` supports HMAC keys and constant-time verification across
+`SHA-1`, `SHA-256`, `SHA-384`, and `SHA-512`:
+
+| Method | Signature | Description |
+|---|---|---|
+| `subtle.importKey(format, keyData, algorithm, extractable, keyUsages)` | `("raw", ArrayBuffer \| TypedArray, "HMAC" \| { name: "HMAC", hash }, boolean, string[]) → Promise<CryptoKey>` | Imports raw bytes as an HMAC `CryptoKey` (`hash` defaults to `"SHA-256"` if a bare `"HMAC"` string is passed; usages must be non-empty and contain `"sign"` and/or `"verify"`) |
+| `subtle.sign(algorithm, key, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` | Computes the HMAC tag; requires `"sign"` in `key.usages` |
+| `subtle.verify(algorithm, key, signature, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray, ArrayBuffer \| TypedArray) → Promise<boolean>` | Verifies `signature` against `data` in constant time; requires `"verify"` in `key.usages` |
+| `subtle.exportKey(format, key)` | `("raw", CryptoKey) → Promise<ArrayBuffer>` | Exports the raw key bytes; requires `key.extractable === true` |
+
+```js
+const enc = new TextEncoder();
+const key = await crypto.subtle.importKey(
+  "raw",
+  enc.encode("webhook-secret"),
+  { name: "HMAC", hash: "SHA-256" },
+  false,
+  ["sign", "verify"],
+);
+
+const payload = enc.encode('{"event":"paid"}');
+const sig = await crypto.subtle.sign("HMAC", key, payload);
+const ok = await crypto.subtle.verify("HMAC", key, sig, payload);
+console.log(ok); // true
+```
+
+> Asymmetric algorithms (RSA, ECDSA, Ed25519), symmetric encryption (`encrypt` /
+> `decrypt`), and key generation (`generateKey`) are not built in. Use
+> [`ffi`](/docs/api/ffi) with a native library when you need those primitives.
 
 ## `btoa` / `atob` (globals)
 
@@ -126,22 +155,22 @@ atob("!!!");
 
 | Missing | Instead |
 |---|---|
-| `crypto.subtle.sign` / `verify` | `ffi` + a native crypto library |
-| `crypto.createHash` / `createHmac` | `crypto.subtle.digest` |
-| `crypto.timingSafeEqual` | compare hashes, or write a constant-time loop |
+| `crypto.subtle.encrypt` / `decrypt` / `generateKey` | `ffi` + a native crypto library |
+| `crypto.createHash` / `createHmac` | `crypto.subtle.digest` / `crypto.subtle.sign` (HMAC) |
+| `crypto.timingSafeEqual` | `crypto.subtle.verify` (uses constant-time comparison) |
 | `crypto.randomBytes` (Node) | `crypto.getRandomValues(new Uint8Array(n))` |
 | PBKDF2 / scrypt / HKDF | not available in-runtime |
 
 ## Gotchas
 
-- `subtle.digest` computes synchronously and resolves on the microtask
-  queue — awaiting it does not free the loop for I/O.
+- `crypto.subtle` methods compute synchronously and resolve on the microtask
+  queue — awaiting them does not free the loop for I/O.
 - `getRandomValues` is `Uint8Array`-only-ish: any TypedArray works, plain
   arrays/strings throw.
 - `btoa` / `atob` don't throw on non-Latin-1 — both sides go through
   UTF-8, so Unicode round-trips (unlike browsers).
-- No `crypto` keys, no TLS material access — see [TLS](/docs/guides/tls)
-  for server certificates.
+- `crypto.subtle` keys only support `"raw"` HMAC — for TLS server certificates,
+  see [TLS](/docs/guides/tls).
 
 ## See also
 

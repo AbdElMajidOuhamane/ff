@@ -35,8 +35,8 @@ Everything ships in a single binary. No `npm install` needed for core features.
 | Postgres | Built-in wire client, connection pool, transactions, TLS `verify-full` |
 | WebSocket | Server and client, text and binary frames |
 | Workers | Up to 8 threads, cooperative concurrency |
-| Fetch | Outbound HTTP client with async support |
-| Crypto | randomUUID, getRandomValues, subtle.digest |
+| Fetch | Outbound HTTP client with async + `AbortSignal` support |
+| Crypto | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`) |
 | File System | Sync read, write, mkdir, rm, readdir (+ `*Async` variants) |
 | Subprocesses & FFI | `child_process` (`spawn`/`exec`/`execSync`) and `ffi` (`dlopen`) |
 | Permissions | Deny-by-default `--allow-*` CLI flags |
