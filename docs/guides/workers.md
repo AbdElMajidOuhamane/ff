@@ -110,7 +110,7 @@ Rules:
 
 - Workers live until `terminate()`. There is no idle-exit — the process stays alive while any worker is unterminated.
 - The process exits once all workers are terminated (and the main loop drains).
-- Worker-side uncaught errors surface via the parent's `onerror` and print `[worker] unhandled error: …` diagnostics.
+- Worker-side uncaught errors, timer errors, and microtask errors wake the parent immediately and surface via the parent's `onerror` (printing `[worker] unhandled error: …` or `[worker] timer error: …` diagnostics).
 - `postMessage` after `terminate()` throws — guard or null out the handle.
 
 ## Practical example: non-blocking hash endpoint

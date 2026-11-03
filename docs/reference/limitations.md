@@ -62,6 +62,7 @@ boundary for hostile code.
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
 | Header validation | RFC 7230 character validation | CRLF or invalid header names/values reject before sending |
 | Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (use `AbortSignal.timeout(ms)`) |
+| TLS hostnames | DNS SAN verification only | IP-literal TLS hosts (`https://127.0.0.1:...`) fail closed; connect using DNS hostnames |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 | Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
 
@@ -77,6 +78,7 @@ boundary for hostile code.
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
 | Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
+| Send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full throws `TypeError: WebSocket: send buffer full` |
 | Proxy | Same env vars as `fetch` | `ws://` needs a CONNECT-capable proxy |
 
 ## UDP
@@ -184,6 +186,7 @@ queueMicrotask(fn);
 | Area | Limit | When hit |
 |------|-------|----------|
 | Server TLS versions | TLS 1.2 minimum (TLS 1.0 and 1.1 rejected) | No TLS 1.3 in the default BearSSL build |
+| IP-literal TLS hosts | DNS SAN verification only | `std.crypto.tls.Client` matches DNS SANs, not IP SANs; IP-literal TLS fails closed |
 | `ff upgrade` | Verifies SHA-256 digest from `sha256sums.txt` | Mismatched or missing hash refuses install |
 | `ff compile` input | 20MB source | Larger inputs fail |
 | `ff test` file | 10MB | Larger test files are not loaded |

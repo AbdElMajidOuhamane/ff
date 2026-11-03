@@ -175,6 +175,9 @@ Strings you'll see in practice — useful for assertions in tests:
 | `too many timers (max 128)` | timers |
 | `setTimeout accepts at most 8 callback arguments` | timers |
 | `queueMicrotask requires a function argument` | microtasks |
+| `WebSocket constructor requires a URL` | `new WebSocket` |
+| `WebSocket: send buffer full` | `ws.send` / `ws.sendBinary` |
+| `subtle.importKey: algorithm must be 'HMAC' or { name: 'HMAC', hash: 'SHA-...' }` | `crypto.subtle.importKey` |
 | `too many workers (max 8)` | `new Worker` |
 | `Worker requires a module path` | `new Worker` |
 | `value could not be cloned` | `postMessage` / `structuredClone` with a function/WeakMap/… |

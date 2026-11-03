@@ -97,7 +97,7 @@ async function sha256Hex(chunks) {
 
 | Method | Signature | Description |
 |---|---|---|
-| `subtle.importKey(format, keyData, algorithm, extractable, keyUsages)` | `("raw", ArrayBuffer \| TypedArray, "HMAC" \| { name: "HMAC", hash }, boolean, string[]) → Promise<CryptoKey>` | Imports raw bytes as an HMAC `CryptoKey` (`hash` defaults to `"SHA-256"` if a bare `"HMAC"` string is passed; usages must be non-empty and contain `"sign"` and/or `"verify"`) |
+| `subtle.importKey(format, keyData, algorithm, extractable, keyUsages)` | `("raw", ArrayBuffer \| TypedArray, "HMAC" \| { name: "HMAC", hash? }, boolean, string[]) → Promise<CryptoKey>` | Imports raw bytes as an HMAC `CryptoKey` (`algorithm` can be `"HMAC"` or `{ name: "HMAC", hash?: string }`; `hash` defaults to `"SHA-256"` if omitted; usages must be non-empty and contain `"sign"` and/or `"verify"`) |
 | `subtle.sign(algorithm, key, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` | Computes the HMAC tag; requires `"sign"` in `key.usages` |
 | `subtle.verify(algorithm, key, signature, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray, ArrayBuffer \| TypedArray) → Promise<boolean>` | Verifies `signature` against `data` in constant time; requires `"verify"` in `key.usages` |
 | `subtle.exportKey(format, key)` | `("raw", CryptoKey) → Promise<ArrayBuffer>` | Exports the raw key bytes; requires `key.extractable === true` |

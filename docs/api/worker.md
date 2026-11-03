@@ -151,7 +151,8 @@ w.terminate();
 - A worker **never exits on its own** — even an empty script keeps its
   thread alive, so the main process waits. Call `terminate()`.
 - `terminate()` is immediate; pending `postMessage`s in flight are lost.
-- An uncaught throw in the worker fires `onerror` on the parent; the
+- An uncaught throw, timer callback error, or microtask error in the worker
+  immediately wakes the parent loop and fires `onerror` on the parent; the
   worker thread keeps running unless you terminate it.
 
 ## Gotchas

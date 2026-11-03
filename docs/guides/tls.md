@@ -209,13 +209,15 @@ FF_CA_FILE=cert.pem ff client.js --allow-net=localhost:8443
 
 ## Generate a dev certificate
 
-SubjectAltNames matter — the client verifies the hostname, so mint for `localhost` (and the IP when you dial it numerically):
+SubjectAltNames matter — the client verifies the hostname, so mint for `localhost`:
 
 ```sh
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout key.pem -out cert.pem -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+  -addext "subjectAltName=DNS:localhost"
 ```
+
+> **Note on IP literals:** IP-literal TLS hosts (`https://127.0.0.1:8443` or `wss://127.0.0.1:8443`) fail closed: `std.crypto.tls.Client` verifies DNS SANs, not IP SANs, and disabling host verification would accept any certificate. Always connect to TLS servers using a DNS hostname (e.g. `localhost`).
 
 This creates `cert.pem` and `key.pem` in the current directory. Then:
 
@@ -244,6 +246,8 @@ Only `sslmode=verify-full` and `sslmode=disable` are supported. Full details: [P
 ## Limits you will hit
 
 - Server requires TLS 1.2 minimum (BearSSL profile restricts server versions to TLS 1.2; TLS 1.0 and 1.1 are rejected).
+- IP-literal TLS hosts (`https://127.0.0.1:...` / `wss://127.0.0.1:...`) fail closed: `std.crypto.tls.Client` matches DNS SANs, not IP SANs. Always dial TLS servers using a DNS hostname (e.g. `localhost`).
+- Custom CA bundles loaded via `--ca` or `FF_CA_FILE` are retained across client root bundle rescans and safe to configure before or after server initialization.
 - One listener is TLS-or-plain per `tls` block. No client-certificate auth.
 - Cert ≤ 512KB, key ≤ 256KB.
 - RSA or EC keys; RSA is the well-trodden path.

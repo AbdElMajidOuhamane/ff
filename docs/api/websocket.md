@@ -181,7 +181,7 @@ ff client.js --allow-net=api.example.com:443
 
 | Member | Description |
 |--------|-------------|
-| `send(data)` | Send text (`string`) |
+| `send(data)` | Send text (`string`) or binary (`ArrayBuffer` / `Uint8Array`) |
 | `sendBinary(buf)` | Send bytes (`ArrayBuffer` / `Uint8Array`) |
 | `close(code?, reason?)` | Graceful close, e.g. `ws.close(1000, "done")` |
 | `readyState` | `0` connecting, `1` open, `2` closing, `3` closed |
@@ -213,7 +213,7 @@ throw immediately — every message starts with a `WebSocket: ` prefix:
 new WebSocket("http://localhost:3000/");
 // TypeError: WebSocket: invalid WebSocket URL (expected ws:// or wss://)
 new WebSocket();
-// TypeError: WebSocket: constructor requires a URL
+// TypeError: WebSocket: WebSocket constructor requires a URL
 ```
 
 A denied target also throws synchronously, but is a `PermissionDenied` error
@@ -287,6 +287,7 @@ Connect clients with `--allow-net=127.0.0.1:3000`.
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
 | Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` server-side |
+| Client send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full throws `TypeError: WebSocket: send buffer full` |
 
 ## Troubleshooting
 
