@@ -83,11 +83,22 @@ var no_proxy: ?proxy_mod.NoProxy = null;
 var direct_client: http.Client = undefined;
 var direct_initialized = false;
 
+// std.http's shared client dispatches blocking DNS/connect/TLS/read ops onto
+// std.Io.Threaded. Zig's default worker stack is 16 MiB
+// (std.Thread.SpawnConfig.default_stack_size); the static-musl backend commits
+// ~2-3 MiB RSS per worker. Bound the pool and size stacks for std.http + TLS
+// frames (poll_buffer[64] + handshake state).
+// Keep IO_POOL_MAX >= async_fetch.MAX_FETCH (16). Beyond it, std.Io runs the
+// task inline instead of spawning — correct, just serialized.
+const IO_POOL_MAX: usize = 32;
+const IO_STACK_SIZE: usize = 1024 * 1024;
+
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
     io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-        .async_limit = .limited(64),
+        .stack_size = IO_STACK_SIZE,
+        .async_limit = .limited(IO_POOL_MAX),
     });
     http_client = .{
         .allocator = std.heap.page_allocator,

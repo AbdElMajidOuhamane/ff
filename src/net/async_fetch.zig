@@ -20,6 +20,11 @@ const http = std.http;
 
 pub const MAX_FETCH = 16;
 
+// 256 KiB intermittently SIGSEGVs under the 300-query burst (5/15 runs);
+// keep 1 MiB. Per-thread RSS is handled by removing the 4 MiB threadlocal
+// in worker/message_port.zig instead of under-sizing stacks.
+const WORKER_STACK_SIZE: usize = 1024 * 1024;
+
 // Response-body ceiling, decompressed. A malicious or compromised upstream can
 // otherwise choose both the allocation size (via Content-Length) and the
 // expansion ratio (via gzip/zstd). Worst case here is MAX_FETCH × this value.
@@ -187,7 +192,7 @@ pub fn init(ctx: ?*c.Context) void {
         return;
     };
     for (&worker_threads) |*t| {
-        t.* = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerLoop, .{}) catch {
+        t.* = std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, workerLoop, .{}) catch {
             t.* = null;
             break;
         };

@@ -9,9 +9,30 @@ pub const FRAME_ERROR: u8 = 2;
 /// 4 MB cap guards against a corrupt length prefix causing a huge alloc.
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 
-// DOD: reusable per-thread receive scratch — zero heap alloc per frame
-// after thread start. Payload is valid only until the next recv on this thread.
-threadlocal var recv_scratch: [MAX_FRAME]u8 = undefined;
+// Lazily grown per-thread receive buffer. A 4 MiB threadlocal array here
+// emitted a 4.25 MiB PT_TLS block in *every* thread — including the 16 fetch
+// workers and std.Io threads that never use message ports — and made
+// per-thread RSS scale with stack size. Allocate on first frame, grow to the
+// frame length (capped by MAX_FRAME); zero heap allocation per frame after
+// the high-water mark.
+const gpa = std.heap.smp_allocator;
+threadlocal var recv_scratch: []u8 = &.{};
+
+fn scratchFor(len: usize) ![]u8 {
+    if (recv_scratch.len < len) {
+        if (recv_scratch.len != 0) gpa.free(recv_scratch);
+        recv_scratch = try gpa.alloc(u8, len);
+    }
+    return recv_scratch[0..len];
+}
+
+/// Free the per-thread buffer when a worker thread exits.
+pub fn deinitThreadScratch() void {
+    if (recv_scratch.len != 0) {
+        gpa.free(recv_scratch);
+        recv_scratch = &.{};
+    }
+}
 
 pub const Frame = struct {
     ftype: u8,
@@ -76,7 +97,7 @@ pub const MessagePort = struct {
         if (len > MAX_FRAME) return error.FrameTooLarge;
         const ftype = hdr[4];
         if (ftype != FRAME_MESSAGE and ftype != FRAME_ERROR) return error.BadFrame;
-        const buf = recv_scratch[0..len];
+        const buf = try scratchFor(len);
         try readExact(self.recv_fd, buf);
         return .{ .ftype = ftype, .payload = buf };
     }

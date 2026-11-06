@@ -386,6 +386,7 @@ fn makeErrorEvent(ctx: ?*qjs.Context, msg: []const u8) qjs.Value {
 // ── Worker thread main ──
 
 fn workerMain(data: *WorkerData) void {
+    defer port_mod.deinitThreadScratch();
     defer gpa.destroy(data);
     defer gpa.free(data.module_path);
     defer {
