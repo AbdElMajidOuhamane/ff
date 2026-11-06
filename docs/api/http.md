@@ -232,7 +232,7 @@ return Response.redirect("/moved", 301);              // 301 status only — no 
 | `Response.redirect(url, status?)` | redirect target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | — | Status `0`, type `"error"` (fetch-network-error shape) |
 
-Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Each body reads once (`bodyUsed` goes `true`).
+Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Bodies can be re-read freely (`bodyUsed` stays `false`; `bytes()` returns `ArrayBuffer`).
 
 Headers are case-insensitive and lowercased internally:
 

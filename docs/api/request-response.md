@@ -138,7 +138,7 @@ new Request(otherRequest);                 // clone
 | `url` | `string` | Target URL |
 | `method` | `string` | As given — case preserved (`"post"` stays `"post"`, not uppercased) |
 | `headers` | `headers` | `Headers` instance |
-| `bodyUsed` | `boolean` | Consumed flag |
+| `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
 | `cache`, `credentials`, `mode`, `redirect`, `integrity` | `string` | Standard init fields, stored as given |
 | `keepalive` | `boolean` | |
 | `signal` | `AbortSignal \| undefined` | Abort signal passed via `init.signal` (preserved across `clone()`) |

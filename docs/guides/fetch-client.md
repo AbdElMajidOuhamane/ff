@@ -138,14 +138,14 @@ await fetch("https://api.example.com/submit", {
 
 ## Reading the response
 
-Every reader works on `Response` (and `Request`). Each body reads **once** — after that `bodyUsed` is `true`:
+Every reader works on `Response` (and `Request`). Bodies can be re-read freely (and `bodyUsed` stays `false`):
 
 | Reader | Returns |
 |--------|---------|
 | `await res.text()` | `string` |
 | `await res.json()` | parsed JSON |
 | `await res.arrayBuffer()` | `ArrayBuffer` |
-| `await res.bytes()` | `Uint8Array` |
+| `await res.bytes()` | `ArrayBuffer` |
 | `await res.blob()` | `Blob` |
 | `await res.formData()` | `FormData` |
 
@@ -154,7 +154,7 @@ const res = await fetch("https://example.com/");
 console.log(res.url); // final URL after redirects
 console.log(res.redirected); // true when redirected
 console.log(res.headers.get("content-type"));
-console.log((await res.bytes()).length);
+console.log((await res.bytes()).byteLength);
 ```
 
 ## Redirects

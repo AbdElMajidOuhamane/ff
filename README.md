@@ -102,7 +102,7 @@ toggle.
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
 | `--allow-net` | `fetch`, WebSocket, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` / `PGSSL*` for the global `sql` | exact names |
-| `--allow-run` | `child_process.spawn` / `exec` / `execSync` | basenames or absolute paths |
+| `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` on external PIDs (`kill`) | basenames or absolute paths |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | bare flag only |
 | `--allow-all` | every category above, including FFI | bare flag only |
 
@@ -239,18 +239,20 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | Global | What to know |
 |---|---|
 | `console` | Prints **every** argument, joined with spaces — to **stderr** |
-| `fetch` | 16 slots, HTTP/1.1, 16 MB response cap; needs `--allow-net` on target `host:port`; strips credentials on cross-origin redirects; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
-| `http.serve` | `(url, method, body)` handler, all strings; needs `--allow-net=0.0.0.0:<port>`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
+| `fetch` | 16 slots, HTTP/1.1, 16 MB response cap; needs `--allow-net` on target `host:port`; supports `AbortSignal` cancellation; strips credentials on cross-origin redirects; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
+| `http.serve` | `(url, method, body)` handler, all strings; needs `--allow-net=0.0.0.0:<port>`; returns `{ port, close }` with graceful drain; ephemeral `port: 0` supported; options accept `{ signal }`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
 | `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); status bounded to `100`–`999`; `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
+| `AbortController` / `AbortSignal` | Web-standard cancellation; `AbortSignal.timeout(ms)`, `throwIfAborted()`, abort events; integrates with `fetch` and timers |
+| `structuredClone` | Deep clones JS values via serialization; max 4 MB per clone |
 | `Database` | `Database.open(path)`; needs `--allow-read` + `--allow-write` on the file and `--allow-write` on the parent; synchronous; SQL failures throw plain strings |
 | `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port, `--allow-read` on `sslrootcert` when TLS (`sslmode=verify-full`) is enabled, and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
 | `fs` | Sync calls return `undefined` on I/O failure; writes > 10 MB throw/reject instead of truncating; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
-| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; inherits the parent's permissions |
+| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; worker scope includes `console`, timers, `performance`, `structuredClone`, `workerData`, and `self`; inherits parent permissions |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; needs `--allow-run`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512); `btoa`/`atob` round-trip Unicode via UTF-8 |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512), `subtle` HMAC (`importKey`, `sign`, `verify`, `exportKey`); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
-| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `chdir` is read-gated and throws on denial; `memoryUsage()` and `stats()` are ungated; exit codes clamp to 0–255 |
+| `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `on`/`once`/`off` for POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`); `kill(pid, sig?)` (external PIDs need `--allow-run=kill`); `chdir` is read-gated; `memoryUsage()` and `stats()` are ungated; exit codes clamp to 0–255 |
 | `TextEncoder` / `TextDecoder` | UTF-8 string ↔ bytes |
 | `WebSocket` | Client with `send` / `sendBinary` / `close`; needs `--allow-net`; sync mistakes throw `TypeError: WebSocket: …` |
 | `udp` | Datagram sockets with `bind` / `sendto` / `recvfrom`; needs `--allow-net` on the address |
@@ -394,7 +396,7 @@ ff sever [pkg ...] [--force]
                          Remove dep(s), prune orphans
 ff start [--allow-*] [--cert cert.pem --key key.pem]
                          Run ff.json's "main" (TLS enabled with cert+key)
-ff --watch <file|start> [args...]
+ff --watch <file|start> [--ca <path>] [args...]
                          Restart the child when files change (200ms poll)
 
 ff test [filter] [--allow-*]
@@ -485,15 +487,15 @@ Database:
 **Outbound**
 
 - `fetch`: **16** concurrent slots, HTTP/1.1, **16 MB** response body cap (declared `Content-Length` and decompression), 30 s I/O timeout, max 5 redirects (cross-origin redirects strip `authorization`, `cookie`, `x-api-key`), RFC 7230 header validation
-- No `AbortController` / `signal` / `timeout` / `redirect` init keys
-- WebSocket: **64** client sockets, 16384-byte messages (larger sends truncate), RFC 6455 client masking required, max 125-byte control frames, strict UTF-8 validation on text frames, generation-tagged `{slot, gen}` socket handles
+- `AbortController` and `AbortSignal` supported (`init.signal`, `req.signal`, `AbortSignal.timeout(ms)`, `throwIfAborted()`); `timeout` and `redirect` init keys are ignored
+- WebSocket: **64** client sockets, 16384-byte messages (larger sends truncate), client supports `sendBinary(buf)` as well as text `send(str)`, RFC 6455 client masking required, max 125-byte control frames, strict UTF-8 validation on text frames, generation-tagged `{slot, gen}` socket handles
 - Outbound TLS connection pool: **64**
 - Proxies: HTTP proxies only (no SOCKS), configured via `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
 
 **Timers & loop**
 
 - Max **128** concurrent timers; the 129th throws `TypeError`
-- Max **8** extra timer arguments
+- Max **8** extra timer arguments (more than 8 throws `TypeError: setTimeout accepts at most 8 callback arguments`; also accepts `{ signal }` or `AbortSignal` as 3rd arg)
 - No `process.nextTick` — use `queueMicrotask`
 
 **Console**
@@ -505,7 +507,7 @@ Database:
 
 - Max **8**; 32 MB heap, 1 MB JS stack, 8 MB thread stack each
 - 4 MB per message; no `ArrayBuffer` transfer (always copied)
-- Worker scope is `console` + timers + `postMessage` — no `fs`, `fetch`, or `http.serve`
+- Worker scope includes `console`, timers, `postMessage`, `structuredClone`, `performance` (`performance.now()`), `workerData`, and `self` — no `fs`, `fetch`, or `http.serve`
 - No nested workers; exit only via `terminate()`
 - Inherits the parent's permission policy; there is no per-worker grant
 
@@ -538,7 +540,9 @@ Database:
 
 - `process.env` is a snapshot taken at boot, filtered by `--allow-env` —
   disallowed names are `undefined`; assigning does not affect the OS environment
-- No `stdout`/`stdin` streams, no `hrtime`, no `kill`
+- No `stdout`/`stdin` streams, no `hrtime`
+- `process.kill(pid, sig?)` supported for POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`; external PIDs require `--allow-run=kill`)
+- `process.on`, `process.once`, and `process.off` support signal listeners for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`
 - `process.chdir` needs `--allow-read` on the target; denial throws
   `PermissionDenied`
 - Exit codes clamp to 0–255 (no mod-256 wrap)

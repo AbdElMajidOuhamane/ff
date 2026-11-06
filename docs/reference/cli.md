@@ -340,11 +340,28 @@ Queries GitHub Releases for `AbdElMajidOuhamane/ff` (needs `curl`), compares sem
 
 > **Note:** Releases are published at [github.com/AbdElMajidOuhamane/ff/releases](https://github.com/AbdElMajidOuhamane/ff/releases) — `v0.2.0-beta` is the first. With a release available, `ff upgrade` reports up-to-date for current builds, downloads when you're behind, and only takes the failure row on network errors or a missing release asset.
 
+## Watch mode: ff --watch
+
+```sh
+ff --watch server.js --allow-net=0.0.0.0:3000
+ff --watch start --allow-all
+ff --watch app.js --ca custom-ca.pem --allow-net
+```
+
+Runs as a lightweight supervisor process that watches the current directory tree and automatically restarts the child whenever files change:
+
+- **Target**: Accepts either a JavaScript entry file (`ff --watch <file>`) or `start` (`ff --watch start` to run `main` from `ff.json`).
+- **Flags**: Forwards custom CA (`--ca <path>`) and all permission flags (`--allow-*`) directly to the child.
+- **Polling & Debounce**: Recursively monitors file modification times (`mtime`) and file sizes with a 200 ms polling interval and 100 ms debounce window.
+- **Ignored paths**: Automatically ignores `.git`, `node_modules`, `zig-out`, `.zig-cache`, and `zig-cache`.
+- **Clean restart**: Reaps the previous child process by sending `SIGTERM`, waits up to 500 ms grace period, escalates to `SIGKILL` if the child hangs, then spawns a fresh runtime.
+- **Signal forwarding**: `SIGINT` and `SIGTERM` on the supervisor cleanly terminate the child. Sets `FF_WATCH_PARENT` so the child automatically exits if the parent supervisor terminates.
+
 ## Print the version
 
 ```sh
 ff --version
-# ff 0.2.0-beta (macos-aarch64)
+# ff 0.3.0-beta (macos-aarch64)
 ```
 
 ## Proxy environment
@@ -371,6 +388,7 @@ details and examples.
 | `ff -e <code> [--allow-*]` | Run inline JS as a classic script (`--ca`, permission flags optional) |
 | `ff init [-y] [<dir>]` | Scaffold `ff.json` + entry file |
 | `ff start [--cert --key] [--allow-*]` | Run `main` from `ff.json` |
+| `ff --watch <file\|start> [--ca <path>] [--allow-*]` | File watcher supervisor (200ms poll, auto-restart) |
 | `ff imprint [pkg\|source …]` | Install pure-JS ESM deps from npm, GitHub, Codeberg, or a tarball |
 | `ff sever [pkg …] [--force]` | Remove deps / wipe install |
 | `ff test [filter] [--allow-*]` | Run `test/*.test.js` (repository suite uses `--allow-all`) |

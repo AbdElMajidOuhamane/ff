@@ -141,21 +141,21 @@ The object `fetch` resolves with — and the object your `http.serve` handler re
 | `url` | `string` | Final URL after redirects |
 | `redirected` | `boolean` | `true` when a redirect was followed |
 | `headers` | `Headers` | Response headers |
-| `bodyUsed` | `boolean` | `true` once the body has been read |
+| `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
 | `text()` | `() => Promise<string>` | Body as text |
 | `json()` | `() => Promise<any>` | Body parsed as JSON |
 | `arrayBuffer()` | `() => Promise<ArrayBuffer>` | Body as bytes |
-| `bytes()` | `() => Promise<Uint8Array>` | Body as typed array |
+| `bytes()` | `() => Promise<ArrayBuffer>` | Body as bytes in an `ArrayBuffer` |
 | `blob()` | `() => Promise<Blob>` | Body as `Blob` |
 | `formData()` | `() => Promise<FormData>` | Body parsed as multipart/urlencoded form |
 
-Each body reads **once**:
+Bodies can be re-read freely (`bodyUsed` remains `false`):
 
 ```js
 const res = await fetch("https://example.com/");
-console.log(res.bodyUsed); // false
-await res.text();
-console.log(res.bodyUsed); // true
+console.log(await res.text());
+console.log(await res.json()); // re-reading the body is supported
+console.log(res.bodyUsed);     // false
 ```
 
 Construction + statics (for handlers and tests):
@@ -185,7 +185,7 @@ console.log(await res.json());
 | Member | Description |
 |--------|-------------|
 | `method` / `url` / `headers` / `signal` | As passed to the constructor |
-| `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; single-read |
+| `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; re-readable (`bodyUsed` stays `false`) |
 
 `fetch(req)` applies the same `--allow-net` check to `req.url` as it does to a
 string URL, including on redirect hops.

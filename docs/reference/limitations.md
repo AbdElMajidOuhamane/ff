@@ -97,8 +97,9 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Live timers | 128 | `TypeError: too many timers (max 128)` |
-| Extra timer args | 8 after `ms` | Extras ignored |
+| Extra timer args | 8 after `ms` | Beyond 8 throws `TypeError: setTimeout accepts at most 8 callback arguments` (also accepts `{ signal }` or `AbortSignal` as 3rd arg) |
 | Workers | 8 | `too many workers (max 8)` |
+| Worker scope | `console`, timers, `postMessage`, `structuredClone`, `performance` (`performance.now()`), `workerData`, `self` | No `fs`, `fetch`, `http.serve`, or nested workers |
 | Worker heap | 32 MB + 1 MB JS stack (8 MB thread stack) | — |
 | Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
 | `process.nextTick` | Missing | Use `queueMicrotask` |
