@@ -1798,16 +1798,22 @@ fn resolveHost(host: []const u8, port: u16) !std.Io.net.IpAddress {
     const eai = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res);
     if (@intFromEnum(eai) != 0) return error.DnsFailure;
     defer if (res) |r| std.c.freeaddrinfo(r);
-    const info = res orelse return error.DnsFailure;
-    const sa = info.addr orelse return error.DnsFailure;
-    if (info.family == std.posix.AF.INET) {
-        const sin: *const std.c.sockaddr.in = @ptrCast(@alignCast(sa));
-        const bytes: [4]u8 = @bitCast(@byteSwap(sin.addr));
-        return .{ .ip4 = .{ .bytes = bytes, .port = std.mem.bigToNative(u16, sin.port) } };
+    var cur: ?*std.c.addrinfo = res;
+    while (cur) |info| : (cur = info.next) {
+        const sa = info.addr orelse continue;
+        if (info.family == std.posix.AF.INET) {
+            const sin: *const std.c.sockaddr.in = @ptrCast(@alignCast(sa));
+            const bytes: [4]u8 = @bitCast(sin.addr);
+            return .{ .ip4 = .{ .bytes = bytes, .port = std.mem.bigToNative(u16, sin.port) } };
+        }
     }
-    if (info.family == std.posix.AF.INET6) {
-        const sin6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sa));
-        return .{ .ip6 = .{ .bytes = sin6.addr, .port = std.mem.bigToNative(u16, sin6.port) } };
+    cur = res;
+    while (cur) |info| : (cur = info.next) {
+        const sa = info.addr orelse continue;
+        if (info.family == std.posix.AF.INET6) {
+            const sin6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sa));
+            return .{ .ip6 = .{ .bytes = sin6.addr, .port = std.mem.bigToNative(u16, sin6.port) } };
+        }
     }
     return error.UnsupportedFamily;
 }
