@@ -755,7 +755,19 @@ fn finishReqSpill(id: usize, l: *xev.Loop) void {
     if (native_echo) {
         buildResponse(id, 200, "{\"message\":\"ok\"}");
     } else {
-        callHandler(id, &pr, body); // copies body into a JS string
+        const hdrs = parseHeaders(buf[0..hdr_end]) catch |err| switch (err) {
+            error.HeadersTooLarge => {
+                resetReqSpill(id);
+                rejectWith(id, l, 431, "Request Header Fields Too Large");
+                return;
+            },
+            error.OutOfMemory => {
+                resetReqSpill(id);
+                rejectWith(id, l, 503, "Service Unavailable");
+                return;
+            },
+        };
+        callHandlerWithHeaders(id, &pr, body, hdrs); // copies body into a JS string
     }
     resetReqSpill(id);
 
@@ -777,6 +789,10 @@ fn finishReqSpill(id: usize, l: *xev.Loop) void {
 
 pub fn enableTls() void {
     if (tls_on) tls_active = tls_mod.ready();
+}
+
+pub fn disableTls() void {
+    tls_active = false;
 }
 
 fn armRead(id: usize, l: *xev.Loop) void {
@@ -1402,14 +1418,55 @@ pub fn h2StreamReady(id: usize, stream_id: i32) void {
     http2_mod.dispatchRequest(id, stream_id);
 }
 
-// callHandler — removes the dead tag==7 spin; detects promises via
-// the one-time class-id probe; parks pending promises; unwraps settled ones.
+pub const MAX_REQ_HEADER_BYTES: usize = 64 * 1024;
+
+fn parseHeaders(raw: []const u8) !*headers_mod.HeadersData {
+    const data = headers_mod.acquire() orelse return error.OutOfMemory;
+    errdefer data.release();
+
+    var total_bytes: usize = 0;
+
+    if (raw.len >= 10) {
+        // Skip request line (up to first CRLF)
+        const first_nl = std.mem.indexOfScalar(u8, raw, '\n') orelse raw.len;
+        var i: usize = if (first_nl < raw.len) first_nl + 1 else raw.len;
+        while (i < raw.len) {
+            const line_start = i;
+            while (i < raw.len and raw[i] != '\r' and raw[i] != '\n') i += 1;
+            const line = raw[line_start..i];
+            if (line.len == 0) break;
+            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+                const raw_name = line[0..colon];
+                const name = std.mem.trimEnd(u8, raw_name, " \t");
+                const val = trimOws(line[colon + 1 ..]);
+                if (name.len > 0) {
+                    total_bytes += name.len + val.len;
+                    if (total_bytes > MAX_REQ_HEADER_BYTES) {
+                        return error.HeadersTooLarge;
+                    }
+                    data.appendEntry(name, val);
+                }
+            }
+            while (i < raw.len and (raw[i] == '\r' or raw[i] == '\n')) i += 1;
+        }
+    }
+
+    return data;
+}
+
 pub fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
+    callHandlerWithHeaders(id, parsed, body, null);
+}
+
+// callHandlerWithHeaders — shared by H1 and H2.
+pub fn callHandlerWithHeaders(id: usize, parsed: *const ParsedRequest, body: []const u8, hdrs: ?*headers_mod.HeadersData) void {
     const ctx = handler_ctx orelse {
+        if (hdrs) |h| h.release();
         buildResponse(id, 500, "");
         return;
     };
     const handler = handler_fn orelse {
+        if (hdrs) |h| h.release();
         buildResponse(id, 500, "");
         return;
     };
@@ -1422,12 +1479,19 @@ pub fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) vo
         c.newStringLen(ctx, body.ptr, @intCast(body.len))
     else
         c.newStringLen(ctx, "", 0);
+    const hdrs_val = if (hdrs) |h|
+        headers_mod.createJSObject(ctx, h)
+    else blk: {
+        const empty_h = headers_mod.acquire() orelse break :blk c.JS_UNDEFINED;
+        break :blk headers_mod.createJSObject(ctx, empty_h);
+    };
     defer c.freeValue(ctx, url_val);
     defer c.freeValue(ctx, method_val);
     defer c.freeValue(ctx, body_val);
+    defer c.freeValue(ctx, hdrs_val);
 
-    var argv = [_]c.Value{ url_val, method_val, body_val };
-    var result = c.call(ctx, handler, global, 3, &argv);
+    var argv = [_]c.Value{ url_val, method_val, body_val, hdrs_val };
+    var result = c.call(ctx, handler, global, 4, &argv);
     defer c.freeValue(ctx, result);
 
     if (c.isException(result) != 0) {
@@ -2235,7 +2299,17 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         buildResponse(id, 200, "{\"message\":\"ok\"}");
     } else {
         const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
-        callHandler(id, &pr, body);
+        const hdrs = parseHeaders(read_bufs[id][0..headers_end]) catch |err| switch (err) {
+            error.HeadersTooLarge => {
+                rejectWith(id, l, 431, "Request Header Fields Too Large");
+                return;
+            },
+            error.OutOfMemory => {
+                rejectWith(id, l, 503, "Service Unavailable");
+                return;
+            },
+        };
+        callHandlerWithHeaders(id, &pr, body, hdrs);
     }
     if (cflags[id].h2_active) {
         http2_mod.flushNow(id, l);
@@ -2561,6 +2635,7 @@ fn checkDrainComplete() bool {
     }
     initialized = false;
     closing_server = false;
+    tls_active = false;
     server_running.store(false, .release);
 
     if (handler_fn) |v| {
@@ -2693,7 +2768,7 @@ pub fn closeServer() void {
     _ = checkDrainComplete();
 }
 
-pub fn init(loop: *xev.Loop, port: u16) !void {
+pub fn init(loop: *xev.Loop, port: u16, reuse_port: bool) !void {
     if (initialized) return;
     g_loop = loop;
     closing_server = false;
@@ -2710,6 +2785,11 @@ pub fn init(loop: *xev.Loop, port: u16) !void {
     read_armed_bits = [_]u64{0} ** 8;
     const addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", port) catch unreachable;
     listener_tcp = try xev.TCP.init(addr);
+    const one: c_int = 1;
+    _ = std.posix.setsockopt(listener_tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    if (reuse_port and @hasDecl(std.posix.SO, "REUSEPORT")) {
+        _ = std.posix.setsockopt(listener_tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
+    }
     try listener_tcp.bind(addr);
     try listener_tcp.listen(128);
     var sin: std.posix.sockaddr.in = undefined;
@@ -2747,6 +2827,7 @@ pub fn deinit() void {
     if (!initialized) return;
     initialized = false;
     closing_server = false;
+    tls_active = false;
     accept_armed = false;
     listener_closed = true;
     shutdown_deadline_ms = 0;
@@ -2980,6 +3061,25 @@ test "callHandler without a runtime answers 500" {
     try std.testing.expect(std.mem.indexOf(u8, write_bufs[id][0..write_lens[id]], "HTTP/1.1 500 Internal Server Error\r\n") != null);
     cflags[id] = .{};
     write_lens[id] = 0;
+}
+
+test "parseHeaders enforces MAX_REQ_HEADER_BYTES cap" {
+    const raw_small = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Foo: bar\r\n\r\n";
+    const hdrs = try parseHeaders(raw_small);
+    defer hdrs.release();
+    try std.testing.expectEqualStrings("example.com", hdrs.getFirst("host").?);
+    try std.testing.expectEqualStrings("bar", hdrs.getFirst("x-foo").?);
+
+    var big_hdr = std.ArrayList(u8).empty;
+    defer big_hdr.deinit(gpa);
+    try big_hdr.appendSlice(gpa, "GET / HTTP/1.1\r\n");
+    var i: usize = 0;
+    while (i < 1100) : (i += 1) {
+        try big_hdr.appendSlice(gpa, "X-Padding-Header: 12345678901234567890123456789012345678901234567890\r\n");
+    }
+    try big_hdr.appendSlice(gpa, "\r\n");
+    try std.testing.expect(big_hdr.items.len > MAX_REQ_HEADER_BYTES);
+    try std.testing.expectError(error.HeadersTooLarge, parseHeaders(big_hdr.items));
 }
 
 // ── Framing regression: every ambiguous message must be refused ──

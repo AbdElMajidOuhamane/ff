@@ -213,7 +213,6 @@ pub const RequestData = struct {
         // ResponseData (see response.zig), so createEmbeddedHeaders' retain
         // and deinit's release always pair on a real heap object.
         const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
-        h.* = headers_mod.HeadersData.init();
         return .{
             .pool = std.ArrayList(u8).empty,
             .headers = h,

@@ -85,7 +85,9 @@ pub const StreamFlags = packed struct(u8) {
     dispatched: bool = false, // handed to the JS handler (or parked-pending)
     bad: bool = false, // malformed :method/:path/:authority → 400
     too_large: bool = false, // body exceeded MAX_BODY_SIZE → 413
-    _pad: u3 = 0,
+    too_large_headers: bool = false, // header block > MAX_REQ_HEADER_BYTES → 431
+    internal_error: bool = false, // header shell OOM → 503
+    _pad: u1 = 0,
 };
 
 /// Cold payload: method/path bodies + response staging. Memory rules 2–3
@@ -95,6 +97,8 @@ pub const Stream = struct {
     method_len: usize = 0,
     path_buf: [MAX_PATH]u8 = undefined,
     path_len: usize = 0,
+    req_hdrs: ?*headers_mod.HeadersData = null,
+    req_hdrs_bytes: usize = 0,
     body: std.ArrayList(u8) = std.ArrayList(u8).empty,
     // Response staging (owned copies — see memory rule 2 above).
     resp_nv: std.ArrayList(h2.Nv) = std.ArrayList(h2.Nv).empty,
@@ -110,6 +114,11 @@ pub const Stream = struct {
     }
     /// Recycle dynamic storage from a previous occupant (retain capacity).
     fn resetPayload(self: *Stream) void {
+        if (self.req_hdrs) |h| {
+            h.release();
+            self.req_hdrs = null;
+        }
+        self.req_hdrs_bytes = 0;
         self.body.clearRetainingCapacity();
         self.resp_nv.clearRetainingCapacity();
         self.resp_blob.clearRetainingCapacity();
@@ -120,6 +129,10 @@ pub const Stream = struct {
     }
     /// True free (connection teardown only).
     fn destroy(self: *Stream) void {
+        if (self.req_hdrs) |h| {
+            h.release();
+            self.req_hdrs = null;
+        }
         self.body.deinit(gpa);
         self.resp_nv.deinit(gpa);
         self.resp_blob.deinit(gpa);
@@ -149,6 +162,12 @@ pub const Slot = struct {
     }
     pub fn tooLarge(s: Slot) bool {
         return s.f.too_large;
+    }
+    pub fn tooLargeHeaders(s: Slot) bool {
+        return s.f.too_large_headers;
+    }
+    pub fn internalError(s: Slot) bool {
+        return s.f.internal_error;
     }
     pub fn setDispatched(s: Slot) void {
         s.f.dispatched = true;
@@ -339,25 +358,9 @@ pub fn beginHeadersCb(
     return 0;
 }
 
-pub fn headerCb(
-    _: ?*h2.Session,
-    frame: *const h2.Frame,
-    name: [*]const u8,
-    namelen: usize,
-    value: [*]const u8,
-    valuelen: usize,
-    _: u8,
-    user_data: ?*anyopaque,
-) callconv(.c) c_int {
-    const slot = slotFromPtr(user_data) orelse return 0;
-    const sess = getSession(slot) orelse return 0;
-    // beginHeaders always runs first, but allocate defensively.
-    const st = sess.findStream(frame.hd.stream_id) orelse sess.allocStream(frame.hd.stream_id) orelse return 0;
-    if (st.dispatched()) return 0; // trailers on a dispatched stream: ignore (v1)
-    const n = name[0..namelen];
-    const v = value[0..valuelen];
-    // Only pseudo-headers matter: the H1 handler takes (url, method, body)
-    // and never sees headers, so regular headers are dropped for v1 parity.
+pub fn appendReqHeader(st: Slot, n: []const u8, v: []const u8) void {
+    if (st.f.too_large_headers or st.f.internal_error) return;
+
     if (std.mem.eql(u8, n, ":method")) {
         // RFC 7540 §8.1.2: token, no controls. Reject rather than truncate.
         if (v.len == 0 or v.len > MAX_METHOD) {
@@ -402,7 +405,51 @@ pub fn headerCb(
                 }
             }
         }
+    } else if (n.len > 0 and n[0] == ':') {
+        // Unhandled pseudo-header (:scheme, :status, ...). Never a regular header.
+        return;
+    } else {
+        // Regular header. Allocate the pooled shell on first use, then append.
+        if (st.p.req_hdrs_bytes + n.len + v.len > http_native.MAX_REQ_HEADER_BYTES) {
+            st.f.too_large_headers = true;
+            if (st.p.req_hdrs) |h| {
+                h.release();
+                st.p.req_hdrs = null;
+            }
+            st.p.req_hdrs_bytes = 0;
+            return;
+        }
+        const h = st.p.req_hdrs orelse blk: {
+            const nh = headers_mod.acquire() orelse {
+                st.f.internal_error = true;
+                return;
+            };
+            st.p.req_hdrs = nh;
+            break :blk nh;
+        };
+        st.p.req_hdrs_bytes += n.len + v.len;
+        h.appendEntry(n, v); // validates + lowercases the name
     }
+}
+
+pub fn headerCb(
+    _: ?*h2.Session,
+    frame: *const h2.Frame,
+    name: [*]const u8,
+    namelen: usize,
+    value: [*]const u8,
+    valuelen: usize,
+    _: u8,
+    user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    const slot = slotFromPtr(user_data) orelse return 0;
+    const sess = getSession(slot) orelse return 0;
+    // beginHeaders always runs first, but allocate defensively.
+    const st = sess.findStream(frame.hd.stream_id) orelse sess.allocStream(frame.hd.stream_id) orelse return 0;
+    if (st.dispatched()) return 0; // trailers on a dispatched stream: ignore (v1)
+    const n = name[0..namelen];
+    const v = value[0..valuelen];
+    appendReqHeader(st, n, v);
     return 0;
 }
 
@@ -678,6 +725,18 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
         respondErrorH2(slot_id, 413);
         return;
     }
+    if (st.tooLargeHeaders()) {
+        st.setDispatched();
+        active_stream[slot_id] = stream_id;
+        respondErrorH2(slot_id, 431);
+        return;
+    }
+    if (st.internalError()) {
+        st.setDispatched();
+        active_stream[slot_id] = stream_id;
+        respondErrorH2(slot_id, 503);
+        return;
+    }
     // Malformed pseudo-headers are rejected here, at dispatch, so they never
     // reach the JS handler and never influence routing.
     if (st.bad()) {
@@ -694,6 +753,9 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
     }
     st.setDispatched();
     active_stream[slot_id] = stream_id;
+    const req_hdrs = st.p.req_hdrs;
+    st.p.req_hdrs = null;
+    st.p.req_hdrs_bytes = 0;
     // content_length stays 0: H2 has already buffered the whole body, so no
     // caller derives an offset from this field. Keeping it 0 preserves the
     // content_length invariant that the H1 framing path relies on for its
@@ -709,7 +771,7 @@ pub fn dispatchRequest(slot_id: usize, stream_id: i32) void {
         .ws_bad = false,
         .too_large = false,
     };
-    http_native.callHandler(slot_id, &pr, st.p.body.items);
+    http_native.callHandlerWithHeaders(slot_id, &pr, st.p.body.items, req_hdrs);
 }
 
 /// Find the next completed-but-undispatched stream and dispatch it.
@@ -1084,4 +1146,52 @@ test "h2 session body budget is released with the stream" {
     try std.testing.expectEqual(@as(usize, 6), sess.body_bytes);
     sess.removeStream(1);
     try std.testing.expectEqual(@as(usize, 0), sess.body_bytes);
+}
+
+test "h2 appendReqHeader handles pseudo-headers, regular headers, and 64 KiB cap" {
+    var flags = StreamFlags{};
+    var id: i32 = 1;
+    var stream = Stream{};
+    defer stream.destroy();
+
+    const st = Slot{
+        .f = &flags,
+        .id = &id,
+        .p = &stream,
+    };
+
+    // 1. Handled pseudo-headers
+    appendReqHeader(st, ":method", "POST");
+    appendReqHeader(st, ":path", "/test/path");
+    appendReqHeader(st, ":authority", "example.com");
+    try std.testing.expectEqualStrings("POST", st.method());
+    try std.testing.expectEqualStrings("/test/path", st.path());
+    try std.testing.expect(!st.bad());
+
+    // 2. Unhandled pseudo-headers skipped (no bytes counted, no allocation)
+    appendReqHeader(st, ":scheme", "https");
+    appendReqHeader(st, ":status", "200");
+    try std.testing.expectEqual(@as(usize, 0), st.p.req_hdrs_bytes);
+    try std.testing.expect(st.p.req_hdrs == null);
+
+    // 3. Regular headers appended and lowercased
+    appendReqHeader(st, "X-Custom-Header", "custom-value");
+    try std.testing.expect(st.p.req_hdrs != null);
+    try std.testing.expectEqualStrings("custom-value", st.p.req_hdrs.?.getFirst("x-custom-header").?);
+    try std.testing.expect(st.p.req_hdrs_bytes > 0);
+
+    // 4. Exceeding MAX_REQ_HEADER_BYTES marks too_large_headers and releases partial headers
+    var val: [1000]u8 = undefined;
+    @memset(&val, 'v');
+    var i: usize = 0;
+    while (i < 70) : (i += 1) {
+        appendReqHeader(st, "x-bulk-header", &val);
+    }
+    try std.testing.expect(st.tooLargeHeaders());
+    try std.testing.expect(st.p.req_hdrs == null);
+    try std.testing.expectEqual(@as(usize, 0), st.p.req_hdrs_bytes);
+
+    // 5. Subsequent append while tooLargeHeaders is a no-op
+    appendReqHeader(st, "x-after-cap", "ignored");
+    try std.testing.expect(st.p.req_hdrs == null);
 }

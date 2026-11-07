@@ -6,7 +6,7 @@ order: 1
 
 # HTTP Server
 
-`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body)` — three strings — and returns a `Response`.
+`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body, headers)` and returns a `Response`.
 
 ## Permissions
 
@@ -46,7 +46,7 @@ Create `server.js`:
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   return new Response("Hello, World!");
 });
 ```
@@ -68,7 +68,7 @@ The handler can also be `async` (or return a `Promise`) — the connection parks
 
 ```js
 // server.js
-http.serve({ port: 3000 }, async (url, method, body) => {
+http.serve({ port: 3000 }, async (url, method, body, headers) => {
   return new Response("Hello, World!");
 });
 ```
@@ -88,6 +88,16 @@ http.serve(4242, handler);
 http.serve({}, handler);
 ```
 
+### Port reuse (`reusePort`)
+
+To allow multiple server processes to bind to the same port using kernel load balancing (`SO_REUSEPORT`), set `reusePort: true`:
+
+```js
+http.serve({ port: 3000, reusePort: true }, handler);
+```
+
+By default `reusePort` is `false` (safe standard `SO_REUSEADDR` is always enabled). Note that on Linux all processes sharing a port must set `reusePort: true`.
+
 ```sh
 ff server.js --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
@@ -101,17 +111,30 @@ curl http://127.0.0.1:4242/
 
 ## Inspecting the incoming request
 
-The handler receives three strings: `url` (path + query string), `method` (e.g. `"GET"`), and `body` (request text, empty string when none). Log them to see what's coming in:
+The handler receives `(url, method, body, headers)`:
+- `url`: request path + query string (string)
+- `method`: uppercase HTTP method (e.g. `"GET"`, string)
+- `body`: request text (string, empty when none)
+- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2)
+
+### Working with request headers
+
+The `headers` parameter provides standard `Headers` methods:
+- `headers.get(name)`: returns the header value (case-insensitive), or `null` if absent. Multi-value headers are comma-joined (`"a, b"`), except `Cookie` which joins with `"; "` per RFC 9113 §8.2.3, and `Set-Cookie` which returns the first value (use `getAll` to retrieve all).
+- `headers.has(name)`: returns `true` if present, `false` otherwise.
+- `headers.getAll(name)`: returns an array of all values for the header name.
+- Total request header size is capped at 4 KB for HTTP/1.1 (`READ_BUF_SIZE`) and 64 KiB for HTTP/2. Requests exceeding the limit receive `431 Request Header Fields Too Large`.
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   console.log("Method:", method);
   console.log("URL:", url);
 
   const parsed = new URL(url, "http://localhost");
   console.log("Path:", parsed.pathname);
   console.log("Query:", parsed.searchParams.get("name"));
+  console.log("User-Agent:", headers.get("user-agent"));
 
   console.log("Body:", body);
   return new Response("logged!");
@@ -269,6 +292,7 @@ needs the listener grant.
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
 | Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request headers (HTTP/2) | 64 KiB | Beyond → `431 Request Header Fields Too Large` |
 | Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` (HTTP/2 allows 10 MB/stream, 16 MB/session) |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
 | Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |

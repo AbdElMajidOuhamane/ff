@@ -183,7 +183,7 @@ permission flags.
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   if (url === "/json") return Response.json({ ok: true });
   if (url === "/echo" && method === "POST") return new Response(body);
   return new Response("not found", { status: 404 });
@@ -240,7 +240,7 @@ Every global, one line each — full signatures live in the [API overview](docs/
 |---|---|
 | `console` | Prints **every** argument, joined with spaces — to **stderr** |
 | `fetch` | 16 slots, HTTP/1.1, 16 MB response cap; needs `--allow-net` on target `host:port`; supports `AbortSignal` cancellation; strips credentials on cross-origin redirects; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
-| `http.serve` | `(url, method, body)` handler, all strings; needs `--allow-net=0.0.0.0:<port>`; returns `{ port, close }` with graceful drain; ephemeral `port: 0` supported; options accept `{ signal }`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
+| `http.serve` | `(url, method, body, headers)` handler; `headers` is a web-standard `Headers` instance; needs `--allow-net=0.0.0.0:<port>`; returns `{ port, close }` with graceful drain; ephemeral `port: 0` supported; options accept `{ signal, reusePort }`; return a `Response` or `{ status, body }`; WebSocket upgrades are automatic |
 | `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); status bounded to `100`–`999`; `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
 | `AbortController` / `AbortSignal` | Web-standard cancellation; `AbortSignal.timeout(ms)`, `throwIfAborted()`, abort events; integrates with `fetch` and timers |
 | `structuredClone` | Deep clones JS values via serialization; max 4 MB per clone |
@@ -471,10 +471,10 @@ Database:
 
 **HTTP**
 
-- HTTP/2 accepted by the server (TLS + ALPN; validates pseudo-headers, max 512-byte `:path`, 16-byte `:method`, 100 concurrent streams, and caps request bodies at 10 MB per stream / 16 MB per session); outbound clients are HTTP/1.1 only
+- HTTP/2 accepted by the server (TLS + ALPN; validates pseudo-headers, max 512-byte `:path`, 16-byte `:method`, 64 KiB request headers, 100 concurrent streams, and caps request bodies at 10 MB per stream / 16 MB per session); outbound clients are HTTP/1.1 only
 - Server TLS requires TLS 1.2 minimum (TLS 1.0 and 1.1 rejected; no TLS 1.3 in BearSSL)
 - Max **512** concurrent HTTP connections
-- Request headers (HTTP/1.1): capped at **4 KB** (`431 Request Header Fields Too Large`)
+- Request headers: capped at **4 KB** for HTTP/1.1, **64 KiB** for HTTP/2 (`431 Request Header Fields Too Large`)
 - Request bodies (HTTP/1.1): **1 MB** hard cap (requests up to 4 KB total stay in the static buffer; larger bodies spill to the heap up to 1 MB with 64 KB retained per idle slot and a 64 MB global in-flight cap; beyond 1 MB → `413`, global budget exhausted → `503`)
 - Response bodies: buffered, hard cap **10 MB** (64 KB static stage buffer,
   larger bodies spill to the heap; beyond 10 MB → `500`)

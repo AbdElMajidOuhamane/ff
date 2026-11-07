@@ -148,7 +148,6 @@ pub const ResponseData = struct {
     pub fn init() ResponseData {
         // C1 FIX: pooled headers shell (headers.zig freelist).
         const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
-        h.* = headers_mod.HeadersData.init();
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
             .status = 200,

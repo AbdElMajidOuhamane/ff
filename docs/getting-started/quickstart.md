@@ -74,7 +74,7 @@ Create `server.js`:
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   const path = url.split("?")[0];
   if (path === "/") return { status: 200, body: "hello from fairyfly" };
   return { status: 404, body: "not found" };

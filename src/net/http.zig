@@ -71,7 +71,10 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     // Cheap probe first so the no-tls path stays allocation-free.
     const probe = c.getPropertyStr(ctx, opts_val, "tls");
     defer c.freeValue(ctx, probe);
-    if (c.isObject(probe) == 0) return true; // no tls requested — plain http
+    if (c.isObject(probe) == 0) {
+        http_native.disableTls();
+        return true; // no tls requested — plain http
+    }
     if (!tls_server.available) {
         throwTypeError(ctx, "built without TLS (rebuild without -Dbearssl=false)");
         return false;
@@ -148,12 +151,19 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
 
     const opts_val = argv[0];
     var port: u16 = 3000;
+    var reuse_port: bool = false;
 
     if (c.isObject(opts_val) != 0) {
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
         port = extractIntFromVal(ctx, port_val, 3000);
         c.freeValue(ctx, port_val);
         if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+
+        const rp_val = c.getPropertyStr(ctx, opts_val, "reusePort");
+        defer c.freeValue(ctx, rp_val);
+        if (c.isBool(rp_val) != 0) {
+            reuse_port = c.toBool(ctx, rp_val) != 0;
+        }
 
         const ws_obj_val = c.getPropertyStr(ctx, opts_val, "websocket");
         defer c.freeValue(ctx, ws_obj_val);
@@ -201,7 +211,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return c.JS_EXCEPTION;
     };
 
-    http_native.init(&loop_ptr.loop, port) catch |err| {
+    http_native.init(&loop_ptr.loop, port, reuse_port) catch |err| {
         cli.errorMsg("cannot start server on port {d}: {s}", .{ port, @errorName(err) });
         throwTypeError(ctx, "failed to start server (is the port in use?)");
         return c.JS_EXCEPTION;

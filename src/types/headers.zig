@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
 const simd = std.simd;
@@ -201,24 +202,50 @@ const HDR_POOL_MAX: usize = 32;
 var hdr_pool: [HDR_POOL_MAX]*HeadersData = undefined;
 var hdr_pool_n: usize = 0;
 
-/// Pooled HeadersData shell, freshly init()'d (refcount = 1).
+pub var stat_pool_hit: std.atomic.Value(usize) = .{ .raw = 0 };
+pub var stat_pool_miss: std.atomic.Value(usize) = .{ .raw = 0 };
+
+const HDR_RETAIN_ENTRIES: usize = 64;
+const HDR_RETAIN_BYTES: usize = 4096;
+const HDR_RETAIN_SLICES: usize = 64;
+
+/// Pooled HeadersData shell, freshly cleared (refcount = 1).
 /// Null only on OOM — callers use `orelse` like the old gpa.create path.
 pub fn acquire() ?*HeadersData {
     if (hdr_pool_n > 0) {
         hdr_pool_n -= 1;
+        if (builtin.is_test or builtin.mode == .Debug) {
+            _ = stat_pool_hit.fetchAdd(1, .monotonic);
+        }
         const h = hdr_pool[hdr_pool_n];
-        h.* = HeadersData.init();
+        h.refcount.store(1, .release);
         return h;
     }
-    return gpa.create(HeadersData) catch null;
+    if (builtin.is_test or builtin.mode == .Debug) {
+        _ = stat_pool_miss.fetchAdd(1, .monotonic);
+    }
+    const h = gpa.create(HeadersData) catch return null;
+    h.* = HeadersData.init();
+    return h;
 }
 
 fn releaseToPool(h: *HeadersData) void {
-    h.deinit();
     if (hdr_pool_n < HDR_POOL_MAX) {
+        if (h.entries.capacity > HDR_RETAIN_ENTRIES or
+            h.names.capacity > HDR_RETAIN_BYTES or
+            h.values.capacity > HDR_RETAIN_BYTES or
+            h.merge_buf.capacity > HDR_RETAIN_BYTES or
+            h.view_buf.capacity > HDR_RETAIN_SLICES)
+        {
+            h.deinit();
+            h.* = HeadersData.init();
+        } else {
+            h.clear();
+        }
         hdr_pool[hdr_pool_n] = h;
         hdr_pool_n += 1;
     } else {
+        h.deinit();
         gpa.destroy(h);
     }
 }
@@ -412,15 +439,23 @@ pub const HeadersData = struct {
         }
         if (count == 0) return null;
         if (count == 1) return self.valueOf(self.entries.items[first.?]);
+
+        // Set-Cookie is the conventional exception: return the first value; use
+        // getAll() to retrieve every Set-Cookie header.
+        if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
+            return self.valueOf(self.entries.items[first.?]);
+        }
         self.merge_buf.clearRetainingCapacity();
         self.merge_buf.ensureTotalCapacity(gpa, joined_len - 2) catch {};
+        const is_cookie = std.ascii.eqlIgnoreCase(name, "cookie");
+        const sep: []const u8 = if (is_cookie) "; " else ", ";
         var skipped = false;
         for (self.entries.items) |e| {
             if (!nameMatches(self.nameOf(e), name, q)) continue;
             if (!skipped) {
                 skipped = true;
             } else {
-                self.merge_buf.appendSlice(gpa, ", ") catch break;
+                self.merge_buf.appendSlice(gpa, sep) catch break;
             }
             self.merge_buf.appendSlice(gpa, self.valueOf(e)) catch break;
         }
@@ -658,7 +693,6 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     _ = this_val;
     // C1 FIX: pooled shell instead of gpa.create per `new Headers()`.
     const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = HeadersData.init();
 
     if (argc > 0) {
         const init_val = argv[0];
@@ -762,6 +796,106 @@ pub fn setup(ctx: ?*c.Context) void {
 }
 pub fn createJSObject(ctx: ?*c.Context, data: *HeadersData) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(headers_class_id));
+    if (c.isException(obj) != 0) {
+        data.release();
+        return c.JS_UNDEFINED;
+    }
     c.setOpaque(obj, data);
     return obj;
+}
+
+test "HeadersData pool reuses capacity and tracks hit/miss" {
+    const hits_before = stat_pool_hit.load(.monotonic);
+    const misses_before = stat_pool_miss.load(.monotonic);
+
+    const h1 = acquire() orelse return error.OutOfMemory;
+    try std.testing.expect(stat_pool_miss.load(.monotonic) > misses_before or stat_pool_hit.load(.monotonic) > hits_before);
+
+    // Append some headers to ensure capacity is allocated
+    h1.appendEntry("x-test-1", "value1");
+    h1.appendEntry("x-test-2", "value2");
+    try std.testing.expect(h1.entries.capacity >= 2);
+    const cap_entries = h1.entries.capacity;
+    const cap_names = h1.names.capacity;
+
+    // Release back to pool
+    h1.release();
+
+    // Re-acquire: must hit pool, retain capacity, and have 0 entries
+    const hits_mid = stat_pool_hit.load(.monotonic);
+    const h2 = acquire() orelse return error.OutOfMemory;
+    defer h2.release();
+
+    try std.testing.expectEqual(hits_mid + 1, stat_pool_hit.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), h2.len());
+    try std.testing.expectEqual(cap_entries, h2.entries.capacity);
+    try std.testing.expectEqual(cap_names, h2.names.capacity);
+}
+
+test "cookie and set-cookie behaviors per RFC 9113" {
+    var h = HeadersData.init();
+    defer h.deinit();
+
+    h.appendEntry("cookie", "a=1");
+    h.appendEntry("cookie", "b=2");
+    h.appendEntry("x-multi", "val1");
+    h.appendEntry("x-multi", "val2");
+    h.appendEntry("set-cookie", "a=1");
+    h.appendEntry("set-cookie", "b=2");
+
+    try std.testing.expectEqualStrings("a=1; b=2", h.getFirst("cookie").?);
+    try std.testing.expectEqualStrings("val1, val2", h.getFirst("x-multi").?);
+    try std.testing.expectEqualStrings("a=1", h.getFirst("set-cookie").?);
+    try std.testing.expectEqual(@as(usize, 2), h.getAllValues("set-cookie").len);
+}
+
+test "pathological oversized headers shrink instead of permanently pinning memory" {
+    // 1. Exceed HDR_RETAIN_ENTRIES (64)
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < 70) : (i += 1) {
+            h.appendEntry("x-header", "value");
+        }
+        try std.testing.expect(h.entries.capacity > HDR_RETAIN_ENTRIES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.entries.capacity);
+    }
+
+    // 2. Exceed HDR_RETAIN_SLICES in view_buf via getAllValues
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < 70) : (i += 1) {
+            h.appendEntry("x-multi", "val");
+        }
+        _ = h.getAllValues("x-multi");
+        try std.testing.expect(h.view_buf.capacity > HDR_RETAIN_SLICES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.view_buf.capacity);
+    }
+
+    // 3. Exceed HDR_RETAIN_BYTES in merge_buf via getFirst
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var long_val: [1000]u8 = undefined;
+        @memset(&long_val, 'a');
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            h.appendEntry("x-join", &long_val);
+        }
+        _ = h.getFirst("x-join");
+        try std.testing.expect(h.merge_buf.capacity > HDR_RETAIN_BYTES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.merge_buf.capacity);
+    }
 }
