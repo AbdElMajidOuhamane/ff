@@ -1,14 +1,14 @@
 ---
 title: crypto
-description: randomUUID, getRandomValues, subtle (digest, HMAC importKey/sign/verify/exportKey) — and btoa/atob, with their deviations.
+description: randomUUID, getRandomValues, subtle (digest, HMAC importKey/sign/verify/exportKey), bcrypt (hash, verify) — and btoa/atob, with their deviations.
 order: 11
 ---
 
 # `crypto`
 
-Random values, digests, HMAC signing/verification, and base64. Everything is
-synchronous except `crypto.subtle` methods, which return Promises (resolved
-immediately).
+Random values, digests, HMAC signing/verification, native off-loop bcrypt, and base64.
+Everything is synchronous except `crypto.subtle` methods (which resolve on the
+microtask queue) and `crypto.bcrypt` (which runs off the event loop on a dedicated thread pool).
 
 ```js
 const id = crypto.randomUUID();           // "3f8a1c2e-…"
@@ -16,6 +16,8 @@ const key = new Uint8Array(32);
 crypto.getRandomValues(key);              // filled in place
 
 const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"));
+const pwHash = await crypto.bcrypt.hash("supersecret", { cost: 12 });
+const valid = await crypto.bcrypt.verify("supersecret", pwHash);
 ```
 
 ## `crypto.randomUUID()`
@@ -122,6 +124,49 @@ console.log(ok); // true
 > `decrypt`), and key generation (`generateKey`) are not built in. Use
 > [`ffi`](/docs/api/ffi) with a native library when you need those primitives.
 
+## `crypto.bcrypt` (`hash`, `verify`)
+
+Native promise-based bcrypt password hashing running on a dedicated background
+worker pool off the event loop. Hashing or verifying passwords will never starve
+or stutter HTTP traffic, WebSocket connections, or timer callbacks.
+
+| Method | Signature | Description |
+|---|---|---|
+| `crypto.bcrypt.hash(password, options?)` | `(string, { cost?: number }?) → Promise<string>` | Hashes password into standard modular crypt `$2b$` format. `cost` defaults to `12` (range `4`–`14`). |
+| `crypto.bcrypt.verify(password, hash)` | `(string, string) → Promise<boolean>` | Verifies password against a `$2b$`, `$2a$`, or `$2y$` modular crypt hash using Zig's std bcrypt verifier (the KDF dominates timing). |
+
+```js
+// Hash a password with default cost 12
+const hash = await crypto.bcrypt.hash("correct-horse-battery-staple");
+// "$2b$12$..."
+
+// Custom cost (4 to 14)
+const fastHash = await crypto.bcrypt.hash("temp-pin", { cost: 10 });
+
+// Verify password
+const isValid = await crypto.bcrypt.verify("correct-horse-battery-staple", hash);
+console.log(isValid); // true
+
+const isInvalid = await crypto.bcrypt.verify("wrong-password", hash);
+console.log(isInvalid); // false
+```
+
+### Safety & Constraints
+
+- **Passwords ≤ 72 bytes:** Per bcrypt design, passwords exceeding 72 bytes are
+  rejected (`Error: bcrypt: password exceeds 72 bytes`).
+- **Bounded worker queue:** Backed by a dedicated thread pool (2–4 threads with
+  256 KiB stacks) and a fixed 16-slot ring queue. If all 16 slots are busy, calls
+  reject immediately with `Error: crypto.bcrypt: queue full` rather than growing
+  unbounded memory.
+- **Off-event-loop execution:** Key derivation and crypt rounds execute strictly on
+  worker threads. CSPRNG salt generation occurs synchronously on dispatch; no
+  allocations occur on the hot path after initialization.
+- **Main-thread only:** Calling `crypto.bcrypt` inside a `Worker` thread throws
+  `TypeError: crypto.bcrypt is not available in workers`.
+- **No sync methods:** `hashSync` and `verifySync` are intentionally not provided
+  to prevent developers from blocking the event loop.
+
 ## `btoa` / `atob` (globals)
 
 ```js
@@ -159,7 +204,7 @@ atob("!!!");
 | `crypto.createHash` / `createHmac` | `crypto.subtle.digest` / `crypto.subtle.sign` (HMAC) |
 | `crypto.timingSafeEqual` | `crypto.subtle.verify` (uses constant-time comparison) |
 | `crypto.randomBytes` (Node) | `crypto.getRandomValues(new Uint8Array(n))` |
-| PBKDF2 / scrypt / HKDF | not available in-runtime |
+| PBKDF2 / scrypt / HKDF | not available in-runtime (for password hashing, use `crypto.bcrypt`) |
 
 ## Gotchas
 

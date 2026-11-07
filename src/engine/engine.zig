@@ -31,6 +31,7 @@ const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 const udp_api = @import("../api/udp.zig");
 const child_process_api = @import("../api/child_process.zig");
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -264,6 +265,7 @@ pub const Runtime = struct {
         child_process_api.setLoop(&loop_ptr.loop);
         process_api.setLoop(&loop_ptr.loop);
         worker_mod.setLoop(&loop_ptr.loop);
+        bcrypt_pool.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{
@@ -489,6 +491,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        bcrypt_pool.deinit();
         fetch_api.deinitClient();
         process_api.deinit(self.ctx);
         self.timer_manager.cancelAll();

@@ -1,5 +1,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
+const thread_marker = @import("../worker/thread_marker.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -650,6 +652,155 @@ fn atobCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     return c.newStringLen(ctx, out.ptr, out_len);
 }
 
+fn rejectPromiseWithError(ctx: ?*c.Context, reject_fn: c.Value, msg: []const u8) void {
+    const err = c.newError(ctx);
+    if (c.isException(err) != 0) return;
+    const msg_val = c.newStringLen(ctx, msg.ptr, msg.len);
+    _ = c.setPropertyStr(ctx, err, "message", msg_val);
+    var args = [_]c.Value{err};
+    const ret = c.call(ctx, reject_fn, c.JS_UNDEFINED, 1, &args);
+    c.freeValue(ctx, ret);
+    c.freeValue(ctx, err);
+}
+
+fn bcryptHashCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (thread_marker.isWorkerThread()) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt is not available in workers");
+        return c.JS_EXCEPTION;
+    }
+    if (argc < 1 or c.isString(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt.hash requires a password string");
+        return c.JS_EXCEPTION;
+    }
+
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return promise;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+
+    var pw_buf: [128]u8 = undefined;
+    const pw_ex = extractStringAuto(ctx, argv[0], &pw_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer pw_ex.deinit();
+
+    if (pw_ex.slice.len > bcrypt_pool.MAX_PASSWORD) {
+        rejectPromiseWithError(ctx, cap[1], "bcrypt: password exceeds 72 bytes");
+        return promise;
+    }
+
+    var cost: u6 = bcrypt_pool.DEFAULT_COST;
+    if (argc >= 2) {
+        if (c.isObject(argv[1]) != 0) {
+            const cost_val = c.getPropertyStr(ctx, argv[1], "cost");
+            defer c.freeValue(ctx, cost_val);
+            if (c.isUndefined(cost_val) == 0) {
+                if (c.isNumber(cost_val) == 0) {
+                    rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                    return promise;
+                }
+                var parsed_cost: i32 = 0;
+                if (c.toInt32(ctx, &parsed_cost, cost_val) != 0 or parsed_cost < bcrypt_pool.MIN_COST or parsed_cost > bcrypt_pool.MAX_COST) {
+                    rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                    return promise;
+                }
+                cost = @intCast(parsed_cost);
+            }
+        } else if (c.isNumber(argv[1]) != 0) {
+            var parsed_cost: i32 = 0;
+            if (c.toInt32(ctx, &parsed_cost, argv[1]) != 0 or parsed_cost < bcrypt_pool.MIN_COST or parsed_cost > bcrypt_pool.MAX_COST) {
+                rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                return promise;
+            }
+            cost = @intCast(parsed_cost);
+        } else {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: options must be an object");
+            return promise;
+        }
+    }
+
+    bcrypt_pool.submitHash(ctx.?, pw_ex.slice, cost, cap[0], cap[1]) catch |err| switch (err) {
+        error.QueueFull => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: queue full");
+        },
+        error.PasswordTooLong => {
+            rejectPromiseWithError(ctx, cap[1], "bcrypt: password exceeds 72 bytes");
+        },
+        error.OutOfMemory => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        },
+        error.EntropyUnavailable => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: entropy unavailable");
+        },
+        else => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: submission failed");
+        },
+    };
+
+    return promise;
+}
+
+fn bcryptVerifyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (thread_marker.isWorkerThread()) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt is not available in workers");
+        return c.JS_EXCEPTION;
+    }
+    if (argc < 2 or c.isString(argv[0]) == 0 or c.isString(argv[1]) == 0) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt.verify requires (password, hash)");
+        return c.JS_EXCEPTION;
+    }
+
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return promise;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+
+    var pw_buf: [128]u8 = undefined;
+    const pw_ex = extractStringAuto(ctx, argv[0], &pw_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer pw_ex.deinit();
+
+    var h_buf: [128]u8 = undefined;
+    const h_ex = extractStringAuto(ctx, argv[1], &h_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer h_ex.deinit();
+
+    if (h_ex.slice.len > bcrypt_pool.MAX_HASH_STR) {
+        var args = [_]c.Value{c.JS_FALSE};
+        const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+        c.freeValue(ctx, ret);
+        return promise;
+    }
+
+    bcrypt_pool.submitVerify(ctx.?, pw_ex.slice, h_ex.slice, cap[0], cap[1]) catch |err| switch (err) {
+        error.QueueFull => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: queue full");
+        },
+        error.HashTooLong => {
+            var args = [_]c.Value{c.JS_FALSE};
+            const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+            c.freeValue(ctx, ret);
+        },
+        error.OutOfMemory => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        },
+        else => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: submission failed");
+        },
+    };
+
+    return promise;
+}
+
 pub fn setup(ctx: *c.Context) void {
     const rt = c.getRuntime(ctx);
     var key_def = c.ClassDef{
@@ -681,6 +832,13 @@ pub fn setup(ctx: *c.Context) void {
     const exportKey_fn = c.newCFunction(ctx, subtleExportKeyCallback, "exportKey", 2);
     _ = c.definePropertyValueStr(ctx, subtle_obj, "exportKey", exportKey_fn, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, crypto_obj, "subtle", subtle_obj, c.PROP_C_W_E);
+
+    const bcrypt_obj = c.newObject(ctx);
+    const bcrypt_hash_fn = c.newCFunction(ctx, bcryptHashCallback, "hash", 2);
+    _ = c.definePropertyValueStr(ctx, bcrypt_obj, "hash", bcrypt_hash_fn, c.PROP_C_W_E);
+    const bcrypt_verify_fn = c.newCFunction(ctx, bcryptVerifyCallback, "verify", 2);
+    _ = c.definePropertyValueStr(ctx, bcrypt_obj, "verify", bcrypt_verify_fn, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, crypto_obj, "bcrypt", bcrypt_obj, c.PROP_C_W_E);
 
     const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1);
     _ = c.definePropertyValueStr(ctx, global, "btoa", btoa_fn, c.PROP_C_W_E);

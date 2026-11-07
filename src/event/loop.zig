@@ -11,6 +11,7 @@ const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 // C2: async FS completions drain here (Promise settlements on the JS thread).
 const fs_mod = @import("../api/fs.zig");
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
 const child_process = @import("../api/child_process.zig");
 const process_api = @import("../api/process.zig");
 
@@ -99,6 +100,7 @@ pub const EventLoop = struct {
         // C2: in-flight async FS jobs keep the process alive (else
         // `await fs.readFileAsync()` would exit before settling).
         if (fs_mod.pending.load(.acquire) > 0) return true;
+        if (bcrypt_pool.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         if (child_process.liveCount() > 0) return true;
         // Queue entries only count as blocking when nothing is unref'd:
@@ -176,6 +178,10 @@ pub const EventLoop = struct {
                 fs_mod.ensureArmed();
             }
             fs_mod.drainCompleted(ctx);
+            if (bcrypt_pool.pending.load(.acquire) > 0) {
+                bcrypt_pool.arm(&self.loop);
+            }
+            bcrypt_pool.drainCompleted(ctx);
             if (worker_mod.liveCount() > 0) {
                 worker_mod.arm(&self.loop);
             }

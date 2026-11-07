@@ -60,3 +60,7 @@ test {
 test {
     _ = @import("modules/resolver.zig");
 }
+
+test {
+    _ = @import("crypto/bcrypt_pool.zig");
+}

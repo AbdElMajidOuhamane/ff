@@ -249,7 +249,7 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `fs` | Sync calls return `undefined` on I/O failure; writes > 10 MB throw/reject instead of truncating; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
 | `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; worker scope includes `console`, timers, `performance`, `structuredClone`, `workerData`, and `self`; inherits parent permissions |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; needs `--allow-run`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512), `subtle` HMAC (`importKey`, `sign`, `verify`, `exportKey`); `btoa`/`atob` round-trip Unicode via UTF-8 |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512), `subtle` HMAC (`importKey`, `sign`, `verify`, `exportKey`), `bcrypt` (`hash`, `verify` off-event-loop); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
 | `Blob` / `FormData` | `blob()` / `formData()` readers work; `form.size()` is a method |
 | `process` | `argv` mirrors the OS argv; `env` is a boot snapshot filtered by `--allow-env`; `on`/`once`/`off` for POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`); `kill(pid, sig?)` (external PIDs need `--allow-run=kill`); `chdir` is read-gated; `memoryUsage()` and `stats()` are ungated; exit codes clamp to 0–255 |

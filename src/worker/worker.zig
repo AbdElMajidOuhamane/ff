@@ -6,6 +6,8 @@ const microtasks = @import("../event/microtasks.zig");
 const timers_mod = @import("../event/timers.zig");
 const port_mod = @import("message_port.zig");
 const serialize = @import("serialize.zig");
+const crypto_api = @import("../api/crypto.zig");
+const thread_marker = @import("thread_marker.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -36,6 +38,8 @@ var slots: [MAX_WORKERS]Slot = [_]Slot{.{}} ** MAX_WORKERS;
 threadlocal var tls_port: ?port_mod.MessagePort = null;
 threadlocal var tls_tm: ?*timers_mod.TimerManager = null;
 threadlocal var tls_perf_origin: i96 = 0;
+
+pub const isWorkerThread = thread_marker.isWorkerThread;
 
 const WorkerData = struct {
     slot: u16,
@@ -393,6 +397,8 @@ fn workerMain(data: *WorkerData) void {
         if (data.initial_payload) |b| gpa.free(b);
     }
     defer data.channel.closeAll();
+    thread_marker.setWorkerThread(true);
+    defer thread_marker.setWorkerThread(false);
     tls_port = data.channel;
     defer tls_port = null;
 
@@ -498,6 +504,7 @@ fn setupWorkerGlobals(ctx: *qjs.Context, initial_payload: ?[]u8) void {
     _ = qjs.definePropertyValueStr(ctx, perf, "now", now_fn, qjs.PROP_C_W_E);
     _ = qjs.definePropertyValueStr(ctx, global, "performance", perf, qjs.PROP_C_W_E);
     serialize.setup(ctx);
+    crypto_api.setup(ctx);
 }
 
 fn jsWorkerPostMessage(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c]qjs.Value) callconv(.c) qjs.Value {
