@@ -14,18 +14,26 @@
 //! Phase 3 tx: BEGIN pins conn (in_tx bit); tx queries route straight to it;
 //!   COMMIT/ROLLBACK unpin + release; detachTx on every death path; destroyTx
 //!   for GC'd Tx (in-flight jobs root the Tx object, so only idle conns seen).
+//! §TLS: sslmode=verify-full only. One BearSSL client state per connection,
+//!   allocated at setup (≤ max conns), never per query. wqueue/rbuf keep
+//!   carrying PLAINTEXT and the pump moves bytes only at the socket edge, so
+//!   every protocol function below stays TLS-agnostic. `woff` indexes plaintext
+//!   fed to the engine; writeCb acks CIPHERTEXT — the two counters never mix.
 //! §Hot/cold: Job.err.* cold (only ErrorResponse); query fields hot.
-//! §Layout: ConnFlags packed u8 (incl. in_tx); state/auth/op enum(u8); FieldDesc dense [];
+//! §Layout: ConnFlags packed u8 (incl. in_tx, tls_pumping); state/auth/op/tls
+//!   enum(u8); FieldDesc dense [];
 //!   FieldDesc carries a RowDesc-time JS atom (no per-cell re-atomize); // ◀ FIX-1
 //!   AoS Conn/Job justified: N ≤ max(10), whole-object access per op — no MultiArrayList/SoA.
 //! §SIMD: N/A (text wire protocol, no numeric hot loop).
-//! Cold (exempt): SCRAM/DNS/Config/pool create; QuickJS heap for promises/rows/errors.
+//! Cold (exempt): SCRAM/DNS/Config/pool create/TLS anchors; QuickJS heap for
+//!   promises/rows/errors.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const counting = @import("../util/counting_allocator.zig");
+const tls_client = @import("tls_client.zig");
 
 var pg_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -41,6 +49,23 @@ const ARENA_RETAIN_LIMIT: usize = 32 * 1024;
 const WQUEUE_CAP_MAX: usize = 64 * 1024;
 /// Per-connection read buffer cap (no growth past this; full → failConn).
 const RBUF_CAP_MAX: usize = 64 * 1024;
+
+/// PostgreSQL SSLRequest: Int32 length 8 + Int32 code 80877103.
+const SSL_REQUEST_CODE: u32 = 80877103;
+const SSL_REQUEST_LEN: u32 = 8;
+
+/// BR_SSL_CLOSED (bearssl_ssl.h): the one exclusive engine-state bit — set on
+/// handshake failure or peer close_notify. Spelled locally so this file still
+/// compiles with -Dbearssl=false (where TLS is unreachable anyway).
+const TLS_CLOSED: c_uint = if (tls_client.available) 0x0001 else 0;
+
+/// BearSSL error codes (bearssl_ssl.h / bearssl_x509.h) we translate into
+/// something actionable. Numeric because this file must compile with
+/// -Dbearssl=false, where the bssl namespace is empty.
+const BR_ERR_UNSUPPORTED_VERSION: c_int = 3;
+const BR_ERR_X509_EXPIRED: c_int = 54;
+const BR_ERR_X509_BAD_SERVER_NAME: c_int = 56;
+const BR_ERR_X509_NOT_TRUSTED: c_int = 62;
 
 pub var pending: std.atomic.Value(u32) = .{ .raw = 0 };
 pub var stat_submit: std.atomic.Value(u32) = .{ .raw = 0 };
@@ -86,6 +111,15 @@ pub fn dumpStats() void {
     );
 }
 
+/// TLS policy. libpq's `require` / `prefer` / `verify-ca` are deliberately not
+/// representable: BearSSL's client must validate the chain to obtain the key
+/// that authenticates the handshake, so "encrypt without verifying" cannot be
+/// built from it. Callers get `verify-full` or nothing (sql.zig refuses the rest).
+pub const SslMode = enum(u8) {
+    disable,
+    verify_full,
+};
+
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -93,6 +127,10 @@ pub const Config = struct {
     password: []const u8 = "",
     database: []const u8 = "postgres",
     max: usize = 10,
+    sslmode: SslMode = .disable,
+    /// PEM trust bundle; required (and only read) for .verify_full. Parsed once
+    /// per process into tls_client's sealed anchor store before any socket opens.
+    sslrootcert: []const u8 = "",
 };
 
 pub const FieldDesc = struct {
@@ -266,6 +304,18 @@ const AuthPhase = enum(u8) {
     done,
 };
 
+/// Where the connection sits in the TLS upgrade. `none` also covers a plain
+/// sslmode=disable connection: no engine is ever created for it.
+const TlsPhase = enum(u8) {
+    none,
+    /// SSLRequest written; waiting for the single 'S' / 'N' reply byte.
+    await_ssl_reply,
+    /// BearSSL handshake running; plaintext must not be fed yet.
+    handshake,
+    /// Handshake complete: wqueue/rbuf are plaintext for the engine.
+    ready,
+};
+
 /// Hot I/O flags packed — matches http_native ConnFlags pattern.
 const ConnFlags = packed struct(u8) {
     read_armed: bool = false,
@@ -273,13 +323,17 @@ const ConnFlags = packed struct(u8) {
     close_after_write: bool = false,
     fd_open: bool = true,
     in_tx: bool = false,
-    _pad: u3 = 0,
+    /// Re-entrancy latch: processBuffer → armRead → tlsPump must not nest.
+    tls_pumping: bool = false,
+    _pad: u2 = 0,
 };
 
 comptime {
     std.debug.assert(@sizeOf(ConnFlags) == 1);
     std.debug.assert(@sizeOf(ConnState) == 1);
     std.debug.assert(@sizeOf(AuthPhase) == 1);
+    std.debug.assert(@sizeOf(TlsPhase) == 1);
+    std.debug.assert(@sizeOf(SslMode) == 1);
 }
 
 const Scram = struct {
@@ -306,6 +360,11 @@ const Conn = struct {
     tcp: xev.TCP,
     state: ConnState = .connecting,
     auth_phase: AuthPhase = .none,
+    tls_phase: TlsPhase = .none,
+    /// Heap for one engine: ~34 KB, one per connection, setup-time only.
+    tls: ?*tls_client.TlsState = null,
+    /// Single-byte SSLRequest answer, read before the engine exists.
+    ssl_reply: [1]u8 = undefined,
     scram: ?*Scram = null,
     md5_salt: [4]u8 = undefined,
     job: ?*Job = null,
@@ -324,6 +383,10 @@ const Conn = struct {
 
     fn deinit(self: *Conn) void {
         detachTx(self);
+        if (self.tls) |st| {
+            gpa.destroy(st);
+            self.tls = null;
+        }
         if (self.scram) |s| {
             s.deinit();
             gpa.destroy(s);
@@ -348,7 +411,17 @@ pub const Pool = struct {
     closed: bool = false,
 
     pub fn create(config: Config) !*Pool {
+        // Fail closed: verify-full without a sealed anchor store would silently
+        // become a plaintext connection, which is the exact downgrade TLS is
+        // supposed to prevent.
+        if (config.sslmode == .verify_full) {
+            if (!tls_client.ready()) return error.TlsNotConfigured;
+            // DNS SANs only: an IP literal would fail every handshake with
+            // "not trusted", so say what is actually wrong.
+            if (std.Io.net.IpAddress.parse(config.host, 0)) |_| return error.TlsNeedsHostname else |_| {}
+        }
         const owned = try dupeConfig(config);
+        errdefer freeConfig(owned);
         const p = try gpa.create(Pool);
         p.* = .{ .config = owned };
         if (builtin.mode == .Debug) {
@@ -520,9 +593,14 @@ pub const Pool = struct {
 fn dupeConfig(cfg: Config) !Config {
     var out = cfg;
     out.host = try gpa.dupe(u8, cfg.host);
+    errdefer gpa.free(out.host);
     out.user = try gpa.dupe(u8, cfg.user);
+    errdefer gpa.free(out.user);
     out.password = try gpa.dupe(u8, cfg.password);
+    errdefer gpa.free(out.password);
     out.database = try gpa.dupe(u8, cfg.database);
+    errdefer gpa.free(out.database);
+    out.sslrootcert = try gpa.dupe(u8, cfg.sslrootcert);
     return out;
 }
 
@@ -531,6 +609,7 @@ fn freeConfig(cfg: Config) void {
     gpa.free(cfg.user);
     gpa.free(cfg.password);
     gpa.free(cfg.database);
+    gpa.free(cfg.sslrootcert);
 }
 
 fn removeConn(pool: *Pool, conn: *Conn) void {
@@ -560,6 +639,10 @@ fn detachTx(conn: *Conn) void {
 
 fn destroyConn(conn: *Conn) void {
     detachTx(conn);
+    if (conn.tls) |st| {
+        gpa.destroy(st);
+        conn.tls = null;
+    }
     if (conn.scram) |s| {
         s.deinit();
         gpa.destroy(s);
@@ -573,8 +656,13 @@ fn destroyConn(conn: *Conn) void {
 fn terminateAndDestroy(conn: *Conn) void {
     detachTx(conn);
     if (conn.flags.fd_open) {
-        const term = "X\x00\x00\x00\x04";
-        _ = std.c.write(conn.tcp.fd, term.ptr, term.len);
+        // Never emit the plaintext Terminate 'X' inside a TLS session: that
+        // would be an unencrypted frontend message. Dropping the socket makes
+        // the backend abort the session, which is the safe outcome here.
+        if (conn.tls == null) {
+            const term = "X\x00\x00\x00\x04";
+            _ = std.c.write(conn.tcp.fd, term.ptr, term.len);
+        }
         _ = std.c.close(conn.tcp.fd);
         conn.flags.fd_open = false;
     }
@@ -682,16 +770,37 @@ fn connectCb(
     _ = tcp;
     conn.state = .auth;
     conn.auth_phase = .wait_r;
-    queueStartup(conn) catch {
-        failConn(conn, "failed to queue startup");
-        return .disarm;
-    };
+    if (conn.pool.config.sslmode == .verify_full) {
+        // Negotiate before any credential leaves the process: SSLRequest first,
+        // StartupMessage only after the handshake completes.
+        conn.tls_phase = .await_ssl_reply;
+        queueSslRequest(conn) catch {
+            failConn(conn, "failed to queue SSLRequest");
+            return .disarm;
+        };
+    } else {
+        queueStartup(conn) catch {
+            failConn(conn, "failed to queue startup");
+            return .disarm;
+        };
+    }
     armWrite(conn, l);
     return .disarm;
 }
 
+fn queueSslRequest(conn: *Conn) !void {
+    var msg: [8]u8 = undefined;
+    std.mem.writeInt(u32, msg[0..4], SSL_REQUEST_LEN, .big);
+    std.mem.writeInt(u32, msg[4..8], SSL_REQUEST_CODE, .big);
+    try conn.wqueue.appendSlice(gpa, &msg);
+}
+
 fn armWrite(conn: *Conn, l: *xev.Loop) void {
     if (conn.flags.write_armed or conn.state == .dead) return;
+    if (conn.tls != null) {
+        tlsPump(conn, l);
+        return;
+    }
     if (conn.woff >= conn.wqueue.items.len) return;
     conn.flags.write_armed = true;
     const slice = conn.wqueue.items[conn.woff..];
@@ -700,6 +809,24 @@ fn armWrite(conn: *Conn, l: *xev.Loop) void {
 
 fn armRead(conn: *Conn, l: *xev.Loop) void {
     if (conn.flags.read_armed or conn.state == .dead) return;
+    if (conn.tls_phase == .await_ssl_reply) {
+        conn.flags.read_armed = true;
+        conn.tcp.read(l, &conn.read_comp, .{ .slice = conn.ssl_reply[0..] }, Conn, conn, readCb);
+        return;
+    }
+    if (conn.tls) |st| {
+        // Ciphertext lands straight in the engine's record buffer — no copy.
+        const space = tls_client.recvRecSpace(st);
+        if (space.len == 0) {
+            // The engine must flush before it can take input; the write
+            // completion re-enters the pump and arms the read there.
+            tlsPump(conn, l);
+            return;
+        }
+        conn.flags.read_armed = true;
+        conn.tcp.read(l, &conn.read_comp, .{ .slice = space }, Conn, conn, readCb);
+        return;
+    }
     const start = conn.rbuf.items.len;
     if (conn.rbuf.capacity - start < 8192) {
         const new_cap = @min(start + 8192, RBUF_CAP_MAX);
@@ -740,6 +867,13 @@ fn writeCb(
         failConn(conn, "write failed");
         return .disarm;
     };
+    if (conn.tls) |st| {
+        // n counts CIPHERTEXT written. woff must NOT move here: it indexes the
+        // plaintext queue, advanced only when the engine accepts bytes.
+        tls_client.sendRecAck(st, n);
+        tlsPump(conn, l);
+        return .disarm;
+    }
     conn.woff += n;
     if (conn.flags.close_after_write) {
         if (conn.flags.fd_open) {
@@ -749,6 +883,10 @@ fn writeCb(
         const pool = conn.pool;
         removeConn(pool, conn);
         detachTx(conn);
+        if (conn.tls) |st| {
+            gpa.destroy(st);
+            conn.tls = null;
+        }
         if (conn.scram) |s| {
             s.deinit();
             gpa.destroy(s);
@@ -799,11 +937,152 @@ fn readCb(
         failConn(conn, "connection closed by server");
         return .disarm;
     }
+    if (conn.tls_phase == .await_ssl_reply) {
+        conn.tls_phase = .none;
+        switch (conn.ssl_reply[0]) {
+            'S' => startTls(conn, l),
+            // verify-full cannot continue unencrypted; refusing here is the
+            // whole point of asking for TLS.
+            'N' => failConn(conn, "server does not support TLS"),
+            else => failConn(conn, "invalid SSLRequest reply"),
+        }
+        return .disarm;
+    }
+    if (conn.tls) |st| {
+        tls_client.recvRecAck(st, n);
+        tlsPump(conn, l);
+        return .disarm;
+    }
     conn.rbuf.items.len += n;
     processBuffer(conn, l);
     return .disarm;
 }
 
+/// Upgrade the socket after the server answered 'S'. Allocation happens once
+/// per connection; from here every byte on the wire is ciphertext.
+fn startTls(conn: *Conn, l: *xev.Loop) void {
+    const st = gpa.create(tls_client.TlsState) catch {
+        failConn(conn, "out of memory");
+        return;
+    };
+    // host doubles as SNI and as the name the certificate must cover.
+    if (!tls_client.initState(st, conn.pool.config.host)) {
+        gpa.destroy(st);
+        failConn(conn, "TLS init failed");
+        return;
+    }
+    conn.tls = st;
+    conn.tls_phase = .handshake;
+    // The SSLRequest already left wqueue; the engine owns the wire now.
+    conn.wqueue.clearRetainingCapacity();
+    conn.woff = 0;
+    tlsPump(conn, l);
+}
+
+/// Single driver for the BearSSL engine. Invariants:
+///   * wqueue holds plaintext; woff is the plaintext fed into the engine.
+///   * The kernel only ever sees ciphertext from sendRecReady().
+///   * Plaintext is fed only in .ready (never during the handshake).
+///   * Re-entry from processBuffer→armRead is swallowed by tls_pumping; the
+///     outer call continues and picks the queued frames up in step 4.
+fn tlsPump(conn: *Conn, l: *xev.Loop) void {
+    const st = conn.tls orelse return;
+    if (conn.flags.tls_pumping) return;
+    if (conn.flags.write_armed) return; // in-flight write re-enters from writeCb
+    conn.flags.tls_pumping = true;
+    defer conn.flags.tls_pumping = false;
+
+    if ((tls_client.curState(st) & TLS_CLOSED) != 0) {
+        // Closed before the first application byte = handshake failure; after
+        // that it is the peer's close_notify. Users act on these differently.
+        if (tls_client.handshakeDone(st)) {
+            failConn(conn, "TLS connection closed by server");
+            return;
+        }
+        const code = tls_client.lastError(st);
+        var buf: [96]u8 = undefined;
+        const msg: []const u8 = switch (code) {
+            BR_ERR_X509_NOT_TRUSTED => "TLS: server certificate is not trusted (check sslrootcert)",
+            BR_ERR_X509_BAD_SERVER_NAME => "TLS: server certificate does not match the host name",
+            BR_ERR_X509_EXPIRED => "TLS: server certificate has expired",
+            BR_ERR_UNSUPPORTED_VERSION => "TLS: no protocol version in common (TLS 1.2 required)",
+            else => std.fmt.bufPrint(&buf, "TLS handshake failed (bearssl error {d})", .{code}) catch "TLS handshake failed",
+        };
+        failConn(conn, msg);
+        return;
+    }
+
+    // 1) Decrypted backend messages → rbuf → the ordinary PG parser.
+    while (true) {
+        const app = tls_client.recvAppReady(st);
+        if (app.len == 0) break;
+        if (conn.rbuf.items.len + app.len > RBUF_CAP_MAX) {
+            failConn(conn, "read buffer full");
+            return;
+        }
+        conn.rbuf.appendSlice(gpa, app) catch {
+            failConn(conn, "out of memory");
+            return;
+        };
+        tls_client.recvAppAck(st, app.len);
+        processBuffer(conn, l);
+        if (conn.state == .dead) return;
+    }
+
+    // 2) Handshake finished: only now may the StartupMessage be queued, so no
+    //    credential ever precedes the cipher.
+    if (conn.tls_phase == .handshake and tls_client.handshakeDone(st)) {
+        conn.tls_phase = .ready;
+        queueStartup(conn) catch {
+            failConn(conn, "failed to queue startup");
+            return;
+        };
+    }
+
+    // 3) Ciphertext still owed from a partial write or the handshake.
+    var out = tls_client.sendRecReady(st);
+    if (out.len == 0 and conn.tls_phase == .ready and conn.woff < conn.wqueue.items.len) {
+        // 4) Feed as much queued plaintext as the engine accepts, then force a
+        //    record. Large queries stop at the buffer edge and resume here
+        //    after the next write completion — the queue itself is unbounded
+        //    only up to the job's own size.
+        while (conn.woff < conn.wqueue.items.len) {
+            const fed = tls_client.sendAppFeed(st, conn.wqueue.items[conn.woff..]);
+            if (fed == 0) break;
+            conn.woff += fed;
+        }
+        if (conn.woff >= conn.wqueue.items.len) {
+            // The engine copied these bytes; the plaintext source can go.
+            conn.wqueue.clearRetainingCapacity();
+            if (conn.wqueue.capacity > WQUEUE_CAP_MAX) {
+                conn.wqueue.shrinkAndFree(gpa, 0);
+                _ = stat_wqueue_shrink.fetchAdd(1, .monotonic);
+            }
+            conn.woff = 0;
+        }
+        tls_client.flush(st);
+        out = tls_client.sendRecReady(st);
+    }
+    if (out.len > 0) {
+        conn.flags.write_armed = true;
+        conn.tcp.write(l, &conn.write_comp, .{ .slice = out }, Conn, conn, writeCb);
+        return;
+    }
+
+    // 5) Nothing to send. Arm a read only when somebody is waiting for the
+    //    backend; idle pooled conns stay parked with no completion pending.
+    if (conn.flags.read_armed) return;
+    if (conn.state != .auth and conn.state != .busy) return;
+    const space = tls_client.recvRecSpace(st);
+    if (space.len == 0) {
+        // No output, no input room, nobody closed: the engine cannot progress.
+        // Fail the query instead of leaving the promise pending forever.
+        failConn(conn, "TLS engine stalled");
+        return;
+    }
+    conn.flags.read_armed = true;
+    conn.tcp.read(l, &conn.read_comp, .{ .slice = space }, Conn, conn, readCb);
+}
 /// A1 FIX: shift the unconsumed tail to the front ONCE per read batch.
 /// (Was: one copyForwards per protocol message → O(n²) memmove on bursts.)
 fn compactRbuf(conn: *Conn) void {
@@ -1124,7 +1403,6 @@ fn settleEnd(job: *Job, conn: *Conn) void {
     settleJobDone(job);
     pool.release(conn);
 }
-
 fn settleJobDone(job: *Job) void {
     const ctx = g_ctx orelse {
         _ = pending.fetchSub(1, .acq_rel);
@@ -1520,16 +1798,22 @@ fn resolveHost(host: []const u8, port: u16) !std.Io.net.IpAddress {
     const eai = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res);
     if (@intFromEnum(eai) != 0) return error.DnsFailure;
     defer if (res) |r| std.c.freeaddrinfo(r);
-    const info = res orelse return error.DnsFailure;
-    const sa = info.addr orelse return error.DnsFailure;
-    if (info.family == std.posix.AF.INET) {
-        const sin: *const std.c.sockaddr.in = @ptrCast(@alignCast(sa));
-        const bytes: [4]u8 = @bitCast(@byteSwap(sin.addr));
-        return .{ .ip4 = .{ .bytes = bytes, .port = std.mem.bigToNative(u16, sin.port) } };
+    var cur: ?*std.c.addrinfo = res;
+    while (cur) |info| : (cur = info.next) {
+        const sa = info.addr orelse continue;
+        if (info.family == std.posix.AF.INET) {
+            const sin: *const std.c.sockaddr.in = @ptrCast(@alignCast(sa));
+            const bytes: [4]u8 = @bitCast(sin.addr);
+            return .{ .ip4 = .{ .bytes = bytes, .port = std.mem.bigToNative(u16, sin.port) } };
+        }
     }
-    if (info.family == std.posix.AF.INET6) {
-        const sin6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sa));
-        return .{ .ip6 = .{ .bytes = sin6.addr, .port = std.mem.bigToNative(u16, sin6.port) } };
+    cur = res;
+    while (cur) |info| : (cur = info.next) {
+        const sa = info.addr orelse continue;
+        if (info.family == std.posix.AF.INET6) {
+            const sin6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sa));
+            return .{ .ip6 = .{ .bytes = sin6.addr, .port = std.mem.bigToNative(u16, sin6.port) } };
+        }
     }
     return error.UnsupportedFamily;
 }

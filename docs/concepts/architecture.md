@@ -45,6 +45,7 @@ codebase makes the rest of the documentation predictable.
 |---|---|---|
 | `src/api/` | Every JS global | Looking up a global's behaviour |
 | `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket | Networking limits or protocol details |
+| `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` flag parsing and scope checks |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
 | `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData` | Fetch API semantics |
 | `src/worker/` | Workers + structured clone | Worker limits |
@@ -73,9 +74,10 @@ the full inventory.
 - **SoA connection table** — 512 slots stored as parallel arrays with packed
   2-byte flags (`ConnFlags` is a `packed struct(u16)`), so the hot loop
   touches cache lines, not objects.
-- **Static per-slot buffers** — 64 KB response staging per connection;
-  bodies above that spill to the heap (capped at 10 MB), and spills up to
-  256 KB are retained for reuse instead of re-allocated.
+- **Static per-slot buffers** — 4 KB request read buffer (spills to the
+  heap up to 1 MB per request, retaining up to 64 KB per slot within a 64 MB
+  global budget) and 64 KB response staging per connection (spills to the
+  heap up to 10 MB, retaining up to 256 KB for reuse).
 - **`HeadersData` refcount** — one heap object with an atomic refcount,
   shared by `Request` / `Response` / `Headers` across thread boundaries.
 - **Zero-copy URLs** — one allocation per URL; components are pooled slices.
@@ -87,16 +89,18 @@ the full inventory.
 
 ```sh
 zig build -Doptimize=ReleaseFast   # what `make build` uses
-zig build -Dbearssl=false          # drop TLS (HTTPS/WSS unavailable)
+zig build -Dbearssl=false          # drop TLS (HTTPS/WSS/Postgres TLS unavailable)
 zig build -Dffi=false              # keep the `ffi` global, but `dlopen`/`callback` throw (needs `--allow-ffi` at runtime regardless)
 zig build -Dio_uring=false         # Linux: use epoll instead of io_uring
+zig build -Dstrip=false            # keep debug symbols in ReleaseFast/ReleaseSmall builds
+zig build -Dsanitize-c=true        # enable C UBSan for debugging C sources
 zig build -Dversion=1.2.3          # version reported by `ff --version`
 ```
 
 | Vendor | Version | Role |
 |---|---|---|
 | quickjs-ng | 0.16.2 | JS engine |
-| BearSSL | 0.6 | TLS 1.2 for HTTPS/WSS |
+| BearSSL | 0.6 | TLS 1.2 for HTTPS, WSS, and Postgres (`verify-full`) |
 | SQLite | 3.53.4 | `Database` |
 | nghttp2 | 1.70.0 | HTTP/2 framing + HPACK |
 

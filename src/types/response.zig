@@ -37,7 +37,10 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
 fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
-    _ = c.toInt32(ctx, &out, val);
+    if (c.toInt32(ctx, &out, val) == -1) return default; // exception
+    // Bounded cast: a negative or >3-digit status traps in safe builds and
+    // wraps to 65535 in ReleaseFast (new Response("x", { status: -1 })).
+    if (out < 100 or out > 999) return default;
     return @intCast(out);
 }
 
@@ -145,7 +148,6 @@ pub const ResponseData = struct {
     pub fn init() ResponseData {
         // C1 FIX: pooled headers shell (headers.zig freelist).
         const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
-        h.* = headers_mod.HeadersData.init();
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
             .status = 200,

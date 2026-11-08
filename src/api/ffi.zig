@@ -35,8 +35,16 @@ const c = @import("../c.zig").c;
 const xev = @import("xev");
 const microtasks = @import("../event/microtasks.zig");
 const ffcfg = @import("ffcfg");
+const permissions = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
+
+fn requireFfi(ctx: ?*c.Context, api: []const u8) bool {
+    if (permissions.global().ffiAllowed()) return true;
+    _ = deny.throwBare(ctx, api, .ffi);
+    return false;
+}
 
 // ── libffi surface (stable C ABI) ──
 
@@ -341,12 +349,6 @@ const ArgSpec = struct {
 
 const MAX_ARGS: usize = 32;
 const MAX_STRUCT: usize = 512; // fixed return arena; larger → error at dlopen
-
-var allow: bool = false;
-
-pub fn setAllow(v: bool) void {
-    allow = v;
-}
 
 var lib_class_id: c.ClassID = 0;
 var ptr_class_id: c.ClassID = 0;
@@ -1710,10 +1712,7 @@ fn parseSymbol(ctx: ?*c.Context, lib: *Lib, name: []const u8, desc: c.Value, han
 
 fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
-    if (!allow) {
-        _ = c.throwTypeError(ctx, "ffi.dlopen requires --allow-ffi");
-        return c.JS_EXCEPTION;
-    }
+    if (!requireFfi(ctx, "ffi.dlopen")) return c.JS_EXCEPTION;
     if (!ffcfg.ffi) {
         _ = c.throwTypeError(ctx, "ffi.dlopen: FFI not compiled in (build with -Dffi=true)");
         return c.JS_EXCEPTION;
@@ -1960,6 +1959,7 @@ fn memTypeArg(ctx: ?*c.Context, v: c.Value) ?FfiKind {
 
 fn readCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.read")) return c.JS_EXCEPTION;
     if (argc < 2) {
         _ = c.throwTypeError(ctx, "ffi.read: expected (ptr, type, offset?)");
         return c.JS_EXCEPTION;
@@ -1972,6 +1972,7 @@ fn readCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
 
 fn writeCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.write")) return c.JS_EXCEPTION;
     if (argc < 3) {
         _ = c.throwTypeError(ctx, "ffi.write: expected (ptr, type, value, offset?)");
         return c.JS_EXCEPTION;
@@ -1985,6 +1986,7 @@ fn writeCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
 
 fn copyBytesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.copyBytes")) return c.JS_EXCEPTION;
     if (argc < 2) {
         _ = c.throwTypeError(ctx, "ffi.copyBytes: expected (ptr, byteLength)");
         return c.JS_EXCEPTION;
@@ -2000,6 +2002,7 @@ fn copyBytesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c
 
 fn writeBytesCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.writeBytes")) return c.JS_EXCEPTION;
     if (argc < 2) {
         _ = c.throwTypeError(ctx, "ffi.writeBytes: expected (ptr, data)");
         return c.JS_EXCEPTION;
@@ -2019,6 +2022,7 @@ fn structFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 
 fn structInitCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.struct")) return c.JS_EXCEPTION;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "ffi.struct: expected a field array");
         return c.JS_EXCEPTION;
@@ -2049,6 +2053,7 @@ fn unionFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 
 fn unionInitCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.union")) return c.JS_EXCEPTION;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "ffi.union: expected a member array");
         return c.JS_EXCEPTION;
@@ -2106,10 +2111,7 @@ fn callbackFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
 
 fn callbackFactory(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
-    if (!allow) {
-        _ = c.throwTypeError(ctx, "ffi.callback requires --allow-ffi");
-        return c.JS_EXCEPTION;
-    }
+    if (!requireFfi(ctx, "ffi.callback")) return c.JS_EXCEPTION;
     if (!ffcfg.ffi) {
         _ = c.throwTypeError(ctx, "ffi.callback: FFI not compiled in (build with -Dffi=true)");
         return c.JS_EXCEPTION;
@@ -2224,6 +2226,7 @@ fn callbackFactory(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
 
 fn cstringCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.cstring")) return c.JS_EXCEPTION;
     if (argc < 1) return c.JS_NULL;
     const arg = argv[0];
     if (c.isNull(arg) != 0 or c.isUndefined(arg) != 0) return c.JS_NULL;
@@ -2251,7 +2254,7 @@ fn cstringCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c
     return c.newStringLen(ctx, s, std.mem.len(s));
 }
 
-fn ptrCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+fn ptrCallbackImpl(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 1) return c.JS_NULL;
     const arg = argv[0];
@@ -2281,8 +2284,19 @@ fn ptrCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
     return c.JS_EXCEPTION;
 }
 
+fn ptrCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (!requireFfi(ctx, "ffi.ptr")) return c.JS_EXCEPTION;
+    return ptrCallbackImpl(ctx, this_val, argc, argv);
+}
+
+fn viewCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (!requireFfi(ctx, "ffi.view")) return c.JS_EXCEPTION;
+    return ptrCallbackImpl(ctx, this_val, argc, argv);
+}
+
 fn isNullCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
+    if (!requireFfi(ctx, "ffi.isNull")) return c.JS_EXCEPTION;
     if (argc < 1) return jsBool(ctx, true);
     const arg = argv[0];
     if (c.isNull(arg) != 0 or c.isUndefined(arg) != 0) return jsBool(ctx, true);
@@ -2384,7 +2398,7 @@ pub fn setup(ctx: *c.Context) void {
 
     // ffi.view(p) normalizes to a FfiPtr — the pointer object itself is
     // the view (getters live on it).
-    const view_fn = c.newCFunction(ctx, ptrCallback, "view", 2);
+    const view_fn = c.newCFunction(ctx, viewCallback, "view", 2);
     _ = c.definePropertyValueStr(ctx, ffi_obj, "view", view_fn, c.PROP_C_W_E);
 
     const isnull_fn = c.newCFunction(ctx, isNullCallback, "isNull", 1);
@@ -2405,6 +2419,6 @@ pub fn setup(ctx: *c.Context) void {
     const cb_f = c.newCFunction(ctx, callbackFactory, "callback", 2);
     _ = c.definePropertyValueStr(ctx, ffi_obj, "callback", cb_f, c.PROP_C_W_E);
 
-    _ = c.definePropertyValueStr(ctx, ffi_obj, "allowed", jsBool(ctx, allow), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, ffi_obj, "allowed", jsBool(ctx, permissions.global().ffiAllowed()), c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, global, "ffi", ffi_obj, c.PROP_C_W_E);
 }

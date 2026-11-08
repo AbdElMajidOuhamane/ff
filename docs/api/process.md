@@ -1,12 +1,12 @@
 ---
 title: Process
-description: argv, env, cwd, exit, pid — what process gives you, and what's missing on purpose.
+description: argv, env, cwd, exit, pid, signals (on/once/off/kill) — what process gives you, and what's missing on purpose.
 order: 13
 ---
 
 # Process
 
-`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, and exit. Subprocesses live on the separate [child_process](/docs/api/child-process) global.
+`process` is a small global for inspecting and controlling the running program: arguments, environment, working directory, identity, signals, and exit. Subprocesses live on the separate [child_process](/docs/api/child-process) global.
 
 ## Quick look
 
@@ -19,8 +19,8 @@ console.log("home:", process.env.HOME);
 ```
 
 ```sh
-ff info.js hello
-# args: ["/usr/local/bin/ff", "info.js", "hello"]
+ff info.js hello --allow-env=HOME
+# args: ["/usr/local/bin/ff", "info.js", "hello", "--allow-env=HOME"]
 # pid: 12345 on darwin arm64
 # cwd: /Users/ada/demo
 # home: /Users/ada
@@ -30,14 +30,34 @@ ff info.js hello
 
 | Member | Type | Description |
 |--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime and script name (`["/path/to/ff", "main.js", …]`) |
-| `process.env` | `object` | Environment snapshot as plain key/value strings |
+| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and any `--allow-*` flags (`["/path/to/ff", "main.js", …]`) |
+| `process.env` | `object` | Filtered environment snapshot — only names granted by `--allow-env` appear |
 | `process.cwd()` | `() => string` | Current working directory |
-| `process.chdir(path)` | `(path) => void` | Change directory — silent no-op on failure (`undefined` returned, cwd unchanged) |
+| `process.chdir(path)` | `(path) => void` | Change directory — throws `PermissionDenied` when the target is outside `--allow-read`; a missing/unreachable path is a silent no-op |
 | `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
 | `process.pid` | `number` | OS process id |
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
+| `process.on(signal, fn)` | `(string, (sig) => void) => process` | Register a signal listener (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`; max 8 per signal) |
+| `process.once(signal, fn)` | `(string, (sig) => void) => process` | Register a one-shot signal listener |
+| `process.off(signal, fn)` / `process.removeListener(signal, fn)` | `(string, Function) => process` | Remove a registered signal listener |
+| `process.kill(pid, signal?)` | `(number, string?) => boolean` | Send a signal (default `"SIGTERM"`). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
+| `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
+| `process.stats()` | `() => object` | Internal allocator, spill, and pool counters |
+
+## Permissions
+
+Only three members are gated:
+
+| Member | Flag | Notes |
+|--------|------|-------|
+| `process.env` | `--allow-env=NAME,…` | Built once at startup; disallowed keys are absent |
+| `process.chdir(path)` | `--allow-read=<target>` | The target must be inside a read scope |
+| `process.kill(pid, sig?)` | `--allow-run=kill` | Only checked when `pid !== process.pid`; self-signaling is always allowed |
+
+Everything else — `argv`, `cwd`, `exit`, `pid`, `platform`, `arch`,
+`on`, `once`, `off`, `removeListener`, `memoryUsage`, `stats` — is always
+available. `process.exit()` works even when every category is denied.
 
 ## Arguments: `argv`
 
@@ -56,6 +76,10 @@ ff greet.js
 # hello, world
 ```
 
+Permission flags are **not stripped** from `argv`: `ff app.js --allow-read=.`
+leaves `--allow-read=.` in `process.argv`. They are also interpreted as policy,
+so do not use a `--allow-*`-shaped value as an application argument.
+
 A tiny flag parser needs nothing else:
 
 ```js
@@ -67,14 +91,16 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-ff serve.js --port 4242
+ff serve.js --port 4242 --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 # ok
 ```
 
 ## Environment: `env`
 
-Plain object, string values only. Missing keys read as `undefined` — fail fast on required ones:
+A plain object with string values, built at startup from the OS environment and
+filtered by `--allow-env`. A name outside the grant is absent, so it reads as
+`undefined` — fail fast on required ones:
 
 ```js
 // config.js
@@ -86,22 +112,46 @@ http.serve({ port }, () => new Response("ok"));
 ```
 
 ```sh
-PORT=4242 API_TOKEN=secret ff config.js
+PORT=4242 API_TOKEN=secret ff config.js \
+  --allow-env=PORT,API_TOKEN \
+  --allow-net=0.0.0.0:3000
 ```
 
-> **Note:** `process.env` is a startup snapshot and there is no `.env` loader. Export variables (or prefix the command, as above) before starting `ff`. The `FF_` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`) are read the same way — see the env guide.
+> **Note:** `process.env` is a startup snapshot, not a live view, and there is
+> no `.env` loader. Export variables (or prefix the command, as above) before
+> starting `ff`. Only granted names are copied into the object; bare
+> `--allow-env` grants all of them. The `FF_*` variables (`FF_ECHO`, `FF_CERT`,
+> `FF_KEY`, `FF_CA_FILE`) are read by the runtime itself, but the application
+> sees them only if `--allow-env` includes them.
 
 ## Working directory: `cwd` / `chdir`
 
 ```js
 console.log(process.cwd()); // where ff was launched
-process.chdir("/tmp");      // move — a bad path is a silent no-op
-console.log(process.cwd()); // /tmp
+process.chdir("/tmp");      // needs --allow-read=/tmp
+console.log(process.cwd()); // /private/tmp on macOS, /tmp on Linux
 ```
 
-`chdir` **never throws**: on a missing/unreachable path it returns `undefined` and the cwd stays put. Verify with `process.cwd()` if the path is user-supplied.
+```sh
+ff move.js --allow-read=/tmp
+```
 
-Relative file paths in `fs` and module-adjacent lookups resolve against the cwd, so `chdir` before serving from a data dir is a legitimate pattern. Prefer absolute paths in long-lived servers to avoid surprises.
+`chdir` has two distinct failure modes:
+
+- **Permission denial** — the target is outside the `read` scopes. It throws an
+  `Error` named `PermissionDenied` with `code: "PERMISSION_DENIED"` before the
+  working directory changes.
+- **OS failure** — the path was allowed but is missing or unreachable. It
+  returns `undefined` and the cwd stays put. Verify with `process.cwd()` when
+  the path is user-supplied.
+
+Scope roots are fixed at launch. A later `chdir` does **not** move them, so
+`--allow-read=.` remains the launch directory. Relative `fs` paths resolve
+against the new cwd and must still land inside a scope captured at startup.
+
+Relative file paths in `fs` and module-adjacent lookups resolve against the cwd,
+so `chdir` before serving from a data dir is a legitimate pattern. Prefer
+absolute paths in long-lived servers to avoid surprises.
 
 ## Exiting: `exit`
 
@@ -117,7 +167,60 @@ if (badConfig) {
 - Non-zero codes fail CI (`make test`, `test/run.sh` treat them as failure).
 - An **uncaught throw** — at the top level of your script or of an imported module — prints `Error: …` with its stack to stderr and exits `1` on its own; no catch-all needed.
 
-> **Note:** There is no signal-handling API. Stop servers with `Ctrl-C` from the terminal, or `process.exit(0)` for programmatic shutdown.
+## Signals and graceful shutdown: `on`, `once`, `off`, `kill`
+
+Listen for POSIX signals (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`)
+to drain servers or clean up resources before exiting:
+
+```js
+const server = http.serve({ port: 3000 }, () => new Response("ok"));
+
+process.once("SIGTERM", async (sig) => {
+  console.log("received", sig, "— draining");
+  await server.close();
+});
+```
+
+- Up to **8** listeners can be attached per signal.
+- Signal handlers run asynchronously on the event loop tick after the OS signal arrives.
+- When `http.serve` is running and no user listener is registered for `SIGINT` / `SIGTERM`, the runtime automatically triggers `server.close()` on those signals.
+- `process.kill(pid, signal?)` sends a signal (`"SIGTERM"` when omitted). Signaling `process.pid` needs no permission flag; signaling another process requires `--allow-run=kill` (or bare `--allow-run`).
+
+## Memory and allocator introspection
+
+### `process.memoryUsage()`
+
+Returns an object with the current process Resident Set Size (`rss`) in bytes:
+
+```js
+const { rss } = process.memoryUsage();
+console.log(`RSS: ${(rss / 1024 / 1024).toFixed(1)} MB`);
+```
+
+### `process.stats()`
+
+Returns internal runtime counters tracking heap spills, buffer reuse, and pool activity grouped by subsystem (`fetch`, `http`, `pg`, `child`):
+
+```js
+console.log(process.stats());
+// {
+//   fetch: { bodyHeap: 0, hdrSpill: 0, decompressHeap: 0 },
+//   http: { bodySpill: 0, bodySpillReuse: 0, reqSpill: 0, reqSpillReuse: 0 },
+//   pg: {
+//     submit: 0,
+//     jobReuse: 0,
+//     jobFresh: 0,
+//     wqueueGrow: 0,
+//     wqueueShrink: 0,
+//     waitEnqueue: 0,
+//     arenaResetFail: 0,
+//     freelistDestroy: 0
+//   },
+//   child: { spawned: 0, truncated: 0, outHeap: 0 }
+// }
+```
+
+Neither call requires permission flags.
 
 ## Practical example: CLI with subcommands
 
@@ -138,9 +241,12 @@ if (cmd === "greet") {
 
 ```sh
 ff tool.js greet ada   # hello, ada
-ff tool.js serve       # serves on 3000 (or $PORT)
+ff tool.js serve --allow-env=PORT --allow-net=0.0.0.0:3000
 ff tool.js bogus       # usage… (exit 1)
 ```
+
+`greet` is pure JS and needs no flags. `serve` needs `net`, plus `env` if it
+should read `PORT`.
 
 ## What `process` does *not* have
 
@@ -149,7 +255,6 @@ ff tool.js bogus       # usage… (exit 1)
 | `spawn` / `exec` / `execFile` | Provided on the separate [child_process](/docs/api/child-process) global |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
-| `on('SIGINT')` / signal handlers | `Ctrl-C` in the terminal; `process.exit()` in code |
 | `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
 
 (`process.memoryUsage()` does exist — its `rss` is a peak counter from `getrusage`, see the [API page](/docs/api/process).)
@@ -158,9 +263,17 @@ Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
 
 ## Troubleshooting
 
-**`process.env.X` is undefined** — the variable wasn't exported in the launching shell. `X=1 ff app.js` (prefix) or `export X=1` first. No `.env` file is read.
+**`process.env.X` is undefined** — either the variable wasn't exported in the
+launching shell, or `--allow-env` does not include it. Check both:
+`X=1 ff app.js --allow-env=X`. No `.env` file is read.
 
-**`chdir` silently does nothing** — the path is missing or unreachable. It never throws; call `process.cwd()` afterwards when the dir is user-supplied.
+**`chdir` threw `PermissionDenied`** — the target is outside every `read`
+scope. Add `--allow-read=<target>` (or a parent directory). This is different
+from a missing directory, which is still a silent no-op.
+
+**`chdir` silently does nothing** — the path is allowed but missing or
+unreachable. It returns `undefined` and leaves the cwd unchanged; call
+`process.cwd()` afterwards when the dir is user-supplied.
 
 **Exit code surprises** — codes clamp to 0–255 and `exit()` skips all draining. For "finish work then quit", drain first, then exit. An uncaught top-level or module throw already exits `1` by itself; errors thrown *inside* an HTTP handler become a `500` response instead.
 

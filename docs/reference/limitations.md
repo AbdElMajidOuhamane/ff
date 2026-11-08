@@ -8,18 +8,46 @@ order: 2
 
 Fairyfly trades breadth for speed and auditability. This page lists every hard cap; each guide links back here from its own summary table.
 
+## Permissions
+
+Native APIs are deny-by-default. The full model lives in
+[Permissions](/docs/concepts/permissions); the constraints that matter when
+designing are:
+
+| Constraint | Detail |
+|---|---|
+| Policy lifetime | Parsed once before the runtime starts; immutable for the process; workers inherit it |
+| Scope roots | Resolved against the launch cwd and fixed; `process.chdir()` does not move them |
+| Path scopes | Canonicalized and symlink-resolved; 4096-byte limit; no globs or extensions |
+| Network scopes | Literal host match with no DNS; `localhost` ≠ `127.0.0.1`; bind is always `0.0.0.0` |
+| Environment scopes | Exact, case-sensitive names; disallowed keys are absent from `process.env` |
+| Run scopes | Basename or absolute path; `exec` / `execSync` also need `/bin/sh` |
+| FFI | Bare `--allow-ffi` only; gates every `ffi` entry point except `ffi.allowed`; trust-equivalent to full access |
+| Module loading | `import` and `new Worker(path)` do not need `read`; loaded code runs with the process policy |
+| Isolation | In-process policy, not an OS sandbox; a symlink swapped between check and syscall can escape a path scope |
+| Granularity | Process-global; no per-request or per-user scopes |
+| Deny flags | None; the default is deny, and only `--allow-*` changes it |
+
+`run` and `ffi` execute arbitrary code with the process's authority. Use
+permissions to reduce mistakes in code you mostly trust, not as the only
+boundary for hostile code.
+
 ## HTTP server
 
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Request body | ~4 KB (shares the 4 KB read buffer) | Beyond → `413 Payload Too Large` |
+| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
 | Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
 | Response headers | 2048 bytes | Headers beyond the cap are dropped |
+| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
-| Bind address | Always `0.0.0.0` | No host option, no `FF_PORT` |
+| Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Terminated with `400 Bad Request` |
+| Response status | 100..999 | Clamped/validated to 100..999 |
+| Bind address | Always `0.0.0.0` | No host option, no `FF_PORT`; the net scope must be `0.0.0.0:<port>` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
-| HTTP/2 | TLS + ALPN only (nghttp2) | Plain sockets stay HTTP/1.1 |
+| HTTP/2 | TLS + ALPN only (nghttp2); pseudo-headers validated (`:path` ≤ 512 B, `:method` ≤ 16 B); request body ≤ 10 MB/stream and ≤ 16 MB/session | Plain sockets stay HTTP/1.1 |
 | `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
 
 ## Fetch (client)
@@ -28,9 +56,13 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 |------|-------|----------|
 | Concurrent fetches | 16 | The 17th waits for a free slot |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
+| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject |
 | I/O timeout | 30s | Slow servers fail |
-| Redirects | Followed, max 5 hops | Throws `Too many redirects` |
-| Abort / `signal` | Not supported | `signal` / `timeout` / `redirect` init keys are ignored |
+| Redirects | Followed, max 5 hops | Throws `Too many redirects`; every hop is re-checked against `--allow-net` |
+| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
+| Header validation | RFC 7230 character validation | CRLF or invalid header names/values reject before sending |
+| Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (use `AbortSignal.timeout(ms)`) |
+| TLS hostnames | DNS SAN verification only | IP-literal TLS hosts (`https://127.0.0.1:...`) fail closed; connect using DNS hostnames |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 | Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
 
@@ -40,8 +72,13 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
 | Message size | 16384 bytes | Larger frames truncate |
-| Handshake URL path | 512 bytes | Longer paths fail |
+| Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
+| Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
+| Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |
+| Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
+| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
 | Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
+| Send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full throws `TypeError: WebSocket: send buffer full` |
 | Proxy | Same env vars as `fetch` | `ws://` needs a CONNECT-capable proxy |
 
 ## UDP
@@ -60,8 +97,9 @@ Fairyfly trades breadth for speed and auditability. This page lists every hard c
 | Area | Limit | When hit |
 |------|-------|----------|
 | Live timers | 128 | `TypeError: too many timers (max 128)` |
-| Extra timer args | 8 after `ms` | Extras ignored |
+| Extra timer args | 8 after `ms` | Beyond 8 throws `TypeError: setTimeout accepts at most 8 callback arguments` (also accepts `{ signal }` or `AbortSignal` as 3rd arg) |
 | Workers | 8 | `too many workers (max 8)` |
+| Worker scope | `console`, timers, `postMessage`, `structuredClone`, `performance` (`performance.now()`), `workerData`, `self` | No `fs`, `fetch`, `http.serve`, or nested workers |
 | Worker heap | 32 MB + 1 MB JS stack (8 MB thread stack) | — |
 | Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
 | `process.nextTick` | Missing | Use `queueMicrotask` |
@@ -75,8 +113,10 @@ queueMicrotask(fn);
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Path length | 4096 bytes | Longer paths fail |
+| Path length | 4096 bytes | Longer paths fail, including permission scopes |
 | Read per call | 10MB, sync | Larger reads fail |
+| Write per call | 10MB hard cap (sync and async) | Beyond 10MB throws/rejects instead of truncating |
+| Permission scopes | Canonicalized at launch | `chdir` does not move them; symlink targets must stay inside a scope |
 | API style | Sync + six `*Async` Promise variants (`readFileAsync`, `writeFileAsync`, `existsAsync`, `mkdirAsync`, `rmAsync`, `readdirAsync`) | No `fs.watch` — poll with timers |
 
 ## Console
@@ -93,6 +133,8 @@ queueMicrotask(fn);
 | Module system | ESM only | No `require()`, no CommonJS |
 | Relative extensions | Optional for `.js` | `./x` probes `./x.js`, then `./x/index.js`; other extensions must be written out |
 | Bare specifiers | Resolved via `node_modules` | Needs `ff imprint` install first |
+| Package containment | Strict directory boundary | Manifest targets (`main`, `module`, `exports`) and subpaths containing `..` or escaping package root are rejected |
+| Program loading | Not a `read` operation | `import` and `new Worker(path)` work without `--allow-read` |
 | `Buffer` | Missing | Use `Uint8Array` |
 | DOM / `window` | Missing | Backend only |
 | Subprocess API | Separate global | `child_process.spawn` / `exec` / `execSync` — see the child_process section below |
@@ -104,24 +146,29 @@ queueMicrotask(fn);
 | `db.exec` | First statement only | Multi-statement SQL needs `db.execNoArgs` |
 | Parameters | Positional `?` only | Named `:x` / `$x` are not supported |
 | Integer precision | ±2⁵³ | Beyond → precision loss in JS |
+| Open permissions | `read` + `write` on the file, `write` on the parent | WAL/-shm siblings need the parent; `:memory:` is exempt |
 
 ## Postgres
 
 | Area | Limit | When hit |
 |------|-------|----------|
 | Pool | 10 connections | Extra queries queue |
-| TLS (`sslmode`) | Not supported | — |
+| TLS (`sslmode`) | `verify-full` and `disable` supported via BearSSL | `sslmode=verify-full` requires `sslrootcert` pointing to valid PEM CA bundle; libpq modes (`require`, `prefer`, `verify-ca`) rejected |
 | Connection/socket timeouts | None | Slow queries wait indefinitely |
 | `rowCount` | Returned rows only | INSERT/UPDATE row counts are not reported |
 | COPY | Not supported | — |
+| Permission scope | `net` on the DSN host and port, plus `read` on `sslrootcert` when TLS is used | Global `sql` also needs `env` to read `PG_*` / `DATABASE_URL` / `PGSSL*`; otherwise it falls back to `127.0.0.1:5432` |
 
 ## Process
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| `process.env` | Snapshot at boot | Assigning to it does not affect the OS environment |
+| `process.env` | Filtered snapshot at boot | Only `--allow-env` names are present; assigning to it does not affect the OS environment |
+| `process.chdir` | Needs `read` on the target | Outside the scope it throws `PermissionDenied`; an allowed missing path is still a silent no-op |
+| Signals (`process.on` / `once` / `off`) | `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` (max 8 listeners per signal) | Unsupported signal names or > 8 listeners throw `TypeError` |
+| `process.kill(pid, sig?)` | Needs `--allow-run=kill` when `pid !== process.pid` | Self-signaling `process.pid` is ungated |
 | stdout/stdin streams | Missing | No `process.stdout.write` or stdin reads |
-| `hrtime`, `kill` | Missing | — |
+| `hrtime` | Missing | Use `performance.now()` |
 | Runaway JS watchdog | None | An infinite loop hangs the process |
 
 ## child_process
@@ -133,12 +180,15 @@ queueMicrotask(fn);
 | Platform | POSIX only (macOS/Linux) | Windows throws |
 | stdin, streams, events | Missing | Use `wait()` + captured `stdout` / `stderr` |
 | ff exit | Children are not killed | Call `kill()` yourself |
+| `exec` shell | `exec` / `execSync` always run `/bin/sh -c` | `/bin/sh` must be in `--allow-run`; permitting it permits any command string |
 
 ## TLS and bytecode
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| TLS versions | TLS 1.2 (BearSSL build) | No TLS 1.3 in the default build |
+| Server TLS versions | TLS 1.2 minimum (TLS 1.0 and 1.1 rejected) | No TLS 1.3 in the default BearSSL build |
+| IP-literal TLS hosts | DNS SAN verification only | `std.crypto.tls.Client` matches DNS SANs, not IP SANs; IP-literal TLS fails closed |
+| `ff upgrade` | Verifies SHA-256 digest from `sha256sums.txt` | Mismatched or missing hash refuses install |
 | `ff compile` input | 20MB source | Larger inputs fail |
 | `ff test` file | 10MB | Larger test files are not loaded |
 | REPL line | 8192 bytes | Longer lines truncate |
@@ -162,3 +212,6 @@ queueMicrotask(fn);
 - HTTP redirects **are followed** (up to 5 hops) by `fetch`.
 - Port shorthand `http.serve(3000, handler)` **works**; the default port is `3000`.
 - `make install` targets **`~/.local/bin/ff`**, not `/usr/local/bin`.
+- `import` and `new Worker(path)` do **not** need `--allow-read`; program loading is a carve-out.
+- `process.argv`, `cwd`, `exit`, `pid`, `platform`, `arch`, `on`, `once`, `off`, `memoryUsage`, and `stats` are **not** permission-gated (`process.kill` is ungated for `process.pid`).
+- `ff imprint`, `ff fmt`, `ff upgrade`, and `ff compile` are CLI operations, not runtime APIs, and are **not** gated by `--allow-*`.

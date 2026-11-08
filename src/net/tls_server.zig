@@ -22,6 +22,10 @@ pub const ST_RECVAPP: c_uint = if (available) bssl.BR_SSL_RECVAPP else 4;
 
 pub const MAX_CERTS: usize = 4;
 
+// TLS 1.2 = 0x0303 (bearssl_ssl.h). Declared locally rather than relying on
+// translate-c emitting the macro, so the floor cannot silently disappear.
+const TLS12: c_uint = 0x0303;
+
 // ── Static server configuration (init-time only, zero hot-path allocations) ──
 var g_cert_pool: [32 * 1024]u8 = undefined;
 var g_certs: [MAX_CERTS]bssl.br_x509_certificate = undefined;
@@ -189,6 +193,13 @@ pub fn slotInit(ctx: *Ctx, iobuf: []u8) void {
             bssl.br_skey_decoder_get_rsa(&g_skey),
         );
     }
+    // TLS VERSION FLOOR. The "full" profiles deliberately enable TLS 1.0,
+    // 1.1 and 1.2 (vendor/bearssl/src/ssl/ssl_server_full_ec.c:100 calls
+    // br_ssl_engine_set_versions(..., BR_TLS10, BR_TLS12)), so a client could
+    // otherwise negotiate a deprecated protocol with CBC suites. Narrow the
+    // version column to 1.2 only; BearSSL has no TLS 1.3, so this is the
+    // strongest policy it can express. Must run BEFORE br_ssl_server_reset.
+    bssl.br_ssl_engine_set_versions(&ctx.eng, TLS12, TLS12);
     bssl.br_ssl_engine_set_buffer(&ctx.eng, @ptrCast(iobuf.ptr), iobuf.len, 1);
     // ALPN: advertise h2 first (server preference order), http/1.1 fallback.
     bssl.br_ssl_engine_set_protocol_names(@ptrCast(&ctx.eng), @ptrCast(&g_alpn_ptrs), 2);
@@ -215,6 +226,7 @@ pub fn recvRecAck(ctx: *Ctx, len: usize) void {
 
 /// Ciphertext the engine wants on the wire (single contiguous span).
 pub fn sendRecReady(ctx: *Ctx) []const u8 {
+    if (!available) return &[_]u8{};
     var n: usize = 0;
     const p = bssl.br_ssl_engine_sendrec_buf(&ctx.eng, &n) orelse return &[_]u8{};
     const base: [*]const u8 = @ptrCast(p);
@@ -222,6 +234,7 @@ pub fn sendRecReady(ctx: *Ctx) []const u8 {
 }
 
 pub fn sendRecAck(ctx: *Ctx, len: usize) void {
+    if (!available) return;
     bssl.br_ssl_engine_sendrec_ack(&ctx.eng, len);
 }
 

@@ -8,6 +8,56 @@ order: 16
 
 The `http` module starts servers. It has one function, `http.serve`, plus the response helpers you return from your handler.
 
+## Permissions
+
+`http.serve` listens on the network, so it always needs `--allow-net` on the
+bind address:
+
+```sh
+ff server.js --allow-net=0.0.0.0:3000
+```
+
+- The server binds to `0.0.0.0`; there is no host option. The check is always
+  `0.0.0.0:<port>`, even when clients connect over loopback. Granting
+  `127.0.0.1:3000` or `localhost:3000` will **not** let the server start.
+- A scope without a port matches every port: `--allow-net=0.0.0.0` is enough
+  for any listener port.
+- The same grant covers HTTP, WebSocket upgrades, and TLS on that port.
+- A denied listener throws synchronously from `http.serve`:
+
+```js
+try {
+  http.serve({ port: 3000 }, handler);
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // http.serve requires --allow-net for '0.0.0.0:3000'
+}
+```
+
+### TLS files need `read`
+
+`tls.cert` and `tls.key` are either inline PEM (the string starts with
+`-----BEGIN `) or a file path. Inline PEM needs no file permission; a path
+needs `--allow-read` on that file:
+
+```sh
+ff server.js \
+  --allow-net=0.0.0.0:3000 \
+  --allow-read=cert.pem,key.pem
+```
+
+A denied TLS path throws `PermissionDenied` with messages like
+`http.serve tls.cert requires --allow-read for 'cert.pem'` (and the same for
+`tls.key`) before the listener starts. Path scopes follow the normal rules:
+resolved against the launch cwd, symlink-checked, and not moved by
+`process.chdir()`.
+
+The `FF_CERT` / `FF_KEY` env vars used by `ff start` are read by the CLI and do
+**not** need `--allow-read`. Only paths passed to `http.serve({ tls })` are
+runtime reads.
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -18,35 +68,39 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/
 # hello
 ```
 
 ## `http.serve(signatures)`
 
-Three call shapes are accepted:
+Two call shapes are accepted, and both return a server handle (`{ port, close }`):
 
 ```js
-http.serve(handler);                 // default port 3000
-http.serve(4242, handler);           // port shorthand
-http.serve({ port: 4242 }, handler); // options object
+const srv = http.serve(3000, handler);           // port shorthand
+const srv = http.serve({ port: 4242 }, handler); // options object
 ```
 
-| Signature | Port used |
-|-----------|-----------|
-| `http.serve(handler)` | `3000` |
-| `http.serve(port, handler)` | `port` |
-| `http.serve(options, handler)` | `options.port`, or `3000` when omitted |
+| Signature | Port used | Returns |
+|-----------|-----------|---------|
+| `http.serve(port, handler)` | `port` (`0` picks an ephemeral OS port) | `{ port: number, close(callback?): Promise<void> }` |
+| `http.serve(options, handler)` | `options.port`, or `3000` when omitted | `{ port: number, close(callback?): Promise<void> }` |
 
-The server binds to `0.0.0.0`. There is no host option.
+The server binds to `0.0.0.0`. There is no host option. When `port: 0` is
+passed, `srv.port` contains the actual bound port assigned by the OS.
+
+> **Note:** the one-argument form `http.serve(handler)` is **not** supported by
+> the current runtime — it throws `TypeError: http.serve requires (options, handler)`.
+> Use `http.serve(3000, handler)` or `http.serve({}, handler)` for the default port.
 
 ## Options reference
 
 ```js
-http.serve(
+const server = http.serve(
   {
-    port: 3000,                       // default 3000
+    port: 3000,                       // default 3000 (0 for ephemeral port)
+    signal: ac.signal,                // optional — AbortSignal that calls server.close()
     tls: { cert: "...", key: "..." }, // optional — enables HTTPS/WSS on the same port
     websocket: {                      // optional — enables WebSocket upgrades
       open: (socket) => {},
@@ -60,11 +114,39 @@ http.serve(
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `port` | `number` | `3000` | Listen port |
-| `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN`) or a file path. Cert max 512KB, key max 256KB. Enables HTTPS and WSS alongside plain HTTP/WS |
+| `port` | `number` | `3000` | Listen port (`0` lets the OS pick an available port) |
+| `signal` | `AbortSignal` | none | Aborting the signal triggers `server.close()` |
+| `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN `) or a file path. Cert max 512KB, key max 256KB. Enables HTTPS and WSS alongside plain HTTP/WS |
 | `websocket.open` | `(socket) => void` | none | Fires when a client completes the upgrade |
 | `websocket.message` | `(socket, data) => void` | none | Fires per frame; `data` is a string (text) or `Uint8Array` (binary) |
 | `websocket.close` | `(socket) => void` | none | Fires when a client disconnects |
+
+## Graceful shutdown: `server.close()` and signals
+
+`server.close(callback?)` stops accepting new connections and drains existing
+ones cleanly:
+
+- Closes the listening socket immediately so new connections are refused.
+- Closes idle HTTP/1.1 keep-alive sockets and active WebSocket connections.
+- Marks in-flight HTTP/1.1 requests with `Connection: close` so each socket
+  closes as soon as its response finishes flushing.
+- Sends HTTP/2 `GOAWAY` on active H2 sessions and closes them once active
+  streams complete.
+- Resolves the returned `Promise<void>` (and invokes optional `callback`) once
+  all 512 connection slots are free, allowing the event loop to exit naturally.
+
+```js
+const server = http.serve({ port: 3000 }, handler);
+
+process.once("SIGTERM", async () => {
+  await server.close();
+  console.log("drained cleanly");
+});
+```
+
+If you do **not** register your own `SIGINT` or `SIGTERM` listener via
+`process.on` / `process.once`, `http.serve` automatically traps `SIGINT` and
+`SIGTERM` and calls `server.close()` for you.
 
 When the `websocket` block is present, any request carrying
 `Connection: Upgrade`, `Upgrade: websocket`, and `Sec-WebSocket-Key` is
@@ -86,6 +168,9 @@ http.serve(
   (url, method, body) => new Response("http here, ws upgrades on this port"),
 );
 ```
+
+WebSocket upgrades share the listener's net grant:
+`--allow-net=0.0.0.0:3000`.
 
 Server sockets expose `send` / `sendBinary` only — track peers by object reference in a `Set` (see the WebSocket guide).
 
@@ -117,6 +202,16 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 });
 ```
 
+An async handler that calls out needs grants for **both** sides:
+
+```sh
+ff server.js \
+  --allow-net=0.0.0.0:3000,example.com:443
+```
+
+The listener is granted by `0.0.0.0:3000`; the outbound `fetch` is granted by
+`example.com:443`. One repeatable flag can carry both scopes.
+
 ## Response helpers
 
 Build responses with the global `Response` class:
@@ -137,7 +232,7 @@ return Response.redirect("/moved", 301);              // 301 status only — no 
 | `Response.redirect(url, status?)` | redirect target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | — | Status `0`, type `"error"` (fetch-network-error shape) |
 
-Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Each body reads once (`bodyUsed` goes `true`).
+Read bodies back with `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` — all work on `Request` and `Response`. Bodies can be re-read freely (`bodyUsed` stays `false`; `bytes()` returns `ArrayBuffer`).
 
 Headers are case-insensitive and lowercased internally:
 
@@ -172,18 +267,32 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/json        # {"ok":true}
 curl -i http://127.0.0.1:3000/old      # 301 without Location (clients won't follow)
 curl -X POST http://127.0.0.1:3000/echo -d hi  # hi
 ```
 
+## Runtime config: `FF_ECHO`
+
+`FF_ECHO` is read by the runtime, not by JavaScript, so it needs no
+`--allow-env`. Setting any value (even empty) makes every request return
+`200 {"message":"ok"}` without invoking your handler:
+
+```sh
+FF_ECHO=1 ff server.js --allow-net=0.0.0.0:3000
+```
+
+The listener still needs its net grant — echo mode bypasses the handler, not
+the permission check. See the [env guide](/docs/guides/env#ff_echo-smoke-mode).
+
 ## Limits (summary)
 
-Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s handler watchdog (→ `504`), plain listeners speak HTTP/1.1 (HTTP/2 needs TLS).
+Full table lives in the Limitations reference; the ones that bite here: 512 concurrent connections, 4 KB max HTTP/1.1 request headers (→ `431`), 1 MB max HTTP/1.1 request body (4 KB static buffer spills to the heap, 64 MB global spill budget; → `413` / `503`; HTTP/2 allows 10 MB per stream / 16 MB per session), 10 MB max response body (the 64 KB staging buffer spills to the heap), 30s read deadline (incomplete requests terminated), 30s handler watchdog (→ `504`), strict HTTP framing (ambiguous Content-Length/Transfer-Encoding, obs-fold, or BWS rejected with 400 Bad Request), Response status clamped to 100..999, plain listeners speak HTTP/1.1 (HTTP/2 needs TLS), bind is always `0.0.0.0`.
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
 - [HTTP Server guide](/docs/guides/http-server) — tutorial version of this page
 - [WebSocket guide](/docs/guides/websocket) — `send` / `sendBinary` patterns
 - [TLS guide](/docs/guides/tls) — `tls: { cert, key }` in depth

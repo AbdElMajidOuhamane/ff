@@ -8,6 +8,91 @@ order: 5
 
 `SQL` (and the ready-made `sql`) is global — no import, no package. Native Zig client, extended protocol, lazy pool of up to 10 connections.
 
+## Permissions
+
+Postgres is a network database, so connection setup needs `--allow-net`:
+
+| Operation | Needs |
+|---|---|
+| `new SQL(dsn)` / `new SQL(options)` | `--allow-net=<host>:<port>` — checked in the constructor |
+| TLS with `sslmode=verify-full` | `--allow-read=<sslrootcert-path>` to load the CA bundle |
+| Global `sql` (first use) | The same net and read grants, plus `--allow-env` for any `PG_TEST_DSN` / `DATABASE_URL` / `PG*` / `PGSSL*` variables |
+| `sql.connect()` | Net grant on the configured host and port |
+
+```sh
+ff todos.js --allow-net=127.0.0.1:5432
+```
+
+- The check uses the literal host from the DSN. `localhost` and `127.0.0.1`
+  are different scopes; there is no DNS matching.
+- The default port is `5432` when the DSN omits one, and that is the port
+  checked. `postgres://user:pass@db.example.com/app` needs
+  `--allow-net=db.example.com:5432`.
+- IPv6 hosts with a port need brackets in the flag:
+  `--allow-net=[::1]:5432`.
+- A scope without a port matches any port: `--allow-net=db.example.com`.
+
+### Global `sql` and environment permission
+
+The global `sql` reads configuration **through the permission filter**, not
+through `process.env`. A variable that `--allow-env` does not grant is silently
+ignored, and the next source is tried:
+
+```text
+PG_TEST_DSN → DATABASE_URL → PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE/PGSSLMODE/PGSSLROOTCERT → defaults
+```
+
+```sh
+# Use an env DSN:
+ff app.js --allow-env=PG_TEST_DSN --allow-net=db.example.com:5432
+
+# Use PG* pieces with TLS:
+ff app.js \
+  --allow-env=PGHOST,PGPORT,PGUSER,PGPASSWORD,PGDATABASE,PGSSLMODE,PGSSLROOTCERT \
+  --allow-net=db.example.com:5432 \
+  --allow-read=./ca.pem
+
+# No env grant: falls back to 127.0.0.1:5432
+ff app.js --allow-net=127.0.0.1:5432
+```
+
+The defaults are host `127.0.0.1`, port `5432`, user `postgres`, empty
+password, database `postgres`.
+
+> **Gotcha:** a missing `--allow-env` does **not** raise `PermissionDenied` for
+> the variable. It quietly falls through to the default host, which can look
+> like "connection refused" rather than a permissions problem.
+
+### Denial shapes
+
+`new SQL(dsn)` checks eagerly and names the host:
+
+```js
+try {
+  new SQL("postgres://u:p@127.0.0.1:5432/app");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // SQL requires --allow-net for '127.0.0.1:5432'
+}
+```
+
+The global pool is built lazily, on first use, and its denial message is
+generic:
+
+```js
+try {
+  await sql`SELECT 1`;
+} catch (e) {
+  console.error(e.message); // sql requires --allow-net for 'configured host'
+}
+```
+
+`sql.unsafe`, `sql.begin`, and `sql.connect` use the same generic
+`'configured host'` detail with their own API name. They do not print the
+actual host, so check the DSN and your `--allow-net` scope when debugging.
+
+Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -29,21 +114,84 @@ sql.close();
 ```
 
 ```sh
-ff todos.js
+ff todos.js --allow-net=127.0.0.1:5432
 ```
 
-## `new SQL(dsn)` / global `sql`
+## `new SQL(dsn | options)` / global `sql`
 
 ```js
+// Via DSN string:
 const sql = new SQL("postgres://user:pass@127.0.0.1:5432/app");
+
+// Or via options object:
+const sql = new SQL({
+  host: "127.0.0.1",
+  port: 5432,
+  user: "user",
+  password: "pass",
+  database: "app",
+  max: 10, // pool size (1..100, default 10)
+});
+
 await sql.connect(); // optional: probe with SELECT 1, rejects if unreachable
 ```
 
-`new SQL(dsn)` builds a pool around that DSN. The global `sql` is the same API preconfigured from the environment — checked in order: `PG_TEST_DSN`, `DATABASE_URL`, then `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE`, then defaults (`127.0.0.1:5432`, user `postgres`).
+`new SQL(dsn | options)` builds a pool and checks its host/port
+immediately. The global `sql` is the same API preconfigured from the
+environment — checked in order: `PG_TEST_DSN`, `DATABASE_URL`, then `PGHOST` /
+`PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE` / `PGSSLMODE` / `PGSSLROOTCERT`, then defaults
+(`127.0.0.1:5432`, user `postgres`, database `postgres`). Only variables
+granted by `--allow-env` are visible to this lookup.
 
-Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10.
+Connections are lazy: the first query opens them, idle connections are reused, and the pool caps at 10 (or configured `max`). For the global `sql`, that first query is also when the net permission check runs.
 
-> **Caution:** With no DSN argument and no environment set, queries reject with `TypeError: no database pool`. Export `PG_TEST_DSN` (or pass the DSN) before running.
+> **Caution:** With no DSN argument and no granted environment, the global
+> `sql` points at `127.0.0.1:5432` and needs
+> `--allow-net=127.0.0.1:5432`. If that host is not running Postgres, the query
+> rejects with a connection error. Export an allowed DSN — or pass one to
+> `new SQL(dsn)` — to point somewhere else.
+
+## TLS / SSL configuration
+
+Postgres connections support TLS encryption using Fairyfly's embedded BearSSL engine:
+
+```js
+// Via DSN query parameters:
+const sql = new SQL("postgres://user:pass@db.example.com:5432/app?sslmode=verify-full&sslrootcert=./ca.pem");
+
+// Or via options object:
+const sql = new SQL({
+  host: "db.example.com",
+  port: 5432,
+  user: "user",
+  password: "pass",
+  database: "app",
+  sslmode: "verify-full",
+  sslrootcert: "./ca.pem",
+});
+```
+
+```sh
+ff app.js \
+  --allow-net=db.example.com:5432 \
+  --allow-read=./ca.pem
+```
+
+### Supported modes
+
+| `sslmode` | Description |
+|---|---|
+| `"verify-full"` | Full TLS handshake: validates server certificate chain against the trusted root in `sslrootcert` and verifies the hostname matches the certificate |
+| `"disable"` | Plaintext TCP connection without TLS |
+
+> **Security Note:** libpq's `require`, `prefer`, and `verify-ca` are **not supported** and throw `TypeError: sslmode must be 'disable' or 'verify-full'`. BearSSL requires chain validation to derive keys for handshake verification, so Fairyfly fails closed rather than allowing unauthenticated or downgrade-vulnerable TLS connections.
+
+### Root certificate rules
+
+- `sslrootcert` points to a PEM-encoded CA bundle (capped at 512 KB).
+- When `sslmode=verify-full`, reading `sslrootcert` is checked against `--allow-read`. A missing grant throws `PermissionDenied`.
+- **Anchor sealing:** The CA trust store is process-global and sealed after the first pool initializes TLS. A subsequent pool that specifies a different `sslrootcert` fails with an error rather than silently trusting the earlier bundle.
+- Environment variables: `PGSSLMODE` and `PGSSLROOTCERT` configure TLS for the global `sql` instance (when permitted by `--allow-env`).
 
 ## Reading and writing: tag / `unsafe`
 
@@ -126,6 +274,10 @@ try {
 | `message` | Server message text |
 | `detail` | Extra context when the server sends it |
 
+Permission failures are different: they are local `Error` objects with
+`name: "PermissionDenied"` and `code: "PERMISSION_DENIED"`, thrown before a
+connection is attempted. They have no SQLSTATE `severity` or `detail`.
+
 ## Transactions: `begin` + `transaction(fn)`
 
 ```js
@@ -183,7 +335,10 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 ```
 
 ```sh
-PG_TEST_DSN='postgres://fairyfly:fairyfly@127.0.0.1:5432/fairyfly' ff server.js
+PG_TEST_DSN='postgres://fairyfly:fairyfly@127.0.0.1:5432/fairyfly' \
+ff server.js \
+  --allow-env=PG_TEST_DSN \
+  --allow-net=127.0.0.1:5432,0.0.0.0:3000
 curl -X POST http://127.0.0.1:3000/notes \
   -H "content-type: application/json" -d '{"text":"buy milk"}'
 # {"id":1,"text":"buy milk"}
@@ -191,15 +346,44 @@ curl http://127.0.0.1:3000/notes
 # [{"id":1,"text":"buy milk"}]
 ```
 
+The DSN is read through `process.env`, so `--allow-env=PG_TEST_DSN` is
+required. The net grant covers both the database connection and the HTTP
+listener.
+
 Full working app: `examples/todo-app/` (CRUD + jsonb/arrays + transactions). Script tour: `examples/sql-todo.js`.
 
 ## Troubleshooting
 
-**`TypeError: no database pool`** — no DSN argument and no `PG_TEST_DSN` / `DATABASE_URL` / `PG*` variables. Export one, or use `new SQL(dsn)`.
+**`PermissionDenied: sql requires --allow-net for 'configured host'`** — the
+global pool cannot reach the configured host. Add the host and port to
+`--allow-net`. The message does not name the host, so check which config source
+won: `PG_TEST_DSN`, `DATABASE_URL`, `PG*`, or the `127.0.0.1:5432` default.
 
-**Connection refused** — Postgres isn't listening (Docker not up? `docker compose up -d`), or the host/port in the DSN is wrong.
+**`PermissionDenied: SQL requires --allow-net for 'host:port'`** — same issue
+from the `new SQL(dsn)` constructor. The message names the checked host; add
+that exact scope. `localhost` will not match `127.0.0.1`.
+
+**`PG_TEST_DSN` seems ignored** — `--allow-env=PG_TEST_DSN` is missing. The
+global `sql` silently falls through to `DATABASE_URL`, the `PG*` variables, or
+the defaults. `process.env.PG_TEST_DSN` is also `undefined` without the grant.
+
+**`TypeError: no database pool`** — the global pool could not be built, for
+example because an allowed DSN variable is malformed. Fix the DSN or pass one
+to `new SQL(dsn)`.
+
+**Connection refused** — Postgres isn't listening (Docker not up? `docker compose up -d`), or the host/port in the DSN is wrong. If you expected an env DSN but got the default, check `--allow-env`.
 
 **`password authentication failed`** — credentials in the DSN don't match the server. Check `PGUSER` / `PGPASSWORD`; environment variables override nothing once a DSN argument is passed.
+
+**`TypeError: sslmode must be 'disable' or 'verify-full'`** — an unsupported `sslmode` was passed (such as `require` or `prefer`). Only `disable` and `verify-full` are supported.
+
+**`TypeError: SQL: TLS setup failed (PermissionDenied)`** — the path specified by `sslrootcert` is outside your `--allow-read` scope. Add the path to `--allow-read`.
+
+**`TypeError: SQL: TLS setup failed (SslRootCertUnreadable)`** — the CA certificate file at `sslrootcert` could not be read or exceeds 512 KB.
+
+**`TypeError: SQL: TLS setup failed (MissingSslRootCert)`** — `sslmode=verify-full` was set, but no `sslrootcert` path was specified in the DSN, options object, or `PGSSLROOTCERT`.
+
+**`TypeError: SQL: TLS setup failed (NoBearssl)`** — the runtime was compiled without TLS support (`-Dbearssl=false`).
 
 **`relation "x" does not exist`** — the migration never ran on this database (wrong database name? fresh server?). Run the `CREATE TABLE` before the queries.
 
@@ -208,3 +392,10 @@ Full working app: `examples/todo-app/` (CRUD + jsonb/arrays + transactions). Scr
 **`no operator matches` / type errors at the server** — a parameter was encoded as a different type than the column expects (e.g. `text` param against an `integer` column). Cast in the SQL (`$1::int`) or pass the right JS type.
 
 **Queries after `sql.close()` fail** — by design. Close only at shutdown, one pool per process (per worker).
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [SQLite API](/docs/api/sqlite) — embedded, filesystem-gated database
+- [API overview](/docs/api/overview) — every injected global
+- [Limitations](/docs/reference/limitations) — every hard cap

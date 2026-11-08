@@ -46,7 +46,13 @@ function childCode(url) {
   );
 }
 async function runChild(env, url) {
-  const c = child_process.spawn(process.argv[0], ["-e", childCode(url)], { env });
+  // The child is a fresh, deny-by-default ff process. All three cases fetch
+  // localhost:<port>; the proxy hop to 127.0.0.1 is internal and not gated.
+  const c = child_process.spawn(
+    process.argv[0],
+    ["-e", childCode(url), "--allow-net=localhost:" + port],
+    { env },
+  );
   await c.wait();
   return decoder.decode(c.stderr);
 }

@@ -113,10 +113,30 @@ fn importTarget(v: std.json.Value) ?[]const u8 {
     return null;
 }
 
+/// A manifest-named target (`main`, `module`, `exports`) must stay inside the
+/// package directory. Node's exports map rejects escaping paths; without this,
+/// a dependency whose `main` says "../../../etc/x" turns module loading into an
+/// arbitrary file read with the process's permissions.
+fn escapesPackage(target: []const u8) bool {
+    if (std.mem.startsWith(u8, target, "/")) return true;
+    var it = std.mem.splitScalar(u8, target, '/');
+    while (it.next()) |comp| {
+        if (std.mem.eql(u8, comp, "..")) return true;
+    }
+    return false;
+}
+
 // Join + normalize + verify. A manifest-named file that is absent is a
 // broken install: single message, hard error — resolving a different
 // version higher up would mask it (npm errors here too).
 fn verifiedJoin(allocator: Allocator, pkgdir: []const u8, target: []const u8) ![]u8 {
+    if (escapesPackage(target)) {
+        std.debug.print(
+            "could not load module filename '{s}' (escapes package directory '{s}')\n",
+            .{ target, pkgdir },
+        );
+        return error.ModuleNotFound;
+    }
     const clean = if (std.mem.startsWith(u8, target, "./")) target[2..] else target;
     const cand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, clean });
     defer allocator.free(cand);
@@ -146,6 +166,9 @@ fn resolvePackageDir(allocator: Allocator, pkgdir: []const u8, rest: []const u8)
         } else |_| {}
     }
     if (rest.len > 0) {
+        // The specifier's subpath is attacker-shaped too: `pkg/../../x`
+        // would otherwise be joined straight onto pkgdir.
+        if (escapesPackage(rest)) return null; // keep walking; never join out
         const cand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pkgdir, rest });
         defer allocator.free(cand);
         if (!pathExists(allocator, cand)) return null; // keep walking
@@ -218,4 +241,13 @@ pub fn readFile(allocator: Allocator, path: []const u8) ![]const u8 {
     const buf = try allocator.alloc(u8, size);
     _ = c.fread(buf.ptr, 1, size, file);
     return buf;
+}
+
+test "manifest targets cannot escape the package directory" {
+    try std.testing.expect(escapesPackage("../../etc/passwd"));
+    try std.testing.expect(escapesPackage("a/../../b"));
+    try std.testing.expect(escapesPackage("/etc/passwd"));
+    try std.testing.expect(!escapesPackage("dist/index.js"));
+    try std.testing.expect(!escapesPackage("./dist/index.js"));
+    try std.testing.expect(!escapesPackage("index.js"));
 }

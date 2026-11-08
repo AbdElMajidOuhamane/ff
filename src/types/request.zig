@@ -213,7 +213,6 @@ pub const RequestData = struct {
         // ResponseData (see response.zig), so createEmbeddedHeaders' retain
         // and deinit's release always pair on a real heap object.
         const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
-        h.* = headers_mod.HeadersData.init();
         return .{
             .pool = std.ArrayList(u8).empty,
             .headers = h,
@@ -633,6 +632,12 @@ fn requestClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     const obj = c.newObjectClass(ctx, @intCast(request_class_id));
     c.setOpaque(obj, new_data);
     setRequestProps(ctx, obj, new_data);
+    const sig = c.getPropertyStr(ctx, this_val, "signal");
+    if (c.isObject(sig) != 0) {
+        _ = c.definePropertyValueStr(ctx, obj, "signal", sig, c.PROP_C_W_E);
+    } else {
+        c.freeValue(ctx, sig);
+    }
     return obj;
 }
 
@@ -761,6 +766,21 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     const obj = c.newObjectClass(ctx, @intCast(request_class_id));
     c.setOpaque(obj, data);
     setRequestProps(ctx, obj, data);
+    if (argc > 1 and c.isObject(argv[1]) != 0) {
+        const sig = c.getPropertyStr(ctx, argv[1], "signal");
+        if (c.isObject(sig) != 0) {
+            _ = c.definePropertyValueStr(ctx, obj, "signal", sig, c.PROP_C_W_E);
+        } else {
+            c.freeValue(ctx, sig);
+        }
+    } else if (c.isObject(arg0) != 0) {
+        const sig = c.getPropertyStr(ctx, arg0, "signal");
+        if (c.isObject(sig) != 0) {
+            _ = c.definePropertyValueStr(ctx, obj, "signal", sig, c.PROP_C_W_E);
+        } else {
+            c.freeValue(ctx, sig);
+        }
+    }
     return obj;
 }
 

@@ -186,6 +186,103 @@ pub fn connect(
     return &tc.connection;
 }
 
+/// Direct TLS connection without an HTTP proxy.
+///
+/// IP-literal hosts fail closed: std.crypto.tls.Client does not verify IP SANs,
+/// and disabling host verification would accept any certificate signed by the
+/// configured CA. Use a DNS name, or add explicit IP-SAN verification here.
+pub fn connectDirect(
+    client: *Client,
+    host: HostName,
+    port: u16,
+) !*Client.Connection {
+    const io = client.io;
+
+    if (client.connection_pool.findConnection(io, .{
+        .host = host,
+        .port = port,
+        .protocol = .tls,
+    })) |node| return node;
+
+    var stream = try host.connect(io, port, .{ .mode = .stream });
+    var stream_owned = true;
+    errdefer if (stream_owned) stream.close(io);
+    tls_transport.tuneFd(stream.socket.handle);
+
+    rescan: {
+        {
+            try client.ca_bundle_lock.lockShared(io);
+            defer client.ca_bundle_lock.unlockShared(io);
+            if (client.now != null) break :rescan;
+        }
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const now = Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, now) catch return error.CertificateBundleLoadFailure;
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    }
+
+    const alloc_len = allocLen(client, host.bytes.len);
+    const base = try client.allocator.alignedAlloc(u8, .of(TlsConn), alloc_len);
+    errdefer client.allocator.free(base);
+    const host_buffer = base[@sizeOf(TlsConn)..][0..host.bytes.len];
+    const tls_read_buffer_len = client.tls_buffer_size + client.read_buffer_size;
+    const tls_read_buffer = host_buffer.ptr[host_buffer.len..][0..tls_read_buffer_len];
+    const tls_write_buffer = tls_read_buffer.ptr[tls_read_buffer_len..][0..client.tls_buffer_size];
+    const socket_write_buffer = tls_write_buffer.ptr[client.tls_buffer_size..][0..client.write_buffer_size];
+    const socket_read_buffer = socket_write_buffer.ptr[client.write_buffer_size..][0..client.tls_buffer_size];
+    @memcpy(host_buffer, host.bytes);
+
+    const tc: *TlsConn = @ptrCast(base);
+    tc.connection = .{
+        .client = client,
+        .stream_writer = stream.writer(io, tls_write_buffer),
+        .stream_reader = stream.reader(io, socket_read_buffer),
+        .pool_node = .{},
+        .port = port,
+        .host_len = @intCast(host.bytes.len),
+        .proxied = false,
+        .closing = false,
+        .protocol = .tls,
+    };
+    var random_buffer: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&random_buffer);
+
+    const host_opt: @TypeOf(@as(std.crypto.tls.Client.Options, undefined).host) =
+        .{ .explicit = host.bytes };
+
+    tc.client = std.crypto.tls.Client.init(
+        &tc.connection.stream_reader.interface,
+        &tc.connection.stream_writer.interface,
+        .{
+            .host = host_opt,
+            .ca = .{ .bundle = .{
+                .gpa = client.allocator,
+                .io = client.io,
+                .lock = &client.ca_bundle_lock,
+                .bundle = &client.ca_bundle,
+            } },
+            .ssl_key_log = client.ssl_key_log,
+            .read_buffer = tls_read_buffer,
+            .write_buffer = socket_write_buffer,
+            .entropy = &random_buffer,
+            .realtime_now = client.now.?,
+            .allow_truncation_attacks = true,
+        },
+    ) catch |err| switch (err) {
+        error.WriteFailed => return tc.connection.stream_writer.err.?,
+        error.ReadFailed => return tc.connection.stream_reader.err.?,
+        else => |e| return e,
+    };
+
+    stream_owned = false;
+    client.connection_pool.addUsed(io, &tc.connection);
+    return &tc.connection;
+}
+
 /// Mirrors Connection.Tls.allocLen (0.16.0); destroy() frees exactly this.
 fn allocLen(client: *Client, host_len: usize) usize {
     const tls_read_buffer_len = client.tls_buffer_size + client.read_buffer_size;

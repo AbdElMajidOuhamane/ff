@@ -5,6 +5,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const udp_native = @import("../net/udp_native.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -34,6 +36,15 @@ fn throwErr(ctx: ?*c.Context, comptime fmt: []const u8, args: anytype) c.Value {
     _ = c.setPropertyStr(ctx, err, "message", m);
     _ = c.throw(ctx, err);
     return c.JS_EXCEPTION;
+}
+
+/// Returns false with a pending PermissionDenied exception.
+fn allowNet(ctx: ?*c.Context, api: []const u8, addr: []const u8, port: u16) bool {
+    if (perm.global().checkNet(addr, port) == .allowed) return true;
+    var detail_buf: [300]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ addr, port }) catch addr;
+    _ = deny.throw(ctx, api, .net, detail);
+    return false;
 }
 
 fn makeSocketObj(ctx: ?*c.Context, slot: u16, inet6: bool) c.Value {
@@ -124,6 +135,9 @@ fn sockBind(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
         return throwErr(ctx, "bind: invalid port", .{});
     const addr = std.Io.net.IpAddress.parse(addr_s, port) catch
         return throwErr(ctx, "bind: invalid address", .{});
+
+    if (!allowNet(ctx, "udp.bind", addr_s, port)) return c.JS_EXCEPTION;
+
     udp_native.bindSock(h.slot, addr) catch {
         return throwErr(ctx, "bind: failed (address in use?)", .{});
     };
@@ -145,6 +159,9 @@ fn sockConnect(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
         return throwErr(ctx, "connect: port required", .{});
     const addr = std.Io.net.IpAddress.parse(addr_s, port) catch
         return throwErr(ctx, "connect: invalid address", .{});
+
+    if (!allowNet(ctx, "udp.connect", addr_s, port)) return c.JS_EXCEPTION;
+
     udp_native.connectSock(h.slot, addr) catch |err| {
         return throwErr(ctx, "connect: {s}", .{@errorName(err)});
     };
@@ -166,6 +183,9 @@ fn sockSendto(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Valu
         return throwErr(ctx, "sendto: port required", .{});
     const addr = std.Io.net.IpAddress.parse(addr_s, port) catch
         return throwErr(ctx, "sendto: invalid address", .{});
+
+    if (!allowNet(ctx, "udp.sendto", addr_s, port)) return c.JS_EXCEPTION;
+
     return submitSendPromise(ctx, h.slot, argv[0], addr);
 }
 
@@ -179,6 +199,7 @@ fn sockSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value)
     }
     const dest = udp_native.peerOf(h.slot) orelse
         return throwErr(ctx, "send: socket is not connected", .{});
+    // The destination was authorized at connect() time; send() inherits it.
     return submitSendPromise(ctx, h.slot, argv[0], dest);
 }
 

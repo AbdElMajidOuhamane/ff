@@ -23,7 +23,8 @@ From `src/event/loop.zig` (`runWithMicrotasks`), in order:
    fetch, query…). If only queued submissions remain, drain them *without*
    blocking — that's what lets an `unref()`'d timer stop holding the process.
 2. **Drain subsystems** in a fixed order: fetch → WebSocket client → FFI →
-   async `fs` → workers. Each drain settles Promises on the JS thread.
+   async `fs` → workers → child process → OS signals (`process.on`). Each drain
+   settles Promises or invokes signal listeners on the JS thread.
 3. **Pump microtasks** — every `queueMicrotask` callback queued this turn.
 4. **GC check** every 8192 turns, and only when the heap exceeds 8 MB.
 5. **Exit or sleep**: if nothing relevant is pending, the loop stops and the

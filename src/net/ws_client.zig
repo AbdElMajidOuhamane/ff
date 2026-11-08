@@ -35,6 +35,7 @@ pub const MAX_WS = 64;
 pub const WS_MSG_SIZE = ws.WS_MSG_SIZE;
 pub const RDBUF = 65536;
 const CLOSE_REASON_MAX = 123;
+const ENTROPY_POOL_SIZE: usize = 1024;
 const JOB_FREE: u8 = 0;
 const JOB_BUSY: u8 = 1;
 const JOB_DONE: u8 = 2;
@@ -43,9 +44,6 @@ const EV_NONE: u8 = 0;
 const EV_OPEN: u8 = 1;
 const EV_MESSAGE: u8 = 2;
 const EV_CLOSE: u8 = 3;
-const TX_TEXT: u8 = 1;
-const TX_BINARY: u8 = 2;
-const TX_CLOSE: u8 = 3;
 
 var states: [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_WS;
 // Gap-2 fix: single-thread-owned flags packed to 1 byte/slot (cf.
@@ -76,13 +74,15 @@ var paths: [MAX_WS][]const u8 = [_][]const u8{""} ** MAX_WS;
 var ports: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
 var keys: [MAX_WS][28]u8 = undefined;
 var close_deadline: [MAX_WS]i64 = [_]i64{0} ** MAX_WS;
+pub const TX_BUF_SIZE: usize = 32768;
 var tx_pending: [MAX_WS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_WS;
-var tx_job: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
+var tx_lock: [MAX_WS]std.Io.Mutex = [_]std.Io.Mutex{std.Io.Mutex.init} ** MAX_WS;
 var tx_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
+var tx_has_close: [MAX_WS]bool = [_]bool{false} ** MAX_WS;
 var tx_code: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
 var tx_reason_len: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
 var tx_reason: [MAX_WS][CLOSE_REASON_MAX]u8 = undefined;
-var tx_msg: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+var tx_buf: [MAX_WS][TX_BUF_SIZE]u8 = undefined;
 var rx_event: [MAX_WS]u8 = [_]u8{0} ** MAX_WS;
 var rx_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
 var rx_code: [MAX_WS]u16 = [_]u16{0} ** MAX_WS;
@@ -93,9 +93,11 @@ var rx_err: [MAX_WS][64]u8 = undefined;
 var rx_msg: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
 var rd_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
 var partial_len: [MAX_WS]usize = [_]usize{0} ** MAX_WS;
-var wb: [MAX_WS][WS_MSG_SIZE + ws.MAX_HDR]u8 = undefined;
+var wb: [MAX_WS][TX_BUF_SIZE]u8 = undefined;
 var rd_buf: [MAX_WS][RDBUF]u8 = undefined;
 var partial: [MAX_WS][WS_MSG_SIZE]u8 = undefined;
+var entropy_pool: [MAX_WS][ENTROPY_POOL_SIZE]u8 = undefined;
+var entropy_off: [MAX_WS]usize = [_]usize{ENTROPY_POOL_SIZE} ** MAX_WS;
 // F7-B: static per-slot URL storage — no per-connection dupe/free.
 // `hosts`/`paths` stay slice views so all downstream uses are untouched.
 var host_bufs: [MAX_WS][256:0]u8 = undefined;
@@ -111,7 +113,16 @@ var cmd_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var worker_started: bool = false; // guarded by poolLock (submit path only)
 var free_list: [MAX_WS]u16 = undefined;
 var free_count: usize = MAX_WS;
-var pool_lock: std.atomic.Mutex = .unlocked;
+// Incarnation counter per slot, bumped in releaseSlot(). Handles carry it so a
+// retained JS WebSocket cannot address a recycled slot and end up sending on
+// another peer's outbound connection. Mirrors udp_native's (slot, gen) rule.
+var gens: [MAX_WS]u16 = [_]u16{1} ** MAX_WS;
+
+/// Slot handle: index + incarnation. Minted by submit(), consumed by
+/// sendBytes/closeWs, validated by isValid().
+pub const Handle = struct { slot: u16, gen: u16 };
+
+var pool_lock: std.Io.Mutex = std.Io.Mutex.init;
 const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
@@ -121,12 +132,16 @@ var g_loop: ?*xev.Loop = null; // CHANGED
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 var socks: [MAX_WS]?c.Value = [_]?c.Value{null} ** MAX_WS;
 
+fn lockIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 fn poolLock() void {
-    while (!pool_lock.tryLock()) std.atomic.spinLoopHint();
+    pool_lock.lockUncancelable(lockIo());
 }
 
 fn poolUnlock() void {
-    pool_lock.unlock();
+    pool_lock.unlock(lockIo());
 }
 
 fn poolInit() void {
@@ -154,7 +169,17 @@ fn releaseSlot(s: usize) void {
     wflags[s].ws_open = false;
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
+    tx_lock[s].lockUncancelable(lockIo());
+    tx_len[s] = 0;
+    tx_has_close[s] = false;
+    tx_pending[s].store(false, .release);
+    tx_lock[s].unlock(lockIo());
     states[s].store(JOB_FREE, .release);
+    gens[s] +%= 1; // retire this incarnation: stale handles stop validating
+    // Unchecked cursor into a static column: a double release would write past
+    // free_list. Latent, but make it structural (same rule as http_native).
+    std.debug.assert(free_count < MAX_WS);
+    if (free_count >= MAX_WS) return;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
@@ -171,6 +196,30 @@ pub fn init(ctx: ?*c.Context) void { // CHANGED: takes ctx
     };
 }
 
+pub fn deinit() void {
+    for (0..MAX_WS) |s| {
+        if (socks[s]) |v| {
+            if (g_ctx) |ctx| c.freeValue(ctx, v);
+            socks[s] = null;
+        }
+        if (w_conns[s]) |cn| {
+            cleanupConn(s, cn, &w_reqs[s]);
+            w_conns[s] = null;
+        } else if (sock_fds[s] >= 0) {
+            _ = std.c.close(sock_fds[s]);
+            sock_fds[s] = -1;
+        }
+        if (w_reqs[s]) |*rr| {
+            rr.deinit();
+            w_reqs[s] = null;
+        }
+    }
+    _ = pending.store(0, .release);
+    async_armed = false;
+    g_loop = null;
+    g_ctx = null;
+}
+
 pub fn submit(
     ctx: ?*c.Context,
     obj: c.Value,
@@ -178,7 +227,7 @@ pub fn submit(
     path: []const u8,
     port: u16,
     tls_flag: bool,
-) !usize {
+) !Handle {
     poolLock();
     defer poolUnlock();
     const s = acquireSlot() orelse return error.NoConnectionAvailable;
@@ -202,6 +251,8 @@ pub fn submit(
     rd_len[s] = 0;
     partial_len[s] = 0;
     tx_pending[s] = .{ .raw = false };
+    tx_len[s] = 0;
+    tx_has_close[s] = false;
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
     close_deadline[s] = 0;
@@ -219,7 +270,7 @@ pub fn submit(
     want_connect[s] = true;
     wakeWorker();
     ensureArmed();
-    return s;
+    return .{ .slot = @intCast(s), .gen = gens[s] };
 }
 
 fn makeCmdPipe() !void {
@@ -248,25 +299,80 @@ fn startWorkerOnce() !void {
     worker_started = true;
 }
 
-pub fn sendBytes(s: usize, bytes: []const u8, binary: bool) void {
-    if (states[s].load(.acquire) == JOB_FREE) return;
-    if (!wflags[s].ws_open) return;
-    if (bytes.len > WS_MSG_SIZE) return;
-    if (tx_pending[s].load(.acquire)) return;
-    @memcpy(tx_msg[s][0..bytes.len], bytes);
-    tx_len[s] = bytes.len;
-    tx_job[s] = if (binary) TX_BINARY else TX_TEXT;
-    tx_pending[s].store(true, .release);
-    wakeWorker();
+/// True when this handle still names the live incarnation of its slot.
+pub fn isValid(h: Handle) bool {
+    const s: usize = h.slot;
+    if (s >= MAX_WS) return false;
+    if (gens[s] != h.gen) return false;
+    return states[s].load(.acquire) != JOB_FREE;
 }
 
-pub fn closeWs(s: usize, code: u16, reason: []const u8) void {
-    if (states[s].load(.acquire) == JOB_FREE) return;
+pub fn genOf(s: usize) u16 {
+    return gens[s];
+}
+
+fn nextMaskLocked(s: usize) [4]u8 {
+    if (entropy_off[s] + 4 > ENTROPY_POOL_SIZE) {
+        getRandomBytes(entropy_pool[s][0..]);
+        entropy_off[s] = 0;
+    }
+    const mask = entropy_pool[s][entropy_off[s]..][0..4].*;
+    entropy_off[s] += 4;
+    return mask;
+}
+
+fn appendFrameLocked(s: usize, opcode: u8, payload: []const u8) bool {
+    if (payload.len > WS_MSG_SIZE) return false;
+    var tmp_hdr: [ws.MAX_HDR]u8 = undefined;
+    const hdr_len = ws.buildHeader(&tmp_hdr, opcode, true, payload.len);
+    const total_len = hdr_len + 4 + payload.len;
+    if (tx_len[s] + total_len > TX_BUF_SIZE) return false;
+
+    tmp_hdr[1] |= 0x80;
+    @memcpy(tx_buf[s][tx_len[s]..][0..hdr_len], tmp_hdr[0..hdr_len]);
+
+    const mask = nextMaskLocked(s);
+    @memcpy(tx_buf[s][tx_len[s] + hdr_len ..][0..4], &mask);
+
+    const data_start = tx_len[s] + hdr_len + 4;
+    @memcpy(tx_buf[s][data_start..][0..payload.len], payload);
+    ws.unmask(tx_buf[s][data_start..][0..payload.len], mask);
+
+    tx_len[s] += total_len;
+    return true;
+}
+
+pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) bool {
+    if (!isValid(h)) return false;
+    const s: usize = h.slot;
+    if (!wflags[s].ws_open) return false;
+    if (bytes.len > WS_MSG_SIZE) return false;
+    const io = lockIo();
+    tx_lock[s].lockUncancelable(io);
+    defer tx_lock[s].unlock(io);
+    if (!appendFrameLocked(s, if (binary) ws.OP_BINARY else ws.OP_TEXT, bytes)) return false;
+    tx_pending[s].store(true, .release);
+    wakeWorker();
+    return true;
+}
+
+pub fn closeWs(h: Handle, code: u16, reason: []const u8) void {
+    if (!isValid(h)) return;
+    const s: usize = h.slot;
+    if (wflags[s].ws_sent_close) return;
+    const io = lockIo();
+    tx_lock[s].lockUncancelable(io);
+    defer tx_lock[s].unlock(io);
+    var payload: [2 + CLOSE_REASON_MAX]u8 = undefined;
+    payload[0] = @intCast(code >> 8);
+    payload[1] = @intCast(code & 0xff);
     const rlen = @min(reason.len, @as(usize, CLOSE_REASON_MAX));
+    @memcpy(payload[2..][0..rlen], reason[0..rlen]);
+    _ = appendFrameLocked(s, ws.OP_CLOSE, payload[0 .. 2 + rlen]);
+    tx_code[s] = code;
     @memcpy(tx_reason[s][0..rlen], reason[0..rlen]);
     tx_reason_len[s] = @intCast(rlen);
-    tx_code[s] = code;
-    tx_job[s] = TX_CLOSE;
+    tx_has_close[s] = true;
     tx_pending[s].store(true, .release);
     wakeWorker();
 }
@@ -306,7 +412,16 @@ fn connectSlot(s: usize) void {
                 failClose(s, null, "connect failed", &req);
                 return;
             };
-        }
+        } else if (std.Io.net.IpAddress.parse(hosts[s], 0)) |_| {
+            const host_name = std.Io.net.HostName.init(hosts[s]) catch {
+                failClose(s, null, "invalid host", &req);
+                return;
+            };
+            tunnel_conn = tls_tunnel.connectDirect(wss_client, host_name, ports[s]) catch {
+                failClose(s, null, "connect failed", &req);
+                return;
+            };
+        } else |_| {}
         req = wss_client.request(.GET, uri, .{
             .extra_headers = &[_]http.Header{
                 .{ .name = "Upgrade", .value = "websocket" },
@@ -477,7 +592,6 @@ fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) 
     w_conns[s] = null;
     w_reqs[s] = null;
     wflags[s].conn_live = false;
-    _ = pending.fetchSub(1, .release);
     signalEvent(s);
     finishSlot(s);
 }
@@ -490,7 +604,6 @@ fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8,
     rx_event[s] = EV_CLOSE;
     if (conn) |cn| cleanupConn(s, cn, r);
     wflags[s].conn_live = false;
-    _ = pending.fetchSub(1, .release);
     signalEvent(s);
     finishSlot(s);
 }
@@ -498,16 +611,14 @@ fn failClose(s: usize, conn: ?*http.Client.Connection, comptime msg: []const u8,
 fn cleanupConn(s: usize, conn: ?*http.Client.Connection, r: *?http.Client.Request) void {
     const fd = sock_fds[s];
     sock_fds[s] = -1;
-    if (wflags[s].tls_active) {
-        if (r.*) |*rr| rr.connection = null;
-        if (conn) |cn| {
-            cn.closing = true;
-            // Release into the pool of the client that owns the connection:
-            // NO_PROXY routes wss to direct_client, proxied wss to the shared
-            // client (and tls_tunnel connections also live in the shared
-            // client's pool). Releasing into the wrong pool corrupts it.
-            cn.client.connection_pool.release(cn, cn.client.io);
-        }
+    if (r.*) |*rr| rr.connection = null;
+    if (conn) |cn| {
+        cn.closing = true;
+        // Release into the pool of the client that owns the connection:
+        // NO_PROXY routes wss to direct_client, proxied wss to the shared
+        // client (and tls_tunnel connections also live in the shared
+        // client's pool). Releasing into the wrong pool corrupts it.
+        cn.client.connection_pool.release(cn, cn.client.io);
     } else if (fd >= 0) {
         _ = std.c.close(fd);
     }
@@ -767,28 +878,39 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
 }
 
 fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
-    // F7-B: the per-slot wake-pipe drain is gone (single cmd_pipe, drained in
-    // the shared worker loop). The tx_* columns are the level-triggered work
-    // description; the wake byte was only ever a notification.
     if (!tx_pending[s].load(.acquire)) return true;
-    const job = tx_job[s];
-    const code = tx_code[s];
-    const rlen: usize = tx_reason_len[s];
-    var reason: [CLOSE_REASON_MAX]u8 = undefined;
-    @memcpy(reason[0..rlen], tx_reason[s][0..rlen]);
-    var msg: [WS_MSG_SIZE]u8 = undefined;
-    var mlen: usize = 0;
-    if (job != TX_CLOSE) {
-        mlen = @min(tx_len[s], WS_MSG_SIZE);
-        @memcpy(msg[0..mlen], tx_msg[s][0..mlen]);
+    var to_write: usize = 0;
+    var had_close = false;
+    const io = lockIo();
+    tx_lock[s].lockUncancelable(io);
+    if (tx_len[s] > 0) {
+        to_write = tx_len[s];
+        @memcpy(wb[s][0..to_write], tx_buf[s][0..to_write]);
+        tx_len[s] = 0;
+    }
+    if (tx_has_close[s]) {
+        had_close = true;
+        tx_has_close[s] = false;
     }
     tx_pending[s].store(false, .release);
-    switch (job) {
-        TX_TEXT => return sendFrame(s, cn, ws.OP_TEXT, msg[0..mlen]),
-        TX_BINARY => return sendFrame(s, cn, ws.OP_BINARY, msg[0..mlen]),
-        TX_CLOSE => return initiateClose(s, cn, code, reason[0..rlen]),
-        else => return true,
+    tx_lock[s].unlock(io);
+
+    if (to_write > 0) {
+        writeWs(s, cn, wb[s][0..to_write]) catch return false;
     }
+    if (had_close) {
+        if (!wflags[s].ws_sent_close) {
+            wflags[s].ws_sent_close = true;
+            close_deadline[s] = monoMillis() + UPGRADE_TIMEOUT_MS;
+            if (rx_event[s] != EV_CLOSE) {
+                rx_code[s] = tx_code[s];
+                const crl = tx_reason_len[s];
+                @memcpy(rx_reason[s][0..crl], tx_reason[s][0..crl]);
+                rx_reason_len[s] = crl;
+            }
+        }
+    }
+    return true;
 }
 
 // ---- Main-thread pump (QuickJS) ----
@@ -870,15 +992,13 @@ fn dispatchEvent(
     event_name: [*:0]const u8,
     event_val: ?c.Value,
 ) void {
+    defer if (event_val) |ev| c.freeValue(ctx, ev);
     const prop = c.getPropertyStr(ctx, sock_val, event_name);
     // FIX: JS_GetPropertyStr returns a new ref — previously dropped on both
     // the non-function early return and the normal path.
     defer c.freeValue(ctx, prop);
     if (c.isFunction(ctx, prop) == 0) return;
     if (event_val) |ev| {
-        // FIX: every caller passes a freshly built event (make*Event) — we own
-        // it. JS_Call copies argv, so the ref stays ours after the dispatch.
-        defer c.freeValue(ctx, ev);
         var argv = [_]c.Value{ev};
         const ret = c.call(ctx, prop, sock_val, 1, &argv);
         defer c.freeValue(ctx, ret);
@@ -953,6 +1073,7 @@ fn completeEvent(ctx: ?*c.Context, s: usize) void {
             setReadyState(ctx, sv, 3);
             dispatchEvent(ctx, sv, "onclose", makeCloseEvent(ctx, s));
         }
+        _ = pending.fetchSub(1, .acq_rel);
         releaseSlot(s);
         return;
     }

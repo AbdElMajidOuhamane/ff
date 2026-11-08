@@ -24,7 +24,7 @@ There is no single "4-thread pool" doing everything. Each subsystem owns its thr
 | `ffi` | own 4-thread pool | each native call parks a pool thread while it runs |
 | `fetch` | 16 dedicated threads (1 MB stack each) | one thread per slot — a 16-way fan-out truly runs in parallel |
 | Postgres / TLS | none | event-driven on the loop thread; no helper threads |
-| `Worker` | 8 OS threads (8 MB stack each) | one JS runtime + 32 MB heap each; 4 MB per message |
+| `Worker` | 8 OS threads (8 MB stack each) | one JS runtime + 32 MB heap each, running an independent `libxev` loop; wakes parent on message/timer/error; 4 MB per message |
 
 JavaScript itself never runs in parallel with other JavaScript. Two JS
 sections execute one after the other, always.
@@ -91,8 +91,8 @@ w.postMessage({ password: "hunter2" });
 
 Workers have their **own** JS runtime and event loop. They share no state
 and talk only by messages (structured clone). The worker scope has
-`console`, timers, `postMessage`, `workerData`, and `performance` — no
-`fs`, no `fetch`, no `http.serve`.
+`console`, timers, `structuredClone`, `postMessage`, `workerData`, and
+`performance` — no `fs`, no `fetch`, no `http.serve`.
 
 ## Limits worth memorising
 

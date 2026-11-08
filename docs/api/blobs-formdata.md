@@ -171,4 +171,4 @@ curl -X POST http://127.0.0.1:3000/drop --data-binary @photo.png
 
 **`X is not a function` on `blob.stream()`** — doesn't exist. Use `text()` / `arrayBuffer()` / `bytes()`.
 
-**Server rejects an upload over ~4KB with `413`** — the whole request (headers + body) must fit in a single 4 KB read buffer. Responses are the roomy side: bodies up to 10 MB (a 64 KB stage buffer spills to the heap past that). Chunk large uploads across requests.
+**Server rejects an HTTP/1.1 upload over 1 MB with `413`** — HTTP/1.1 requests up to 4 KB (headers + body) use a static buffer, and larger bodies spill to the heap up to **1 MB** per request (64 MB process-wide spill cap; HTTP/2 allows up to 10 MB per stream / 16 MB per session). Responses allow bodies up to 10 MB (a 64 KB stage buffer spills to the heap past that). Chunk HTTP/1.1 uploads larger than 1 MB across requests.

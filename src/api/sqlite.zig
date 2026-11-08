@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const sqlite_c = @import("sqlite_c");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
 const gpa = std.heap.smp_allocator;
 
@@ -612,6 +614,32 @@ fn jsOpen(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) c
     var path_len: usize = 0;
     const path_ptr = c.toCStringLen(ctx, &path_len, argv[0]) orelse return c.JS_EXCEPTION;
     defer c.freeCString(ctx, path_ptr);
+    const path = path_ptr[0..path_len];
+
+    if (std.mem.indexOfScalar(u8, path, 0) != null) {
+        _ = c.throwTypeError(ctx, "Database.open: path contains a NUL byte");
+        return c.JS_EXCEPTION;
+    }
+    if (path.len == 0) {
+        _ = c.throwTypeError(ctx, "Database.open: empty path");
+        return c.JS_EXCEPTION;
+    }
+    if (std.mem.startsWith(u8, path, "file:")) {
+        _ = c.throwTypeError(ctx, "Database.open: URI filenames are not supported");
+        return c.JS_EXCEPTION;
+    }
+    if (!std.mem.eql(u8, path, ":memory:")) {
+        if (perm.global().checkPath(.read, path) == .denied)
+            return deny.throw(ctx, "Database.open", .read, path);
+        if (perm.global().checkPath(.write, path) == .denied)
+            return deny.throw(ctx, "Database.open", .write, path);
+
+        // WAL/-shm siblings are written by SQLite directly, so the containing
+        // directory must be writable too, not just the database file.
+        const parent = std.fs.path.dirname(path) orelse ".";
+        if (perm.global().checkPath(.write, parent) == .denied)
+            return deny.throw(ctx, "Database.open", .write, parent);
+    }
 
     const path_z = gpa.allocSentinel(u8, path_len, 0) catch return c.throwOutOfMemory(ctx);
     defer gpa.free(path_z);

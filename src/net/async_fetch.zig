@@ -7,6 +7,7 @@ const response_mod = @import("../types/response.zig");
 const headers_mod = @import("../types/headers.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig");
+const perm = @import("../security/permissions.zig");
 
 var job_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -18,6 +19,17 @@ const counting = @import("../util/counting_allocator.zig");
 const http = std.http;
 
 pub const MAX_FETCH = 16;
+
+// 256 KiB intermittently SIGSEGVs under the 300-query burst (5/15 runs);
+// keep 1 MiB. Per-thread RSS is handled by removing the 4 MiB threadlocal
+// in worker/message_port.zig instead of under-sizing stacks.
+const WORKER_STACK_SIZE: usize = 1024 * 1024;
+
+// Response-body ceiling, decompressed. A malicious or compromised upstream can
+// otherwise choose both the allocation size (via Content-Length) and the
+// expansion ratio (via gzip/zstd). Worst case here is MAX_FETCH × this value.
+// Policy constant, not a layout one — raise deliberately.
+const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
 
 const JOB_FREE: u8 = 0;
 const JOB_BUSY: u8 = 1;
@@ -36,6 +48,9 @@ const JOB_CLAIMED: u8 = 3;
 // Hot path touches only `states` + `pending` + ring indices.
 // Payload columns below are cold per-job data, never scanned in drains.
 var states: [MAX_FETCH]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB_FREE }} ** MAX_FETCH;
+var slot_gens: [MAX_FETCH]std.atomic.Value(u16) = [_]std.atomic.Value(u16){.{ .raw = 0 }} ** MAX_FETCH;
+var aborted: [MAX_FETCH]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.{ .raw = false }} ** MAX_FETCH;
+var active_fds: [MAX_FETCH]std.atomic.Value(i32) = [_]std.atomic.Value(i32){.{ .raw = -1 }} ** MAX_FETCH;
 var resolve_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var reject_funcs: [MAX_FETCH]?c.Value = [_]?c.Value{null} ** MAX_FETCH;
 var results: [MAX_FETCH]?*response_mod.ResponseData = [_]?*response_mod.ResponseData{null} ** MAX_FETCH;
@@ -116,6 +131,9 @@ fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
     const s: usize = free_list[free_count];
+    _ = slot_gens[s].fetchAdd(1, .acq_rel);
+    aborted[s].store(false, .release);
+    active_fds[s].store(-1, .release);
     states[s].store(JOB_BUSY, .release);
     return s;
 }
@@ -131,6 +149,8 @@ fn releaseSlot(s: usize) void {
     freeResolvers(s);
     results[s] = null;
     errs[s] = null;
+    std.debug.assert(free_count < MAX_FETCH);
+    if (free_count >= MAX_FETCH) return;
     free_list[free_count] = @intCast(s);
     free_count += 1;
 }
@@ -172,7 +192,7 @@ pub fn init(ctx: ?*c.Context) void {
         return;
     };
     for (&worker_threads) |*t| {
-        t.* = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerLoop, .{}) catch {
+        t.* = std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, workerLoop, .{}) catch {
             t.* = null;
             break;
         };
@@ -253,6 +273,11 @@ fn workerLoop() void {
         if (stop) return;
     }
 }
+pub const SubmitToken = struct {
+    slot: u16,
+    gen: u16,
+};
+
 pub fn submit(
     ctx: ?*c.Context,
     resolve_func: c.Value,
@@ -262,7 +287,7 @@ pub fn submit(
     method: http.Method,
     headers_ptr: *headers_mod.HeadersData,
     body: ?[]const u8, // ◀ FIX-4: BORROWED (was caller-owned heap [:0])
-) !void {
+) !SubmitToken {
     poolLock();
     defer poolUnlock();
     const s = acquireSlot() orelse {
@@ -333,6 +358,24 @@ pub fn submit(
     ringUnlock();
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
     ensureArmed();
+    return .{ .slot = @intCast(s), .gen = slot_gens[s].load(.acquire) };
+}
+
+pub fn abortSlot(ctx: ?*c.Context, s: usize, gen: u16, reason: c.Value) void {
+    if (s >= MAX_FETCH) return;
+    if (slot_gens[s].load(.acquire) != gen) return;
+    if (states[s].load(.acquire) == JOB_FREE) return;
+    aborted[s].store(true, .seq_cst);
+    const fd = active_fds[s].load(.seq_cst);
+    if (fd >= 0) {
+        _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
+    }
+    if (reject_funcs[s]) |reject| {
+        var args = [_]c.Value{reason};
+        const ret = c.call(ctx, reject, c.JS_UNDEFINED, 1, &args);
+        c.freeValue(ctx, ret);
+    }
+    freeResolvers(s);
 }
 fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]const u8 {
     const scheme_sep = std.mem.indexOf(u8, current_url, "://") orelse return null;
@@ -359,14 +402,29 @@ fn resolveRedirectInto(out: []u8, current_url: []const u8, loc: []const u8) ?[]c
     const q = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
     const dir_end = std.mem.lastIndexOfScalar(u8, path[0..q], '/') orelse 0;
     if (auth_end + dir_end + 1 + loc.len > out.len) return null;
-    var n: usize = 0;
+    // FIX: join at auth_end, not auth_start. Writing the directory at
+    // auth_start overwrote the authority ("http://a.com/x/y" + "z" became
+    // "http:///x/z"), so every relative Location failed as an invalid URL.
+    var n: usize = auth_end;
     @memcpy(out[0..auth_end], current_url[0..auth_end]);
-    n = auth_start;
     @memcpy(out[n..][0 .. dir_end + 1], path[0 .. dir_end + 1]);
     n += dir_end + 1;
     @memcpy(out[n..][0..loc.len], loc);
     return out[0..n];
 }
+
+/// Headers that carry caller credentials. Stripped once a redirect leaves the
+/// origin the caller supplied. std.http's `privileged_headers` would do this,
+/// but this path builds `extra_headers` by hand and never marks any.
+fn isCredentialHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "cookie") or
+        std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+        std.ascii.eqlIgnoreCase(name, "www-authenticate") or
+        std.ascii.eqlIgnoreCase(name, "x-api-key") or
+        std.ascii.eqlIgnoreCase(name, "x-auth-token");
+}
+
 fn runJob(slot_id: u16) void {
     const s: usize = slot_id;
     if (builtin.mode == .Debug) job_counter.reset();
@@ -415,7 +473,22 @@ fn runJob(slot_id: u16) void {
             if (owned_body) |b| gpa.free(b);
         }
     }
+    // Cross-origin redirect state. `first_origin` records the origin the
+    // caller's headers were supplied for; the first hop that differs triggers
+    // a one-time rebuild of the header list without credential headers.
+    var first_origin_buf: [320]u8 = undefined;
+    var first_origin: []const u8 = "";
+    var filtered_buf: [64]http.Header = undefined;
+    var filtered_view: std.ArrayList(http.Header) = .empty;
+    var filtered_used_heap = false;
+    defer if (filtered_used_heap) filtered_view.deinit(gpa);
+    var cross_origin_hdrs: ?[]http.Header = null;
+
     hop: while (true) {
+        if (aborted[s].load(.acquire)) {
+            failSlot(s, "The operation was aborted");
+            return;
+        }
         const current_uri = std.Uri.parse(current_url) catch {
             failSlot(s, "Invalid URL");
             return;
@@ -436,6 +509,51 @@ fn runJob(slot_id: u16) void {
             .plain => 80,
             .tls => 443,
         };
+        if (perm.global().checkNet(hop_host.bytes, hop_port) == .denied) {
+            failSlot(s, "PermissionDenied: fetch requires --allow-net");
+            return;
+        }
+
+        // Origin tracking + credential stripping. Format is host:port:scheme
+        // so a scheme downgrade also counts as crossing the origin.
+        var hop_origin_buf: [320]u8 = undefined;
+        const hop_origin = std.fmt.bufPrint(&hop_origin_buf, "{s}:{d}:{s}", .{
+            hop_host.bytes,
+            hop_port,
+            if (protocol == .tls) "tls" else "plain",
+        }) catch "";
+        if (first_origin.len == 0) {
+            @memcpy(first_origin_buf[0..hop_origin.len], hop_origin);
+            first_origin = first_origin_buf[0..hop_origin.len];
+        }
+        var hop_hdrs: []http.Header = http_hdrs;
+        if (!std.mem.eql(u8, first_origin, hop_origin)) {
+            if (cross_origin_hdrs) |cached| {
+                hop_hdrs = cached;
+            } else {
+                if (http_hdrs.len <= filtered_buf.len) {
+                    var k: usize = 0;
+                    for (http_hdrs) |h| {
+                        if (isCredentialHeader(h.name)) continue;
+                        filtered_buf[k] = h;
+                        k += 1;
+                    }
+                    cross_origin_hdrs = filtered_buf[0..k];
+                } else {
+                    filtered_used_heap = true;
+                    for (http_hdrs) |h| {
+                        if (isCredentialHeader(h.name)) continue;
+                        filtered_view.append(gpa, h) catch {
+                            failSlot(s, "Out of memory");
+                            return;
+                        };
+                    }
+                    cross_origin_hdrs = filtered_view.items;
+                }
+                hop_hdrs = cross_origin_hdrs.?;
+            }
+        }
+
         const req_client = tls.clientForHost(hop_host.bytes, hop_port, protocol);
         // https through a proxy: std.http.Client cannot TLS-upgrade its
         // CONNECT tunnel (ziglang/zig#19878), so tls_tunnel builds the TLS
@@ -448,10 +566,16 @@ fn runJob(slot_id: u16) void {
                     failSlot(s, "Network error");
                     return;
                 };
-            }
+            } else if (std.Io.net.IpAddress.parse(hop_host.bytes, 0)) |_| {
+                tunnel_conn = tls_tunnel.connectDirect(req_client, hop_host, hop_port) catch |err| {
+                    std.debug.print("[fetch] TLS connect failed: {s} url={s}\n", .{ @errorName(err), current_url });
+                    failSlot(s, "Network error");
+                    return;
+                };
+            } else |_| {}
         }
         var req = req_client.request(current_method, current_uri, .{
-            .extra_headers = http_hdrs,
+            .extra_headers = hop_hdrs,
             .connection = tunnel_conn,
         }) catch |err| {
             std.debug.print("[fetch] request failed: {s} url={s}\n", .{ @errorName(err), current_url });
@@ -467,8 +591,21 @@ fn runJob(slot_id: u16) void {
         req.redirect_behavior = .unhandled;
         defer req.deinit();
         var slot: ?usize = null;
-        if (req.connection) |cn| slot = tls.attach(cn);
+        if (req.connection) |cn| {
+            slot = tls.attach(cn);
+            active_fds[s].store(@intCast(cn.stream_reader.stream.socket.handle), .seq_cst);
+        }
         defer if (slot) |sl| tls.detach(sl);
+        defer {
+            active_fds[s].store(-1, .seq_cst);
+            if (aborted[s].load(.acquire)) {
+                if (req.connection) |cn| cn.closing = true;
+            }
+        }
+        if (aborted[s].load(.seq_cst)) {
+            failSlot(s, "The operation was aborted");
+            return;
+        }
         if (current_body) |payload| {
             req.transfer_encoding = .{ .content_length = payload.len };
             var body_writer = req.sendBodyUnflushed(&.{}) catch {
@@ -549,6 +686,10 @@ fn runJob(slot_id: u16) void {
             failSlot(s, "Out of memory");
             return;
         };
+        // Every early return after this point must return the shell to the
+        // freelist (the size-cap exits below are new).
+        var resp_kept = false;
+        defer if (!resp_kept) response_mod.releaseData(resp_data);
         // F1: take ownership of the slot's parsed headers directly — no
         // create+release of a throwaway HeadersData per fetch.
         resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
@@ -621,6 +762,12 @@ fn runJob(slot_id: u16) void {
             if (wire_cl) |cl| {
                 if (cl > 0) {
                     const len: usize = @intCast(cl);
+                    // The upstream declares the allocation size: never trust it
+                    // past the policy ceiling.
+                    if (len > MAX_RESPONSE_BODY) {
+                        failSlot(s, "ResponseTooLarge: body exceeds limit");
+                        return;
+                    }
                     // Reuse 64K stage buffer; heap spill measured via stat_body_heap.
                     if (len <= body_stage_bufs[s].len) {
                         const b = body_stage_bufs[s][0..len];
@@ -674,6 +821,8 @@ fn runJob(slot_id: u16) void {
                 }
             } else {
                 // Unknown length: fill stage buffer first, spill to heap only if needed.
+                // This path also covers every compressed response, so the cap
+                // bounds decompressed output (decompression-bomb defence).
                 var chunk: [16 * 1024]u8 = undefined;
                 var total: usize = 0;
                 var heap_acc: std.ArrayList(u8) = .empty;
@@ -685,6 +834,10 @@ fn runJob(slot_id: u16) void {
                         break :acc_b 0;
                     };
                     if (n == 0) break;
+                    if (total + n > MAX_RESPONSE_BODY) {
+                        failSlot(s, "ResponseTooLarge: body exceeds limit");
+                        return;
+                    }
                     if (!heap_used and total + n <= body_stage_bufs[s].len) {
                         @memcpy(body_stage_bufs[s][total..][0..n], chunk[0..n]);
                         total += n;
@@ -719,14 +872,6 @@ fn runJob(slot_id: u16) void {
                     }
                 }
             }
-            if (compressed) {
-                var plain_reader = response.reader(&transfer_buf);
-                var drain: [2048]u8 = undefined;
-                while (true) {
-                    const n = plain_reader.readSliceShort(drain[0..]) catch break;
-                    if (n == 0) break;
-                }
-            }
             if (body_incomplete) {
                 req.connection.?.closing = true;
             }
@@ -756,10 +901,12 @@ fn runJob(slot_id: u16) void {
                 job_counter.alloc_count -| job_counter.free_count,
             });
             // C1 FIX: pooled ResponseData shells are reused, not freed —
-            // per-job balance holds modulo ≤1 shell transfer (was: exact).
+            // per-job balance holds modulo transferred buffers (pool + optional owned_body).
+            const max_transferred: usize = if (resp_data.owned_body != null) 2 else 1;
             std.debug.assert(job_counter.alloc_count >= job_counter.free_count);
-            std.debug.assert(job_counter.alloc_count - job_counter.free_count <= 1);
+            std.debug.assert(job_counter.alloc_count - job_counter.free_count <= max_transferred);
         }
+        resp_kept = true;
         okSlot(s, resp_data);
         break :hop;
     }

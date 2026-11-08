@@ -14,12 +14,12 @@ Fairyfly is a lightweight backend JavaScript runtime built with Zig and QuickJS.
 
 - Cold start matters (CLI tools, edge functions, short-lived jobs)
 - Memory is capped (strict container limits)
-- You want the whole runtime to fit in your head (~24k lines of Zig across 54 files)
+- You want the whole runtime to fit in your head (~32k lines of Zig across 73 files)
 
 ## When NOT to use Fairyfly
 
 - Browser parity — no DOM, no `window` object
-- npm ecosystem — no automatic `node_modules` resolution
+- Full npm ecosystem — only pure-JS ESM packages work (`ff imprint`; no CommonJS, no `node:` builtins)
 
 If you need those, use Node.js, Bun, or Deno instead.
 
@@ -30,13 +30,16 @@ Everything ships in a single binary. No `npm install` needed for core features.
 | Feature | Details |
 |---------|---------|
 | HTTP/HTTPS Server | 512 connection slots, SoA layout, HTTP/2 via nghttp2 |
-| TLS | BearSSL, zero-alloc hot path, TLS 1.2 only |
+| TLS | BearSSL, zero-alloc hot path, TLS 1.2 (HTTPS, WSS, Postgres `verify-full`) |
 | SQLite | Embedded database, single-file amalgamation |
+| Postgres | Built-in wire client, connection pool, transactions, TLS `verify-full` |
 | WebSocket | Server and client, text and binary frames |
 | Workers | Up to 8 threads, cooperative concurrency |
-| Fetch | Outbound HTTP client with async support |
-| Crypto | randomUUID, getRandomValues, subtle.digest |
+| Fetch | Outbound HTTP client with async + `AbortSignal` support |
+| Crypto | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`) |
 | File System | Sync read, write, mkdir, rm, readdir (+ `*Async` variants) |
+| Subprocesses & FFI | `child_process` (`spawn`/`exec`/`execSync`) and `ffi` (`dlopen`) |
+| Permissions | Deny-by-default `--allow-*` CLI flags |
 | Timers | setTimeout, setInterval, queueMicrotask |
 | URL | Full WHATWG URL API |
 

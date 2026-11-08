@@ -8,6 +8,50 @@ order: 2
 
 `fetch` is a global function. It sends one HTTP request and resolves with a `Response` — including for HTTP error statuses like `404` or `500`.
 
+## Permissions
+
+`fetch` reaches the network, so every request needs `--allow-net`:
+
+| Scope | Grants |
+|---|---|
+| `--allow-net=api.example.com` | That host on **any** port |
+| `--allow-net=api.example.com:443` | That host and port only |
+| `--allow-net=*.example.com` | Subdomains, but **not** the apex `example.com` |
+| `--allow-net=*` or bare `--allow-net` | Every host and port |
+
+- Matching uses the URL's **literal host**, lowercased. There is no DNS
+  resolution and no IP matching: `localhost` and `127.0.0.1` are different
+  scopes, and granting `api.example.com` does not permit fetching
+  `https://93.184.216.34/`.
+- Default ports count. `https://example.com/` checks `example.com:443`;
+  `http://example.com/` checks `example.com:80`.
+- Every redirect hop is checked independently against the new URL.
+- A configured proxy does not change the destination check; see
+  [Proxies](#proxies) for the proxy-host caveat.
+
+Failure takes two different shapes:
+
+```js
+// Initial URL outside --allow-net: fetch() throws synchronously.
+try {
+  fetch("https://api.example.com/items");
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+}
+
+// A redirect hop outside --allow-net: the promise rejects with a string.
+try {
+  await fetch("https://allowed.example.com/");
+} catch (e) {
+  console.error(String(e)); // PermissionDenied: fetch requires --allow-net
+}
+```
+
+The initial denial message names the host and port:
+`fetch requires --allow-net for 'api.example.com:443'`. The redirect-hop
+string carries neither `code` nor the host. Full model:
+[Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 ```js
@@ -20,17 +64,17 @@ order: 2
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=example.com:443
 ```
 
 ## Modules vs scripts
 
-`ff` treats a file as an ES module only when its name ends in `.mjs` or
-its first code is `import`/`export`. A plain `.js` file runs as a classic
-script, where top-level `await` is a syntax error — so the runnable
-examples on this page wrap async code in `(async () => { ... })()`. Save
-any of them with a `.mjs` extension if you'd rather use top-level `await`
-as written.
+`ff` forces ES module evaluation when a file ends in `.mjs`. For `.js` files,
+`ff` tries classic-script compilation first and automatically falls back to ES
+module evaluation when the file contains `import`, `export`, or top-level
+`await` anywhere in the source. The runnable examples on this page wrap async
+code in `(async () => { ... })()` so they also work when pasted into classic-script
+contexts.
 
 ## `fetch(url, init?)`
 
@@ -41,17 +85,50 @@ await fetch("https://example.com/items", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({ text: "hi" }),
+  signal: AbortSignal.timeout(5000),
 });
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `url` | `string` | Request target. `http://` and `https://` only |
+| `url` | `string \| Request` | Request target. `http://` and `https://` only |
 | `init.method` | `string` | Default `"GET"` — exact-case token only (see Gotchas) |
 | `init.headers` | object / `Headers` | Header pairs, case-insensitive |
 | `init.body` | `string \| ArrayBuffer \| Uint8Array \| Blob \| FormData \| URLSearchParams` | Default none — only strings (and `URLSearchParams`) survive intact (see Gotchas) |
+| `init.signal` | `AbortSignal` | Cancels the request if already aborted or aborted while in flight |
 
-Only `method` / `headers` / `body` are read. These init keys are **ignored**: `signal`, `timeout`, `redirect`, `credentials`, `cache`, `mode`.
+Only `method`, `headers`, `body`, and `signal` are read. These init keys are **ignored**: `timeout`, `redirect`, `credentials`, `cache`, `mode`.
+
+## Cancellation: `AbortController` and `AbortSignal`
+
+Use `AbortController` or `AbortSignal.timeout(ms)` to cancel a `fetch` before or
+during an in-flight request. Aborting closes the underlying socket immediately
+and rejects the `fetch` promise with `signal.reason`:
+
+```js
+const ac = new AbortController();
+setTimeout(() => ac.abort(new Error("timed out")), 2000);
+
+try {
+  const res = await fetch("https://example.com/slow", { signal: ac.signal });
+} catch (err) {
+  console.error("aborted:", err);
+}
+
+// Or use the built-in timeout helper:
+const res = await fetch("https://example.com/api", {
+  signal: AbortSignal.timeout(3000),
+});
+```
+
+| Member | Description |
+|--------|-------------|
+| `new AbortController()` | Creates `{ signal, abort(reason?) }` |
+| `AbortSignal.abort(reason?)` | Returns an already-aborted `AbortSignal` |
+| `AbortSignal.timeout(ms)` | Returns an `AbortSignal` that aborts with a `"TimeoutError"` after `ms` |
+| `signal.aborted` / `signal.reason` | Boolean state and rejection reason (defaults to `"AbortError"`) |
+| `signal.throwIfAborted()` | Throws `signal.reason` if `signal.aborted` is `true` |
+| `signal.onabort` / `addEventListener("abort", fn, { once? })` / `removeEventListener("abort", fn)` | Abort event listeners |
 
 ## `Response` reference
 
@@ -64,21 +141,21 @@ The object `fetch` resolves with — and the object your `http.serve` handler re
 | `url` | `string` | Final URL after redirects |
 | `redirected` | `boolean` | `true` when a redirect was followed |
 | `headers` | `Headers` | Response headers |
-| `bodyUsed` | `boolean` | `true` once the body has been read |
+| `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
 | `text()` | `() => Promise<string>` | Body as text |
 | `json()` | `() => Promise<any>` | Body parsed as JSON |
 | `arrayBuffer()` | `() => Promise<ArrayBuffer>` | Body as bytes |
-| `bytes()` | `() => Promise<Uint8Array>` | Body as typed array |
+| `bytes()` | `() => Promise<ArrayBuffer>` | Body as bytes in an `ArrayBuffer` |
 | `blob()` | `() => Promise<Blob>` | Body as `Blob` |
 | `formData()` | `() => Promise<FormData>` | Body parsed as multipart/urlencoded form |
 
-Each body reads **once**:
+Bodies can be re-read freely (`bodyUsed` remains `false`):
 
 ```js
 const res = await fetch("https://example.com/");
-console.log(res.bodyUsed); // false
-await res.text();
-console.log(res.bodyUsed); // true
+console.log(await res.text());
+console.log(await res.json()); // re-reading the body is supported
+console.log(res.bodyUsed);     // false
 ```
 
 Construction + statics (for handlers and tests):
@@ -107,8 +184,11 @@ console.log(await res.json());
 
 | Member | Description |
 |--------|-------------|
-| `method` / `url` / `headers` | As passed to the constructor |
-| `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; single-read |
+| `method` / `url` / `headers` / `signal` | As passed to the constructor |
+| `text()` / `json()` / `arrayBuffer()` / `bytes()` / `blob()` / `formData()` | Same readers as `Response`; re-readable (`bodyUsed` stays `false`) |
+
+`fetch(req)` applies the same `--allow-net` check to `req.url` as it does to a
+string URL, including on redirect hops.
 
 ## `Headers` reference
 
@@ -125,7 +205,7 @@ h.delete("x-id");
 h.entries(); h.keys(); h.values();
 h.forEach((value, key) => console.log(key, value));
 h.toString();
-h.size;
+h.size();              // header count
 ```
 
 | Method | Description |
@@ -137,13 +217,18 @@ h.size;
 | `append(name, value)` | Add another value |
 | `delete(name)` | Remove the header |
 | `entries()` / `keys()` / `values()` / `forEach()` | Iterate |
-| `toString()` / `size` | Debug string / header count |
+| `toString()` / `size()` | Debug string / header count |
 
 CR/LF characters in header values are dropped.
 
 ## Redirects
 
 Followed automatically up to 5 hops. `res.redirected` and `res.url` tell you where the response actually came from. Past 5 hops, `fetch` throws `Too many redirects`. There is no manual-redirect mode.
+
+Every hop is re-checked against `--allow-net`. A redirect from an allowed host
+to a host outside the scope rejects the promise with the string
+`"PermissionDenied: fetch requires --allow-net"`; the initial request is not
+retried and no `Response` is produced.
 
 Note: redirects your own `http.serve` handler returns via `Response.redirect()` carry no `Location` header, so nothing follows them — see Gotchas.
 
@@ -170,9 +255,16 @@ are supported (no SOCKS), and the proxy URL itself must be `http://` — an
 `https://` proxy URL (TLS to the proxy) is rejected.
 
 ```sh
-HTTP_PROXY=http://127.0.0.1:8080 ff client.js
-NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js
+HTTP_PROXY=http://127.0.0.1:8080 ff client.js --allow-net=api.example.com:443
+NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js --allow-net=api.example.com:443
 ```
+
+> **Permissions caveat:** proxy variables are read by the runtime directly, so
+> no `--allow-env` grant is needed. `--allow-net` is checked against the
+> **destination** URL, not the proxy host. If the environment configures a
+> proxy, an allowed request will connect to that proxy even when its host is
+> absent from every `--allow-net` scope. Set `NO_PROXY` or clear the proxy
+> variables when that is not intended.
 
 ## Full example
 
@@ -200,14 +292,24 @@ NO_PROXY=localhost,127.0.0.1 HTTPS_PROXY=http://proxy.corp:8080 ff client.js
 ```
 
 ```sh
-ff client.js
+ff client.js --allow-net=api.example.com:443
 ```
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 30s I/O timeout, 5 redirect hops, no abort/`signal`, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `x-api-key`), RFC 7230 header validation, HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
+
+**Permission denial is two different shapes.** The initial URL throws a real
+`Error` with `name: "PermissionDenied"` and `code: "PERMISSION_DENIED"`.
+A redirect-hop denial rejects with the plain string
+`"PermissionDenied: fetch requires --allow-net"` — no `code`, no host. Catch
+both, and log with `String(e)` so string rejections print something useful.
+
+**Cross-origin redirects strip credentials.** If a redirect crosses to a different origin (different scheme, host, or port), Fairyfly automatically strips sensitive headers (`authorization`, `cookie`, `x-api-key`) to prevent credential leakage.
+
+**Response body limit is 16 MB.** Both the declared Content-Length and decompressed (gzip/deflate) body data are capped at 16 MiB. Larger responses fail and reject the promise.
 
 **Method names are exact-case.** `fetch` matches `init.method` against the standard tokens verbatim — `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"`. Anything else, including lowercase (`"post"`), is sent as `GET` (a body is still attached). Your `http.serve` handler likewise sees the method exactly as the client sent it, so normalize before comparing (`method.toUpperCase() === "POST"`).
 
@@ -219,10 +321,11 @@ Full table lives in the Limitations reference: 16 concurrent fetches, 64KB body 
 return new Response(null, { status: 302, headers: { Location: "/new-path" } });
 ```
 
-**Rejections are plain strings.** Network failures reject with `"Network error"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"` — `e.message` is `undefined`, so log `String(e)`.
+**Rejections are plain strings.** Network failures reject with `"Network error"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"` — `e.message` is `undefined`, so log `String(e)`. The initial permission denial is the exception: it throws an `Error` and never reaches the promise.
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
 - [Fetch Client guide](/docs/guides/fetch-client) — tutorial version of this page
 - [HTTP Server guide](/docs/guides/http-server) — serving instead of calling
 - [Limitations](/docs/reference/limitations) — every hard cap

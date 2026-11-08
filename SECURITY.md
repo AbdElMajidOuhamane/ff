@@ -8,7 +8,7 @@
 | older releases | :x:                |
 
 Only the latest GitHub release is supported
-(currently `v0.1.0-canary` line). If you run an older build, upgrade first
+(currently `v0.2.0-beta` line). If you run an older build, upgrade first
 and re-test — the issue may already be fixed.
 
 ## Reporting a vulnerability

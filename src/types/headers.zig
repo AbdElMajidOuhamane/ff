@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const gpa = std.heap.smp_allocator;
 const simd = std.simd;
@@ -67,6 +68,45 @@ fn lowerAsciiSimd(buf: []u8) void {
     }
 }
 
+// ── Header syntax validation (RFC 7230 §3.2) ──
+// Why here and not in the consumers: std.http.Client writes extra_headers
+// verbatim ("name: value\r\n") and only *asserts* CR/LF-freedom under
+// `std.debug.runtime_safety` (Client.zig request()). ReleaseFast is the
+// shipped mode, so a CRLF-bearing value reaches the wire and splits the
+// request. Validating at the dense-pool append keeps it one pass, zero alloc.
+
+inline fn isTchar(ch: u8) bool {
+    return switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'a'...'z', 'A'...'Z' => true,
+        else => false,
+    };
+}
+
+/// RFC 7230 token — the only byte class legal in a field-name.
+fn validHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| {
+        if (!isTchar(ch)) return false;
+    }
+    return true;
+}
+
+/// RFC 7230 field-value: HTAB, SP, VCHAR (0x21-0x7E) and obs-text (0x80-0xFF).
+/// CR, LF, NUL and every other CTL are refused.
+fn validHeaderValue(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch == '\r' or ch == '\n' or ch == 0) return false;
+        if (ch < 0x20 and ch != '\t') return false;
+        if (ch == 0x7f) return false;
+    }
+    return true;
+}
+
+fn validHeaderPair(name: []const u8, value: []const u8) bool {
+    return validHeaderName(name) and validHeaderValue(value);
+}
+
 // Gap-6 fix: stored names are ALWAYS lowercase (tryAppendEntry lowercases
 // at insert), so per-scan `eqlIgnoreCase` re-cases both sides on every
 // element. Lower the query ONCE per call into caller stack storage, then
@@ -113,6 +153,33 @@ test "lowerAsciiSimd matches std.ascii.toLower" {
     }
 }
 
+test "header syntax validation refuses injection primitives" {
+    // Legal.
+    try std.testing.expect(validHeaderPair("x-api-key", "abc"));
+    try std.testing.expect(validHeaderPair("x-api-key", "héllo")); // obs-text
+    try std.testing.expect(validHeaderPair("x-api-key", "a\tb")); // HTAB
+    try std.testing.expect(validHeaderPair("x-api-key", ""));
+    // Request-splitting primitives.
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\r\nX-Injected: 1"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\nb"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\x00b"));
+    try std.testing.expect(!validHeaderPair("x-api-key", "a\r"));
+    // Illegal names.
+    try std.testing.expect(!validHeaderPair("bad name", "v"));
+    try std.testing.expect(!validHeaderPair("bad:name", "v"));
+    try std.testing.expect(!validHeaderPair("bad\r\nname", "v"));
+    try std.testing.expect(!validHeaderPair("", "v"));
+}
+
+test "tryAppendEntry rejects CRLF instead of storing it" {
+    var h = HeadersData.init();
+    defer h.deinit();
+    try h.tryAppendEntry("x-ok", "v");
+    try std.testing.expectError(error.InvalidHeader, h.tryAppendEntry("x-bad", "a\r\nb"));
+    try std.testing.expectError(error.InvalidHeader, h.tryAppendEntry("bad name", "v"));
+    try std.testing.expectEqual(@as(usize, 1), h.len());
+}
+
 pub const Pair = struct { name: []const u8, value: []const u8 };
 const Entry = struct {
     name_off: u32,
@@ -135,24 +202,50 @@ const HDR_POOL_MAX: usize = 32;
 var hdr_pool: [HDR_POOL_MAX]*HeadersData = undefined;
 var hdr_pool_n: usize = 0;
 
-/// Pooled HeadersData shell, freshly init()'d (refcount = 1).
+pub var stat_pool_hit: std.atomic.Value(usize) = .{ .raw = 0 };
+pub var stat_pool_miss: std.atomic.Value(usize) = .{ .raw = 0 };
+
+const HDR_RETAIN_ENTRIES: usize = 64;
+const HDR_RETAIN_BYTES: usize = 4096;
+const HDR_RETAIN_SLICES: usize = 64;
+
+/// Pooled HeadersData shell, freshly cleared (refcount = 1).
 /// Null only on OOM — callers use `orelse` like the old gpa.create path.
 pub fn acquire() ?*HeadersData {
     if (hdr_pool_n > 0) {
         hdr_pool_n -= 1;
+        if (builtin.is_test or builtin.mode == .Debug) {
+            _ = stat_pool_hit.fetchAdd(1, .monotonic);
+        }
         const h = hdr_pool[hdr_pool_n];
-        h.* = HeadersData.init();
+        h.refcount.store(1, .release);
         return h;
     }
-    return gpa.create(HeadersData) catch null;
+    if (builtin.is_test or builtin.mode == .Debug) {
+        _ = stat_pool_miss.fetchAdd(1, .monotonic);
+    }
+    const h = gpa.create(HeadersData) catch return null;
+    h.* = HeadersData.init();
+    return h;
 }
 
 fn releaseToPool(h: *HeadersData) void {
-    h.deinit();
     if (hdr_pool_n < HDR_POOL_MAX) {
+        if (h.entries.capacity > HDR_RETAIN_ENTRIES or
+            h.names.capacity > HDR_RETAIN_BYTES or
+            h.values.capacity > HDR_RETAIN_BYTES or
+            h.merge_buf.capacity > HDR_RETAIN_BYTES or
+            h.view_buf.capacity > HDR_RETAIN_SLICES)
+        {
+            h.deinit();
+            h.* = HeadersData.init();
+        } else {
+            h.clear();
+        }
         hdr_pool[hdr_pool_n] = h;
         hdr_pool_n += 1;
     } else {
+        h.deinit();
         gpa.destroy(h);
     }
 }
@@ -270,6 +363,10 @@ pub const HeadersData = struct {
         self.tryAppendEntry(name, value) catch return;
     }
     pub fn tryAppendEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
+        // Ingest gate: a rejected pair never reaches the pools, so every
+        // downstream serializer (std.http extra_headers, Response headers)
+        // is CRLF-safe by construction.
+        if (!validHeaderPair(name, value)) return error.InvalidHeader;
         const nbase = self.names.items.len;
         try self.names.appendSlice(gpa, name);
         errdefer self.names.items.len = nbase;
@@ -285,6 +382,10 @@ pub const HeadersData = struct {
         });
     }
     pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+        // The replace branch writes `values` directly (no appendEntry), so the
+        // gate must be repeated here or `headers.set("x", "a\r\nb")` would
+        // bypass validation entirely.
+        if (!validHeaderPair(name, value)) return;
         var lower_buf: [128]u8 = undefined;
         const q = lowerQuery(name, &lower_buf);
         var first: ?usize = null;
@@ -338,15 +439,23 @@ pub const HeadersData = struct {
         }
         if (count == 0) return null;
         if (count == 1) return self.valueOf(self.entries.items[first.?]);
+
+        // Set-Cookie is the conventional exception: return the first value; use
+        // getAll() to retrieve every Set-Cookie header.
+        if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
+            return self.valueOf(self.entries.items[first.?]);
+        }
         self.merge_buf.clearRetainingCapacity();
         self.merge_buf.ensureTotalCapacity(gpa, joined_len - 2) catch {};
+        const is_cookie = std.ascii.eqlIgnoreCase(name, "cookie");
+        const sep: []const u8 = if (is_cookie) "; " else ", ";
         var skipped = false;
         for (self.entries.items) |e| {
             if (!nameMatches(self.nameOf(e), name, q)) continue;
             if (!skipped) {
                 skipped = true;
             } else {
-                self.merge_buf.appendSlice(gpa, ", ") catch break;
+                self.merge_buf.appendSlice(gpa, sep) catch break;
             }
             self.merge_buf.appendSlice(gpa, self.valueOf(e)) catch break;
         }
@@ -584,7 +693,6 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     _ = this_val;
     // C1 FIX: pooled shell instead of gpa.create per `new Headers()`.
     const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = HeadersData.init();
 
     if (argc > 0) {
         const init_val = argv[0];
@@ -688,6 +796,106 @@ pub fn setup(ctx: ?*c.Context) void {
 }
 pub fn createJSObject(ctx: ?*c.Context, data: *HeadersData) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(headers_class_id));
+    if (c.isException(obj) != 0) {
+        data.release();
+        return c.JS_UNDEFINED;
+    }
     c.setOpaque(obj, data);
     return obj;
+}
+
+test "HeadersData pool reuses capacity and tracks hit/miss" {
+    const hits_before = stat_pool_hit.load(.monotonic);
+    const misses_before = stat_pool_miss.load(.monotonic);
+
+    const h1 = acquire() orelse return error.OutOfMemory;
+    try std.testing.expect(stat_pool_miss.load(.monotonic) > misses_before or stat_pool_hit.load(.monotonic) > hits_before);
+
+    // Append some headers to ensure capacity is allocated
+    h1.appendEntry("x-test-1", "value1");
+    h1.appendEntry("x-test-2", "value2");
+    try std.testing.expect(h1.entries.capacity >= 2);
+    const cap_entries = h1.entries.capacity;
+    const cap_names = h1.names.capacity;
+
+    // Release back to pool
+    h1.release();
+
+    // Re-acquire: must hit pool, retain capacity, and have 0 entries
+    const hits_mid = stat_pool_hit.load(.monotonic);
+    const h2 = acquire() orelse return error.OutOfMemory;
+    defer h2.release();
+
+    try std.testing.expectEqual(hits_mid + 1, stat_pool_hit.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), h2.len());
+    try std.testing.expectEqual(cap_entries, h2.entries.capacity);
+    try std.testing.expectEqual(cap_names, h2.names.capacity);
+}
+
+test "cookie and set-cookie behaviors per RFC 9113" {
+    var h = HeadersData.init();
+    defer h.deinit();
+
+    h.appendEntry("cookie", "a=1");
+    h.appendEntry("cookie", "b=2");
+    h.appendEntry("x-multi", "val1");
+    h.appendEntry("x-multi", "val2");
+    h.appendEntry("set-cookie", "a=1");
+    h.appendEntry("set-cookie", "b=2");
+
+    try std.testing.expectEqualStrings("a=1; b=2", h.getFirst("cookie").?);
+    try std.testing.expectEqualStrings("val1, val2", h.getFirst("x-multi").?);
+    try std.testing.expectEqualStrings("a=1", h.getFirst("set-cookie").?);
+    try std.testing.expectEqual(@as(usize, 2), h.getAllValues("set-cookie").len);
+}
+
+test "pathological oversized headers shrink instead of permanently pinning memory" {
+    // 1. Exceed HDR_RETAIN_ENTRIES (64)
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < 70) : (i += 1) {
+            h.appendEntry("x-header", "value");
+        }
+        try std.testing.expect(h.entries.capacity > HDR_RETAIN_ENTRIES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.entries.capacity);
+    }
+
+    // 2. Exceed HDR_RETAIN_SLICES in view_buf via getAllValues
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < 70) : (i += 1) {
+            h.appendEntry("x-multi", "val");
+        }
+        _ = h.getAllValues("x-multi");
+        try std.testing.expect(h.view_buf.capacity > HDR_RETAIN_SLICES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.view_buf.capacity);
+    }
+
+    // 3. Exceed HDR_RETAIN_BYTES in merge_buf via getFirst
+    {
+        const h = acquire() orelse return error.OutOfMemory;
+        var long_val: [1000]u8 = undefined;
+        @memset(&long_val, 'a');
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            h.appendEntry("x-join", &long_val);
+        }
+        _ = h.getFirst("x-join");
+        try std.testing.expect(h.merge_buf.capacity > HDR_RETAIN_BYTES);
+        h.release();
+
+        const h2 = acquire() orelse return error.OutOfMemory;
+        defer h2.release();
+        try std.testing.expectEqual(@as(usize, 0), h2.merge_buf.capacity);
+    }
 }

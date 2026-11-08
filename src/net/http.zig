@@ -6,8 +6,24 @@ const tls_server = @import("tls_server.zig");
 const tls = @import("tls.zig");
 const engine = @import("../engine/engine.zig");
 const api_ws = @import("../api/websocket.zig");
+const fetch_api = @import("../api/fetch.zig");
+const process_api = @import("../api/process.zig");
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
 
-pub var server_running = std.atomic.Value(bool).init(false);
+pub const server_running = &http_native.server_running;
+
+fn serverCloseCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return c.JS_EXCEPTION;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+    const cb_val = if (argc >= 1) argv[0] else c.JS_UNDEFINED;
+    http_native.registerCloseWaiter(ctx, cap[0], cb_val);
+    http_native.closeServer();
+    return promise;
+}
 
 fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
     _ = c.throwTypeError(ctx, "http.serve: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
@@ -18,6 +34,15 @@ fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
     var out: i32 = 0;
     if (c.toInt32(ctx, &out, val) == -1) return default;
     return @intCast(out);
+}
+
+/// Returns false with a pending JS exception when the bind is not allowed.
+fn allowListen(ctx: ?*c.Context, port: u16) bool {
+    if (perm.global().checkNet("0.0.0.0", port) == .allowed) return true;
+    var detail_buf: [32]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "0.0.0.0:{d}", .{port}) catch "0.0.0.0";
+    _ = deny.throw(ctx, "http.serve", .net, detail);
+    return false;
 }
 
 /// Copy a JS string into a page_allocator-owned Zig slice (caller frees).
@@ -45,14 +70,20 @@ fn resolvePem(owned: []u8) ?[]u8 {
 fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     // Cheap probe first so the no-tls path stays allocation-free.
     const probe = c.getPropertyStr(ctx, opts_val, "tls");
-    if (c.isObject(probe) == 0) return true; // no tls requested — plain http
+    defer c.freeValue(ctx, probe);
+    if (c.isObject(probe) == 0) {
+        http_native.disableTls();
+        return true; // no tls requested — plain http
+    }
     if (!tls_server.available) {
         throwTypeError(ctx, "built without TLS (rebuild without -Dbearssl=false)");
         return false;
     }
 
     const cert_val = c.getPropertyStr(ctx, probe, "cert");
+    defer c.freeValue(ctx, cert_val);
     const key_val = c.getPropertyStr(ctx, probe, "key");
+    defer c.freeValue(ctx, key_val);
     if (c.isString(cert_val) == 0 or c.isString(key_val) == 0) {
         throwTypeError(ctx, "tls.cert and tls.key must be strings (PEM content or file path)");
         return false;
@@ -68,6 +99,21 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
         return false;
     };
     defer std.heap.page_allocator.free(key_str);
+
+    // A path here was chosen by JS, so it is a file read like any other.
+    // Inline PEM content needs no filesystem access.
+    if (!std.mem.startsWith(u8, cert_str, "-----BEGIN ")) {
+        if (perm.global().checkPath(.read, cert_str) == .denied) {
+            _ = deny.throw(ctx, "http.serve tls.cert", .read, cert_str);
+            return false;
+        }
+    }
+    if (!std.mem.startsWith(u8, key_str, "-----BEGIN ")) {
+        if (perm.global().checkPath(.read, key_str) == .denied) {
+            _ = deny.throw(ctx, "http.serve tls.key", .read, key_str);
+            return false;
+        }
+    }
 
     const cert_pem = resolvePem(cert_str) orelse {
         throwTypeError(ctx, "could not read tls.cert");
@@ -89,8 +135,8 @@ fn loadTlsFromOptions(ctx: ?*c.Context, opts_val: c.Value) bool {
     // Best-effort: when the cert came from a path, also make the runtime's own
     // fetch/wss client trust it (same as --cert). Process-lifetime by design.
     // (Skipped for inline PEM content.)
-    if (cert_pem.ptr != cert_str.ptr and tls.ca_file == null) {
-        tls.ca_file = std.heap.page_allocator.dupe(u8, cert_str) catch null;
+    if (cert_pem.ptr != cert_str.ptr) {
+        tls.addCaFile(cert_str);
     }
 
     http_native.enableTls();
@@ -105,29 +151,45 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
 
     const opts_val = argv[0];
     var port: u16 = 3000;
+    var reuse_port: bool = false;
 
     if (c.isObject(opts_val) != 0) {
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
         port = extractIntFromVal(ctx, port_val, 3000);
+        c.freeValue(ctx, port_val);
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+
+        const rp_val = c.getPropertyStr(ctx, opts_val, "reusePort");
+        defer c.freeValue(ctx, rp_val);
+        if (c.isBool(rp_val) != 0) {
+            reuse_port = c.toBool(ctx, rp_val) != 0;
+        }
 
         const ws_obj_val = c.getPropertyStr(ctx, opts_val, "websocket");
+        defer c.freeValue(ctx, ws_obj_val);
         if (c.isObject(ws_obj_val) != 0) {
             http_native.ws_enabled = true;
             const open_val = c.getPropertyStr(ctx, ws_obj_val, "open");
+            defer c.freeValue(ctx, open_val);
             if (c.isFunction(ctx, open_val) != 0) {
                 http_native.ws_on_open = c.dupValue(ctx, open_val);
             }
             const msg_val = c.getPropertyStr(ctx, ws_obj_val, "message");
+            defer c.freeValue(ctx, msg_val);
             if (c.isFunction(ctx, msg_val) != 0) {
                 http_native.ws_on_message = c.dupValue(ctx, msg_val);
             }
             const close_val = c.getPropertyStr(ctx, ws_obj_val, "close");
+            defer c.freeValue(ctx, close_val);
             if (c.isFunction(ctx, close_val) != 0) {
                 http_native.ws_on_close = c.dupValue(ctx, close_val);
             }
         }
     } else if (c.isNumber(opts_val) != 0) {
         port = extractIntFromVal(ctx, opts_val, 3000);
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+    } else {
+        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
     }
 
     const handler_val = argv[1];
@@ -149,15 +211,26 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return c.JS_EXCEPTION;
     };
 
-    http_native.init(&loop_ptr.loop, port) catch |err| {
+    http_native.init(&loop_ptr.loop, port, reuse_port) catch |err| {
         cli.errorMsg("cannot start server on port {d}: {s}", .{ port, @errorName(err) });
         throwTypeError(ctx, "failed to start server (is the port in use?)");
         return c.JS_EXCEPTION;
     };
 
-    server_running.store(true, .release);
+    process_api.enableServerSignalTrap();
 
-    return c.JS_UNDEFINED;
+    if (c.isObject(opts_val) != 0) {
+        const sig_val = c.getPropertyStr(ctx, opts_val, "signal");
+        defer c.freeValue(ctx, sig_val);
+        if (fetch_api.getAbortSignalData(ctx, sig_val) != null) {
+            _ = fetch_api.attachServerToSignal(ctx, sig_val);
+        }
+    }
+
+    const server_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, server_obj, "port", c.newInt32(ctx, @intCast(http_native.bound_port)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, server_obj, "close", c.newCFunction(ctx, serverCloseCallback, "close", 1), c.PROP_C_W_E);
+    return server_obj;
 }
 
 pub fn setup(ctx: ?*c.Context) void {

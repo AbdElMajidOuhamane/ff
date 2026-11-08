@@ -6,7 +6,39 @@ order: 1
 
 # HTTP Server
 
-`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body)` — three strings — and returns a `Response`.
+`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body, headers)` and returns a `Response`.
+
+## Permissions
+
+Servers are deny-by-default. Every `http.serve` needs `--allow-net` on the
+bind address:
+
+```sh
+ff server.js --allow-net=0.0.0.0:3000
+```
+
+- The server always binds `0.0.0.0`, and the permission check is always
+  `0.0.0.0:<port>` — even when clients connect over loopback. Granting
+  `127.0.0.1:3000` or `localhost:3000` will not start the listener.
+- A scope without a port (`--allow-net=0.0.0.0`) covers every port.
+- The same grant covers HTTP, WebSocket upgrades, and TLS on that port.
+- `tls.cert` / `tls.key` file paths need `--allow-read`; inline PEM does not.
+  `FF_CERT` / `FF_KEY` used by `ff start` are CLI reads and need no runtime
+  grant.
+- `FF_ECHO` is runtime config and needs no `--allow-env`, but echo mode does
+  **not** bypass the listener's `--allow-net` check.
+- Denial is synchronous:
+
+```js
+try {
+  http.serve({ port: 3000 }, handler);
+} catch (e) {
+  console.error(e.name, e.code); // PermissionDenied PERMISSION_DENIED
+  console.error(e.message);      // http.serve requires --allow-net for '0.0.0.0:3000'
+}
+```
+
+Full model: [Permissions](/docs/concepts/permissions).
 
 ## Hello-world server
 
@@ -14,7 +46,7 @@ Create `server.js`:
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   return new Response("Hello, World!");
 });
 ```
@@ -22,7 +54,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 Run it with `ff`:
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 ```
 
 Verify in another terminal:
@@ -36,7 +68,7 @@ The handler can also be `async` (or return a `Promise`) — the connection parks
 
 ```js
 // server.js
-http.serve({ port: 3000 }, async (url, method, body) => {
+http.serve({ port: 3000 }, async (url, method, body, headers) => {
   return new Response("Hello, World!");
 });
 ```
@@ -52,30 +84,57 @@ http.serve({ port: 4242 }, handler);
 // Shorthand — port number as the first argument
 http.serve(4242, handler);
 
-// Default port 3000
-http.serve(handler);
+// Options object with the default port 3000
+http.serve({}, handler);
 ```
 
+### Port reuse (`reusePort`)
+
+To allow multiple server processes to bind to the same port using kernel load balancing (`SO_REUSEPORT`), set `reusePort: true`:
+
+```js
+http.serve({ port: 3000, reusePort: true }, handler);
+```
+
+By default `reusePort` is `false` (safe standard `SO_REUSEADDR` is always enabled). Note that on Linux all processes sharing a port must set `reusePort: true`.
+
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 ```
 
-> **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS.
+> **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS. The permission scope must name that bind address.
+
+> **Note:** `http.serve(handler)` (one argument) is **not** supported by the
+> current runtime; it throws `TypeError: http.serve requires (options, handler)`.
+> Use `http.serve(3000, handler)` or `http.serve({}, handler)` instead.
 
 ## Inspecting the incoming request
 
-The handler receives three strings: `url` (path + query string), `method` (e.g. `"GET"`), and `body` (request text, empty string when none). Log them to see what's coming in:
+The handler receives `(url, method, body, headers)`:
+- `url`: request path + query string (string)
+- `method`: uppercase HTTP method (e.g. `"GET"`, string)
+- `body`: request text (string, empty when none)
+- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2)
+
+### Working with request headers
+
+The `headers` parameter provides standard `Headers` methods:
+- `headers.get(name)`: returns the header value (case-insensitive), or `null` if absent. Multi-value headers are comma-joined (`"a, b"`), except `Cookie` which joins with `"; "` per RFC 9113 §8.2.3, and `Set-Cookie` which returns the first value (use `getAll` to retrieve all).
+- `headers.has(name)`: returns `true` if present, `false` otherwise.
+- `headers.getAll(name)`: returns an array of all values for the header name.
+- Total request header size is capped at 4 KB for HTTP/1.1 (`READ_BUF_SIZE`) and 64 KiB for HTTP/2. Requests exceeding the limit receive `431 Request Header Fields Too Large`.
 
 ```js
 // server.js
-http.serve({ port: 3000 }, (url, method, body) => {
+http.serve({ port: 3000 }, (url, method, body, headers) => {
   console.log("Method:", method);
   console.log("URL:", url);
 
   const parsed = new URL(url, "http://localhost");
   console.log("Path:", parsed.pathname);
   console.log("Query:", parsed.searchParams.get("name"));
+  console.log("User-Agent:", headers.get("user-agent"));
 
   console.log("Body:", body);
   return new Response("logged!");
@@ -83,7 +142,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl -X POST "http://127.0.0.1:3000/greet?name=ada" -d "hi"
 # server prints:
 # Method: POST
@@ -111,7 +170,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl -i http://127.0.0.1:3000/missing
 # HTTP/1.1 404 Not Found
 # content-type: application/json; charset=utf-8
@@ -149,7 +208,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/          # Home
 curl http://127.0.0.1:3000/users/42  # {"id":42,"name":"Ada"}
 curl -i http://127.0.0.1:3000/nope   # 404 Not found
@@ -194,7 +253,10 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff server.js
+ff server.js \
+  --allow-net=0.0.0.0:3000 \
+  --allow-read=notes.db \
+  --allow-write=.
 curl http://127.0.0.1:3000/notes
 # []
 
@@ -206,6 +268,9 @@ curl http://127.0.0.1:3000/notes
 # [{"id":1,"text":"buy milk"}]
 ```
 
+SQLite opens the database read/write and writes WAL siblings next to it; the
+file needs both grants and the parent directory needs `write`.
+
 > **Note:** `db.lastInsertRowId()` is a method — the `()` is required. Without it you'd serialize the function object instead of the id.
 
 ## Smoke-testing with FF_ECHO
@@ -213,23 +278,39 @@ curl http://127.0.0.1:3000/notes
 Set `FF_ECHO` to any value and every request returns canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
 
 ```sh
-FF_ECHO=1 ff server.js
+FF_ECHO=1 ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/anything
 # {"message":"ok"}
 ```
+
+Echo mode is runtime configuration, so it needs no `--allow-env`. It still
+needs the listener grant.
 
 ## Reference: limits
 
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th waits for a free slot |
-| Request body | ~4 KB total (headers + body share one read buffer) | Beyond → `413 Payload Too Large` |
+| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request headers (HTTP/2) | 64 KiB | Beyond → `431 Request Header Fields Too Large` |
+| Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` (HTTP/2 allows 10 MB/stream, 16 MB/session) |
 | Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
+| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
-| Bind address | Always `0.0.0.0` | No host option exists |
+| Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Connection terminated with `400 Bad Request` |
+| Response status | 100..999 | Clamped/validated to 100..999 |
+| Bind address | Always `0.0.0.0` | No host option exists; the net scope must be `0.0.0.0:<port>` |
 | Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |
 
 ## Troubleshooting
+
+**`http.serve` throws `PermissionDenied`** — the listener's port is outside
+every `--allow-net` scope. Add `--allow-net=0.0.0.0:<port>`. `127.0.0.1` and
+`localhost` will not match the bind address.
+
+**TLS fails with `PermissionDenied` on `tls.cert` / `tls.key`** — the path is
+outside `--allow-read`. Add the file (and any symlink target) to the scope, or
+pass inline PEM, which needs no file grant.
 
 **Empty 200 when I return a string** — wrap it: `return new Response("hello")`. Bare strings are not bodies.
 
@@ -239,4 +320,11 @@ curl http://127.0.0.1:3000/anything
 
 **`id` comes back wrong in JSON** — you wrote `db.lastInsertRowId` without calling it. Always `db.lastInsertRowId()`.
 
-**Stopping the server** — there is no `server.stop()` API. Stop the process with `Ctrl-C`, or call `process.exit(0)` from your code for programmatic shutdown.
+**Stopping the server** — `http.serve` returns `{ port, close }`. Call `await server.close()` (or pass `{ signal }` to `http.serve`) to stop accepting new connections and drain active requests cleanly. `SIGINT` and `SIGTERM` also trigger `server.close()` automatically when no custom listener is registered for that signal.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [http API](/docs/api/http) — full `http.serve` reference
+- [TLS guide](/docs/guides/tls) — HTTPS/WSS setup
+- [Limitations](/docs/reference/limitations) — every hard cap

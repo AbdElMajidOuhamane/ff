@@ -11,7 +11,9 @@ const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 // C2: async FS completions drain here (Promise settlements on the JS thread).
 const fs_mod = @import("../api/fs.zig");
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
 const child_process = @import("../api/child_process.zig");
+const process_api = @import("../api/process.zig");
 
 var g_thread_pool: xev.ThreadPool = undefined;
 
@@ -23,13 +25,14 @@ fn timersAlive() bool {
     return tm.hasReferencedTimers();
 }
 
-// Timer completions armed in the loop that JS has unref'd. Saturating
+// Timer completions armed in the loop that JS has unref'd, plus the
+// background signal watcher when no signal is pending. Saturating
 // subtract is required: sched_bits is set at setTimeout() time while
 // loop.active only rises once the submission is processed, so sched can
 // legitimately lead active by one.
 inline fn unrefArmed() usize {
-    const tm = timer_mgr orelse return 0;
-    return tm.unrefScheduledCount();
+    const tm_unref = if (timer_mgr) |tm| tm.unrefScheduledCount() else 0;
+    return tm_unref + process_api.unrefSignalCount() + worker_mod.unrefAsyncCount();
 }
 
 pub const EventLoop = struct {
@@ -97,6 +100,7 @@ pub const EventLoop = struct {
         // C2: in-flight async FS jobs keep the process alive (else
         // `await fs.readFileAsync()` would exit before settling).
         if (fs_mod.pending.load(.acquire) > 0) return true;
+        if (bcrypt_pool.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         if (child_process.liveCount() > 0) return true;
         // Queue entries only count as blocking when nothing is unref'd:
@@ -174,8 +178,16 @@ pub const EventLoop = struct {
                 fs_mod.ensureArmed();
             }
             fs_mod.drainCompleted(ctx);
+            if (bcrypt_pool.pending.load(.acquire) > 0) {
+                bcrypt_pool.arm(&self.loop);
+            }
+            bcrypt_pool.drainCompleted(ctx);
+            if (worker_mod.liveCount() > 0) {
+                worker_mod.arm(&self.loop);
+            }
             worker_mod.drainCompleted(ctx);
             child_process.drainCompleted(ctx);
+            process_api.drainSignals(ctx);
             microtasks.pumpMicrotasks(ctx);
             if (gc_ticks >= next_gc_check) {
                 next_gc_check += GC_POLICE;

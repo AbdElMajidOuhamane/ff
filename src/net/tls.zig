@@ -83,11 +83,22 @@ var no_proxy: ?proxy_mod.NoProxy = null;
 var direct_client: http.Client = undefined;
 var direct_initialized = false;
 
+// std.http's shared client dispatches blocking DNS/connect/TLS/read ops onto
+// std.Io.Threaded. Zig's default worker stack is 16 MiB
+// (std.Thread.SpawnConfig.default_stack_size); the static-musl backend commits
+// ~2-3 MiB RSS per worker. Bound the pool and size stacks for std.http + TLS
+// frames (poll_buffer[64] + handshake state).
+// Keep IO_POOL_MAX >= async_fetch.MAX_FETCH (16). Beyond it, std.Io runs the
+// task inline instead of spawning — correct, just serialized.
+const IO_POOL_MAX: usize = 32;
+const IO_STACK_SIZE: usize = 1024 * 1024;
+
 pub fn init() void {
     if (client_initialized) return;
     poolInit();
     io_backend = std.Io.Threaded.init(std.heap.page_allocator, .{
-        .async_limit = .limited(64),
+        .stack_size = IO_STACK_SIZE,
+        .async_limit = .limited(IO_POOL_MAX),
     });
     http_client = .{
         .allocator = std.heap.page_allocator,
@@ -107,21 +118,86 @@ pub fn init() void {
     client_initialized = true;
 }
 
+/// Register a CA PEM file path and load it into any already-initialized HTTP
+/// clients. Safe to call both before `init()` (CLI `--ca`) and after `init()`
+/// (JS `http.serve({ tls: { cert } })`).
+pub fn addCaFile(path: []const u8) void {
+    if (ca_file == null) {
+        ca_file = std.heap.page_allocator.dupe(u8, path) catch null;
+    }
+    if (client_initialized) {
+        applyCaFile(&http_client, path);
+        if (direct_initialized) applyCaFile(&direct_client, path);
+    }
+}
+
+const CertBundle = std.crypto.Certificate.Bundle;
+const CertDer = std.crypto.Certificate.der;
+
+const SubjectAdapter = struct {
+    cb: *const CertBundle,
+    pub fn hash(_: @This(), k: []const u8) u64 {
+        return std.hash_map.hashString(k);
+    }
+    pub fn eql(ctx: @This(), a: []const u8, b_key: CertDer.Element.Slice) bool {
+        const b = ctx.cb.bytes.items[b_key.start..b_key.end];
+        return std.mem.eql(u8, a, b);
+    }
+};
+
 /// Load a PEM CA bundle into one client. `path` is borrowed (argv/env
 /// memory); the cert data is copied into the client's bundle.
 /// Parameter is `target`, not `client`: Zig forbids shadowing the
 /// container-level `pub fn client()`.
 fn applyCaFile(target: *http.Client, path: []const u8) void {
-    var file = std.Io.Dir.cwd().openFile(target.io, path, .{}) catch {
-        std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
-        return;
+    target.ca_bundle_lock.lock(target.io) catch return;
+    defer target.ca_bundle_lock.unlock(target.io);
+    // Populate system roots and set `target.now` BEFORE adding custom certs;
+    // otherwise std.http.Client.request() sees `client.now == null` on the
+    // first HTTPS call, rescans OS roots into a fresh bundle, and swaps out
+    // `target.ca_bundle` — wiping the custom CA loaded here.
+    const now = target.now orelse blk: {
+        const ts = Io.Clock.real.now(target.io);
+        target.ca_bundle.rescan(target.allocator, target.io, ts) catch {};
+        target.now = ts;
+        break :blk ts;
     };
+
+    // Parse into a temporary bundle first so we can evict any colliding
+    // Subject (e.g. a stale `CN=localhost` in macOS System.keychain) before
+    // calling addCertsFromFile on `target.ca_bundle` (whose parseCert keeps
+    // the first cert per Subject and silently drops later duplicates).
+    var tmp: CertBundle = .empty;
+    defer tmp.deinit(target.allocator);
+    {
+        var file = std.Io.Dir.cwd().openFile(target.io, path, .{}) catch {
+            std.debug.print("[tls] CA file: could not open '{s}'\n", .{path});
+            return;
+        };
+        defer file.close(target.io);
+        var file_reader = file.reader(target.io, &.{});
+        tmp.addCertsFromFile(
+            target.allocator,
+            &file_reader,
+            now.toSeconds(),
+        ) catch |e| {
+            std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
+            return;
+        };
+    }
+    var it = tmp.map.keyIterator();
+    while (it.next()) |k| {
+        const subj = tmp.bytes.items[k.start..k.end];
+        _ = target.ca_bundle.map.removeAdapted(subj, SubjectAdapter{ .cb = &target.ca_bundle });
+    }
+
+    var file = std.Io.Dir.cwd().openFile(target.io, path, .{}) catch return;
     defer file.close(target.io);
     var file_reader = file.reader(target.io, &.{});
     target.ca_bundle.addCertsFromFile(
-        std.heap.page_allocator,
+        target.allocator,
         &file_reader,
-        0,
+        now.toSeconds(),
     ) catch |e| {
         std.debug.print("[tls] CA file: load failed ({s})\n", .{@errorName(e)});
     };

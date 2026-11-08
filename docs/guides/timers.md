@@ -42,7 +42,15 @@ console.log("cancelled");
 cancelled
 ```
 
-`setTimeout` returns a numeric id; `clearTimeout(id)` cancels it. Clearing an unknown or expired id is a safe no-op — it never throws. Same pair for intervals: `setInterval` / `clearInterval`.
+`setTimeout` returns a `Timeout` handle (also usable as a numeric id); `clearTimeout(id)` cancels it. Clearing an unknown or expired id is a safe no-op — it never throws. Same pair for intervals: `setInterval` / `clearInterval`.
+
+You can also cancel a timer or interval with an `AbortSignal` by passing `{ signal }` (or the `AbortSignal` directly) as the third argument:
+
+```js
+const ac = new AbortController();
+setTimeout(() => console.log("never prints"), 100, { signal: ac.signal });
+ac.abort();
+```
 
 ## Repeat on an interval
 
@@ -161,9 +169,9 @@ Unhealthy stretches back off to 5s; the `.unref()` keeps the reschedule timer fr
 
 | API | Description |
 |-----|-------------|
-| `setTimeout(fn, ms, ...args≤8)` | Run once; returns `Timeout` (numeric-compatible) |
+| `setTimeout(fn, ms, ...args≤8)` | Run once; returns `Timeout` (also accepts `{ signal }` as 3rd arg) |
 | `clearTimeout(id)` | Cancel; unknown/expired ids are no-ops |
-| `setInterval(fn, ms, ...args≤8)` | Repeat; returns `Timeout` |
+| `setInterval(fn, ms, ...args≤8)` | Repeat; returns `Timeout` (also accepts `{ signal }` as 3rd arg) |
 | `clearInterval(id)` | Stop repeating |
 | `t.unref()` / `t.ref()` / `t.hasRef()` / `t.refresh()` | Exit-hold control on the handle |
 | `queueMicrotask(fn)` | Run before next timer/I/O; the `nextTick` replacement |

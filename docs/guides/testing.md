@@ -8,6 +8,53 @@ order: 8
 
 Fairyfly has no external test framework. Put files ending in `.test.js` inside `test/` and run them with `ff test` (one process, all files) or `test/run.sh` (one process per file).
 
+## Permissions
+
+Test code runs under the same deny-by-default policy as any other script.
+Pass the grants the tests need to the runner:
+
+```sh
+ff test --allow-net=example.com:443
+ff test server-smoke --allow-net=0.0.0.0:3901,127.0.0.1:3901
+ff test --allow-all
+```
+
+- Permission flags are parsed by `ff` itself, not by the test filter. They may
+  appear before or after the filter, and they are skipped when choosing which
+  files to run.
+- A flag applies to **every** test file in that `ff test` run. There is no
+  per-file grant.
+- The runner reads `test/*.test.js` as program files, so no `--allow-read` is
+  needed just to load tests. Reads inside a test still need a scope.
+- `test/run.sh` runs each file with `--allow-all` because the suite covers
+  filesystem, network, env, subprocesses, FFI, and the denial matrix itself.
+  Tests that assert a denial must spawn a child `ff` with narrower flags
+  instead of relying on the parent's policy.
+- Minimal grants are better than `--allow-all` for application tests: a
+  missing scope is a real failure you want to see.
+
+Common grants:
+
+| Test uses | Flag |
+|---|---|
+| `fetch` / `WebSocket` client | `--allow-net=<host>:<port>` |
+| `http.serve` / `udp.bind` | `--allow-net=0.0.0.0:<port>` (or the UDP address) |
+| `fs` reads / writes | `--allow-read=<path>`, `--allow-write=<path>` |
+| `Database.open` | `--allow-read=<db>` and `--allow-write=<dir>` |
+| `process.env` | `--allow-env=<NAME>` |
+| `child_process` | `--allow-run=<program>` |
+| `ffi` | `--allow-ffi` |
+
+For a server fixture that also fetches itself, grant both the listener and the
+client URL:
+
+```sh
+ff test server-smoke --allow-net=0.0.0.0:3901,127.0.0.1:3901
+```
+
+`0.0.0.0:3901` is the `http.serve` bind check; `127.0.0.1:3901` is the
+outbound `fetch` check. Full model: [Permissions](/docs/concepts/permissions).
+
 ## Quick look
 
 Create `test/smoke.test.js`:
@@ -33,6 +80,8 @@ ff test smoke
 #
 # 1 passed, 0 failed
 ```
+
+This test touches no native API, so it needs no permission flags.
 
 ## The `check` / `done` pattern
 
@@ -85,6 +134,7 @@ Behavior:
 - Prints `OK   test/<name>` or `FAIL test/<name>` per file, then a `{passed} passed, {failed} failed` summary.
 - Exit code is `1` when any file fails.
 - Files larger than 10MB are not loaded (`FAIL … (read error)`).
+- Permission flags in the command line apply to all files in the run; `--allow-all` makes every test file unrestricted.
 
 ## Running tests: `test/run.sh`
 
@@ -97,6 +147,11 @@ Same job, one process per file:
 # ...
 # all tests passed
 ```
+
+`run.sh` passes `--allow-all` to every file — the suite covers fs, net, env,
+run, FFI, and the denial matrix. The permission tests spawn child `ff`
+processes with narrower flags, so the parent's `--allow-all` does not hide a
+missing check.
 
 Green means every file exited `0` **and** printed no `FAIL` lines. `make test`
 runs build + C fixtures, `zig build test`, then `test/run.sh`. `make ci` adds
@@ -123,6 +178,10 @@ check("body text", typeof (await res.text()) === "string");
 done("fetch-smoke");
 ```
 
+```sh
+ff test fetch-smoke --allow-net=example.com:443
+```
+
 For a server fixture, serve on a fixed test port, hit it, then `done()` (which exits and closes the listener):
 
 ```js
@@ -137,11 +196,14 @@ done("server-smoke");
 ```
 
 ```sh
-ff test server-smoke
+ff test server-smoke --allow-net=0.0.0.0:3901,127.0.0.1:3901
 # OK   test/server-smoke.test.js
 #
 # 1 passed, 0 failed
 ```
+
+Both grants are required: the listener binds `0.0.0.0:3901`, and the client
+fetches `127.0.0.1:3901`.
 
 ## Practical example: testing a JSON endpoint
 
@@ -176,7 +238,48 @@ check("rejects empty", bad.status === 400);
 done("notes");
 ```
 
+```sh
+ff test notes --allow-net=0.0.0.0:3902,127.0.0.1:3902
+```
+
+## Testing denials
+
+To assert that a missing grant fails closed, run a child process with a
+narrower policy. The parent test runner can keep `--allow-all`; the child
+starts clean:
+
+```js
+// test/permissions.test.js
+import { check, done } from "./lib.mjs";
+import { execSync } from "node:process"; // not available — use child_process instead
+```
+
+Use the real global:
+
+```js
+const BIN = "./zig-out/bin/ff";
+const out = child_process.execSync(
+  `${BIN} -e 'try { fs.readFile("nope.txt"); } catch (e) { console.log(e.code); }'`,
+  { maxBuffer: 1024 * 1024 },
+);
+check("read denied", out.stdout.includes("PERMISSION_DENIED"));
+```
+
+Note that `execSync` itself needs `--allow-run=/bin/sh` in the parent. The
+repo's `test/permissions.test.js` follows this pattern and builds the child
+command lines with explicit scopes.
+
 ## Troubleshooting
+
+**Tests fail with `PermissionDenied`** — add the matching flag to the
+`ff test` command. Common pairs: `fetch` needs `--allow-net=<host>:<port>`;
+`http.serve` needs `--allow-net=0.0.0.0:<port>`; SQLite needs both file read
+and directory write scopes.
+
+**A test passes under `--allow-all` but fails with narrow flags** — the test
+is missing a real grant. Add the specific scope rather than widening the
+whole run. For server fixtures, remember the listener and client checks use
+different addresses.
 
 **`No test/ directory found.`** — run from the project root, not from inside `test/`.
 
@@ -185,3 +288,14 @@ done("notes");
 **`FAIL test/x.test.js (read error)`** — the file exceeds the 10MB per-file cap or is unreadable.
 
 **Passes under `ff test`, fails under `run.sh`** — something printed `FAIL` without failing `check()`. Search the output for stray `FAIL` text.
+
+**Denial test passes unexpectedly under `run.sh`** — the parent has
+`--allow-all`. Spawn a child `ff` with explicit flags and assert its
+`PermissionDenied` output; don't rely on the parent's policy.
+
+## See also
+
+- [Permissions](/docs/concepts/permissions) — flags, scopes, denial contract
+- [Errors and exit codes](/docs/concepts/errors) — denial shapes
+- [child_process](/docs/api/child-process) — spawning child `ff` processes in tests
+- [Limitations](/docs/reference/limitations) — every hard cap

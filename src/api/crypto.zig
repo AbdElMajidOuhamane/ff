@@ -1,7 +1,75 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
+const thread_marker = @import("../worker/thread_marker.zig");
 
 const gpa = std.heap.smp_allocator;
+
+var crypto_key_class_id: c.ClassID = 0;
+
+const HashAlgo = enum(u8) {
+    sha1,
+    sha256,
+    sha384,
+    sha512,
+
+    fn fromSlice(s: []const u8) ?HashAlgo {
+        if (std.ascii.eqlIgnoreCase(s, "SHA-1")) return .sha1;
+        if (std.ascii.eqlIgnoreCase(s, "SHA-256")) return .sha256;
+        if (std.ascii.eqlIgnoreCase(s, "SHA-384")) return .sha384;
+        if (std.ascii.eqlIgnoreCase(s, "SHA-512")) return .sha512;
+        return null;
+    }
+
+    fn name(self: HashAlgo) []const u8 {
+        return switch (self) {
+            .sha1 => "SHA-1",
+            .sha256 => "SHA-256",
+            .sha384 => "SHA-384",
+            .sha512 => "SHA-512",
+        };
+    }
+
+    fn digestLen(self: HashAlgo) usize {
+        return switch (self) {
+            .sha1 => 20,
+            .sha256 => 32,
+            .sha384 => 48,
+            .sha512 => 64,
+        };
+    }
+};
+
+const CryptoKeyData = struct {
+    key_inline: [128]u8 = undefined,
+    key_heap: ?[]u8 = null,
+    key_len: usize = 0,
+    hash: HashAlgo = .sha256,
+    extractable: bool = false,
+    can_sign: bool = false,
+    can_verify: bool = false,
+
+    fn keySlice(self: *const CryptoKeyData) []const u8 {
+        if (self.key_heap) |h| return h;
+        return self.key_inline[0..self.key_len];
+    }
+
+    fn deinit(self: *CryptoKeyData) void {
+        if (self.key_heap) |h| {
+            std.crypto.secureZero(u8, h);
+            gpa.free(h);
+            self.key_heap = null;
+        }
+        std.crypto.secureZero(u8, &self.key_inline);
+    }
+};
+
+fn cryptoKeyFinalizer(_: ?*c.Runtime, val: c.Value) callconv(.c) void {
+    const ptr = c.getOpaque(val, crypto_key_class_id) orelse return;
+    const data: *CryptoKeyData = @ptrCast(@alignCast(ptr));
+    data.deinit();
+    gpa.destroy(data);
+}
 
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 
@@ -176,66 +244,362 @@ fn randomUUIDCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     return c.newStringLen(ctx, &uuid, 36);
 }
 
+fn resolvePromiseWithValue(ctx: ?*c.Context, val: c.Value) c.Value {
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) {
+        c.freeValue(ctx, val);
+        return promise;
+    }
+    var args = [_]c.Value{val};
+    const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+    c.freeValue(ctx, val);
+    c.freeValue(ctx, cap[0]);
+    c.freeValue(ctx, cap[1]);
+    if (c.isException(ret) != 0) {
+        c.freeValue(ctx, promise);
+        return ret;
+    }
+    c.freeValue(ctx, ret);
+    return promise;
+}
+
+fn parseHashAlgoVal(ctx: ?*c.Context, val: c.Value) ?HashAlgo {
+    var buf: [64]u8 = undefined;
+    if (c.isString(val) != 0) {
+        const ex = extractStringAuto(ctx, val, &buf) orelse return null;
+        defer ex.deinit();
+        return HashAlgo.fromSlice(ex.slice);
+    }
+    if (c.isObject(val) != 0) {
+        const name_val = c.getPropertyStr(ctx, val, "name");
+        defer c.freeValue(ctx, name_val);
+        if (c.isString(name_val) == 0) return null;
+        const ex = extractStringAuto(ctx, name_val, &buf) orelse return null;
+        defer ex.deinit();
+        return HashAlgo.fromSlice(ex.slice);
+    }
+    return null;
+}
+
+fn checkHmacAlgo(ctx: ?*c.Context, val: c.Value) bool {
+    var buf: [64]u8 = undefined;
+    if (c.isString(val) != 0) {
+        const ex = extractStringAuto(ctx, val, &buf) orelse return false;
+        defer ex.deinit();
+        return std.ascii.eqlIgnoreCase(ex.slice, "HMAC");
+    }
+    if (c.isObject(val) != 0) {
+        const name_val = c.getPropertyStr(ctx, val, "name");
+        defer c.freeValue(ctx, name_val);
+        if (c.isString(name_val) == 0) return false;
+        const ex = extractStringAuto(ctx, name_val, &buf) orelse return false;
+        defer ex.deinit();
+        return std.ascii.eqlIgnoreCase(ex.slice, "HMAC");
+    }
+    return false;
+}
+
+/// When the caller passes { name: "HMAC", hash: ... }, the requested hash must
+/// match the key's hash. A bare "HMAC" or {name:"HMAC"} is allowed and uses
+/// the key's hash, which is what the WebCrypto normalization permits.
+fn hmacAlgoHashMatches(ctx: ?*c.Context, val: c.Value, key_hash: HashAlgo) bool {
+    if (c.isObject(val) == 0) return true;
+    const hash_val = c.getPropertyStr(ctx, val, "hash");
+    defer c.freeValue(ctx, hash_val);
+    if (c.isUndefined(hash_val) != 0 or c.isNull(hash_val) != 0) return true;
+    const requested = parseHashAlgoVal(ctx, hash_val) orelse return false;
+    return requested == key_hash;
+}
+
+fn computeHmac(hash: HashAlgo, key: []const u8, msg: []const u8, out: *[64]u8) usize {
+    switch (hash) {
+        .sha1 => {
+            std.crypto.auth.hmac.HmacSha1.create(out[0..20], msg, key);
+            return 20;
+        },
+        .sha256 => {
+            std.crypto.auth.hmac.sha2.HmacSha256.create(out[0..32], msg, key);
+            return 32;
+        },
+        .sha384 => {
+            std.crypto.auth.hmac.sha2.HmacSha384.create(out[0..48], msg, key);
+            return 48;
+        },
+        .sha512 => {
+            std.crypto.auth.hmac.sha2.HmacSha512.create(out[0..64], msg, key);
+            return 64;
+        },
+    }
+}
+
 fn subtleDigestCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 2) {
         _ = c.throwTypeError(ctx, "subtle.digest requires algorithm and data");
         return c.JS_EXCEPTION;
     }
-    var algo_buf: [64]u8 = undefined;
-    const algo_ex = extractStringAuto(ctx, argv[0], &algo_buf) orelse {
-        _ = c.throwTypeError(ctx, "subtle.digest: invalid algorithm");
+    const hash = parseHashAlgoVal(ctx, argv[0]) orelse {
+        if (c.hasException(ctx)) return c.JS_EXCEPTION;
+        _ = c.throwTypeError(ctx, "subtle.digest: unsupported algorithm (SHA-1/SHA-256/SHA-384/SHA-512)");
         return c.JS_EXCEPTION;
     };
-    defer algo_ex.deinit();
     const bytes = backingBytes(ctx, argv[1]) orelse {
         _ = c.throwTypeError(ctx, "subtle.digest: data must be ArrayBuffer or TypedArray");
         return c.JS_EXCEPTION;
     };
 
     var digest_buf: [64]u8 = undefined;
-    var digest_len: usize = 0;
-    if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-1")) {
-        std.crypto.hash.Sha1.hash(bytes, digest_buf[0..20], .{});
-        digest_len = 20;
-    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-256")) {
-        std.crypto.hash.sha2.Sha256.hash(bytes, digest_buf[0..32], .{});
-        digest_len = 32;
-    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-384")) {
-        std.crypto.hash.sha2.Sha384.hash(bytes, digest_buf[0..48], .{});
-        digest_len = 48;
-    } else if (std.ascii.eqlIgnoreCase(algo_ex.slice, "SHA-512")) {
-        std.crypto.hash.sha2.Sha512.hash(bytes, digest_buf[0..64], .{});
-        digest_len = 64;
-    } else {
-        _ = c.throwTypeError(ctx, "subtle.digest: unsupported algorithm (SHA-1/SHA-256/SHA-384/SHA-512)");
+    const digest_len = hash.digestLen();
+    switch (hash) {
+        .sha1 => std.crypto.hash.Sha1.hash(bytes, digest_buf[0..20], .{}),
+        .sha256 => std.crypto.hash.sha2.Sha256.hash(bytes, digest_buf[0..32], .{}),
+        .sha384 => std.crypto.hash.sha2.Sha384.hash(bytes, digest_buf[0..48], .{}),
+        .sha512 => std.crypto.hash.sha2.Sha512.hash(bytes, digest_buf[0..64], .{}),
+    }
+
+    const ab = c.newArrayBufferCopy(ctx, digest_buf[0..digest_len].ptr, digest_len);
+    if (c.isException(ab) != 0) return ab;
+    return resolvePromiseWithValue(ctx, ab);
+}
+
+fn subtleImportKeyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 5) {
+        _ = c.throwTypeError(ctx, "subtle.importKey requires (format, keyData, algorithm, extractable, keyUsages)");
+        return c.JS_EXCEPTION;
+    }
+    var fmt_buf: [32]u8 = undefined;
+    if (c.isString(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: format must be 'raw'");
+        return c.JS_EXCEPTION;
+    }
+    const fmt_ex = extractStringAuto(ctx, argv[0], &fmt_buf) orelse return c.JS_EXCEPTION;
+    defer fmt_ex.deinit();
+    if (!std.mem.eql(u8, fmt_ex.slice, "raw")) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: only 'raw' format is supported");
         return c.JS_EXCEPTION;
     }
 
-    var cap: [2]c.Value = undefined;
-    const promise = c.newPromiseCapability(ctx, &cap);
-    if (c.isException(promise) != 0) return promise;
-    const ab = c.newArrayBufferCopy(ctx, digest_buf[0..digest_len].ptr, digest_len);
-    if (c.isException(ab) != 0) {
-        c.freeValue(ctx, cap[0]);
-        c.freeValue(ctx, cap[1]);
-        c.freeValue(ctx, promise);
-        return ab;
+    const key_bytes = backingBytes(ctx, argv[1]) orelse {
+        _ = c.throwTypeError(ctx, "subtle.importKey: keyData must be ArrayBuffer or TypedArray");
+        return c.JS_EXCEPTION;
+    };
+    if (key_bytes.len == 0) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: keyData must not be empty");
+        return c.JS_EXCEPTION;
     }
-    var args = [_]c.Value{ab};
-    const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
-    if (c.isException(ret) != 0) {
-        c.freeValue(ctx, ab);
-        c.freeValue(ctx, cap[0]);
-        c.freeValue(ctx, cap[1]);
-        c.freeValue(ctx, promise);
-        return ret;
+
+    if (!checkHmacAlgo(ctx, argv[2])) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: algorithm must be 'HMAC' or { name: 'HMAC', hash: 'SHA-...' }");
+        return c.JS_EXCEPTION;
     }
-    c.freeValue(ctx, ret);
-    c.freeValue(ctx, ab);
-    c.freeValue(ctx, cap[0]);
-    c.freeValue(ctx, cap[1]);
-    return promise;
+    const hash: HashAlgo = if (c.isObject(argv[2]) != 0) blk: {
+        const hash_prop = c.getPropertyStr(ctx, argv[2], "hash");
+        defer c.freeValue(ctx, hash_prop);
+        if (c.isUndefined(hash_prop) != 0) break :blk .sha256;
+        break :blk parseHashAlgoVal(ctx, hash_prop) orelse {
+            _ = c.throwTypeError(ctx, "subtle.importKey: unsupported HMAC hash (SHA-1/SHA-256/SHA-384/SHA-512)");
+            return c.JS_EXCEPTION;
+        };
+    } else .sha256;
+
+    const extractable = c.toBool(ctx, argv[3]) > 0;
+
+    if (c.isArray(ctx, argv[4]) == 0) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: keyUsages must be an array");
+        return c.JS_EXCEPTION;
+    }
+    const len_val = c.getPropertyStr(ctx, argv[4], "length");
+    defer c.freeValue(ctx, len_val);
+    var usages_len: i32 = 0;
+    if (c.toInt32(ctx, &usages_len, len_val) != 0 or usages_len <= 0 or usages_len > 16) {
+        _ = c.throwTypeError(ctx, "subtle.importKey: keyUsages must be a non-empty array");
+        return c.JS_EXCEPTION;
+    }
+
+    var can_sign = false;
+    var can_verify = false;
+    var u_idx: u32 = 0;
+    while (u_idx < @as(u32, @intCast(usages_len))) : (u_idx += 1) {
+        const u_val = c.getPropertyUint32(ctx, argv[4], u_idx);
+        defer c.freeValue(ctx, u_val);
+        if (c.isString(u_val) == 0) {
+            _ = c.throwTypeError(ctx, "subtle.importKey: invalid key usage");
+            return c.JS_EXCEPTION;
+        }
+        var u_buf: [32]u8 = undefined;
+        const u_ex = extractStringAuto(ctx, u_val, &u_buf) orelse return c.JS_EXCEPTION;
+        defer u_ex.deinit();
+        if (std.mem.eql(u8, u_ex.slice, "sign")) {
+            can_sign = true;
+        } else if (std.mem.eql(u8, u_ex.slice, "verify")) {
+            can_verify = true;
+        } else {
+            _ = c.throwTypeError(ctx, "subtle.importKey: HMAC only supports 'sign' and 'verify' usages");
+            return c.JS_EXCEPTION;
+        }
+    }
+
+    const key_data = gpa.create(CryptoKeyData) catch return c.throwOutOfMemory(ctx);
+    key_data.* = .{
+        .key_len = key_bytes.len,
+        .hash = hash,
+        .extractable = extractable,
+        .can_sign = can_sign,
+        .can_verify = can_verify,
+    };
+    if (key_bytes.len <= key_data.key_inline.len) {
+        @memcpy(key_data.key_inline[0..key_bytes.len], key_bytes);
+    } else {
+        key_data.key_heap = gpa.dupe(u8, key_bytes) catch {
+            gpa.destroy(key_data);
+            return c.throwOutOfMemory(ctx);
+        };
+    }
+
+    const key_obj = c.newObjectClass(ctx, @intCast(crypto_key_class_id));
+    if (c.isException(key_obj) != 0) {
+        key_data.deinit();
+        gpa.destroy(key_data);
+        return key_obj;
+    }
+    c.setOpaque(key_obj, key_data);
+
+    _ = c.definePropertyValueStr(ctx, key_obj, "type", c.newStringLen(ctx, "secret", 6), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, key_obj, "extractable", if (extractable) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
+
+    const algo_obj = c.newObject(ctx);
+    _ = c.definePropertyValueStr(ctx, algo_obj, "name", c.newStringLen(ctx, "HMAC", 4), c.PROP_C_W_E);
+    const hash_obj = c.newObject(ctx);
+    const hname = hash.name();
+    _ = c.definePropertyValueStr(ctx, hash_obj, "name", c.newStringLen(ctx, hname.ptr, hname.len), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, algo_obj, "hash", hash_obj, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, algo_obj, "length", c.newInt64(ctx, @intCast(key_bytes.len * 8)), c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, key_obj, "algorithm", algo_obj, c.PROP_C_W_E);
+
+    const usages_arr = c.newArray(ctx);
+    var out_idx: u32 = 0;
+    if (can_sign) {
+        _ = c.definePropertyValueUint32(ctx, usages_arr, out_idx, c.newStringLen(ctx, "sign", 4), c.PROP_C_W_E);
+        out_idx += 1;
+    }
+    if (can_verify) {
+        _ = c.definePropertyValueUint32(ctx, usages_arr, out_idx, c.newStringLen(ctx, "verify", 6), c.PROP_C_W_E);
+    }
+    _ = c.definePropertyValueStr(ctx, key_obj, "usages", usages_arr, c.PROP_C_W_E);
+
+    return resolvePromiseWithValue(ctx, key_obj);
+}
+
+fn subtleSignCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 3) {
+        _ = c.throwTypeError(ctx, "subtle.sign requires (algorithm, key, data)");
+        return c.JS_EXCEPTION;
+    }
+    if (!checkHmacAlgo(ctx, argv[0])) {
+        _ = c.throwTypeError(ctx, "subtle.sign: unsupported algorithm (expected HMAC)");
+        return c.JS_EXCEPTION;
+    }
+    const ptr = c.getOpaque2(ctx, argv[1], crypto_key_class_id) orelse {
+        _ = c.throwTypeError(ctx, "subtle.sign: key must be a CryptoKey");
+        return c.JS_EXCEPTION;
+    };
+    const key_data: *CryptoKeyData = @ptrCast(@alignCast(ptr));
+    if (!key_data.can_sign) {
+        _ = c.throwTypeError(ctx, "subtle.sign: key does not support 'sign' usage");
+        return c.JS_EXCEPTION;
+    }
+    if (!hmacAlgoHashMatches(ctx, argv[0], key_data.hash)) {
+        _ = c.throwTypeError(ctx, "subtle.sign: algorithm hash does not match key");
+        return c.JS_EXCEPTION;
+    }
+    const bytes = backingBytes(ctx, argv[2]) orelse {
+        _ = c.throwTypeError(ctx, "subtle.sign: data must be ArrayBuffer or TypedArray");
+        return c.JS_EXCEPTION;
+    };
+
+    var mac_buf: [64]u8 = undefined;
+    const mac_len = computeHmac(key_data.hash, key_data.keySlice(), bytes, &mac_buf);
+    const ab = c.newArrayBufferCopy(ctx, mac_buf[0..mac_len].ptr, mac_len);
+    if (c.isException(ab) != 0) return ab;
+    return resolvePromiseWithValue(ctx, ab);
+}
+
+fn subtleVerifyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 4) {
+        _ = c.throwTypeError(ctx, "subtle.verify requires (algorithm, key, signature, data)");
+        return c.JS_EXCEPTION;
+    }
+    if (!checkHmacAlgo(ctx, argv[0])) {
+        _ = c.throwTypeError(ctx, "subtle.verify: unsupported algorithm (expected HMAC)");
+        return c.JS_EXCEPTION;
+    }
+    const ptr = c.getOpaque2(ctx, argv[1], crypto_key_class_id) orelse {
+        _ = c.throwTypeError(ctx, "subtle.verify: key must be a CryptoKey");
+        return c.JS_EXCEPTION;
+    };
+    const key_data: *CryptoKeyData = @ptrCast(@alignCast(ptr));
+    if (!key_data.can_verify) {
+        _ = c.throwTypeError(ctx, "subtle.verify: key does not support 'verify' usage");
+        return c.JS_EXCEPTION;
+    }
+    if (!hmacAlgoHashMatches(ctx, argv[0], key_data.hash)) {
+        _ = c.throwTypeError(ctx, "subtle.verify: algorithm hash does not match key");
+        return c.JS_EXCEPTION;
+    }
+    const sig_bytes = backingBytes(ctx, argv[2]) orelse {
+        _ = c.throwTypeError(ctx, "subtle.verify: signature must be ArrayBuffer or TypedArray");
+        return c.JS_EXCEPTION;
+    };
+    const data_bytes = backingBytes(ctx, argv[3]) orelse {
+        _ = c.throwTypeError(ctx, "subtle.verify: data must be ArrayBuffer or TypedArray");
+        return c.JS_EXCEPTION;
+    };
+
+    var mac_buf: [64]u8 = undefined;
+    _ = computeHmac(key_data.hash, key_data.keySlice(), data_bytes, &mac_buf);
+    const valid = switch (key_data.hash) {
+        .sha1 => sig_bytes.len == 20 and std.crypto.timing_safe.eql([20]u8, mac_buf[0..20].*, sig_bytes[0..20].*),
+        .sha256 => sig_bytes.len == 32 and std.crypto.timing_safe.eql([32]u8, mac_buf[0..32].*, sig_bytes[0..32].*),
+        .sha384 => sig_bytes.len == 48 and std.crypto.timing_safe.eql([48]u8, mac_buf[0..48].*, sig_bytes[0..48].*),
+        .sha512 => sig_bytes.len == 64 and std.crypto.timing_safe.eql([64]u8, mac_buf[0..64].*, sig_bytes[0..64].*),
+    };
+    return resolvePromiseWithValue(ctx, if (valid) c.JS_TRUE else c.JS_FALSE);
+}
+
+fn subtleExportKeyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (argc < 2) {
+        _ = c.throwTypeError(ctx, "subtle.exportKey requires (format, key)");
+        return c.JS_EXCEPTION;
+    }
+    var fmt_buf: [32]u8 = undefined;
+    if (c.isString(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "subtle.exportKey: format must be 'raw'");
+        return c.JS_EXCEPTION;
+    }
+    const fmt_ex = extractStringAuto(ctx, argv[0], &fmt_buf) orelse return c.JS_EXCEPTION;
+    defer fmt_ex.deinit();
+    if (!std.mem.eql(u8, fmt_ex.slice, "raw")) {
+        _ = c.throwTypeError(ctx, "subtle.exportKey: only 'raw' format is supported");
+        return c.JS_EXCEPTION;
+    }
+    const ptr = c.getOpaque2(ctx, argv[1], crypto_key_class_id) orelse {
+        _ = c.throwTypeError(ctx, "subtle.exportKey: key must be a CryptoKey");
+        return c.JS_EXCEPTION;
+    };
+    const key_data: *CryptoKeyData = @ptrCast(@alignCast(ptr));
+    if (!key_data.extractable) {
+        _ = c.throwTypeError(ctx, "subtle.exportKey: key is not extractable");
+        return c.JS_EXCEPTION;
+    }
+    const raw = key_data.keySlice();
+    const ab = c.newArrayBufferCopy(ctx, raw.ptr, raw.len);
+    if (c.isException(ab) != 0) return ab;
+    return resolvePromiseWithValue(ctx, ab);
 }
 
 fn btoaCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -288,7 +652,164 @@ fn atobCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     return c.newStringLen(ctx, out.ptr, out_len);
 }
 
+fn rejectPromiseWithError(ctx: ?*c.Context, reject_fn: c.Value, msg: []const u8) void {
+    const err = c.newError(ctx);
+    if (c.isException(err) != 0) return;
+    const msg_val = c.newStringLen(ctx, msg.ptr, msg.len);
+    _ = c.setPropertyStr(ctx, err, "message", msg_val);
+    var args = [_]c.Value{err};
+    const ret = c.call(ctx, reject_fn, c.JS_UNDEFINED, 1, &args);
+    c.freeValue(ctx, ret);
+    c.freeValue(ctx, err);
+}
+
+fn bcryptHashCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (thread_marker.isWorkerThread()) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt is not available in workers");
+        return c.JS_EXCEPTION;
+    }
+    if (argc < 1 or c.isString(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt.hash requires a password string");
+        return c.JS_EXCEPTION;
+    }
+
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return promise;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+
+    var pw_buf: [128]u8 = undefined;
+    const pw_ex = extractStringAuto(ctx, argv[0], &pw_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer pw_ex.deinit();
+
+    if (pw_ex.slice.len > bcrypt_pool.MAX_PASSWORD) {
+        rejectPromiseWithError(ctx, cap[1], "bcrypt: password exceeds 72 bytes");
+        return promise;
+    }
+
+    var cost: u6 = bcrypt_pool.DEFAULT_COST;
+    if (argc >= 2) {
+        if (c.isObject(argv[1]) != 0) {
+            const cost_val = c.getPropertyStr(ctx, argv[1], "cost");
+            defer c.freeValue(ctx, cost_val);
+            if (c.isUndefined(cost_val) == 0) {
+                if (c.isNumber(cost_val) == 0) {
+                    rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                    return promise;
+                }
+                var parsed_cost: i32 = 0;
+                if (c.toInt32(ctx, &parsed_cost, cost_val) != 0 or parsed_cost < bcrypt_pool.MIN_COST or parsed_cost > bcrypt_pool.MAX_COST) {
+                    rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                    return promise;
+                }
+                cost = @intCast(parsed_cost);
+            }
+        } else if (c.isNumber(argv[1]) != 0) {
+            var parsed_cost: i32 = 0;
+            if (c.toInt32(ctx, &parsed_cost, argv[1]) != 0 or parsed_cost < bcrypt_pool.MIN_COST or parsed_cost > bcrypt_pool.MAX_COST) {
+                rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: cost must be an integer between 4 and 14");
+                return promise;
+            }
+            cost = @intCast(parsed_cost);
+        } else {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: options must be an object");
+            return promise;
+        }
+    }
+
+    bcrypt_pool.submitHash(ctx.?, pw_ex.slice, cost, cap[0], cap[1]) catch |err| switch (err) {
+        error.QueueFull => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: queue full");
+        },
+        error.PasswordTooLong => {
+            rejectPromiseWithError(ctx, cap[1], "bcrypt: password exceeds 72 bytes");
+        },
+        error.OutOfMemory => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        },
+        error.EntropyUnavailable => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: entropy unavailable");
+        },
+        else => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: submission failed");
+        },
+    };
+
+    return promise;
+}
+
+fn bcryptVerifyCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = this_val;
+    if (thread_marker.isWorkerThread()) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt is not available in workers");
+        return c.JS_EXCEPTION;
+    }
+    if (argc < 2 or c.isString(argv[0]) == 0 or c.isString(argv[1]) == 0) {
+        _ = c.throwTypeError(ctx, "crypto.bcrypt.verify requires (password, hash)");
+        return c.JS_EXCEPTION;
+    }
+
+    var cap: [2]c.Value = undefined;
+    const promise = c.newPromiseCapability(ctx, &cap);
+    if (c.isException(promise) != 0) return promise;
+    defer c.freeValue(ctx, cap[0]);
+    defer c.freeValue(ctx, cap[1]);
+
+    var pw_buf: [128]u8 = undefined;
+    const pw_ex = extractStringAuto(ctx, argv[0], &pw_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer pw_ex.deinit();
+
+    var h_buf: [128]u8 = undefined;
+    const h_ex = extractStringAuto(ctx, argv[1], &h_buf) orelse {
+        rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        return promise;
+    };
+    defer h_ex.deinit();
+
+    if (h_ex.slice.len > bcrypt_pool.MAX_HASH_STR) {
+        var args = [_]c.Value{c.JS_FALSE};
+        const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+        c.freeValue(ctx, ret);
+        return promise;
+    }
+
+    bcrypt_pool.submitVerify(ctx.?, pw_ex.slice, h_ex.slice, cap[0], cap[1]) catch |err| switch (err) {
+        error.QueueFull => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: queue full");
+        },
+        error.HashTooLong => {
+            var args = [_]c.Value{c.JS_FALSE};
+            const ret = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &args);
+            c.freeValue(ctx, ret);
+        },
+        error.OutOfMemory => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: out of memory");
+        },
+        else => {
+            rejectPromiseWithError(ctx, cap[1], "crypto.bcrypt: submission failed");
+        },
+    };
+
+    return promise;
+}
+
 pub fn setup(ctx: *c.Context) void {
+    const rt = c.getRuntime(ctx);
+    var key_def = c.ClassDef{
+        .class_name = "CryptoKey",
+        .finalizer = cryptoKeyFinalizer,
+    };
+    _ = c.newClassID(rt, &crypto_key_class_id);
+    _ = c.newClass(rt, crypto_key_class_id, &key_def);
+
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const crypto_obj = c.newObject(ctx);
@@ -302,7 +823,22 @@ pub fn setup(ctx: *c.Context) void {
     const subtle_obj = c.newObject(ctx);
     const digest_fn = c.newCFunction(ctx, subtleDigestCallback, "digest", 2);
     _ = c.definePropertyValueStr(ctx, subtle_obj, "digest", digest_fn, c.PROP_C_W_E);
+    const importKey_fn = c.newCFunction(ctx, subtleImportKeyCallback, "importKey", 5);
+    _ = c.definePropertyValueStr(ctx, subtle_obj, "importKey", importKey_fn, c.PROP_C_W_E);
+    const sign_fn = c.newCFunction(ctx, subtleSignCallback, "sign", 3);
+    _ = c.definePropertyValueStr(ctx, subtle_obj, "sign", sign_fn, c.PROP_C_W_E);
+    const verify_fn = c.newCFunction(ctx, subtleVerifyCallback, "verify", 4);
+    _ = c.definePropertyValueStr(ctx, subtle_obj, "verify", verify_fn, c.PROP_C_W_E);
+    const exportKey_fn = c.newCFunction(ctx, subtleExportKeyCallback, "exportKey", 2);
+    _ = c.definePropertyValueStr(ctx, subtle_obj, "exportKey", exportKey_fn, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, crypto_obj, "subtle", subtle_obj, c.PROP_C_W_E);
+
+    const bcrypt_obj = c.newObject(ctx);
+    const bcrypt_hash_fn = c.newCFunction(ctx, bcryptHashCallback, "hash", 2);
+    _ = c.definePropertyValueStr(ctx, bcrypt_obj, "hash", bcrypt_hash_fn, c.PROP_C_W_E);
+    const bcrypt_verify_fn = c.newCFunction(ctx, bcryptVerifyCallback, "verify", 2);
+    _ = c.definePropertyValueStr(ctx, bcrypt_obj, "verify", bcrypt_verify_fn, c.PROP_C_W_E);
+    _ = c.definePropertyValueStr(ctx, crypto_obj, "bcrypt", bcrypt_obj, c.PROP_C_W_E);
 
     const btoa_fn = c.newCFunction(ctx, btoaCallback, "btoa", 1);
     _ = c.definePropertyValueStr(ctx, global, "btoa", btoa_fn, c.PROP_C_W_E);

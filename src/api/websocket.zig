@@ -5,8 +5,14 @@ const std = @import("std");
 
 pub var ws_class_id: c.ClassID = 0;
 
+// Handle, not a pointer (DOD §5 / udp_native precedent): the slot INDEX plus
+// the connection GENERATION. The JS object outlives its connection — apps keep
+// sockets in a broadcast set — and the slot is recycled by the next accept.
+// Without the generation, a stale handle addresses a different peer's
+// connection and delivers one tenant's message to another.
 const WsData = struct {
     slot_id: u16,
+    gen: u16,
 };
 
 fn wsFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
@@ -17,22 +23,30 @@ fn wsFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
-pub fn makeSocket(ctx: ?*c.Context, id: u16) ?c.Value {
+pub fn makeSocket(ctx: ?*c.Context, id: u16, gen: u16) ?c.Value {
+    if (id >= http_native.MAX_CONN) return null;
     const obj = c.newObjectClass(ctx, @intCast(ws_class_id));
     const data = std.heap.smp_allocator.create(WsData) catch return null;
-    data.* = .{ .slot_id = id };
+    data.* = .{ .slot_id = id, .gen = gen };
     c.setOpaque(obj, data);
     return obj;
 }
 
-fn slotIdFromThis(ctx: ?*c.Context, this_val: c.Value) ?usize {
+/// Resolve this handle to a live slot, or null when the connection it was
+/// created for is gone. Silent null (not a throw) keeps
+/// `for (const ws of set) ws.send(...)` from aborting on the first
+/// disconnected peer.
+fn liveSlot(ctx: ?*c.Context, this_val: c.Value) ?usize {
     const data_ptr = c.getOpaque2(ctx, this_val, ws_class_id) orelse return null;
     const data: *WsData = @ptrCast(@alignCast(data_ptr));
-    return data.slot_id;
+    const id: usize = data.slot_id;
+    if (id >= http_native.MAX_CONN) return null;
+    if (http_native.slotGen(id) != data.gen) return null;
+    return id;
 }
 
 fn socketSend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    const id = slotIdFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    const id = liveSlot(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 1) return c.JS_UNDEFINED;
     const arg = argv[0];
     if (c.isString(arg) != 0) {
@@ -63,7 +77,7 @@ fn backingBytes(ctx: ?*c.Context, arg: c.Value) ?[]const u8 {
 }
 
 fn socketSendBinary(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
-    const id = slotIdFromThis(ctx, this_val) orelse return c.JS_UNDEFINED;
+    const id = liveSlot(ctx, this_val) orelse return c.JS_UNDEFINED;
     if (argc < 1) return c.JS_UNDEFINED;
     const bytes = backingBytes(ctx, argv[0]) orelse return c.JS_UNDEFINED;
     http_native.wsSendBinary(id, bytes);

@@ -9,6 +9,7 @@ const microtasks = @import("../event/microtasks.zig");
 const console_api = @import("../api/console.zig");
 const fs_api = @import("../api/fs.zig");
 const process_api = @import("../api/process.zig");
+const permissions_api = @import("../api/permissions.zig");
 const crypto_api = @import("../api/crypto.zig");
 const url_api = @import("../api/url.zig");
 const fetch_api = @import("../api/fetch.zig");
@@ -30,6 +31,7 @@ const pg_client = @import("../net/pg_client.zig");
 const ffi_api = @import("../api/ffi.zig");
 const udp_api = @import("../api/udp.zig");
 const child_process_api = @import("../api/child_process.zig");
+const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
 
 const gpa = std.heap.smp_allocator;
 var boot_arena: std.heap.ArenaAllocator = undefined;
@@ -41,6 +43,8 @@ pub fn getEventLoop() ?*EventLoop {
 
 pub fn deinitNetwork() void {
     http_native.deinit();
+    ws_client.deinit();
+    worker_mod.deinit();
     sql_api.deinit();
 }
 
@@ -75,42 +79,6 @@ fn makeTimeout(ctx: ?*qjs.Context, id: usize) ?qjs.Value {
     const obj = qjs.newObjectClass(ctx, @intCast(timeout_class_id));
     qjs.setOpaque(obj, @ptrFromInt(id + 1));
     return obj;
-}
-
-// CHANGED: source-based module detection (replaces buggy JS_DetectModule)
-fn sourceHasModuleSyntax(source: []const u8) bool {
-    var i: usize = 0;
-    while (i < source.len) {
-        const ch = source[i];
-        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == ';' or ch == ',') {
-            i += 1;
-            continue;
-        }
-        if (ch == '/' and i + 1 < source.len and source[i + 1] == '/') {
-            i += 2;
-            while (i < source.len and source[i] != '\n') i += 1;
-            continue;
-        }
-        if (ch == '/' and i + 1 < source.len and source[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
-            if (i + 1 < source.len) i += 2;
-            continue;
-        }
-        if (ch == '-' and i + 1 < source.len and source[i + 1] == '-') {
-            i += 2;
-            while (i < source.len and source[i] != '\n') i += 1;
-            continue;
-        }
-        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "import ")) return true;
-        if (i + 7 <= source.len and std.mem.startsWith(u8, source[i..], "export ")) return true;
-        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import{")) return true;
-        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "export{")) return true;
-        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import('")) return true;
-        if (i + 8 <= source.len and std.mem.startsWith(u8, source[i..], "import(\"")) return true;
-        return false;
-    }
-    return false;
 }
 
 fn moduleNormalize(ctx: ?*qjs.Context, base_name: [*c]const u8, name: [*c]const u8, opaque_: ?*anyopaque) callconv(.c) [*c]u8 {
@@ -229,6 +197,7 @@ pub const Runtime = struct {
         console_api.setup(ctx);
         fs_api.setup(ctx);
         process_api.setup(ctx, args);
+        permissions_api.setup(ctx);
         crypto_api.setup(ctx);
         url_api.setup(ctx);
         fetch_api.setup(ctx);
@@ -294,6 +263,9 @@ pub const Runtime = struct {
         ffi_api.setLoop(&loop_ptr.loop);
         fs_api.setLoop(&loop_ptr.loop);
         child_process_api.setLoop(&loop_ptr.loop);
+        process_api.setLoop(&loop_ptr.loop);
+        worker_mod.setLoop(&loop_ptr.loop);
+        bcrypt_pool.setLoop(&loop_ptr.loop);
 
         const runtime = try boot.create(Runtime);
         runtime.* = .{
@@ -361,6 +333,32 @@ pub const Runtime = struct {
             }
         }
         const rt = g_runtime orelse return qjs.JS_UNDEFINED;
+        var sig_val: qjs.Value = qjs.JS_UNDEFINED;
+        var sig_owned = false;
+        if (argc >= 3 and qjs.isObject(argv[2]) != 0) {
+            if (fetch_api.getAbortSignalData(ctx, argv[2]) != null) {
+                sig_val = argv[2];
+            } else {
+                const prop = qjs.getPropertyStr(ctx, argv[2], "signal");
+                if (fetch_api.getAbortSignalData(ctx, prop) != null) {
+                    sig_val = prop;
+                    sig_owned = true;
+                } else {
+                    qjs.freeValue(ctx, prop);
+                }
+            }
+        }
+        defer if (sig_owned) qjs.freeValue(ctx, sig_val);
+
+        if (fetch_api.getAbortSignalData(ctx, sig_val)) |sd| {
+            if (sd.aborted) {
+                if (as_object) {
+                    return makeTimeout(ctx, 128) orelse qjs.throwOutOfMemory(ctx);
+                }
+                return qjs.newInt32(ctx, -1);
+            }
+        }
+
         const args_slice: []const qjs.Value = if (nargs > 0) argv[2..][0..nargs] else &.{};
         const id = if (interval)
             rt.timer_manager.setInterval(ctx.?, argv[0], @intCast(ms), args_slice)
@@ -371,6 +369,7 @@ pub const Runtime = struct {
             _ = qjs.throwTypeError(ctx, "too many timers (max 128)");
             return qjs.JS_EXCEPTION;
         };
+        _ = fetch_api.attachTimerToSignal(ctx, sig_val, slot);
         if (as_object) {
             return makeTimeout(ctx, slot) orelse qjs.throwOutOfMemory(ctx);
         }
@@ -492,7 +491,9 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        bcrypt_pool.deinit();
         fetch_api.deinitClient();
+        process_api.deinit(self.ctx);
         self.timer_manager.cancelAll();
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
@@ -521,43 +522,69 @@ pub const Runtime = struct {
         return true;
     }
 
-    // CHANGED: source-based module detection instead of buggy JS_DetectModule
+    // Script-first parse probe: a plain script keeps script semantics
+    // (top-level `this`, sloppy mode, globals). Module mode is only tried when
+    // script parsing fails — import/export cannot parse as a script. The cost
+    // is one extra parse for modules, zero for scripts, and only at startup.
     pub fn evalModule(self: *Runtime, source: []const u8, filename: [:0]const u8) bool {
-        const is_module = blk: {
-            if (std.mem.endsWith(u8, filename, ".mjs")) break :blk true;
-            break :blk sourceHasModuleSyntax(source);
-        };
-        const flags: c_int = if (is_module)
-            qjs.EVAL_TYPE_MODULE
-        else
-            qjs.EVAL_TYPE_GLOBAL;
-        const result = qjs.eval(
+        const forced_module = std.mem.endsWith(u8, filename, ".mjs");
+        var is_module = forced_module;
+        var flags: c_int = if (forced_module) qjs.EVAL_TYPE_MODULE else qjs.EVAL_TYPE_GLOBAL;
+
+        var fun = qjs.eval(
             self.ctx,
             source.ptr,
             source.len,
             filename.ptr,
-            flags,
+            flags | qjs.EVAL_FLAG_COMPILE_ONLY,
         );
+
+        if (!forced_module and qjs.isException(fun) != 0) {
+            qjs.freeValue(self.ctx, fun);
+            const script_exc = qjs.getException(self.ctx); // clears current_exception
+            flags = qjs.EVAL_TYPE_MODULE;
+            fun = qjs.eval(
+                self.ctx,
+                source.ptr,
+                source.len,
+                filename.ptr,
+                flags | qjs.EVAL_FLAG_COMPILE_ONLY,
+            );
+            if (qjs.isException(fun) != 0) {
+                qjs.freeValue(self.ctx, script_exc);
+                reportAndFail(self, qjs.getException(self.ctx));
+                return false;
+            }
+            qjs.freeValue(self.ctx, script_exc);
+            is_module = true;
+        }
+
+        if (qjs.isException(fun) != 0) {
+            reportAndFail(self, qjs.getException(self.ctx));
+            return false;
+        }
+
+        // JS_EvalFunction takes ownership of `fun` (quickjs.c:38085).
+        // Do not free `fun` after this call.
+        const result = qjs.evalFunction(self.ctx, fun);
         defer qjs.freeValue(self.ctx, result);
+
         if (qjs.isException(result) != 0) {
             reportAndFail(self, qjs.getException(self.ctx));
             return false;
         }
+
         // A module's top-level throw is routed into the module promise rather
-        // than into JS_EXCEPTION (js_evaluate_module resolves it via the
-        // rejecting func and returns the promise). The isException branch
-        // above therefore never sees it, which is why `ff bad.js` used to
-        // print nothing and exit 0. Inspect the promise directly.
+        // than into JS_EXCEPTION. Inspect it directly.
         if (is_module) {
             const ps = qjs.promiseState(self.ctx, result);
             if (ps == 2) { // JS_PROMISE_REJECTED
                 const pr = qjs.promiseResult(self.ctx, result);
-                // reportAndFail takes ownership, so hand it a fresh dup and
-                // keep `pr` owned by the defer above.
                 reportAndFail(self, qjs.dupValue(self.ctx, pr));
                 return false;
             }
         }
+
         microtasks.pumpMicrotasks(self.ctx);
         return true;
     }

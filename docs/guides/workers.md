@@ -110,7 +110,7 @@ Rules:
 
 - Workers live until `terminate()`. There is no idle-exit — the process stays alive while any worker is unterminated.
 - The process exits once all workers are terminated (and the main loop drains).
-- Worker-side uncaught errors surface via the parent's `onerror` and print `[worker] unhandled error: …` diagnostics.
+- Worker-side uncaught errors, timer errors, and microtask errors wake the parent immediately and surface via the parent's `onerror` (printing `[worker] unhandled error: …` or `[worker] timer error: …` diagnostics).
 - `postMessage` after `terminate()` throws — guard or null out the handle.
 
 ## Practical example: non-blocking hash endpoint
@@ -168,7 +168,7 @@ The handler returns a `Promise`, so the connection parks while the worker crunch
 | Area | Limit / rule |
 |------|--------------|
 | Max workers | 8 — the 9th throws `too many workers (max 8)` |
-| Worker scope | `console` + timers + `postMessage`/`onmessage`/`workerData` — no `http.serve` in workers, keep servers on the main thread |
+| Worker scope | `console` + timers + `structuredClone` + `performance` + `self` + `postMessage`/`onmessage`/`workerData` — no `http.serve` in workers, keep servers on the main thread |
 | Nested workers | Not supported — spawning from inside a worker fails |
 | Shutdown | Only via `terminate()`; process exits once all workers terminate |
 | Module size | Worker file capped at 10MB on load |

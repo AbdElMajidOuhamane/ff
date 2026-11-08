@@ -53,3 +53,14 @@ test {
 test {
     _ = @import("util/cli.zig");
 }
+
+test {
+    _ = @import("security/permissions.zig");
+}
+test {
+    _ = @import("modules/resolver.zig");
+}
+
+test {
+    _ = @import("crypto/bcrypt_pool.zig");
+}

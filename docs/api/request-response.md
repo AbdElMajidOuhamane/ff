@@ -27,7 +27,7 @@ const data = await res.json();
 |---|---|
 | Signature | `new Response(body?, init?)` |
 | `body` | `string` \| `ArrayBuffer` \| `Uint8Array` (or `null`/omitted) |
-| `init` | `{ status?, statusText?, headers? }` |
+| `init` | `{ status?, statusText?, headers? }` (status must be `100`–`999`, default `200`) |
 
 ```js
 new Response("hello");
@@ -138,9 +138,10 @@ new Request(otherRequest);                 // clone
 | `url` | `string` | Target URL |
 | `method` | `string` | As given — case preserved (`"post"` stays `"post"`, not uppercased) |
 | `headers` | `headers` | `Headers` instance |
-| `bodyUsed` | `boolean` | Consumed flag |
+| `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
 | `cache`, `credentials`, `mode`, `redirect`, `integrity` | `string` | Standard init fields, stored as given |
 | `keepalive` | `boolean` | |
+| `signal` | `AbortSignal \| undefined` | Abort signal passed via `init.signal` (preserved across `clone()`) |
 
 ### Methods
 
@@ -194,6 +195,7 @@ res.headers.forEach((v, k) => console.log(k, v));
 
 - **`bodyUsed` never flips** — it stays `false` before, during, and after
   every read. Don't branch on it; bodies are simply re-readable.
+- **Status code range (100–999)** — `status` is bounded to valid 3-digit HTTP status codes. Out-of-range numbers (negative, `< 100`, or `> 999`) fall back to default (`200`, or `302` for `Response.redirect`).
 - **`headers.size` is a function** — `h.size` is `undefined`;
   `h.size()` is the number. Same for `URLSearchParams.size`.
 - `clone()` corrupts the copy (`"OKABCDEFGH"` → `"OKOKABCDEF"`) — re-read
@@ -201,7 +203,6 @@ res.headers.forEach((v, k) => console.log(k, v));
 - `new Response(body)` copies the bytes; mutating the original afterwards
   does not change the response.
 - `Response.redirect(url)` without a URL **throws** — and with one it still sends no `Location` header, so clients never follow it.
-- `Request` has no `signal` — there is no `AbortController` in Fairyfly.
 - In a handler, the third argument (`body`) is already a **string** — you
   don't call `.text()` on it.
 

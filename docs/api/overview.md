@@ -10,36 +10,56 @@ Everything below is available with **no imports** — Fairyfly injects these
 globals into every script. Bare specifiers still resolve through
 `node_modules` for packages (see [Packages](/docs/guides/packages)).
 
+Native capabilities are **deny-by-default**. The Permission column names the
+flag a global needs; `—` means it is always available. Full model:
+[Permissions](/docs/concepts/permissions).
+
 ## Globals
 
-| Global | What it is | Reference |
-|---|---|---|
-| `console` | Output, colored aliases, `time`/`timeLog`/`timeEnd` | [console](/docs/api/console) |
-| `setTimeout`, `clearTimeout` | One-shot timer (max 128 live) | [Timers](/docs/guides/timers) |
-| `setInterval`, `clearInterval` | Repeating timer | [Timers](/docs/guides/timers) |
-| `queueMicrotask` | Run before the next timer or I/O callback | [Event loop](/docs/concepts/event-loop) |
-| `performance` | `performance.now()` — monotonic ms | [performance](/docs/api/performance) |
-| `URL`, `URLSearchParams` | WHATWG URL parser, query strings | [URL](/docs/api/url) |
-| `Headers` | Case-insensitive header collection | [Request/Response](/docs/api/request-response) |
-| `Request` | Fetch request object | [Request/Response](/docs/api/request-response) |
-| `Response` | Fetch response object + `json`/`redirect`/`error` | [Request/Response](/docs/api/request-response) |
-| `Blob` | Immutable binary blob | [Blob/FormData](/docs/api/blobs-formdata) |
-| `FormData` | `multipart/form-data` container | [Blob/FormData](/docs/api/blobs-formdata) |
-| `TextEncoder`, `TextDecoder` | UTF-8 string ↔ bytes | [Text encoding](/docs/api/text-encoding) |
-| `fetch` | HTTP client (16 slots, HTTP/1.1) | [fetch](/docs/api/fetch) |
-| `WebSocket` | WebSocket client (max 64 sockets) | [WebSocket](/docs/api/websocket) |
-| `Worker` | OS-thread worker (max 8) | [Worker](/docs/api/worker) |
-| `http` | `http.serve(options, handler)` | [http](/docs/api/http) |
-| `udp` | Datagram sockets (`udp.socket`, max 64) | [udp](/docs/api/udp) |
-| `fs` | Sync + Promise filesystem calls | [fs](/docs/api/fs) |
-| `process` | `argv`, `env`, `exit`, `pid`, `memoryUsage`… | [process](/docs/api/process) |
-| `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | [child_process](/docs/api/child-process) |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` | [crypto](/docs/api/crypto) |
-| `btoa`, `atob` | Base64 encode / decode | [crypto](/docs/api/crypto) |
-| `Database` | SQLite (`Database.open(path)`) | [SQLite](/docs/api/sqlite) |
-| `sql`, `SQL` | Postgres tagged templates + pool | [Postgres](/docs/api/postgres) |
-| `ffi` | C-ABI shared libraries (`--allow-ffi`) | [FFI](/docs/api/ffi) |
-| `import.meta.url` | `file://` URL of the current module | [Modules](/docs/guides/modules) |
+| Global | What it is | Permission | Reference |
+|---|---|---|---|
+| `console` | Output, colored aliases, `time`/`timeLog`/`timeEnd` | — | [console](/docs/api/console) |
+| `setTimeout`, `clearTimeout` | One-shot timer (max 128 live) | — | [Timers](/docs/guides/timers) |
+| `setInterval`, `clearInterval` | Repeating timer | — | [Timers](/docs/guides/timers) |
+| `queueMicrotask` | Run before the next timer or I/O callback | — | [Event loop](/docs/concepts/event-loop) |
+| `performance` | `performance.now()` — monotonic ms | — | [performance](/docs/api/performance) |
+| `URL`, `URLSearchParams` | WHATWG URL parser, query strings | — | [URL](/docs/api/url) |
+| `Headers` | Case-insensitive header collection | — | [Request/Response](/docs/api/request-response) |
+| `Request` | Fetch request object | — | [Request/Response](/docs/api/request-response) |
+| `Response` | Fetch response object + `json`/`redirect`/`error` | — | [Request/Response](/docs/api/request-response) |
+| `AbortController`, `AbortSignal` | Cancellation controller + signal (`abort()`, `timeout(ms)`) | — | [fetch](/docs/api/fetch) |
+| `structuredClone` | Deep binary structured clone (max 4 MB) | — | [Worker](/docs/api/worker) |
+| `Blob` | Immutable binary blob | — | [Blob/FormData](/docs/api/blobs-formdata) |
+| `FormData` | `multipart/form-data` container | — | [Blob/FormData](/docs/api/blobs-formdata) |
+| `TextEncoder`, `TextDecoder` | UTF-8 string ↔ bytes | — | [Text encoding](/docs/api/text-encoding) |
+| `fetch` | HTTP client (16 slots, HTTP/1.1) | `net` | [fetch](/docs/api/fetch) |
+| `WebSocket` | WebSocket client (max 64 sockets) | `net` | [WebSocket](/docs/api/websocket) |
+| `Worker` | OS-thread worker (max 8) | — (inherits) | [Worker](/docs/api/worker) |
+| `http` | `http.serve(options, handler)` | `net` (+ `read` for TLS files) | [http](/docs/api/http) |
+| `udp` | Datagram sockets (`udp.socket`, max 64) | `net` | [udp](/docs/api/udp) |
+| `fs` | Sync + Promise filesystem calls | `read` / `write` | [fs](/docs/api/fs) |
+| `process` | `argv`, `env`, `exit`, `pid`, `on`, `kill`, `memoryUsage`… | `env`; `read` for `chdir`; `run` for external `kill` | [process](/docs/api/process) |
+| `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | `run` | [child_process](/docs/api/child-process) |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`) | — | [crypto](/docs/api/crypto) |
+| `btoa`, `atob` | Base64 encode / decode | — | [crypto](/docs/api/crypto) |
+| `Database` | SQLite (`Database.open(path)`) | `read` + `write` | [SQLite](/docs/api/sqlite) |
+| `sql`, `SQL` | Postgres tagged templates + pool | `net` (+ `read` for `sslrootcert`); global `sql` also `env` | [Postgres](/docs/api/postgres) |
+| `ffi` | C-ABI shared libraries (`--allow-ffi`) | `ffi` | [FFI](/docs/api/ffi) |
+| `permissions` | Enabled categories as six booleans | — | [Permissions](/docs/concepts/permissions) |
+| `import.meta.url` | `file://` URL of the current module | — | [Modules](/docs/guides/modules) |
+
+Notes:
+
+- `process.argv`, `pid`, `cwd`, `exit`, `on`, `once`, `off`, `memoryUsage`, and
+  `stats` are not gated. Only `process.env` (`env`), `process.chdir` (`read` on
+  the target), and `process.kill` to a PID other than `process.pid` (`run` for
+  `"kill"`) need a flag.
+- `Worker` loading is a program-loading carve-out: `new Worker(path)` does not
+  need `read`. The worker inherits the process policy for everything it calls.
+- `http` always needs `net` for its `0.0.0.0:<port>` bind. `read` is only
+  checked when `tls.cert` / `tls.key` are file paths rather than inline PEM.
+- `sql` / `SQL` checks `net` against the target host:port. If TLS is configured with `sslrootcert`, `read` on the CA bundle is also checked. The global `sql` pool checks `env` to discover `DATABASE_URL` / `PG*` settings.
+- `Database.open(":memory:")` needs no path permission.
 
 ### Timer handles
 
@@ -63,6 +83,7 @@ URL.parse("not a url");                   // null instead of throwing
 new URL("/a/b", "https://x.example");     // base resolution
 crypto.randomUUID();                      // v4 UUID
 Database.open("app.db");                  // SQLite
+permissions.net;                          // true when --allow-net is active
 ```
 
 Full tables: [Response statics and Database methods](#quick-reference).
@@ -81,7 +102,7 @@ Full tables: [Response statics and Database methods](#quick-reference).
 
 | Method | Signature | Description |
 |---|---|---|
-| `Database.open(path)` | `(string) → Database` | Open or create a database |
+| `Database.open(path)` | `(string) → Database` | Open or create a database; needs `read` + `write` on the file and `write` on its parent |
 | `db.exec(sql, params?)` | `(string, Array?) → undefined` | One statement, bound params |
 | `db.execNoArgs(sql)` | `(string) → undefined` | Multi-statement SQL, no params |
 | `db.row(sql, params?)` | `(string, Array?) → object \| null` | First row |
@@ -91,6 +112,8 @@ Full tables: [Response statics and Database methods](#quick-reference).
 | `db.transaction(fn)` | `(Function) → any` | Auto-commit / rollback |
 | `db.busyTimeout(ms)` | `(number) → undefined` | Busy timeout (default 5000) |
 | `db.close()` | `() → undefined` | Close the handle |
+
+`Database.open(":memory:")` is exempt from the path gates.
 
 ### `sql` / `SQL` methods
 
@@ -102,7 +125,11 @@ Full tables: [Response statics and Database methods](#quick-reference).
 | `sql.begin()` | `() → Promise<Tx>` | Transaction on one connection |
 | `sql.close()` | `() → undefined` | Close the default pool |
 | `tx.commit()` / `tx.rollback()` | `() → Promise<rows>` | End the transaction (resolves `[]`) |
-| `new SQL(dsn)` | `(string) → SQL` | Pool bound to a DSN |
+| `new SQL(dsn | options)` | `(string | object) → SQL` | Pool bound to a DSN or options object (`{ host, port, user, password, database, max, sslmode, sslrootcert }`) |
+
+`new SQL(dsn | options)` checks `net` against the target host and port (and `read` on `sslrootcert` if TLS is enabled). The global `sql`
+also needs `env` if it should read `PG_TEST_DSN` / `DATABASE_URL` / `PG*` (including `PGSSLMODE`, `PGSSLROOTCERT`) at
+startup; otherwise it falls back to `127.0.0.1:5432`.
 
 ## Not provided
 
@@ -115,8 +142,6 @@ use instead:
 | `require()` / CommonJS | `import` / `export` |
 | `process.nextTick` | `queueMicrotask(fn)` |
 | `setImmediate` | `setTimeout(fn, 0)` |
-| `structuredClone` | built into `postMessage`; clone by messaging yourself |
-| `AbortController` / `signal` | not supported by `fetch` |
 | `addEventListener` on `WebSocket` | `ws.onopen = …` style handlers |
 | `TextEncoder#encodeInto` | `encode()` |
 | `process.stdout.write` | `console.log` (goes to **stderr**) |
@@ -126,6 +151,7 @@ Full list with rationale: [Compatibility](/docs/reference/compatibility).
 
 ## See also
 
+- [Permissions](/docs/concepts/permissions) — flags, scopes, error contract
 - [Event loop](/docs/concepts/event-loop) — how these globals interact
 - [Limitations](/docs/reference/limitations) — every hard cap
 - [CLI](/docs/reference/cli) — how to run your code
