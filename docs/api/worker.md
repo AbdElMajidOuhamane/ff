@@ -72,10 +72,11 @@ Globals available inside the worker file:
 | `setTimeout` / `setInterval` / clear\* | Timers work |
 | `queueMicrotask` | |
 | `structuredClone` | Deep binary structured clone (max 4 MB) |
+| `crypto`, `btoa`, `atob` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), and Base64 helpers (`crypto.bcrypt` is main-thread only) |
 | `performance` | `performance.now()` — **own** origin |
 
 Not available: `fetch`, `fs`, `http`, `Database`, `sql`, `process`,
-`import`.
+`crypto.bcrypt`, `import`.
 
 ```js
 // hash-worker.js

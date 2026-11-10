@@ -69,6 +69,8 @@ fs.writeFile("out.txt", "Hello from Fairyfly!");
 
 Creates the file when missing, overwrites when present. Parent directories must exist — use `mkdir` first. Needs `--allow-write` on the file.
 
+`writeFile` and `writeFileAsync` take string data (UTF-8 text); non-string values such as `Uint8Array` or `ArrayBuffer` are coerced via `String()` rather than written as raw bytes.
+
 Writes are capped at **10 MB**. Passing data larger than 10 MB throws an error immediately (`fs.writeFile: data exceeds the 10 MiB limit (nothing written)`) instead of silently truncating the file.
 
 ## Check existence

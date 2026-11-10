@@ -16,7 +16,7 @@ Every global in `Object.getOwnPropertyNames(globalThis)`:
 
 **Web standard:** `fetch` · `Request` · `Response` · `Headers` · `AbortController` · `AbortSignal` · `structuredClone` · `URL` ·
 `URLSearchParams` · `Blob` · `FormData` · `TextEncoder` · `TextDecoder` ·
-`WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`, `subtle.importKey`, `subtle.sign`, `subtle.verify`, `subtle.exportKey`)
+`WebSocket` · `crypto` (`randomUUID`, `getRandomValues`, `subtle.digest`, `subtle.importKey`, `subtle.sign`, `subtle.verify`, `subtle.exportKey`, `bcrypt.hash`, `bcrypt.verify`)
 · `btoa` · `atob` · `performance` · `queueMicrotask` · `DOMException`
 
 **Fairyfly:** `http` · `udp` · `fs` · `process` · `child_process` · `Database` ·

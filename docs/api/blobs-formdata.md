@@ -99,7 +99,7 @@ form.forEach((value, key) => console.log(key, value));
 
 ## Round-tripping: `res.blob()` / `res.formData()`
 
-Both readers work on `Request` and `Response`, single-read like every body reader:
+Both readers work on `Request` and `Response`, and are re-readable like every body reader in Fairyfly:
 
 ```js
 // server.js — echo an upload back as JSON
@@ -142,16 +142,16 @@ Binary parts may not survive the handler's string round-trip — prefer base64 t
 
 ## Practical example: file drop endpoint
 
-Accept a blob, store it, report back:
+Accept a payload as a `Blob`, store its text, and report back (`fs.writeFile` writes string data):
 
 ```js
 // drop.js
 http.serve({ port: 3000 }, async (url, method, body) => {
   if (url === "/drop" && method === "POST") {
-    const incoming = new Blob([body], { type: "application/octet-stream" });
-    const bytes = await incoming.bytes();
-    fs.writeFile(`drop-${Date.now()}.bin`, bytes);
-    return Response.json({ received: bytes.length }, { status: 201 });
+    const incoming = new Blob([body], { type: "text/plain" });
+    const text = await incoming.text();
+    fs.writeFile(`drop-${Date.now()}.txt`, text);
+    return Response.json({ received: incoming.size }, { status: 201 });
   }
   return new Response("POST /drop");
 });

@@ -109,7 +109,7 @@ console.log(all.length); // 0 when empty — never null
 | `row` | `row(sql, params?)` | First matching row as an object, or `null` |
 | `rows` | `rows(sql, params?)` | Array of row objects (empty array when none) |
 
-Row objects map column names to values. `params` is an array bound to `?` placeholders in order — always prefer placeholders over string interpolation (no escaping bugs, no injection).
+Row objects map column names to values. `params` is an array bound to `?` placeholders in order — always prefer placeholders over string interpolation (no escaping bugs, no injection). Each `Database` handle maintains a 64-entry prepared-statement cache (with pre-interned column property atoms and automatic eviction on `SQLITE_SCHEMA`). Parameter binding maps 32-bit signed integers to `INTEGER`, other JS numbers (`double`) to `REAL`, strings to `TEXT`, `ArrayBuffer`/`Uint8Array` to `BLOB`, booleans to `0`/`1`, and `null`/`undefined`/`BigInt` to `NULL`.
 
 ## Writing: `exec` / `execNoArgs`
 
