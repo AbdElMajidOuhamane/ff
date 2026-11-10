@@ -12,7 +12,7 @@ of a server that "gets stuck".
 | Layer | Runs on | Use for | Limit |
 |---|---|---|---|
 | **JS event loop** | one thread | everything you write | see [Event loop](/docs/concepts/event-loop) |
-| **Background I/O** | internal threads | `fetch`, Postgres, TLS, `fs.*Async`, `ffi` calls | per-subsystem pools below — not one shared pool |
+| **Background I/O** | internal threads | `fetch`, Postgres, TLS, `fs.*Async`, `crypto.bcrypt`, `ffi` calls | per-subsystem pools below — not one shared pool |
 | **Workers** | up to 8 OS threads | CPU-bound JS | **8** workers, 32 MB heap each, 4 MB per message |
 
 There is no single "4-thread pool" doing everything. Each subsystem owns its threads:
@@ -21,6 +21,7 @@ There is no single "4-thread pool" doing everything. Each subsystem owns its thr
 |---|---|---|
 | Event-loop pool (`libxev`) | 4 | general loop work |
 | `fs.*Async` | own 4-thread pool + 16 job slots | a 17th concurrent job waits |
+| `crypto.bcrypt` | own 2–4 thread pool (`min(4, max(2, cpu - 1))`) + 16 job slots | a 17th concurrent job rejects immediately (`bcrypt queue full`) |
 | `ffi` | own 4-thread pool | each native call parks a pool thread while it runs |
 | `fetch` | 16 dedicated threads (1 MB stack each) | one thread per slot — a 16-way fan-out truly runs in parallel |
 | Postgres / TLS | none | event-driven on the loop thread; no helper threads |
@@ -91,8 +92,8 @@ w.postMessage({ password: "hunter2" });
 
 Workers have their **own** JS runtime and event loop. They share no state
 and talk only by messages (structured clone). The worker scope has
-`console`, timers, `structuredClone`, `postMessage`, `workerData`, and
-`performance` — no `fs`, no `fetch`, no `http.serve`.
+`console`, timers, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `postMessage`, `workerData`, and
+`performance` — no `fs`, no `fetch`, no `http.serve`, no `crypto.bcrypt`.
 
 ## Limits worth memorising
 

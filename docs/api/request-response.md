@@ -63,7 +63,7 @@ order:
 | `json()` | `Promise<any>` |
 | `arrayBuffer()` | `Promise<ArrayBuffer>` |
 | `bytes()` | `Promise<ArrayBuffer>` — same bytes as `arrayBuffer()`, despite the name; **not** a `Uint8Array` |
-| `blob()` | `Promise<Blob>` — a plain `Object` with the Blob API (`size`, `type`, `text()`, `bytes()`), not a `Blob` instance |
+| `blob()` | `Promise<Blob>` — a `Blob` instance (`size`, `type`, `slice()`, `text()`, `arrayBuffer()`, `bytes()`) |
 | `formData()` | `Promise<FormData>` |
 | `clone()` | `Response` — Known issue: the copy comes back **corrupted**, so don't use it; just re-read the original |
 

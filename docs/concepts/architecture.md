@@ -44,6 +44,7 @@ codebase makes the rest of the documentation predictable.
 | Directory | Contents | Read when |
 |---|---|---|
 | `src/api/` | Every JS global | Looking up a global's behaviour |
+| `src/crypto/` | Dedicated `crypto.bcrypt` worker pool (`bcrypt_pool.zig`) | Password hashing pool and job slots |
 | `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket | Networking limits or protocol details |
 | `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` flag parsing and scope checks |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
@@ -60,6 +61,7 @@ codebase makes the rest of the documentation predictable.
 | JS thread | 1 | All JavaScript, all Promise settlements |
 | Event-loop pool (`libxev`) | 4 | General loop work |
 | `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job waits |
+| `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
 | `ffi` pool | 4 | Each native call parks a pool thread |
 | `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound connections |
 | Postgres / TLS | none | Event-driven on the loop thread |

@@ -23,7 +23,7 @@ From `src/event/loop.zig` (`runWithMicrotasks`), in order:
    fetch, query…). If only queued submissions remain, drain them *without*
    blocking — that's what lets an `unref()`'d timer stop holding the process.
 2. **Drain subsystems** in a fixed order: fetch → WebSocket client → FFI →
-   async `fs` → workers → child process → OS signals (`process.on`). Each drain
+   async `fs` → `crypto.bcrypt` → workers → child process → OS signals (`process.on`). Each drain
    settles Promises or invokes signal listeners on the JS thread.
 3. **Pump microtasks** — every `queueMicrotask` callback queued this turn.
 4. **GC check** every 8192 turns, and only when the heap exceeds 8 MB.
@@ -75,7 +75,9 @@ The process exits when none of these are true:
 | A Postgres query in flight | `sql` / `SQL` |
 | An FFI job in flight | `ffi` non-blocking calls |
 | An async `fs` job in flight | `fs.readFileAsync()` etc. — and Known issue: a *completed* job still pins the process, which then never exits (see [fs](/docs/api/fs)) |
+| A `crypto.bcrypt` job in flight | `crypto.bcrypt.hash()` / `crypto.bcrypt.verify()` |
 | A live `Worker` | until `terminate()` |
+| A live `child_process` | until the child exits and its pipes close |
 
 An **`unref()`'d timer does not hold the process**:
 

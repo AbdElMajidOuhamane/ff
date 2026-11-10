@@ -162,7 +162,7 @@ Construction + statics (for handlers and tests):
 
 | Helper | Signature | Notes |
 |--------|-----------|-------|
-| `new Response(body, init?)` | body: `string \| ArrayBuffer \| null`; init: `{ status?, headers? }` | Defaults to `200`, `content-type: text/plain` when the body has none |
+| `new Response(body, init?)` | body: `string \| ArrayBuffer \| Uint8Array \| null`; init: `{ status?, headers? }` | Defaults to `200`, `content-type: text/plain` when the body has none |
 | `Response.json(data, init?)` | any JSON-serializable data | Sets JSON content-type |
 | `Response.redirect(url, status?)` | target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it (see Gotchas) |
 | `Response.error()` | — | Status `0`, type `"error"` |

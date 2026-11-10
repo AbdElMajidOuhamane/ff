@@ -40,7 +40,7 @@ flag a global needs; `—` means it is always available. Full model:
 | `fs` | Sync + Promise filesystem calls | `read` / `write` | [fs](/docs/api/fs) |
 | `process` | `argv`, `env`, `exit`, `pid`, `on`, `kill`, `memoryUsage`… | `env`; `read` for `chdir`; `run` for external `kill` | [process](/docs/api/process) |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | `run` | [child_process](/docs/api/child-process) |
-| `crypto` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`) | — | [crypto](/docs/api/crypto) |
+| `crypto` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), `bcrypt` (`hash`, `verify` off-event-loop) | — | [crypto](/docs/api/crypto) |
 | `btoa`, `atob` | Base64 encode / decode | — | [crypto](/docs/api/crypto) |
 | `Database` | SQLite (`Database.open(path)`) | `read` + `write` | [SQLite](/docs/api/sqlite) |
 | `sql`, `SQL` | Postgres tagged templates + pool | `net` (+ `read` for `sslrootcert`); global `sql` also `env` | [Postgres](/docs/api/postgres) |

@@ -100,6 +100,7 @@ passed, `srv.port` contains the actual bound port assigned by the OS.
 const server = http.serve(
   {
     port: 3000,                       // default 3000 (0 for ephemeral port)
+    reusePort: false,                 // optional — enables SO_REUSEPORT
     signal: ac.signal,                // optional — AbortSignal that calls server.close()
     tls: { cert: "...", key: "..." }, // optional — enables HTTPS/WSS on the same port
     websocket: {                      // optional — enables WebSocket upgrades
@@ -115,6 +116,7 @@ const server = http.serve(
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `port` | `number` | `3000` | Listen port (`0` lets the OS pick an available port) |
+| `reusePort` | `boolean` | `false` | Enables `SO_REUSEPORT` on the listening socket |
 | `signal` | `AbortSignal` | none | Aborting the signal triggers `server.close()` |
 | `tls` | `{ cert, key }` | none | PEM certificate + private key. Each value is either inline PEM (starts with `-----BEGIN `) or a file path. Cert max 512KB, key max 256KB. Enables HTTPS and WSS alongside plain HTTP/WS |
 | `websocket.open` | `(socket) => void` | none | Fires when a client completes the upgrade |
@@ -176,13 +178,14 @@ Server sockets expose `send` / `sendBinary` only — track peers by object refer
 
 ## Handler reference
 
-The handler is called as `(url, method, body)` — all three are strings:
+The handler is called as `(url, method, body, headers)`:
 
 | Argument | Type | Example |
 |----------|------|---------|
 | `url` | `string` | `"/greet?name=ada"` (path + query) |
 | `method` | `string` | `"GET"`, `"POST"` — exactly as the client sent it (`curl -X post` yields `"post"`); normalize case before comparing |
 | `body` | `string` | Request text, `""` when none |
+| `headers` | `Headers` | Web-standard `Headers` instance populated with incoming request headers (HTTP/1.1 and HTTP/2) |
 
 Return one of:
 
@@ -227,7 +230,7 @@ return Response.redirect("/moved", 301);              // 301 status only — no 
 
 | Helper | Signature | Notes |
 |--------|-----------|-------|
-| `new Response(body, init?)` | `body`: `string \| ArrayBuffer \| null`; `init`: `{ status?, headers? }` | Default `content-type` is `text/plain` when the body has none |
+| `new Response(body, init?)` | `body`: `string \| ArrayBuffer \| Uint8Array \| null`; `init`: `{ status?, headers? }` | Default `content-type` is `text/plain` when the body has none |
 | `Response.json(data, init?)` | any JSON-serializable `data` | Sets `content-type: application/json` |
 | `Response.redirect(url, status?)` | redirect target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | — | Status `0`, type `"error"` (fetch-network-error shape) |
