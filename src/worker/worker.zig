@@ -10,6 +10,8 @@ const crypto_api = @import("../api/crypto.zig");
 const thread_marker = @import("thread_marker.zig");
 
 const gpa = std.heap.smp_allocator;
+const limits = @import("../util/limits.zig");
+const interrupt = @import("../engine/interrupt.zig");
 
 pub const MAX_WORKERS = 8;
 const WORKER_STACK = 8 * 1024 * 1024;
@@ -38,6 +40,7 @@ var slots: [MAX_WORKERS]Slot = [_]Slot{.{}} ** MAX_WORKERS;
 threadlocal var tls_port: ?port_mod.MessagePort = null;
 threadlocal var tls_tm: ?*timers_mod.TimerManager = null;
 threadlocal var tls_perf_origin: i96 = 0;
+threadlocal var tls_slot: usize = 0;
 
 pub const isWorkerThread = thread_marker.isWorkerThread;
 
@@ -401,11 +404,15 @@ fn workerMain(data: *WorkerData) void {
     defer thread_marker.setWorkerThread(false);
     tls_port = data.channel;
     defer tls_port = null;
+    tls_slot = @as(usize, data.slot) + 1;
+    defer tls_slot = 0;
 
     const rt = qjs.newRuntime() orelse return;
     defer qjs.freeRuntime(rt);
-    qjs.setMaxStackSize(rt, 1024 * 1024);
-    qjs.setMemoryLimit(rt, 32 * 1024 * 1024);
+    const lim = limits.get();
+    qjs.setMaxStackSize(rt, lim.stack_bytes);
+    qjs.setMemoryLimit(rt, lim.worker_heap_bytes);
+    interrupt.registerRuntime(rt, @as(usize, data.slot) + 1, lim.cpu_budget_ms);
 
     const ctx = qjs.newContext(rt) orelse return;
     defer qjs.freeContext(ctx);
@@ -434,7 +441,9 @@ fn workerMain(data: *WorkerData) void {
     };
     defer gpa.free(src_z);
 
+    interrupt.enterJs(@as(usize, data.slot) + 1, interrupt.monotonicNowMs());
     const res = qjs.eval(ctx, src_z.ptr, src.len, data.module_path.ptr, qjs.EVAL_TYPE_GLOBAL);
+    interrupt.leaveJs(@as(usize, data.slot) + 1);
     if (qjs.isException(res) != 0) {
         const exc = qjs.getException(ctx);
         defer qjs.freeValue(ctx, exc);
@@ -675,7 +684,9 @@ fn deliverToWorker(ctx: *qjs.Context, fr: port_mod.Frame) void {
     defer qjs.freeValue(ctx, handler);
     if (qjs.isFunction(ctx, handler) == 0) return;
     var args = [_]qjs.Value{event};
+    interrupt.enterJs(tls_slot, interrupt.monotonicNowMs());
     const ret = qjs.call(ctx, handler, global, 1, &args[0]);
+    interrupt.leaveJs(tls_slot);
     if (qjs.isException(ret) != 0) {
         const exc = qjs.getException(ctx);
         defer qjs.freeValue(ctx, exc);

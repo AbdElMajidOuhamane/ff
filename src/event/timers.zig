@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const c = @import("../c.zig").c;
 const microtasks = @import("./microtasks.zig");
+const interrupt = @import("../engine/interrupt.zig");
 
 pub const MAX_TIMERS = 128;
 const MAX_TIMER_ARGS = 8;
@@ -280,7 +281,9 @@ fn timerCallback(
             defer {
                 for (arg_hold[0..n]) |a| c.freeValue(ctx, a);
             }
+            interrupt.enterJs(0, interrupt.monotonicNowMs());
             const ret = c.call(ctx, fn_val, c.JS_UNDEFINED, @intCast(n), if (n > 0) &tm.args[idx][0] else null);
+            interrupt.leaveJs(0);
             // Surface timer exceptions like microtaskJob does; free the
             // (previously leaked) non-exception return value here.
             if (c.isException(ret) != 0) {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const interrupt = @import("../engine/interrupt.zig");
 
 // Set whenever a top-level eval, a module's promise, a queued job, or a
 // timer callback throws. Consumed by main / start  to choose the
@@ -28,6 +29,10 @@ pub fn reportUncaught(ctx: *c.Context, where: []const u8) void {
 // message and the exit status on the <0 path.
 pub fn pumpMicrotasks(ctx: *c.Context) void {
     const rt = c.getRuntime(ctx);
+    const idx = interrupt.getRuntimeIdx(rt) orelse 0;
+    interrupt.enterJs(idx, interrupt.monotonicNowMs());
+    defer interrupt.leaveJs(idx);
+
     var pctx: ?*c.Context = undefined;
     while (true) {
         const rc = c.executePendingJob(rt, &pctx);
