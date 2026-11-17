@@ -103,6 +103,7 @@ pub const EventLoop = struct {
         if (bcrypt_pool.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         if (child_process.liveCount() > 0) return true;
+        if (@import("../api/stdio.zig").isStdinPending()) return true;
         // Queue entries only count as blocking when nothing is unref'd:
         // with an unref'd timer pending, an entry in submissions may be that
         // timer's own submission, and waiting on it is precisely the bug.

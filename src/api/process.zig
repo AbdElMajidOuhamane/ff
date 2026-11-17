@@ -3,6 +3,9 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const builtin = @import("builtin");
 const perm = @import("../security/permissions.zig");
+const limits = @import("../util/limits.zig");
+const env_file = @import("../util/env_file.zig");
+const stdio = @import("stdio.zig");
 const deny = @import("../security/deny.zig");
 const microtasks = @import("../event/microtasks.zig");
 // C3: stat counters live in the net modules (verified: nothing in their
@@ -108,8 +111,14 @@ fn installSignalIdx(idx: usize) void {
     std.posix.sigaction(sig_codes[idx], &act, null);
 }
 
+var g_io: ?std.Io = null;
+
 pub fn setLoop(l: *xev.Loop) void {
     g_loop = l;
+}
+
+pub fn setIo(io: std.Io) void {
+    g_io = io;
 }
 
 /// Armed automatically by `http.serve` so SIGINT/SIGTERM trigger graceful drain
@@ -485,6 +494,21 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
     _ = c.definePropertyValueStr(ctx, process_obj, "arch", zigStringToVal(ctx, arch_str), c.PROP_C_W_E);
 
     const env_obj = c.newObject(ctx);
+
+    // Merge entries from --env-file first if configured (OS env takes precedence)
+    if (limits.get().env_file) |ef_path| {
+        if (g_io) |io| {
+            env_file.load(io, ef_path);
+        }
+        for (env_file.getEntries()) |entry| {
+            if (!perm.global().checkEnv(entry.key)) continue;
+            const key_atom = c.newAtomLen(ctx, entry.key.ptr, entry.key.len);
+            if (key_atom == 0) continue;
+            _ = c.definePropertyValue(ctx, env_obj, key_atom, zigStringToVal(ctx, entry.val), c.PROP_C_W_E);
+            c.freeAtom(ctx, key_atom);
+        }
+    }
+
     const c_environ = std.c.environ;
     var i: usize = 0;
     while (c_environ[i]) |entry| : (i += 1) {
@@ -508,6 +532,8 @@ pub fn setup(ctx: *c.Context, args: std.process.Args) void {
         arg_idx += 1;
     }
     _ = c.definePropertyValueStr(ctx, process_obj, "argv", argv_arr, c.PROP_C_W_E);
+
+    stdio.setup(ctx, process_obj);
 
     _ = c.definePropertyValueStr(ctx, global, "process", process_obj, c.PROP_C_W_E);
 }

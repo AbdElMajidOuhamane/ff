@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("../util/cli.zig");
 const engine = @import("../engine/engine.zig");
 const microtasks = @import("../event/microtasks.zig"); // NEW
+const stdio = @import("../api/stdio.zig");
 
 // ff test [filter] — run test/*.test.js through the runtime.
 // Same convention as test/run.sh: eval returns true = pass.

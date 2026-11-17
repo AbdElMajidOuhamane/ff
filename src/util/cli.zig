@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdio = @import("../api/stdio.zig");
 
 // Shared presentation for ff's own CLI messages.
 //

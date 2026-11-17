@@ -3,6 +3,7 @@ const cli = @import("../util/cli.zig");
 const engine = @import("../engine/engine.zig");
 const qjs = @import("../engine/quickjs_shim.zig");
 const microtasks = @import("../event/microtasks.zig");
+const stdio = @import("../api/stdio.zig");
 const c = @cImport({
     @cInclude("stdio.h");
 });
