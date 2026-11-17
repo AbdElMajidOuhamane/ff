@@ -26,7 +26,8 @@ flag a global needs; `—` means it is always available. Full model:
 | `URL`, `URLSearchParams` | WHATWG URL parser, query strings | — | [URL](/docs/api/url) |
 | `Headers` | Case-insensitive header collection | — | [Request/Response](/docs/api/request-response) |
 | `Request` | Fetch request object | — | [Request/Response](/docs/api/request-response) |
-| `Response` | Fetch response object + `json`/`redirect`/`error` | — | [Request/Response](/docs/api/request-response) |
+| `Response` | Fetch response object + `json`/`redirect`/`error`/`file` | — | [Request/Response](/docs/api/request-response) |
+| `ReadableStream` | WHATWG readable stream with `pull` on demand, controller (`enqueue`/`close`/`error`), `getReader()`, `cancel()`, `locked`. Supports HTTP/1.1 chunked streaming (large chunks sliced transparently); HTTP/2 stream bodies return 501. | — | [Request/Response](/docs/api/request-response) |
 | `AbortController`, `AbortSignal` | Cancellation controller + signal (`abort()`, `timeout(ms)`) | — | [fetch](/docs/api/fetch) |
 | `structuredClone` | Deep binary structured clone (max 4 MB) | — | [Worker](/docs/api/worker) |
 | `Blob` | Immutable binary blob | — | [Blob/FormData](/docs/api/blobs-formdata) |
@@ -35,17 +36,19 @@ flag a global needs; `—` means it is always available. Full model:
 | `fetch` | HTTP client (16 slots, HTTP/1.1) | `net` | [fetch](/docs/api/fetch) |
 | `WebSocket` | WebSocket client (max 64 sockets) | `net` | [WebSocket](/docs/api/websocket) |
 | `Worker` | OS-thread worker (max 8) | — (inherits) | [Worker](/docs/api/worker) |
-| `http` | `http.serve(options, handler)` | `net` (+ `read` for TLS files) | [http](/docs/api/http) |
+| `http` | `http.serve(options, handler)` with routes support | `net` (+ `read` for TLS files) | [http](/docs/api/http) |
+| `tcp` | Direct TCP socket client (`tcp.connect`) | `net` | [tcp](/docs/api/overview) |
+| `ff` | Utilities + cron scheduler (`ff.cron`) | — | [overview](/docs/api/overview) |
 | `udp` | Datagram sockets (`udp.socket`, max 64) | `net` | [udp](/docs/api/udp) |
 | `fs` | Sync + Promise filesystem calls | `read` / `write` | [fs](/docs/api/fs) |
-| `process` | `argv`, `env`, `exit`, `pid`, `on`, `kill`, `memoryUsage`… | `env`; `read` for `chdir`; `run` for external `kill` | [process](/docs/api/process) |
+| `process` | `argv`, `env`, `stdout`, `stdin`, `exit`, `pid`, `on`, `kill`, `memoryUsage`… | `env`; `read` for `chdir`; `run` for external `kill` | [process](/docs/api/process) |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync` (max 8, POSIX) | `run` | [child_process](/docs/api/child-process) |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), `bcrypt` (`hash`, `verify` off-event-loop) | — | [crypto](/docs/api/crypto) |
 | `btoa`, `atob` | Base64 encode / decode | — | [crypto](/docs/api/crypto) |
 | `Database` | SQLite (`Database.open(path)`) | `read` + `write` | [SQLite](/docs/api/sqlite) |
 | `sql`, `SQL` | Postgres tagged templates + pool | `net` (+ `read` for `sslrootcert`); global `sql` also `env` | [Postgres](/docs/api/postgres) |
 | `ffi` | C-ABI shared libraries (`--allow-ffi`) | `ffi` | [FFI](/docs/api/ffi) |
-| `permissions` | Enabled categories as six booleans | — | [Permissions](/docs/concepts/permissions) |
+| `permissions` | Enabled categories as booleans + dynamic `revoke({ name })` | — | [Permissions](/docs/concepts/permissions) |
 | `import.meta.url` | `file://` URL of the current module | — | [Modules](/docs/guides/modules) |
 
 Notes:
@@ -60,6 +63,8 @@ Notes:
   checked when `tls.cert` / `tls.key` are file paths rather than inline PEM.
 - `sql` / `SQL` checks `net` against the target host:port. If TLS is configured with `sslrootcert`, `read` on the CA bundle is also checked. The global `sql` pool checks `env` to discover `DATABASE_URL` / `PG*` settings.
 - `Database.open(":memory:")` needs no path permission.
+- `tcp`: Client-only socket API (`tcp.connect(host, port)`). Hosts must be IP literals (e.g. `127.0.0.1` or `::1`). Writes are capped at 16 KB per call. Requires `--allow-net`.
+- `ff.cron`: In-process cron scheduler running strictly in UTC. Supports 5-field cron syntax (`minute hour dom month dow`, Vixie OR match for restricted DOM/DOW, ranges, and steps e.g. `0-30/5 * * * *`) and interval `@every <duration>` (e.g. `@every 1m`, `@every 10s`). Rejects expressions with no match within 366 days at registration.
 
 ### Timer handles
 

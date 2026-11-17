@@ -79,7 +79,8 @@ The escape hatch is `--allow-all`. Program loading (`import`,
 | `window`, `document`, DOM | absent | backend runtime |
 | `addEventListener` | partial | Present on `AbortSignal`; use `on…` properties on `WebSocket` / `Worker` (`ws.onmessage = …`) |
 | `localStorage` / `sessionStorage` | absent | `fs` or SQLite |
-| `ReadableStream` / `WritableStream` | absent | `arrayBuffer()` / `text()` |
+| `ReadableStream` | **present** | WHATWG stream support (`getReader`, `locked`, `cancel`, `pull` callback on demand, `controller.enqueue`/`close`/`error`/`desiredSize`). HTTP/1.1 chunked response streaming is supported with automatic chunk slicing for payloads larger than 16 KB; HTTP/2 returns 501 Not Implemented for stream response bodies. |
+| `WritableStream` | absent | `arrayBuffer()` / `text()` |
 | `TextEncoder#encodeInto` | absent | `encode()` |
 | `EventSource` (SSE) | absent | raw `http.serve` with `content-type: text/event-stream` |
 | `structuredClone` | **present** | |
@@ -112,6 +113,8 @@ These are the ones that bite during a port:
 | `WebSocket` | Single `on…` handler per event; no `addEventListener` |
 | Worker files | Evaluated as **classic scripts** — `import`/`export` throws |
 | `child_process` | No streams/events — use `wait()` + captured `stdout`/`stderr`; children are not killed on exit |
+| Stream binary chunk borrow | Oversized `Uint8Array` / `ArrayBuffer` stream chunks (>16 KB) are sliced zero-copy across consecutive HTTP chunk writes by borrowing the backing memory rather than copying/transferring. In-place mutations made to the buffer mid-stream are reflected in subsequent slices. |
+| HTTP/2 stream body | Stream response bodies over HTTP/2 return `501 Not Implemented` (HTTP/1.1 chunked streaming is fully supported). |
 
 ## Porting checklist
 

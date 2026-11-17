@@ -52,15 +52,23 @@ Native APIs are **deny-by-default**. A script can only read files, open
 sockets, inspect the environment, spawn children, or load native code when the
 launch command grants it with a `--allow-*` flag.
 
-| Flag | Grants |
-|------|--------|
+| Flag | Grants / Limits |
+|------|-----------------|
 | `--allow-read` | Filesystem reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` |
 | `--allow-write` | Filesystem writes, SQLite database files and their parent directory |
-| `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres |
+| `--allow-net` | `fetch`, `WebSocket`, `http.serve`, TCP (`tcp.connect`), UDP, Postgres |
 | `--allow-env` | `process.env`, Postgres DSN and TLS environment variables (`PG*`, `DATABASE_URL`, `PGSSL*`) |
-| `--allow-run` | `child_process.spawn` / `exec` / `execSync` |
+| `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` |
 | `--allow-ffi` | All `ffi` entry points except `ffi.allowed` |
 | `--allow-all` | All of the above, including FFI |
+| `--deny-read` | Explicitly deny file paths even when covered by `--allow-read` (e.g. `--deny-read=/etc/passwd`) |
+| `--deny-write` | Explicitly deny file paths even when covered by `--allow-write` (e.g. `--deny-write=./secrets`) |
+| `--deny-net` | Explicitly block hosts/ports even when `--allow-net` is active (e.g. `--deny-net=169.254.169.254`) |
+| `--env-file` | Load `.env` file variables into `process.env` (e.g. `--env-file=.env.production`) |
+| `--max-heap` | Set max JavaScript main heap size (e.g. `--max-heap=128MB`) |
+| `--worker-heap` | Set per-worker JavaScript heap size (e.g. `--worker-heap=32MB`, clamps to `--max-heap`) |
+| `--max-stack` | Set max JavaScript execution stack size (e.g. `--max-stack=1MB`, default 1 MB) |
+| `--cpu-budget` | Set maximum consecutive JS execution budget in milliseconds before interrupt (e.g. `--cpu-budget=1000`) |
 
 Flags are repeatable and comma-split. A bare flag grants the whole category:
 

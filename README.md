@@ -96,15 +96,23 @@ Native APIs are **deny-by-default**. The only policy input is `--allow-*` on
 the command line — no `ff.json` field, no environment variable, no runtime
 toggle.
 
-| Flag | Grants | Scope |
+| Flag | Grants / Limits | Scope |
 |---|---|---|
 | `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
-| `--allow-net` | `fetch`, WebSocket, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
+| `--allow-net` | `fetch`, WebSocket, `http.serve`, TCP (`tcp.connect`), UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, `PG*` / `DATABASE_URL` / `PGSSL*` for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` on external PIDs (`kill`) | basenames or absolute paths |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | bare flag only |
 | `--allow-all` | every category above, including FFI | bare flag only |
+| `--deny-read` | explicitly deny file paths even when covered by `--allow-read` | paths |
+| `--deny-write` | explicitly deny file paths even when covered by `--allow-write` | paths |
+| `--deny-net` | explicitly block hosts/ports even when `--allow-net` is active | `host`, `host:port`, `*.domain` |
+| `--max-heap` | set max main JS heap (e.g. `--max-heap=128MB`) | bytes / suffix |
+| `--worker-heap` | set per-worker JS heap (e.g. `--worker-heap=32MB`) | bytes / suffix |
+| `--max-stack` | set max JS stack size (e.g. `--max-stack=1MB`) | bytes / suffix |
+| `--cpu-budget` | interrupt script if loop runs beyond budget in ms (e.g. `--cpu-budget=1000`) | integer ms |
+| `--env-file` | load `.env` file variables into `process.env` | path |
 
 ```sh
 ff server.js --allow-net=0.0.0.0:3000
@@ -247,7 +255,7 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `Database` | `Database.open(path)`; needs `--allow-read` + `--allow-write` on the file and `--allow-write` on the parent; synchronous; SQL failures throw plain strings |
 | `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port, `--allow-read` on `sslrootcert` when TLS (`sslmode=verify-full`) is enabled, and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
 | `fs` | Sync calls return `undefined` on I/O failure; writes > 10 MB throw/reject instead of truncating; permission denial throws `PermissionDenied`; six `*Async` Promise variants |
-| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; worker scope includes `console`, timers, `performance`, `structuredClone`, `workerData`, and `self`; inherits parent permissions |
+| `Worker` | Max 8 OS threads; structured-clone messaging, 4 MB per message; worker scope includes `console`, timers, `performance`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `workerData`, and `self`; inherits parent permissions |
 | `child_process` | Subprocesses: `spawn` / `exec` / `execSync`; needs `--allow-run`; max 8 concurrent, POSIX only; captures output; children are not killed on exit |
 | `crypto` | `randomUUID`, `getRandomValues`, `subtle.digest` (SHA-1/256/384/512), `subtle` HMAC (`importKey`, `sign`, `verify`, `exportKey`), `bcrypt` (`hash`, `verify` off-event-loop); `btoa`/`atob` round-trip Unicode via UTF-8 |
 | `URL` / `URLSearchParams` | `URL.parse` (null-safe); param edits don't flow back to the URL; no percent-encoding — encode yourself |
@@ -507,7 +515,7 @@ Database:
 
 - Max **8**; 32 MB heap, 1 MB JS stack, 8 MB thread stack each
 - 4 MB per message; no `ArrayBuffer` transfer (always copied)
-- Worker scope includes `console`, timers, `postMessage`, `structuredClone`, `performance` (`performance.now()`), `workerData`, and `self` — no `fs`, `fetch`, or `http.serve`
+- Worker scope includes `console`, timers, `postMessage`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `performance` (`performance.now()`), `workerData`, and `self` — no `fs`, `fetch`, `http.serve`, or `crypto.bcrypt`
 - No nested workers; exit only via `terminate()`
 - Inherits the parent's permission policy; there is no per-worker grant
 
