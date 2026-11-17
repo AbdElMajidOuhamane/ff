@@ -618,6 +618,14 @@ fn runJob(slot_id: u16) void {
             };
             body_writer.end() catch {};
             req.connection.?.flush() catch {};
+        } else if (req.method.requestHasBody()) {
+            req.transfer_encoding = .{ .content_length = 0 };
+            var body_writer = req.sendBodyUnflushed(&.{}) catch {
+                failSlot(s, "Failed to send request body");
+                return;
+            };
+            body_writer.end() catch {};
+            req.connection.?.flush() catch {};
         } else {
             req.sendBodiless() catch {
                 failSlot(s, "Failed to send request");
