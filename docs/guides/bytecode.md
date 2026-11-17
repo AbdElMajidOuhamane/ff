@@ -29,6 +29,7 @@ curl http://127.0.0.1:3000/
 ff compile app.js
 ff compile app.js -o app.ffbc
 ff compile app.js --output dist/app.ffbc
+ff compile app.js --standalone -o app
 ```
 
 | Form | Output path |
@@ -36,6 +37,7 @@ ff compile app.js --output dist/app.ffbc
 | `ff compile app.js` | `app.ffbc` (extension replaced) |
 | `ff compile app.js -o out.ffbc` | `out.ffbc` |
 | `ff compile app.js --output dist/app.ffbc` | `dist/app.ffbc` |
+| `ff compile app.js --standalone -o app` | `app` (self-executable binary, no runtime needed) |
 
 Rules:
 
