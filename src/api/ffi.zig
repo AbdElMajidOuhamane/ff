@@ -1759,6 +1759,8 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     const symbols_obj = c.newObject(ctx);
     if (c.isException(symbols_obj) != 0) {
         c.freePropertyEnum(ctx, tab, n);
+        c.setOpaque(lib_obj, null);
+        c.freeValue(ctx, lib_obj);
         freeLib(lib);
         return symbols_obj;
     }
@@ -1768,6 +1770,9 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     while (k < n) : (k += 1) {
         const name_c = atomStrOf(ctx, tab[k].atom) orelse {
             c.freePropertyEnum(ctx, tab, n);
+            c.setOpaque(lib_obj, null);
+            c.freeValue(ctx, lib_obj);
+            c.freeValue(ctx, symbols_obj);
             freeLib(lib);
             return c.JS_EXCEPTION;
         };
@@ -1779,12 +1784,18 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
 
         const sym = parseSymbol(ctx, lib, name, desc, handle) catch {
             c.freePropertyEnum(ctx, tab, n);
+            c.setOpaque(lib_obj, null);
+            c.freeValue(ctx, lib_obj);
+            c.freeValue(ctx, symbols_obj);
             freeLib(lib);
             return c.JS_EXCEPTION;
         };
         if (sym) |s| {
             lib.symbols.append(gpa, s) catch {
                 c.freePropertyEnum(ctx, tab, n);
+                c.setOpaque(lib_obj, null);
+                c.freeValue(ctx, lib_obj);
+                c.freeValue(ctx, symbols_obj);
                 freeLib(lib);
                 return c.throwOutOfMemory(ctx);
             };
@@ -1792,6 +1803,9 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
             const fn_obj = c.newCFunctionData(ctx, symCall, @intCast(s.params.len), @intCast(idx), 1, &data_arr);
             if (c.isException(fn_obj) != 0) {
                 c.freePropertyEnum(ctx, tab, n);
+                c.setOpaque(lib_obj, null);
+                c.freeValue(ctx, lib_obj);
+                c.freeValue(ctx, symbols_obj);
                 freeLib(lib);
                 return fn_obj;
             }
