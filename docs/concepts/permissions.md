@@ -26,26 +26,28 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 
 ## Flags
 
-| Flag | Grants | Scope |
+| Flag | Grants / Restrictions | Scope |
 |---|---|---|
 | `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
-| `--allow-net` | `fetch`, `WebSocket`, `http.serve`, UDP, Postgres | `host`, `host:port`, `*.domain` |
+| `--allow-net` | `fetch`, `WebSocket`, `http.serve`, TCP (`tcp.connect`), UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, Postgres DSN and TLS variables (`PG*`, `DATABASE_URL`, `PGSSL*`) for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` (external PIDs) | basenames or absolute paths (`kill` for `process.kill`) |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | none — bare only |
 | `--allow-all` | every category above, **including FFI** | none |
+| `--deny-read` | explicitly deny file paths even when covered by `--allow-read` | paths |
+| `--deny-write` | explicitly deny file paths even when covered by `--allow-write` | paths |
+| `--deny-net` | explicitly block hosts/ports even when `--allow-net` is active | `host`, `host:port`, `*.domain` |
 
 Rules:
 
 - Flags are repeatable and comma-split: `--allow-read=src,test`.
 - A bare flag grants the whole category: `--allow-net` means any host, any port.
-- An empty scope is invalid: `--allow-read=` fails at startup.
-- There are no `--deny-*` flags. Unknown permission flags fail startup.
-- Scopes are parsed once, before the JS runtime exists, and are immutable for
-  the process lifetime.
+- An empty scope is invalid: `--allow-read=` or `--deny-read=` fails at startup.
+- `--deny-*` flags take precedence over `--allow-*` grants (e.g. `--allow-read=. --deny-read=./secrets`).
+- Scopes are parsed once before the JS runtime starts. Runtime dynamic revocation is available via `permissions.revoke()`.
 - Flags are scanned across the whole argv. A script argument that begins with
-  `--allow-` is interpreted as a permission flag, not passed to the script.
+  `--allow-` or `--deny-` is interpreted as a permission flag, not passed to the script.
 
 ## Path scopes
 
@@ -197,12 +199,17 @@ Details:
 ## Lifetime and inheritance
 
 - The policy is parsed before any runtime object exists and never changes.
-- `globalThis.permissions` exposes booleans for the six categories:
+- `globalThis.permissions` exposes dynamic booleans for the six categories:
   `read`, `write`, `net`, `env`, `run`, `ffi`. A category is `true` when it has
-  any grant, bare or scoped.
-- The object reports enabled categories only; it does not expose the scopes.
-  Reassigning its properties does not change enforcement.
-- Workers inherit the same policy. There is no per-worker grant or drop.
+  any active grant.
+- `permissions.revoke(descriptor)` allows an application to drop privileges at runtime after initialization:
+  ```js
+  permissions.revoke({ name: "read" }); // drops all read permissions
+  permissions.revoke({ name: "write", path: "/tmp/init" }); // revokes specific path scope
+  permissions.revoke({ name: "net", host: "169.254.169.254" }); // revokes specific network scope
+  permissions.revoke({ name: "env", variable: "SECRET_KEY" }); // revokes specific env variable
+  ```
+- Workers inherit the parent process's policy.
 - `ff --watch` forwards permission flags to the child it restarts.
 - `ff start` accepts the flags after `start`; `--cert` / `--key` are CLI
   configuration reads and are not gated by `--allow-read`.

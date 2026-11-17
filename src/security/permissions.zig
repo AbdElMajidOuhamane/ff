@@ -35,6 +35,9 @@ pub const Config = struct {
     env: NameRule = .denied,
     run: NameRule = .denied,
     ffi: bool = false,
+    deny_net: ?[]const NetScope = null,
+    deny_read_paths: ?[]const PathScope = null,
+    deny_write_paths: ?[]const PathScope = null,
 
     pub fn isAllowed(self: *const Config, kind: Kind) bool {
         return switch (kind) {
@@ -62,7 +65,45 @@ pub const Config = struct {
         };
     }
 
+    pub fn revoke(self: *Config, kind: Kind) void {
+        switch (kind) {
+            .read => self.read = .denied,
+            .write => self.write = .denied,
+            .net => self.net = .denied,
+            .env => self.env = .denied,
+            .run => self.run = .denied,
+            .ffi => self.ffi = false,
+        }
+    }
+
+    fn netScopeMatches(scope: NetScope, host: []const u8, port: u16) bool {
+        if (scope.wildcard and scope.host.len == 0) return true;
+        if (scope.port) |p| {
+            if (p != port) return false;
+        }
+        if (scope.wildcard) {
+            return (host.len > scope.host.len + 1 and
+                std.mem.endsWith(u8, host, scope.host) and
+                host[host.len - scope.host.len - 1] == '.');
+        } else {
+            return std.mem.eql(u8, host, scope.host);
+        }
+    }
+
     pub fn checkPath(self: *const Config, kind: Kind, path: []const u8) Decision {
+        const d_scopes = switch (kind) {
+            .read => self.deny_read_paths,
+            .write => self.deny_write_paths,
+            else => null,
+        };
+        if (d_scopes) |scopes| {
+            var d_canon_buf: [max_path]u8 = undefined;
+            if (canonicalizeInput(path, &d_canon_buf)) |canon| {
+                for (scopes) |scope| {
+                    if (isWithin(scope.path, canon)) return .denied;
+                }
+            } else |_| return .denied;
+        }
         const rule = switch (kind) {
             .read => self.read,
             .write => self.write,
@@ -87,29 +128,23 @@ pub const Config = struct {
     }
 
     pub fn checkNet(self: *const Config, host_in: []const u8, port: u16) Decision {
+        if (host_in.len == 0 or host_in.len > 255) return .denied;
+        if (std.mem.indexOfScalar(u8, host_in, 0) != null) return .denied;
+
+        var buf: [256]u8 = undefined;
+        const host = lowerInto(host_in, &buf);
+
+        if (self.deny_net) |d_scopes| {
+            for (d_scopes) |scope| {
+                if (netScopeMatches(scope, host, port)) return .denied;
+            }
+        }
         switch (self.net) {
             .denied => return .denied,
             .all => return .allowed,
             .scoped => |scopes| {
-                if (host_in.len == 0 or host_in.len > 255) return .denied;
-                if (std.mem.indexOfScalar(u8, host_in, 0) != null) return .denied;
-
-                var buf: [256]u8 = undefined;
-                const host = lowerInto(host_in, &buf);
-
                 for (scopes) |scope| {
-                    if (scope.wildcard and scope.host.len == 0) return .allowed;
-                    if (scope.port) |p| {
-                        if (p != port) continue;
-                    }
-                    if (scope.wildcard) {
-                        if (host.len > scope.host.len + 1 and
-                            std.mem.endsWith(u8, host, scope.host) and
-                            host[host.len - scope.host.len - 1] == '.')
-                            return .allowed;
-                    } else if (std.mem.eql(u8, host, scope.host)) {
-                        return .allowed;
-                    }
+                    if (netScopeMatches(scope, host, port)) return .allowed;
                 }
                 return .denied;
             },
@@ -170,6 +205,12 @@ pub const Config = struct {
         defer env_list.deinit(alloc);
         var run_list: std.ArrayList(NameScope) = .empty;
         defer run_list.deinit(alloc);
+        var deny_net_list: std.ArrayList(NetScope) = .empty;
+        defer deny_net_list.deinit(alloc);
+        var deny_read_list: std.ArrayList(PathScope) = .empty;
+        defer deny_read_list.deinit(alloc);
+        var deny_write_list: std.ArrayList(PathScope) = .empty;
+        defer deny_write_list.deinit(alloc);
 
         var all = false;
         var read_all = false;
@@ -184,9 +225,54 @@ pub const Config = struct {
                 all = true;
                 continue;
             }
+            if (std.mem.startsWith(u8, arg, "--deny-net=")) {
+                const val = arg["--deny-net=".len..];
+                if (val.len == 0) return error.InvalidScope;
+                var count: usize = 0;
+                var parts = std.mem.splitScalar(u8, val, ',');
+                while (parts.next()) |p| {
+                    if (p.len == 0) continue;
+                    const s = parseNetScope(alloc, p) catch return error.InvalidScope;
+                    try deny_net_list.append(alloc, s);
+                    count += 1;
+                }
+                if (count == 0) return error.InvalidScope;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--deny-read=")) {
+                const val = arg["--deny-read=".len..];
+                if (val.len == 0) return error.InvalidScope;
+                var count: usize = 0;
+                var parts = std.mem.splitScalar(u8, val, ',');
+                while (parts.next()) |p| {
+                    if (p.len == 0) continue;
+                    var path_buf: [max_path]u8 = undefined;
+                    const canon = canonicalizeInput(p, &path_buf) catch return error.InvalidScope;
+                    try deny_read_list.append(alloc, .{ .path = try alloc.dupe(u8, canon) });
+                    count += 1;
+                }
+                if (count == 0) return error.InvalidScope;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--deny-write=")) {
+                const val = arg["--deny-write=".len..];
+                if (val.len == 0) return error.InvalidScope;
+                var count: usize = 0;
+                var parts = std.mem.splitScalar(u8, val, ',');
+                while (parts.next()) |p| {
+                    if (p.len == 0) continue;
+                    var path_buf: [max_path]u8 = undefined;
+                    const canon = canonicalizeInput(p, &path_buf) catch return error.InvalidScope;
+                    try deny_write_list.append(alloc, .{ .path = try alloc.dupe(u8, canon) });
+                    count += 1;
+                }
+                if (count == 0) return error.InvalidScope;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--deny-")) {
+                return error.UnknownPermissionFlag;
+            }
             if (!std.mem.startsWith(u8, arg, "--allow-")) {
-                if (std.mem.startsWith(u8, arg, "--deny-"))
-                    return error.UnknownPermissionFlag;
                 continue;
             }
 
@@ -258,10 +344,18 @@ pub const Config = struct {
                 .env = .all,
                 .run = .all,
                 .ffi = true,
+                .deny_net = if (deny_net_list.items.len > 0) try deny_net_list.toOwnedSlice(alloc) else null,
+                .deny_read_paths = if (deny_read_list.items.len > 0) try deny_read_list.toOwnedSlice(alloc) else null,
+                .deny_write_paths = if (deny_write_list.items.len > 0) try deny_write_list.toOwnedSlice(alloc) else null,
             };
         }
 
-        var cfg = Config{ .ffi = ffi };
+        var cfg = Config{
+            .ffi = ffi,
+            .deny_net = if (deny_net_list.items.len > 0) try deny_net_list.toOwnedSlice(alloc) else null,
+            .deny_read_paths = if (deny_read_list.items.len > 0) try deny_read_list.toOwnedSlice(alloc) else null,
+            .deny_write_paths = if (deny_write_list.items.len > 0) try deny_write_list.toOwnedSlice(alloc) else null,
+        };
         if (read_all) {
             cfg.read = .all;
         } else if (read_list.items.len > 0) {
@@ -294,6 +388,27 @@ pub const Config = struct {
 var arena_state: std.heap.ArenaAllocator = undefined;
 var initialized = false;
 var current: Config = .{};
+var current_atomic: std.atomic.Value(?*const Config) = std.atomic.Value(?*const Config).init(null);
+const Mutex = struct {
+    state: std.atomic.Value(u8) = .init(0),
+
+    pub fn lock(self: *Mutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    pub fn tryLock(self: *Mutex) bool {
+        return self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        self.state.store(0, .release);
+    }
+};
+
+var perm_mutex: Mutex = .{};
 
 var cwd_buf: [max_path]u8 = undefined;
 var cwd_len: usize = 0;
@@ -326,17 +441,223 @@ pub fn initFromArgs(args: std.process.Args) !void {
     var it = args.iterate();
     while (it.next()) |a| try list.append(alloc, a);
 
-    current = try Config.parse(alloc, list.items);
+    const initial_cfg = try alloc.create(Config);
+    initial_cfg.* = try Config.parse(alloc, list.items);
+    current = initial_cfg.*;
+    current_atomic.store(initial_cfg, .release);
     initialized = true;
 }
 
 pub fn global() *const Config {
-    return &current;
+    return current_atomic.load(.acquire) orelse &current;
+}
+
+pub fn revoke(kind: Kind) void {
+    perm_mutex.lock();
+    defer perm_mutex.unlock();
+    const cur = global();
+    const alloc = arena_state.allocator();
+    const copy = alloc.create(Config) catch return;
+    copy.* = cur.*;
+    switch (kind) {
+        .read => copy.read = .denied,
+        .write => copy.write = .denied,
+        .net => copy.net = .denied,
+        .env => copy.env = .denied,
+        .run => copy.run = .denied,
+        .ffi => copy.ffi = false,
+    }
+    current = copy.*;
+    current_atomic.store(copy, .release);
+}
+
+pub fn revokePath(kind: Kind, target_path: []const u8) void {
+    perm_mutex.lock();
+    defer perm_mutex.unlock();
+    const cur = global();
+    const alloc = arena_state.allocator();
+    const copy = alloc.create(Config) catch return;
+    copy.* = cur.*;
+
+    var canon_buf: [max_path]u8 = undefined;
+    const canon = canonicalizeInput(target_path, &canon_buf) catch target_path;
+    const owned_canon = alloc.dupe(u8, canon) catch return;
+
+    switch (kind) {
+        .read => {
+            switch (copy.read) {
+                .scoped => |scopes| {
+                    var remaining: std.ArrayList(PathScope) = .empty;
+                    for (scopes) |sc| {
+                        if (!std.mem.eql(u8, sc.path, canon) and !std.mem.eql(u8, sc.path, target_path)) {
+                            remaining.append(alloc, sc) catch return;
+                        }
+                    }
+                    if (remaining.items.len == 0) {
+                        copy.read = .denied;
+                    } else {
+                        var still_covered = false;
+                        for (remaining.items) |sc| {
+                            if (isWithin(sc.path, canon)) {
+                                still_covered = true;
+                                break;
+                            }
+                        }
+                        copy.read = .{ .scoped = remaining.toOwnedSlice(alloc) catch return };
+                        if (still_covered) {
+                            var d_list: std.ArrayList(PathScope) = .empty;
+                            if (copy.deny_read_paths) |d| {
+                                d_list.appendSlice(alloc, d) catch return;
+                            }
+                            d_list.append(alloc, .{ .path = owned_canon }) catch return;
+                            copy.deny_read_paths = d_list.toOwnedSlice(alloc) catch return;
+                        }
+                    }
+                },
+                .all => {
+                    var d_list: std.ArrayList(PathScope) = .empty;
+                    if (copy.deny_read_paths) |d| {
+                        d_list.appendSlice(alloc, d) catch return;
+                    }
+                    d_list.append(alloc, .{ .path = owned_canon }) catch return;
+                    copy.deny_read_paths = d_list.toOwnedSlice(alloc) catch return;
+                },
+                .denied => {},
+            }
+        },
+        .write => {
+            switch (copy.write) {
+                .scoped => |scopes| {
+                    var remaining: std.ArrayList(PathScope) = .empty;
+                    for (scopes) |sc| {
+                        if (!std.mem.eql(u8, sc.path, canon) and !std.mem.eql(u8, sc.path, target_path)) {
+                            remaining.append(alloc, sc) catch return;
+                        }
+                    }
+                    if (remaining.items.len == 0) {
+                        copy.write = .denied;
+                    } else {
+                        var still_covered = false;
+                        for (remaining.items) |sc| {
+                            if (isWithin(sc.path, canon)) {
+                                still_covered = true;
+                                break;
+                            }
+                        }
+                        copy.write = .{ .scoped = remaining.toOwnedSlice(alloc) catch return };
+                        if (still_covered) {
+                            var d_list: std.ArrayList(PathScope) = .empty;
+                            if (copy.deny_write_paths) |d| {
+                                d_list.appendSlice(alloc, d) catch return;
+                            }
+                            d_list.append(alloc, .{ .path = owned_canon }) catch return;
+                            copy.deny_write_paths = d_list.toOwnedSlice(alloc) catch return;
+                        }
+                    }
+                },
+                .all => {
+                    var d_list: std.ArrayList(PathScope) = .empty;
+                    if (copy.deny_write_paths) |d| {
+                        d_list.appendSlice(alloc, d) catch return;
+                    }
+                    d_list.append(alloc, .{ .path = owned_canon }) catch return;
+                    copy.deny_write_paths = d_list.toOwnedSlice(alloc) catch return;
+                },
+                .denied => {},
+            }
+        },
+        else => {},
+    }
+    current = copy.*;
+    current_atomic.store(copy, .release);
+}
+
+pub fn revokeNet(target_host: []const u8) void {
+    perm_mutex.lock();
+    defer perm_mutex.unlock();
+    const cur = global();
+    const alloc = arena_state.allocator();
+    const copy = alloc.create(Config) catch return;
+    copy.* = cur.*;
+
+    const parsed_scope = parseNetScope(alloc, target_host) catch null;
+
+    switch (copy.net) {
+        .scoped => |scopes| {
+            var remaining: std.ArrayList(NetScope) = .empty;
+            for (scopes) |sc| {
+                if (!std.mem.eql(u8, sc.host, target_host)) {
+                    remaining.append(alloc, sc) catch return;
+                }
+            }
+            if (remaining.items.len == 0) {
+                copy.net = .denied;
+            } else {
+                copy.net = .{ .scoped = remaining.toOwnedSlice(alloc) catch return };
+                if (parsed_scope) |ps| {
+                    var d_list: std.ArrayList(NetScope) = .empty;
+                    if (copy.deny_net) |d| {
+                        d_list.appendSlice(alloc, d) catch return;
+                    }
+                    d_list.append(alloc, ps) catch return;
+                    copy.deny_net = d_list.toOwnedSlice(alloc) catch return;
+                }
+            }
+        },
+        .all => {
+            var d_list: std.ArrayList(NetScope) = .empty;
+            if (copy.deny_net) |d| {
+                d_list.appendSlice(alloc, d) catch return;
+            }
+            if (parsed_scope) |ps| {
+                d_list.append(alloc, ps) catch return;
+            } else {
+                const owned_host = alloc.dupe(u8, target_host) catch return;
+                d_list.append(alloc, .{ .host = owned_host }) catch return;
+            }
+            copy.deny_net = d_list.toOwnedSlice(alloc) catch return;
+        },
+        .denied => {},
+    }
+    current = copy.*;
+    current_atomic.store(copy, .release);
+}
+
+pub fn revokeEnv(var_name: []const u8) void {
+    perm_mutex.lock();
+    defer perm_mutex.unlock();
+    const cur = global();
+    const alloc = arena_state.allocator();
+    const copy = alloc.create(Config) catch return;
+    copy.* = cur.*;
+
+    switch (copy.env) {
+        .scoped => |scopes| {
+            var remaining: std.ArrayList(NameScope) = .empty;
+            for (scopes) |sc| {
+                if (!std.mem.eql(u8, sc.name, var_name)) {
+                    remaining.append(alloc, sc) catch return;
+                }
+            }
+            if (remaining.items.len == 0) {
+                copy.env = .denied;
+            } else {
+                copy.env = .{ .scoped = remaining.toOwnedSlice(alloc) catch return };
+            }
+        },
+        .all => {
+            copy.env = .denied;
+        },
+        .denied => {},
+    }
+    current = copy.*;
+    current_atomic.store(copy, .release);
 }
 
 pub fn isPermissionFlag(arg: []const u8) bool {
     if (std.mem.eql(u8, arg, "--allow-all") or std.mem.eql(u8, arg, "--allow-ffi"))
         return true;
+    if (std.mem.startsWith(u8, arg, "--deny-")) return true;
     if (!std.mem.startsWith(u8, arg, "--allow-")) return false;
     const rest = arg["--allow-".len..];
     const name = rest[0 .. std.mem.indexOfScalar(u8, rest, '=') orelse rest.len];

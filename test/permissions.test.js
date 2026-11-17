@@ -217,6 +217,32 @@ try {
   );
   check("ffi raw helpers allowed with --allow-ffi", r.code === 0 && r.out.includes("true"));
 
+  // ── Response.file permission check ───────────────────────────────
+  r = await run(`Response.file(${JSON.stringify(base + "/inside.txt")})`);
+  check("Response.file denied by default", denied(r, "requires --allow-read"));
+
+  r = await run(
+    `const rf = Response.file(${JSON.stringify(base + "/inside.txt")}); console.log("status:" + rf.status)`,
+    ["--allow-read=" + base],
+  );
+  check("Response.file allowed with --allow-read", r.code === 0 && r.out.includes("status:200"));
+
+  // ── deny flags ───────────────────────────────────────────────────
+  r = await run(
+    `console.log(fs.readFile(${JSON.stringify(base + "/inside.txt")}))`,
+    ["--allow-read=" + base, "--deny-read=" + base + "/inside.txt"],
+  );
+  check("deny-read blocks read even when allow-read is set", r.code !== 0);
+
+  r = await run(
+    `fetch("http://127.0.0.1:${redirectPort}/")`,
+    ["--allow-net", "--deny-net=127.0.0.1"],
+  );
+  check("deny-net blocks net access", r.code !== 0);
+
+  r = await run(`console.log(1)`, ["--deny-foo"]);
+  check("unknown --deny flag fails loud", r.code !== 0);
+
   // ── sqlite ───────────────────────────────────────────────────────
   r = await run(`Database.open(${JSON.stringify(dbPath)})`);
   check("Database.open denied by default", denied(r, "requires --allow-read"));
