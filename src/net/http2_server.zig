@@ -39,6 +39,7 @@ const http_native = @import("http_native.zig");
 const tls_mod = @import("tls_server.zig");
 const headers_mod = @import("../types/headers.zig");
 const response_mod = @import("../types/response.zig");
+const readable_stream = @import("../types/readable_stream.zig");
 const gpa = std.heap.smp_allocator;
 
 pub const MAX_STREAMS = 100;
@@ -950,7 +951,17 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
     var hdrs: ?*headers_mod.HeadersData = null;
 
     if (c.isObject(result) != 0) {
+        if (readable_stream.isStream(ctx, result)) {
+            respondErrorH2(slot_id, 501);
+            return;
+        }
         if (response_mod.dataFromJS(ctx, result)) |rd| {
+            if (rd.cold) |cold| {
+                if (cold.stream != null) {
+                    respondErrorH2(slot_id, 501);
+                    return;
+                }
+            }
             // Response instance: body/headers point into ResponseData, which
             // is owned by `result` and outlives this function. Borrow is safe.
             status = rd.status;
@@ -967,6 +978,10 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
             }
             const body_val = c.getPropertyStr(ctx, result, "body");
             defer c.freeValue(ctx, body_val);
+            if (readable_stream.isStream(ctx, body_val)) {
+                respondErrorH2(slot_id, 501);
+                return;
+            }
             if (c.isString(body_val) != 0) {
                 if (c.toCString(ctx, body_val)) |cs| {
                     // BORROW LIFETIME (memory rule 4): this cstring is freed by

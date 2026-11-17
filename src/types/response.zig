@@ -5,6 +5,24 @@ const pool_slice_mod = @import("pool_slice.zig");
 const blob_mod = @import("blob.zig");
 const formdata_mod = @import("formdata.zig");
 const gpa = std.heap.smp_allocator;
+const perm = @import("../security/permissions.zig");
+const deny = @import("../security/deny.zig");
+const readable_stream = @import("readable_stream.zig");
+
+fn guessContentType(path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "application/octet-stream";
+    const ext = path[dot..];
+    if (std.ascii.eqlIgnoreCase(ext, ".html") or std.ascii.eqlIgnoreCase(ext, ".htm")) return "text/html; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(ext, ".css")) return "text/css; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(ext, ".js") or std.ascii.eqlIgnoreCase(ext, ".mjs")) return "application/javascript; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(ext, ".json")) return "application/json";
+    if (std.ascii.eqlIgnoreCase(ext, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(ext, ".jpg") or std.ascii.eqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(ext, ".svg")) return "image/svg+xml";
+    if (std.ascii.eqlIgnoreCase(ext, ".txt")) return "text/plain; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(ext, ".wasm")) return "application/wasm";
+    return "application/octet-stream";
+}
 
 var response_class_id: c.ClassID = 0;
 
@@ -89,6 +107,7 @@ const PoolSlice = pool_slice_mod.PoolSlice;
 
 pub const ResponseDataCold = struct {
     response_type_other: PoolSlice,
+    stream: ?c.Value = null,
 };
 
 // C1 FIX: ResponseData shell freelist — one `gpa.create` per fetch() result
@@ -383,11 +402,55 @@ fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
     _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
 }
 
+fn responseBodyGetter(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    _ = argc;
+    _ = argv;
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_UNDEFINED;
+    if (data.cold) |cold| {
+        if (cold.stream) |st| {
+            return c.dupValue(ctx, st);
+        }
+    }
+    if (!data.has_body) return c.JS_NULL;
+    const body_bytes = data.body() orelse return c.JS_NULL;
+    const idx = readable_stream.createStream(ctx, .native_push) orelse return c.JS_NULL;
+    const stream_obj = readable_stream.createJsStream(ctx, idx);
+    const u8_buf = c.newArrayBufferCopy(ctx, body_bytes.ptr, body_bytes.len);
+    _ = readable_stream.pushChunk(ctx, idx, u8_buf);
+    c.freeValue(ctx, u8_buf);
+    readable_stream.closeStream(ctx, idx);
+    return stream_obj;
+}
+
 fn responseText(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     data.body_used = true;
+    if (data.cold) |cold| {
+        if (cold.stream) |st| {
+            if (readable_stream.getStreamSlot(ctx, st)) |slot| {
+                var str_buf: std.ArrayList(u8) = .empty;
+                defer str_buf.deinit(gpa);
+                while (readable_stream.popChunk(slot)) |ch| {
+                    defer c.freeValue(ctx, ch);
+                    var slen: usize = 0;
+                    if (c.toCStringLen(ctx, &slen, ch)) |cs| {
+                        defer c.freeCString(ctx, cs);
+                        str_buf.appendSlice(gpa, cs[0..slen]) catch {};
+                    }
+                }
+                var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
+                const promise = c.newPromiseCapability(ctx, &cap);
+                defer c.freeValue(ctx, cap[0]);
+                defer c.freeValue(ctx, cap[1]);
+                var result = zigStringToJS(ctx, str_buf.items);
+                defer c.freeValue(ctx, result);
+                _ = c.call(ctx, cap[0], c.JS_UNDEFINED, 1, &result);
+                return promise;
+            }
+        }
+    }
     const body_text = data.body() orelse "";
     var cap: [2]c.Value = .{ c.JS_UNDEFINED, c.JS_UNDEFINED };
     const promise = c.newPromiseCapability(ctx, &cap);
@@ -629,11 +692,56 @@ fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Va
     return buildResponseJSObject(ctx, data);
 }
 
+fn responseStaticFile(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
+    if (argc < 1 or c.isString(argv[0]) == 0) {
+        _ = c.throwTypeError(ctx, "Response.file requires a file path");
+        return c.JS_EXCEPTION;
+    }
+    var len: usize = 0;
+    const cstr = c.toCStringLen(ctx, &len, argv[0]) orelse return c.JS_EXCEPTION;
+    defer c.freeCString(ctx, cstr);
+    const path = cstr[0..len];
+
+    if (perm.global().checkPath(.read, path) == .denied) {
+        return deny.throw(ctx, "Response.file", .read, path);
+    }
+
+    const data = acquire() orelse return c.throwOutOfMemory(ctx);
+    data.* = ResponseData.init();
+    data.status = 200;
+    data.setStatusText("OK");
+
+    const file_bytes = std.Io.Dir.cwd().readFileAllocOptions(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        gpa,
+        .limited(50 * 1024 * 1024),
+        .of(u8),
+        0,
+    ) catch |err| {
+        releaseData(data);
+        if (err == error.FileTooBig) {
+            _ = c.throwTypeError(ctx, "Response.file exceeds 50 MB cap");
+        } else {
+            _ = c.throwTypeError(ctx, "could not read file");
+        }
+        return c.JS_EXCEPTION;
+    };
+
+    data.headers.setEntry("content-type", guessContentType(path));
+    data.setBodyOwned(file_bytes);
+    return buildResponseJSObject(ctx, data);
+}
+
 fn responseFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
-    _ = rt;
     if (c.getOpaque(val, response_class_id)) |ptr| {
         const data: *ResponseData = @ptrCast(@alignCast(ptr));
-        // C1 FIX: return the shell to the pool (was deinit + destroy).
+        if (data.cold) |cold| {
+            if (cold.stream) |s| {
+                c.freeValueRT(rt, s);
+                cold.stream = null;
+            }
+        }
         releaseData(data);
     }
 }
@@ -648,7 +756,12 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
 
     if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {
         const body_val = argv[0];
-        if (c.isObject(body_val) != 0) {
+        if (readable_stream.isStream(ctx, body_val)) {
+            data.has_body = true;
+            const cold = gpa.create(ResponseDataCold) catch return c.throwOutOfMemory(ctx);
+            cold.* = .{ .response_type_other = .{}, .stream = c.dupValue(ctx, body_val) };
+            data.cold = cold;
+        } else if (c.isObject(body_val) != 0) {
             var ab_size: usize = 0;
             if (c.getArrayBuffer(ctx, &ab_size, body_val)) |ab_ptr| {
                 const bytes: []const u8 = if (ab_size == 0) "" else ab_ptr[0..ab_size];
@@ -733,6 +846,9 @@ pub fn setup(ctx: ?*c.Context) void {
         const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
         _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
+    const body_atom = c.newAtom(ctx, "body");
+    defer c.freeAtom(ctx, body_atom);
+    _ = c.definePropertyGetSet(ctx, proto, body_atom, c.newCFunction(ctx, responseBodyGetter, "body", 0), c.JS_UNDEFINED, c.PROP_CONFIGURABLE | c.PROP_ENUMERABLE);
     c.setClassProto(ctx, response_class_id, proto);
 
     const global = c.getGlobalObject(ctx);
@@ -746,6 +862,8 @@ pub fn setup(ctx: ?*c.Context) void {
     _ = c.definePropertyValueStr(ctx, ctor, "redirect", static_redirect, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     const static_error = c.newCFunction(ctx, &responseStaticError, "error", 0);
     _ = c.definePropertyValueStr(ctx, ctor, "error", static_error, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+    const static_file = c.newCFunction(ctx, &responseStaticFile, "file", 1);
+    _ = c.definePropertyValueStr(ctx, ctor, "file", static_file, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }
 
 // ── Regression tests: JS_ParseJSON requires buf[len] == '\0' ──
