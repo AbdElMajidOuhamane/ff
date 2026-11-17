@@ -11,7 +11,9 @@ const tls_mod = @import("tls_server.zig");
 const tls_on = tls_mod.available;
 const http2_mod = @import("http2_server.zig");
 const response_mod = @import("../types/response.zig");
+const readable_stream = @import("../types/readable_stream.zig");
 const headers_mod = @import("../types/headers.zig");
+const interrupt = @import("../engine/interrupt.zig");
 const gpa = std.heap.smp_allocator;
 
 // F3: the Debug req_counter (CountingAllocator) that used to wrap this
@@ -213,6 +215,13 @@ var shutdown_deadline_ms: u64 = 0;
 var close_resolve: ?c.Value = null;
 var close_cb_fn: ?c.Value = null;
 var g_loop: ?*xev.Loop = null;
+var conn_stream: [MAX_CONN]?u16 = [_]?u16{null} ** MAX_CONN;
+var conn_stream_val: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
+var conn_chunk_val: [MAX_CONN]?c.Value = [_]?c.Value{null} ** MAX_CONN;
+var conn_chunk_ptr: [MAX_CONN]?[*]const u8 = [_]?[*]const u8{null} ** MAX_CONN;
+var conn_chunk_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var conn_chunk_off: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var conn_chunk_cstr: [MAX_CONN]?[*c]const u8 = [_]?[*c]const u8{null} ** MAX_CONN;
 var initialized: bool = false;
 
 // Gap-7 fix: largest→smallest field order (56B, still ≤64 assert).
@@ -964,7 +973,30 @@ fn noopCancelCb(
     return .disarm;
 }
 
+fn cleanupConnChunk(id: usize) void {
+    if (conn_chunk_cstr[id]) |cs| {
+        if (handler_ctx) |ctx| c.freeCString(ctx, cs);
+        conn_chunk_cstr[id] = null;
+    }
+    if (conn_chunk_val[id]) |v| {
+        if (handler_ctx) |ctx| c.freeValue(ctx, v);
+        conn_chunk_val[id] = null;
+    }
+    conn_chunk_ptr[id] = null;
+    conn_chunk_len[id] = 0;
+    conn_chunk_off[id] = 0;
+}
+
 fn hardClose(id: usize) void {
+    if (conn_stream[id]) |s_idx| {
+        readable_stream.setHttpConn(s_idx, null);
+        conn_stream[id] = null;
+    }
+    if (conn_stream_val[id]) |v| {
+        if (handler_ctx) |ctx| c.freeValue(ctx, v);
+        conn_stream_val[id] = null;
+    }
+    cleanupConnChunk(id);
     states[id] = .closing;
     const loop = g_loop orelse {
         setReadArmed(id, false);
@@ -1176,6 +1208,203 @@ fn resetBodyStaging(id: usize) void {
     cflags[id].body_from_heap = false;
 }
 
+fn appendHex(w: []u8, pos: *usize, value: usize) void {
+    var buf: [16]u8 = undefined;
+    var n: usize = 0;
+    var v = value;
+    if (v == 0) {
+        buf[0] = '0';
+        n = 1;
+    } else {
+        const hex_digits = "0123456789abcdef";
+        while (v > 0) : (v /= 16) {
+            buf[n] = hex_digits[v % 16];
+            n += 1;
+        }
+        std.mem.reverse(u8, buf[0..n]);
+    }
+    @memcpy(w[pos.*..][0..n], buf[0..n]);
+    pos.* += n;
+}
+
+fn formatHeadChunked(
+    id: usize,
+    status: u16,
+    status_text: []const u8,
+    hdrs: ?*headers_mod.HeadersData,
+) usize {
+    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
+    var pos: usize = 0;
+
+    pushStr(w, &pos, "HTTP/1.1 ");
+    appendUInt(w, &pos, status);
+    pushStr(w, &pos, " ");
+    if (status_text.len > 0 and std.mem.indexOfAny(u8, status_text, "\r\n") == null) {
+        pushStr(w, &pos, status_text);
+    } else {
+        pushStr(w, &pos, statusReason(status));
+    }
+    pushStr(w, &pos, "\r\n");
+
+    var seen_ct = false;
+    if (hdrs) |h| {
+        for (0..h.len()) |i| {
+            const p = h.getPair(i);
+            if (isManagedHeader(p.name)) continue;
+            if (std.mem.indexOfAny(u8, p.name, "\r\n") != null or
+                std.mem.indexOfAny(u8, p.value, "\r\n") != null) continue;
+            if (std.ascii.eqlIgnoreCase(p.name, "content-type")) seen_ct = true;
+            if (std.ascii.eqlIgnoreCase(p.name, "transfer-encoding") or
+                std.ascii.eqlIgnoreCase(p.name, "content-length")) continue;
+            if (pos + p.name.len + p.value.len + 4 > HDR_MAX) break;
+            pushStr(w, &pos, p.name);
+            pushStr(w, &pos, ": ");
+            pushStr(w, &pos, p.value);
+            pushStr(w, &pos, "\r\n");
+        }
+    }
+    if (!seen_ct) {
+        pushStr(w, &pos, "Content-Type: text/plain\r\n");
+    }
+    pushStr(w, &pos, "Transfer-Encoding: chunked\r\n");
+    if (cflags[id].keep_alive) {
+        pushStr(w, &pos, "Connection: keep-alive\r\n\r\n");
+    } else {
+        pushStr(w, &pos, "Connection: close\r\n\r\n");
+    }
+    return pos;
+}
+
+fn formatStreamChunk(id: usize, stream_idx: u16, ctx: ?*c.Context) bool {
+    const w: *[WRITE_BUF_SIZE]u8 = &write_bufs[id];
+    var pos: usize = 0;
+    const max_payload = WRITE_BUF_SIZE - 32;
+
+    // 1. If we have a pending oversized chunk in progress:
+    if (conn_chunk_val[id] != null) {
+        const remaining = conn_chunk_len[id] - conn_chunk_off[id];
+        const slice_len = @min(remaining, max_payload);
+        const data_slice = conn_chunk_ptr[id].?[conn_chunk_off[id]..][0..slice_len];
+
+        appendHex(w, &pos, slice_len);
+        pushStr(w, &pos, "\r\n");
+        @memcpy(w[pos..][0..slice_len], data_slice);
+        pos += slice_len;
+        pushStr(w, &pos, "\r\n");
+        write_lens[id] = pos;
+        write_offsets[id] = 0;
+
+        conn_chunk_off[id] += slice_len;
+        if (conn_chunk_off[id] >= conn_chunk_len[id]) {
+            cleanupConnChunk(id);
+        }
+        return true;
+    }
+
+    var chunk_val_opt = readable_stream.popChunk(stream_idx);
+    if (chunk_val_opt == null and readable_stream.st_state[stream_idx] == .readable) {
+        readable_stream.maybePull(ctx, stream_idx);
+        chunk_val_opt = readable_stream.popChunk(stream_idx);
+    }
+    if (chunk_val_opt) |chunk_val| {
+        var bytes_slice: []const u8 = "";
+        var cstr_to_free: ?[*c]const u8 = null;
+
+        if (c.isString(chunk_val) != 0) {
+            var slen: usize = 0;
+            if (c.toCStringLen(ctx, &slen, chunk_val)) |cs| {
+                cstr_to_free = cs;
+                bytes_slice = cs[0..slen];
+            }
+        } else if (c.isObject(chunk_val) != 0) {
+            var u8_size: usize = 0;
+            if (c.getUint8Array(ctx, &u8_size, chunk_val)) |u8_ptr| {
+                bytes_slice = if (u8_size == 0) "" else u8_ptr[0..u8_size];
+            } else {
+                var ab_size: usize = 0;
+                if (c.getArrayBuffer(ctx, &ab_size, chunk_val)) |ab_ptr| {
+                    bytes_slice = if (ab_size == 0) "" else ab_ptr[0..ab_size];
+                }
+            }
+        }
+
+        if (bytes_slice.len <= max_payload) {
+            defer c.freeValue(ctx, chunk_val);
+            defer if (cstr_to_free) |cs| c.freeCString(ctx, cs);
+
+            appendHex(w, &pos, bytes_slice.len);
+            pushStr(w, &pos, "\r\n");
+            @memcpy(w[pos..][0..bytes_slice.len], bytes_slice);
+            pos += bytes_slice.len;
+            pushStr(w, &pos, "\r\n");
+            write_lens[id] = pos;
+            write_offsets[id] = 0;
+            return true;
+        }
+
+        // Oversized chunk: retain and stream in max_payload slices
+        conn_chunk_val[id] = chunk_val;
+        conn_chunk_ptr[id] = bytes_slice.ptr;
+        conn_chunk_len[id] = bytes_slice.len;
+        conn_chunk_off[id] = 0;
+        conn_chunk_cstr[id] = cstr_to_free;
+
+        const slice_len = max_payload;
+        const data_slice = bytes_slice[0..slice_len];
+
+        appendHex(w, &pos, slice_len);
+        pushStr(w, &pos, "\r\n");
+        @memcpy(w[pos..][0..slice_len], data_slice);
+        pos += slice_len;
+        pushStr(w, &pos, "\r\n");
+        write_lens[id] = pos;
+        write_offsets[id] = 0;
+
+        conn_chunk_off[id] += slice_len;
+        return true;
+    }
+
+    if (readable_stream.st_state[stream_idx] == .closed) {
+        pushStr(w, &pos, "0\r\n\r\n");
+        write_lens[id] = pos;
+        write_offsets[id] = 0;
+        conn_stream[id] = null;
+        readable_stream.setHttpConn(stream_idx, null);
+        if (conn_stream_val[id]) |v| {
+            if (ctx) |c_ctx| c.freeValue(c_ctx, v);
+            conn_stream_val[id] = null;
+        }
+        cleanupConnChunk(id);
+        return true;
+    }
+
+    if (readable_stream.st_state[stream_idx] == .errored) {
+        conn_stream[id] = null;
+        readable_stream.setHttpConn(stream_idx, null);
+        if (conn_stream_val[id]) |v| {
+            if (ctx) |c_ctx| c.freeValue(c_ctx, v);
+            conn_stream_val[id] = null;
+        }
+        cleanupConnChunk(id);
+        closeConn(id);
+        return false;
+    }
+
+    return false;
+}
+
+pub fn notifyStreamReady(conn_id: u16) void {
+    const id: usize = @intCast(conn_id);
+    if (id >= MAX_CONN) return;
+    if (states[id] != .writing) return;
+    if (write_lens[id] != 0) return;
+    const stream_idx = conn_stream[id] orelse return;
+    const l = g_loop orelse return;
+    if (formatStreamChunk(id, stream_idx, handler_ctx)) {
+        armWrite(id, l);
+    }
+}
+
 // NEW: shared response staging — used by the sync path and the parked
 // continuation. Reads Response objects natively (opaque pointer, no JS
 // property lookups), plain objects via properties (back-compat). User
@@ -1200,6 +1429,7 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
     var body_bytes: []const u8 = "";
     var has_body = false;
     var hdrs: ?*headers_mod.HeadersData = null;
+    var stream_val_opt: ?c.Value = null;
 
     if (c.isObject(result) != 0) {
         if (response_mod.dataFromJS(ctx, result)) |rd| {
@@ -1207,9 +1437,16 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
             // is owned by `result` and outlives this function. Borrow is safe.
             status = rd.status;
             status_text = rd.statusText();
-            if (rd.body()) |b| {
-                body_bytes = b;
-                has_body = true;
+            if (rd.cold) |cold| {
+                if (cold.stream) |s| {
+                    stream_val_opt = s;
+                }
+            }
+            if (stream_val_opt == null) {
+                if (rd.body()) |b| {
+                    body_bytes = b;
+                    has_body = true;
+                }
             }
             hdrs = rd.headers;
         } else {
@@ -1221,7 +1458,9 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
             const suppress = !wantsBodyBytes(id, status);
             const body_out_val = c.getPropertyStr(ctx, result, "body");
             defer c.freeValue(ctx, body_out_val);
-            if (c.isString(body_out_val) != 0) {
+            if (readable_stream.isStream(ctx, body_out_val)) {
+                stream_val_opt = body_out_val;
+            } else if (c.isString(body_out_val) != 0) {
                 if (c.toCString(ctx, body_out_val)) |cstr| {
                     // BORROW LIFETIME: this cstring is freed by the defer below
                     // when THIS block exits. JS_ToCString returns the internal
@@ -1263,6 +1502,29 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
                     has_body = true;
                 }
             }
+        }
+    }
+
+    if (stream_val_opt) |st_val| {
+        const suppress = !wantsBodyBytes(id, status);
+        if (suppress) {
+            const pos = formatHead(id, status, status_text, hdrs, 0, suppress);
+            write_lens[id] = pos;
+            resetBodyStaging(id);
+            return;
+        }
+        if (readable_stream.getStreamSlot(ctx, st_val)) |s_idx| {
+            const pos = formatHeadChunked(id, status, status_text, hdrs);
+            write_lens[id] = pos;
+            write_offsets[id] = 0;
+            resetBodyStaging(id);
+            conn_stream[id] = s_idx;
+            if (conn_stream_val[id]) |old_v| {
+                c.freeValue(ctx, old_v);
+            }
+            conn_stream_val[id] = c.dupValue(ctx, st_val);
+            readable_stream.setHttpConn(s_idx, @intCast(id));
+            return;
         }
     }
 
@@ -1454,6 +1716,39 @@ fn parseHeaders(raw: []const u8) !*headers_mod.HeadersData {
     return data;
 }
 
+const ParamCapture = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn matchPathPattern(pattern: []const u8, path: []const u8, out_params: *[16]ParamCapture) ?usize {
+    if (std.mem.eql(u8, pattern, "*")) return 0;
+    var p_iter = std.mem.splitScalar(u8, pattern, '/');
+    var u_iter = std.mem.splitScalar(u8, path, '/');
+    var n_params: usize = 0;
+
+    while (true) {
+        const p_seg = p_iter.next();
+        const u_seg = u_iter.next();
+
+        if (p_seg == null and u_seg == null) return n_params;
+        if (p_seg == null or u_seg == null) return null;
+
+        const ps = p_seg.?;
+        const us = u_seg.?;
+
+        if (ps.len > 1 and ps[0] == ':') {
+            if (us.len == 0) return null;
+            if (n_params < out_params.len) {
+                out_params[n_params] = .{ .name = ps[1..], .value = us };
+                n_params += 1;
+            }
+        } else if (!std.mem.eql(u8, ps, us)) {
+            return null;
+        }
+    }
+}
+
 pub fn callHandler(id: usize, parsed: *const ParsedRequest, body: []const u8) void {
     callHandlerWithHeaders(id, parsed, body, null);
 }
@@ -1490,8 +1785,106 @@ pub fn callHandlerWithHeaders(id: usize, parsed: *const ParsedRequest, body: []c
     defer c.freeValue(ctx, body_val);
     defer c.freeValue(ctx, hdrs_val);
 
-    var argv = [_]c.Value{ url_val, method_val, body_val, hdrs_val };
-    var result = c.call(ctx, handler, global, 4, &argv);
+    var target_handler = handler;
+    var matched_route: ?c.Value = null;
+    var params_val: ?c.Value = null;
+
+    if (c.isFunction(ctx, handler) == 0 and c.isObject(handler) != 0) {
+        if (parsed.url.len > 4096) {
+            if (hdrs) |h| h.release();
+            buildResponse(id, 414, "URI Too Long");
+            return;
+        }
+        const clean_url = if (std.mem.indexOfScalar(u8, parsed.url, '?')) |q| parsed.url[0..q] else parsed.url;
+
+        var p: [*c]c.PropertyEnum = null;
+        var count: c_uint = 0;
+        var method_mismatch = false;
+        var matched_atom: ?c.Atom = null;
+        var matched_params: [16]ParamCapture = undefined;
+        var matched_n_params: usize = 0;
+        var key_buf: [512]u8 = undefined;
+
+        if (c.getOwnPropertyNames(ctx, &p, &count, handler, c.GPN_STRING_MASK) == 0) {
+            defer c.freePropertyEnum(ctx, p, count);
+            for (0..count) |idx| {
+                const prop_str = c.atomToCString(ctx, p[idx].atom);
+                if (prop_str == null) continue;
+                defer c.freeCString(ctx, prop_str);
+                const key = std.mem.span(prop_str);
+                if (key.len >= key_buf.len) continue;
+                @memcpy(key_buf[0..key.len], key);
+                const stable_key = key_buf[0..key.len];
+
+                var r_method: ?[]const u8 = null;
+                var r_path: []const u8 = stable_key;
+                if (std.mem.indexOfScalar(u8, stable_key, ' ')) |sp| {
+                    r_method = stable_key[0..sp];
+                    r_path = std.mem.trim(u8, stable_key[sp + 1 ..], " ");
+                }
+
+                var temp_params: [16]ParamCapture = undefined;
+                if (matchPathPattern(r_path, clean_url, &temp_params)) |num_p| {
+                    if (r_method) |rm| {
+                        if (!std.ascii.eqlIgnoreCase(rm, parsed.method)) {
+                            method_mismatch = true;
+                            continue;
+                        }
+                    }
+                    matched_atom = p[idx].atom;
+                    matched_n_params = num_p;
+                    for (0..num_p) |pi| {
+                        matched_params[pi] = temp_params[pi];
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (matched_atom) |atom| {
+            const route_fn = c.getProperty(ctx, handler, atom);
+            if (c.isFunction(ctx, route_fn) != 0) {
+                matched_route = route_fn;
+                target_handler = route_fn;
+
+                const p_obj = c.newObject(ctx);
+                for (0..matched_n_params) |pi| {
+                    const patom = c.newAtomLen(ctx, matched_params[pi].name.ptr, matched_params[pi].name.len);
+                    defer c.freeAtom(ctx, patom);
+                    const pval = c.newStringLen(ctx, matched_params[pi].value.ptr, @intCast(matched_params[pi].value.len));
+                    _ = c.setProperty(ctx, p_obj, patom, pval);
+                }
+                params_val = p_obj;
+            } else {
+                c.freeValue(ctx, route_fn);
+                if (hdrs) |h| h.release();
+                buildResponse(id, 404, "Not Found");
+                return;
+            }
+        } else {
+            if (hdrs) |h| h.release();
+            if (method_mismatch) {
+                buildResponse(id, 405, "Method Not Allowed");
+            } else {
+                buildResponse(id, 404, "Not Found");
+            }
+            return;
+        }
+    }
+    defer if (matched_route) |rf| c.freeValue(ctx, rf);
+    defer if (params_val) |pv| c.freeValue(ctx, pv);
+
+    var argv = [_]c.Value{
+        url_val,
+        method_val,
+        body_val,
+        hdrs_val,
+        if (params_val) |pv| pv else c.JS_UNDEFINED,
+    };
+    const argc: c_int = if (params_val != null) 5 else 4;
+    interrupt.enterJs(0, interrupt.monotonicNowMs());
+    var result = c.call(ctx, target_handler, global, argc, &argv);
+    interrupt.leaveJs(0);
     defer c.freeValue(ctx, result);
 
     if (c.isException(result) != 0) {
@@ -1875,6 +2268,15 @@ fn tryUpgrade(id: usize, l: *xev.Loop, headers_end: usize, pr: *const ParsedRequ
 // CHANGED: clears parked state so a late continuation no-ops.
 
 fn closeConn(id: usize) void {
+    if (conn_stream[id]) |s_idx| {
+        readable_stream.setHttpConn(s_idx, null);
+        conn_stream[id] = null;
+    }
+    if (conn_stream_val[id]) |v| {
+        if (handler_ctx) |ctx| c.freeValue(ctx, v);
+        conn_stream_val[id] = null;
+    }
+    cleanupConnChunk(id);
     http2_mod.removeSession(id);
     if (body_heap[id]) |old| {
         gpa.free(old);
@@ -2411,6 +2813,14 @@ pub fn writeCb(
                 hardClose(id);
                 return .disarm;
             }
+        } else if (conn_stream[id]) |stream_idx| {
+            if (write_lens[id] == 0) {
+                if (formatStreamChunk(id, stream_idx, handler_ctx)) {
+                    armWrite(id, l);
+                    return .disarm;
+                }
+                return .disarm;
+            }
         } else if (body_lens[id] > 0) {
             // Large-body chunked write: load the next chunk from the staged body.
             if (write_lens[id] == 0) {
@@ -2505,6 +2915,20 @@ pub fn writeCb(
     }
 
     write_offsets[id] += written;
+
+    if (conn_stream[id]) |stream_idx| {
+        if (write_offsets[id] < write_lens[id]) {
+            tcp.write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
+            return .disarm;
+        }
+        write_lens[id] = 0;
+        write_offsets[id] = 0;
+        if (formatStreamChunk(id, stream_idx, handler_ctx)) {
+            armWrite(id, l);
+            return .disarm;
+        }
+        return .disarm;
+    }
 
     if (body_lens[id] > 0) {
         if (write_offsets[id] >= write_lens[id]) {
@@ -2768,7 +3192,7 @@ pub fn closeServer() void {
     _ = checkDrainComplete();
 }
 
-pub fn init(loop: *xev.Loop, port: u16, reuse_port: bool) !void {
+pub fn init(loop: *xev.Loop, addr: std.Io.net.IpAddress, reuse_port: bool) !void {
     if (initialized) return;
     g_loop = loop;
     closing_server = false;
@@ -2777,13 +3201,20 @@ pub fn init(loop: *xev.Loop, port: u16, reuse_port: bool) !void {
     shutdown_deadline_ms = 0;
     shutdown_timer_started = false;
     if (std.c.getenv("FF_ECHO") != null) native_echo = true;
+    readable_stream.on_stream_ready = notifyStreamReady;
     for (0..MAX_CONN) |i| {
         slot_ids[i] = @intCast(i);
         free_list[i] = @intCast(i);
+        conn_stream[i] = null;
+        conn_stream_val[i] = null;
+        conn_chunk_val[i] = null;
+        conn_chunk_ptr[i] = null;
+        conn_chunk_len[i] = 0;
+        conn_chunk_off[i] = 0;
+        conn_chunk_cstr[i] = null;
     }
     free_count = MAX_CONN;
     read_armed_bits = [_]u64{0} ** 8;
-    const addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", port) catch unreachable;
     listener_tcp = try xev.TCP.init(addr);
     const one: c_int = 1;
     _ = std.posix.setsockopt(listener_tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
@@ -2797,7 +3228,10 @@ pub fn init(loop: *xev.Loop, port: u16, reuse_port: bool) !void {
     if (std.c.getsockname(listener_tcp.fd, @ptrCast(&sin), &slen) == 0) {
         bound_port = std.mem.bigToNative(u16, sin.port);
     } else {
-        bound_port = port;
+        bound_port = switch (addr) {
+            .ip4 => |a| a.port,
+            .ip6 => |a| a.port,
+        };
     }
     listener_tcp.accept(loop, &accept_comp, void, null, acceptCb);
     if (!watchdog_started) { // NEW
