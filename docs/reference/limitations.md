@@ -100,9 +100,12 @@ boundary for hostile code.
 | Extra timer args | 8 after `ms` | Beyond 8 throws `TypeError: setTimeout accepts at most 8 callback arguments` (also accepts `{ signal }` or `AbortSignal` as 3rd arg) |
 | Workers | 8 | `too many workers (max 8)` |
 | Worker scope | `console`, timers, `postMessage`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `performance` (`performance.now()`), `workerData`, `self` | No `fs`, `fetch`, `http.serve`, `crypto.bcrypt`, or nested workers |
-| Worker heap | 32 MB + 1 MB JS stack (8 MB thread stack) | — |
+| Worker heap | 32 MB default JS heap + `--max-stack` JS stack (thread stack >= max(8 MB, 2 * `--max-stack`)) | — |
 | Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
 | `process.nextTick` | Missing | Use `queueMicrotask` |
+
+> [!NOTE]
+> **Native vs JS stack safety**: QuickJS checks recursion depth against the configured JS limit, but each frame also occupies native stack frames. Setting a JS limit equal to the native reservation is pathological (quickjs-ng PR #1700), triggering SIGSEGV/SIGBUS before QuickJS can throw `RangeError`. Fairyfly enforces native stack >= 2 * JS limit on main and worker threads. Worker native stack automatically grows up to 16 MB when `--max-stack=8MB`. Committed RSS under deep recursion across 8 workers at an 8 MB limit is ~74 MB.
 
 ```js
 // instead of process.nextTick(fn):

@@ -67,8 +67,17 @@ launch command grants it with a `--allow-*` flag.
 | `--env-file` | Load `.env` file variables into `process.env` (e.g. `--env-file=.env.production`) |
 | `--max-heap` | Set max JavaScript main heap size (e.g. `--max-heap=128MB`) |
 | `--worker-heap` | Set per-worker JavaScript heap size (e.g. `--worker-heap=32MB`, clamps to `--max-heap`) |
-| `--max-stack` | Set max JavaScript execution stack size (e.g. `--max-stack=1MB`, default 1 MB) |
+| `--max-stack` | Set max JavaScript execution stack size (e.g. `--max-stack=1MB`, default 1 MB, safe maximum: native stack / 2) |
 | `--cpu-budget` | Set maximum consecutive JS execution budget in milliseconds before interrupt (e.g. `--cpu-budget=1000`) |
+
+### Stack limit safety (`--max-stack`)
+
+QuickJS evaluates JavaScript call stack depth against the `--max-stack` limit, but each JS frame also consumes native C stack frames on the host thread. Setting a JS stack limit equal to or near the OS native stack reservation is pathological (quickjs-ng PR #1700): deep recursion hits OS guard pages (SIGSEGV `139` / SIGBUS `138`) before QuickJS can detect exhaustion and raise a `RangeError`.
+
+Fairyfly enforces that thread native stack >= 2 * JS stack:
+- **Startup threshold**: `--max-stack` is capped at half of the detected main thread native stack (e.g. at most 8 MB on macOS with a 16 MB native stack; 4 MB on Linux with an 8 MB `rlimit`). Values above this threshold fail at startup with an explanatory hint.
+- **Worker stack auto-scaling**: Worker threads automatically scale their native OS stack reservation to `max(8 MB, alignForward(2 * JS stack, pageSize))`. At an 8 MB JS limit, worker thread stacks grow to 16 MB.
+- **Memory trade-off**: Thread stack pages are committed on demand by the OS kernel. Under deep recursion, with 8 worker threads all recursing to an 8 MB limit, maximum committed stack RSS is ~74 MB.
 
 Flags are repeatable and comma-split. A bare flag grants the whole category:
 

@@ -14,7 +14,6 @@ const limits = @import("../util/limits.zig");
 const interrupt = @import("../engine/interrupt.zig");
 
 pub const MAX_WORKERS = 8;
-const WORKER_STACK = 8 * 1024 * 1024;
 const POLL_QUANTUM_MS: i32 = 5;
 
 // ── Parent-side state (main thread only — worker threads never touch this) ──
@@ -157,7 +156,7 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
     };
     wdata.* = .{ .slot = slot, .module_path = abs, .initial_payload = initial, .channel = ch.child };
 
-    slots[slot].thread = std.Thread.spawn(.{ .stack_size = WORKER_STACK }, workerMain, .{wdata}) catch {
+    slots[slot].thread = std.Thread.spawn(.{ .stack_size = limits.get().worker_stack_bytes }, workerMain, .{wdata}) catch {
         gpa.destroy(wdata);
         _ = qjs.throwInternalError(ctx, "Worker thread spawn failed");
         return qjs.JS_EXCEPTION;

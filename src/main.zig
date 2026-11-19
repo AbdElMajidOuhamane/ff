@@ -87,11 +87,33 @@ fn parseLimits(init: std.process.Init) void {
     limits.initFromArgs(init.minimal.args) catch |err| {
         switch (err) {
             error.InvalidHeapSize => cli.failWithHint("invalid --max-heap value", .{}, "heap limit must be between 8MB and 4GB (e.g. --max-heap=64MB)", .{}),
-            error.InvalidStackSize => cli.failWithHint("invalid --max-stack value", .{}, "stack limit must be between 128KB and 64MB (e.g. --max-stack=1MB)", .{}),
+            error.InvalidStackSize => cli.failWithHint("invalid --max-stack value", .{}, "stack limit must be at least 128KB (e.g. --max-stack=1MB)", .{}),
             error.InvalidWorkerHeapSize => cli.failWithHint("invalid --worker-heap value", .{}, "worker heap limit must be between 1MB and main heap size", .{}),
             error.InvalidCpuBudget => cli.failWithHint("invalid --cpu-budget value", .{}, "cpu budget must be between 0 and 3600000 ms", .{}),
             error.MissingEnvFilePath => cli.failWithHint("--env-file requires a path", .{}, "usage: ff --env-file <path>", .{}),
+            error.MissingStackSizeValue => cli.failWithHint("--max-stack requires a value", .{}, "usage: ff --max-stack <size> (e.g. --max-stack=1MB)", .{}),
             error.InvalidByteSize => cli.failWithHint("invalid byte size format", .{}, "use suffixes KB, MB, or GB (e.g. 64MB)", .{}),
+            error.NativeStackTooSmall => {
+                const lim = limits.get();
+                cli.failWithHint(
+                    "native stack is too small",
+                    .{},
+                    "detected native stack is {d} KB; fairyfly requires at least 256 KB",
+                    .{lim.native_stack_bytes / 1024},
+                );
+            },
+            error.StackSizeExceedsNative => {
+                const lim = limits.get();
+                cli.failWithHint(
+                    "--max-stack exceeds safe limit for native stack",
+                    .{},
+                    "detected native stack is {d} MB; safe limit is at most {d} MB (native/2)",
+                    .{
+                        lim.native_stack_bytes / (1024 * 1024),
+                        lim.stack_max_bytes / (1024 * 1024),
+                    },
+                );
+            },
         }
     };
 }

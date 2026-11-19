@@ -110,7 +110,7 @@ toggle.
 | `--deny-net` | explicitly block hosts/ports even when `--allow-net` is active | `host`, `host:port`, `*.domain` |
 | `--max-heap` | set max main JS heap (e.g. `--max-heap=128MB`) | bytes / suffix |
 | `--worker-heap` | set per-worker JS heap (e.g. `--worker-heap=32MB`) | bytes / suffix |
-| `--max-stack` | set max JS stack size (e.g. `--max-stack=1MB`) | bytes / suffix |
+| `--max-stack` | set max JS stack size (e.g. `--max-stack=1MB`, max: native / 2) | bytes / suffix |
 | `--cpu-budget` | interrupt script if loop runs beyond budget in ms (e.g. `--cpu-budget=1000`) | integer ms |
 | `--env-file` | load `.env` file variables into `process.env` | path |
 

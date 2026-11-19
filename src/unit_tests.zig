@@ -64,3 +64,7 @@ test {
 test {
     _ = @import("crypto/bcrypt_pool.zig");
 }
+
+test {
+    _ = @import("util/limits.zig");
+}

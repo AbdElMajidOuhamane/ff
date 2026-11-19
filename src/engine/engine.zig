@@ -197,6 +197,9 @@ pub const Runtime = struct {
         const lim = limits.get();
 
         const rt = qjs.newRuntime() orelse return error.InitFailed;
+        // Invariant (quickjs-ng PR #1700): thread native stack reservation is at
+        // least 2 * stack_bytes, ensuring QuickJS triggers RangeError before native
+        // stack exhaustion (SIGSEGV/SIGBUS).
         qjs.setMaxStackSize(rt, lim.stack_bytes);
         qjs.setMemoryLimit(rt, lim.heap_bytes);
         interrupt.registerRuntime(rt, 0, lim.cpu_budget_ms);
