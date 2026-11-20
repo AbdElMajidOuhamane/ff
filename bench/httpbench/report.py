@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,15 @@ GRID = "#22304a"
 FONT = "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
 MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
 
+# Latency curve: (axis label, field on the aggregated runtime item).
+CURVE = [
+    ("50th", "p50_ms"),
+    ("90th", "p90_ms"),
+    ("95th", "p95_ms"),
+    ("99th", "p99_ms"),
+    ("99.9th", "p99_9_ms"),
+]
+
 
 # ── formatting ────────────────────────────────────────────────────
 
@@ -46,7 +56,7 @@ def fmt_rps(value: float) -> str:
     return f"{value:.0f}"
 
 
-def fmt_ms(value: float) -> str:
+def fmt_ms(value: float | None) -> str:
     if value is None:
         return "—"
     if value >= 100:
@@ -56,7 +66,7 @@ def fmt_ms(value: float) -> str:
     return f"{value:.2f}"
 
 
-def fmt_mb(value: float) -> str:
+def fmt_mb(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{value:.0f}" if value >= 10 else f"{value:.1f}"
@@ -110,79 +120,180 @@ def _grid(x0: float, x1: float, y0: float, y1: float, ticks: int,
     return "".join(out)
 
 
+# ── charts ────────────────────────────────────────────────────────
+
+
 def bar_chart(rows, title: str, subtitle: str, unit: str,
-              width: int = 920, row_h: int = 52, label_fmt=fmt_rps) -> str:
-    """rows: [(runtime, value, low, high)]"""
-    height = 96 + row_h * len(rows)
-    left, right, top = 118, 132, 64
+              width: int = 920, row_h: int = 56, label_fmt=fmt_rps,
+              points: dict | None = None) -> str:
+    """rows: [(runtime, value, low, high)]; points: {runtime: [per-run values]}."""
+    height = 100 + row_h * len(rows)
+    left, right, top = 118, 150, 66
     plot_w = width - left - right
     peak = max((r[3] for r in rows if r[3]), default=1.0) or 1.0
     limit = peak * 1.08
     parts = [_svg_open(width, height, title)]
     parts.append(_text(24, 34, title, 18, TEXT, weight=600))
     parts.append(_text(24, 54, subtitle, 12, MUTED))
-    parts.append(_grid(left, left + plot_w, top, height - 38, 5, lambda t: limit * t,
+    parts.append(_grid(left, left + plot_w, top, height - 40, 5, lambda t: limit * t,
                        label_fmt))
     for i, (runtime, value, low, high) in enumerate(rows):
-        y = top + i * row_h + 8
-        bar_h = 24
+        y = top + i * row_h + 6
+        bar_h = 26
         w = max(2.0, (value / limit) * plot_w)
         lo_x = left + (low / limit) * plot_w
         hi_x = left + (high / limit) * plot_w
-        parts.append(_text(left - 12, y + 17, runtime, 13, TEXT, "end", weight=600))
+        color = color_for(runtime, i)
+        runs = (points or {}).get(runtime, [])
+        tip = f"{runtime}: median {label_fmt(value)} {unit}"
+        if runs:
+            tip += "; runs " + ", ".join(f"{label_fmt(v)}" for v in runs)
+        parts.append(_text(left - 12, y + 18, runtime, 13, TEXT, "end", weight=600))
         parts.append(
             f'<rect x="{left}" y="{y}" width="{w:.1f}" height="{bar_h}" rx="4" '
-            f'fill="{color_for(runtime, i)}" opacity="0.9"/>'
+            f'fill="{color}" opacity="0.88"><title>{esc(tip)}</title></rect>'
         )
         if high > low:
             cy = y + bar_h / 2
             parts.append(
                 f'<line x1="{lo_x:.1f}" y1="{cy:.1f}" x2="{hi_x:.1f}" y2="{cy:.1f}" '
-                f'stroke="{TEXT}" stroke-width="1.2" opacity="0.55"/>'
+                f'stroke="{TEXT}" stroke-width="1.1" opacity="0.45"/>'
             )
-            parts.append(f'<circle cx="{lo_x:.1f}" cy="{cy:.1f}" r="2.6" fill="{TEXT}" opacity="0.7"/>')
-            parts.append(f'<circle cx="{hi_x:.1f}" cy="{cy:.1f}" r="2.6" fill="{TEXT}" opacity="0.7"/>')
-        parts.append(_text(left + w + 10, y + 17, f"{label_fmt(value)} {unit}", 12, MUTED, family=MONO))
+        for j, run_value in enumerate(runs):
+            px = left + (run_value / limit) * plot_w
+            py = y + bar_h / 2 + ((j % 3) - 1) * 5.5
+            parts.append(
+                f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.2" fill="{CARD}" '
+                f'stroke="{TEXT}" stroke-width="1.5">'
+                f"<title>{esc(runtime)} run {j + 1}: {label_fmt(run_value)} {unit}</title>"
+                "</circle>"
+            )
+        parts.append(_text(left + w + 12, y + 18, f"{label_fmt(value)} {unit}", 12, MUTED,
+                           family=MONO))
     parts.append("</svg>")
     return "".join(parts)
 
 
-def grouped_latency_chart(rows, width: int = 920, height: int = 400) -> str:
-    """rows: [(runtime, p50, p95, p99)] — milliseconds."""
-    left, right, top, bottom = 64, 24, 84, 46
+def percentile_curve_chart(rows, width: int = 920, height: int = 430) -> str:
+    """rows: [(runtime, item)] — median latency by percentile."""
+    left, right, top, bottom = 72, 190, 96, 56
     plot_w = width - left - right
     plot_h = height - top - bottom
-    limit = max((r[3] for r in rows), default=1.0) * 1.12 or 1.0
-    series = [("p50", 0), ("p95", 1), ("p99", 2)]
-    series_colors = ["#5eead4", "#fbbf24", "#fb7185"]
+    y_max = max((it.get(field) or 0.0 for _, it in rows for _, field in CURVE),
+                default=1.0) * 1.12 or 1.0
     parts = [_svg_open(width, height, "Latency percentiles")]
-    parts.append(_text(24, 34, "Latency percentiles", 18, TEXT, weight=600))
-    parts.append(_text(24, 54, "milliseconds, lower is better; median of per-run medians", 12, MUTED))
-    for i, (name, _) in enumerate(series):
-        x = width - 300 + i * 92
-        parts.append(f'<rect x="{x}" y="28" width="11" height="11" rx="2" fill="{series_colors[i]}"/>')
-        parts.append(_text(x + 17, 38, name, 12, MUTED, family=MONO))
+    parts.append(_text(24, 34, "Latency by percentile", 18, TEXT, weight=600))
+    parts.append(_text(24, 54, "milliseconds; the tail (99th+) is where runtimes differ most",
+                       12, MUTED))
     ticks = 5
     for i in range(ticks + 1):
-        v = limit * i / ticks
-        y = top + plot_h - (v / limit) * plot_h
+        value = y_max * i / ticks
+        y = top + plot_h - (value / y_max) * plot_h
         parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" stroke="{GRID}"/>')
-        parts.append(_text(left - 10, y + 4, fmt_ms(v), 11, MUTED, "end", family=MONO))
-    group_w = plot_w / max(1, len(rows))
-    bar_w = min(48.0, group_w / 4.6)
-    for gi, (runtime, p50, p95, p99) in enumerate(rows):
-        gx = left + gi * group_w + group_w / 2
-        parts.append(_text(gx, height - 18, runtime, 13, TEXT, "middle", weight=600))
-        for si, (_, _) in enumerate(series):
-            value = (p50, p95, p99)[si]
-            h = max(2.0, (value / limit) * plot_h)
-            x = gx - (len(series) * bar_w) / 2 + si * bar_w
+        parts.append(_text(left - 10, y + 4, fmt_ms(value), 11, MUTED, "end", family=MONO))
+    for i, (label, _) in enumerate(CURVE):
+        x = left + (plot_w * i / (len(CURVE) - 1))
+        parts.append(_text(x, top + plot_h + 22, label, 11, MUTED, "middle", family=MONO))
+    parts.append(_text(left + plot_w / 2, height - 14, "percentile", 12, MUTED, "middle"))
+    for idx, (runtime, item) in enumerate(rows):
+        values = [item.get(field) or 0.0 for _, field in CURVE]
+        color = color_for(runtime, idx)
+        pts = []
+        for i, value in enumerate(values):
+            x = left + (plot_w * i / (len(CURVE) - 1))
+            y = top + plot_h - (value / y_max) * plot_h
+            pts.append(f"{x:.1f},{y:.1f}")
+        parts.append(
+            f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" '
+            f'stroke-width="2.4" stroke-linejoin="round" opacity="0.95"/>'
+        )
+        for i, value in enumerate(values):
+            x = left + (plot_w * i / (len(CURVE) - 1))
+            y = top + plot_h - (value / y_max) * plot_h
             parts.append(
-                f'<rect x="{x:.1f}" y="{top + plot_h - h:.1f}" width="{bar_w - 4:.1f}" '
-                f'height="{h:.1f}" rx="3" fill="{series_colors[si]}" opacity="0.9"/>'
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4.2" fill="{CARD}" '
+                f'stroke="{color}" stroke-width="2.2">'
+                f"<title>{esc(runtime)} {CURVE[i][0]}: {fmt_ms(value)} ms</title></circle>"
             )
-            parts.append(_text(x + (bar_w - 4) / 2, top + plot_h - h - 6, fmt_ms(value),
-                               10, MUTED, "middle", family=MONO))
+        parts.append(_text(left + plot_w + 16, top + 4 + idx * 22, runtime, 13, color,
+                           weight=700))
+        parts.append(_text(left + plot_w + 16, top + 18 + idx * 22,
+                           f"p50 {fmt_ms(values[0])} · p99 {fmt_ms(values[3])} ms",
+                           11, MUTED, family=MONO))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def histogram_chart(rows, width: int = 920, height: int = 430) -> str:
+    """rows: [(runtime, item)] — oha response-time histogram, % of requests.
+
+    oha buckets are upper bounds in seconds; keys are converted to ms.
+    Counts across all runs are summed and normalized per runtime.
+    """
+    datasets = []
+    for runtime, item in rows:
+        agg: dict[float, int] = {}
+        for run in item.get("runs") or []:
+            for bucket_ms, count in run.get("histogram") or []:
+                key = round(float(bucket_ms), 4)
+                agg[key] = agg.get(key, 0) + int(count)
+        total = sum(agg.values())
+        if not agg or total == 0:
+            continue
+        datasets.append((runtime, item, sorted(agg.items()), total))
+    if not datasets:
+        return ""
+
+    x_max = max(dataset[2][-1][0] for dataset in datasets) or 1.0
+    y_max = max(100.0 * count / total for _, _, buckets, total in datasets
+                for _, count in buckets) or 1.0
+    y_max *= 1.08
+    gap = 14
+    panel_w = (width - 48 - gap * (len(datasets) - 1)) / len(datasets)
+    top, bottom = 96, 52
+    plot_h = height - top - bottom
+
+    parts = [_svg_open(width, height, "Latency distribution")]
+    parts.append(_text(24, 34, "Where the requests landed", 18, TEXT, weight=600))
+    parts.append(_text(24, 54,
+                       "oha response-time histogram · % of requests per bucket "
+                       "· oha bucket upper bounds", 12, MUTED))
+    for panel, (runtime, item, buckets, total) in enumerate(datasets):
+        px = 24 + panel * (panel_w + gap)
+        color = color_for(runtime, panel)
+        parts.append(_text(px, top - 30, runtime, 15, color, weight=700))
+        parts.append(_text(px, top - 12,
+                           f"p50 {fmt_ms(item['p50_ms'])} · p99 {fmt_ms(item['p99_ms'])} ms",
+                           11, MUTED, family=MONO))
+        parts.append(
+            f'<rect x="{px:.1f}" y="{top}" width="{panel_w:.1f}" height="{plot_h}" '
+            f'fill="{BG}" stroke="{GRID}" rx="6"/>'
+        )
+        prev = 0.0
+        for bucket_ms, count in buckets:
+            pct = 100.0 * count / total
+            x0 = px + (prev / x_max) * panel_w
+            x1 = px + (bucket_ms / x_max) * panel_w
+            h = (pct / y_max) * plot_h
+            if x1 - x0 >= 1 and h > 0:
+                parts.append(
+                    f'<rect x="{x0 + 0.5:.1f}" y="{top + plot_h - h:.1f}" '
+                    f'width="{max(1.0, x1 - x0 - 1):.1f}" height="{h:.1f}" fill="{color}" '
+                    f'opacity="0.65"><title>≤ {fmt_ms(bucket_ms)} ms: {pct:.1f}%</title></rect>'
+                )
+            prev = bucket_ms
+        for marker in (item["p50_ms"], item["p99_ms"]):
+            mx = px + (marker / x_max) * panel_w
+            parts.append(
+                f'<line x1="{mx:.1f}" y1="{top}" x2="{mx:.1f}" y2="{top + plot_h}" '
+                f'stroke="{TEXT}" stroke-width="1" stroke-dasharray="3 3" opacity="0.35"/>'
+            )
+        parts.append(_text(px, top + plot_h + 20, "0", 10, MUTED, "middle", family=MONO))
+        parts.append(_text(px + panel_w / 2, top + plot_h + 20, fmt_ms(x_max / 2), 10, MUTED,
+                           "middle", family=MONO))
+        parts.append(_text(px + panel_w, top + plot_h + 20, fmt_ms(x_max) + " ms", 10, MUTED,
+                           "middle", family=MONO))
+    parts.append(_text(24, height - 14, "dashed lines: p50 (left) and p99 (right)", 11, MUTED))
     parts.append("</svg>")
     return "".join(parts)
 
@@ -216,7 +327,10 @@ def scatter_chart(rows, width: int = 920, height: int = 400) -> str:
         y = top + plot_h - (p99 / y_max) * plot_h
         color = color_for(runtime, i)
         parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="16" fill="{color}" opacity="0.15"/>')
-        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" fill="{color}"/>')
+        parts.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" fill="{color}">'
+            f"<title>{esc(runtime)}: {fmt_rps(rps)} req/s, p99 {fmt_ms(p99)} ms</title></circle>"
+        )
         # Points cluster on a hello-world workload; alternate above/below and
         # flip the anchor near the right edge so labels never overprint.
         anchor = "end" if x > width - 280 else "start"
@@ -236,14 +350,26 @@ def load(results_dir: Path) -> dict:
     raw = results_dir / "raw.json"
     if not raw.exists():
         raise SystemExit(f"no results at {raw}; run bench.py first")
-    return json.loads(raw.read_text())
+    data = json.loads(raw.read_text())
+    # Backfill fields from oha_runN.json when raw.json was produced by an older schema
+    from bench import parse_oha
+    for runtime, item in (data.get("runtimes") or {}).items():
+        if "p90_ms" not in item or "p99_9_ms" not in item or not any(r.get("histogram") for r in item.get("runs") or []):
+            rt_dir = results_dir / runtime
+            run_files = sorted(rt_dir.glob("oha_run*.json"))
+            if run_files:
+                runs = [parse_oha(f) for f in run_files]
+                item["runs"] = runs
+                item.setdefault("p90_ms", statistics.median(r["p90_ms"] for r in runs))
+                item.setdefault("p99_9_ms", statistics.median(r["p99_9_ms"] for r in runs))
+    return data
 
 
 def write_csv(data: dict, path: Path) -> None:
     fields = [
-        "runtime", "rps_median", "rps_min", "rps_max", "p50_ms", "p95_ms",
-        "p99_ms", "rss_peak_mb", "hf_mean_s", "hf_stddev_s", "hf_rps",
-        "success_pct", "errors",
+        "runtime", "requests_per_run", "rps_median", "rps_min", "rps_max",
+        "p50_ms", "p90_ms", "p95_ms", "p99_ms", "p99_9_ms", "rss_peak_mb",
+        "hf_mean_s", "hf_stddev_s", "hf_rps", "success_pct", "errors",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
@@ -252,12 +378,15 @@ def write_csv(data: dict, path: Path) -> None:
             hf = item.get("hyperfine") or {}
             writer.writerow([
                 runtime,
+                item.get("requests_per_run", ""),
                 f"{item['rps_median']:.2f}",
                 f"{item['rps_min']:.2f}",
                 f"{item['rps_max']:.2f}",
                 f"{item['p50_ms']:.4f}",
+                "" if item.get("p90_ms") is None else f"{item['p90_ms']:.4f}",
                 f"{item['p95_ms']:.4f}",
                 f"{item['p99_ms']:.4f}",
+                "" if item.get("p99_9_ms") is None else f"{item['p99_9_ms']:.4f}",
                 "" if item.get("rss_peak_mb") is None else f"{item['rss_peak_mb']:.2f}",
                 f"{hf['mean_s']:.4f}" if hf else "",
                 f"{hf['stddev_s']:.4f}" if hf else "",
@@ -269,25 +398,34 @@ def write_csv(data: dict, path: Path) -> None:
 
 def write_markdown(data: dict, path: Path) -> None:
     meta = data["meta"]
+    load = (
+        f"{meta['requests']:,} requests per run"
+        if meta.get("requests")
+        else f"{meta['duration_s']}s per run"
+    )
     lines = [
         "# HTTP benchmark — ff vs Deno vs Bun",
         "",
         f"- Date: {meta['started_at']}",
         f"- Host: {meta['host']} ({meta['os']}, {meta['cpu_count']} CPUs)",
-        f"- Client: oha {meta['oha_version']}, hyperfine {meta['hyperfine_version']}",
+        f"- Client: oha {meta['oha_version']}"
+        + (f", hyperfine {meta['hyperfine_version']}"
+           if meta.get("hyperfine_enabled") else ""),
         f"- Load: keep-alive HTTP/1.1, {meta['connections']} connections, "
-        f"{meta['duration_s']}s per run, {plural(meta['runs'], 'run')} (median)",
+        f"{load}, median of {plural(meta['runs'], 'run')}",
         f"- Workload: `{meta['workload']}` on `{meta['path']}`",
+        *([f"- ff args: `{meta['ff_args']}`"] if meta.get("ff_args") else []),
         "",
-        "| runtime | req/s (median) | min–max | p50 ms | p95 ms | p99 ms | peak RSS | success |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| runtime | req/s (median) | min–max | p50 ms | p95 ms | p99 ms | p99.9 ms | peak RSS | success |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for runtime, item in data["runtimes"].items():
         lines.append(
             f"| **{runtime}** | {fmt_rps(item['rps_median'])} | "
             f"{fmt_rps(item['rps_min'])}–{fmt_rps(item['rps_max'])} | "
-            f"{fmt_ms(item['p50_ms'])} | {fmt_ms(item['p95_ms'])} | "
-            f"{fmt_ms(item['p99_ms'])} | {fmt_mb(item.get('rss_peak_mb'))} MB | "
+            f"{fmt_ms(item.get('p50_ms'))} | {fmt_ms(item.get('p95_ms'))} | "
+            f"{fmt_ms(item.get('p99_ms'))} | {fmt_ms(item.get('p99_9_ms'))} | "
+            f"{fmt_mb(item.get('rss_peak_mb'))} MB | "
             f"{item.get('success_pct', 0):.2f}% |"
         )
     lines += [
@@ -302,18 +440,21 @@ def write_markdown(data: dict, path: Path) -> None:
 def render(data: dict, results_dir: Path) -> Path:
     runtimes = list(data["runtimes"].items())
     meta = data["meta"]
+    has_hf = any(item.get("hyperfine") for _, item in runtimes)
     charts_dir = results_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
 
+    points = {rt: [run["rps"] for run in it.get("runs") or []] for rt, it in runtimes}
     throughput = bar_chart(
         [(rt, it["rps_median"], it["rps_min"], it["rps_max"]) for rt, it in runtimes],
         "Throughput",
-        f"median requests/second over {plural(meta['runs'], 'run')} · whiskers = min–max",
+        f"median requests/second over {plural(meta['runs'], 'run')} · "
+        "dots = individual runs · whiskers = min–max",
         "req/s",
+        points=points,
     )
-    latency = grouped_latency_chart(
-        [(rt, it["p50_ms"], it["p95_ms"], it["p99_ms"]) for rt, it in runtimes]
-    )
+    percentiles = percentile_curve_chart(runtimes)
+    histogram = histogram_chart(runtimes)
     scatter = scatter_chart([(rt, it["rps_median"], it["p99_ms"]) for rt, it in runtimes])
     rss_rows = [
         (rt, it["rss_peak_mb"], it["rss_peak_mb"], it["rss_peak_mb"])
@@ -329,43 +470,45 @@ def render(data: dict, results_dir: Path) -> Path:
     ) if rss_rows else ""
     files = {
         "throughput.svg": throughput,
-        "latency.svg": latency,
+        "percentiles.svg": percentiles,
+        "histogram.svg": histogram,
         "scatter.svg": scatter,
         "rss.svg": rss,
     }
     for name, body in files.items():
-        (charts_dir / name).write_text(body)
+        if body:
+            (charts_dir / name).write_text(body)
 
     best_rps = max(runtimes, key=lambda kv: kv[1]["rps_median"])[0]
     best_tail = min(runtimes, key=lambda kv: kv[1]["p99_ms"])[0]
     rss_candidates = [(rt, it) for rt, it in runtimes if it.get("rss_peak_mb") is not None]
     if rss_candidates:
         best_rss, best_rss_item = min(rss_candidates, key=lambda kv: kv[1]["rss_peak_mb"])
-        best_rss_value = fmt_mb(best_rss_item["rss_peak_mb"])
         best_rss_note = f"{fmt_mb(best_rss_item['rss_peak_mb'])} MB peak"
     else:
-        best_rss, best_rss_value, best_rss_note = "—", "—", "not measurable on this host"
+        best_rss, best_rss_note = "—", "not measurable on this host"
 
     table_rows = []
     for runtime, item in runtimes:
         hf = item.get("hyperfine") or {}
-        hf_cell = (
-            f"{hf['mean_s']:.2f} ± {hf['stddev_s']:.2f} s" if hf else "—"
-        )
+        hf_cell = f"<td class='num muted'>{hf['mean_s']:.2f} ± {hf['stddev_s']:.2f} s</td>" if hf else ""
         table_rows.append(
             "<tr>"
             f'<td><span class="dot" style="background:{color_for(runtime, 0)}"></span>'
             f"<strong>{esc(runtime)}</strong></td>"
             f"<td class='num'>{fmt_rps(item['rps_median'])}</td>"
             f"<td class='num muted'>{fmt_rps(item['rps_min'])}–{fmt_rps(item['rps_max'])}</td>"
-            f"<td class='num'>{fmt_ms(item['p50_ms'])}</td>"
-            f"<td class='num'>{fmt_ms(item['p95_ms'])}</td>"
-            f"<td class='num'>{fmt_ms(item['p99_ms'])}</td>"
+            f"<td class='num'>{fmt_ms(item.get('p50_ms'))}</td>"
+            f"<td class='num'>{fmt_ms(item.get('p90_ms'))}</td>"
+            f"<td class='num'>{fmt_ms(item.get('p95_ms'))}</td>"
+            f"<td class='num'>{fmt_ms(item.get('p99_ms'))}</td>"
+            f"<td class='num'>{fmt_ms(item.get('p99_9_ms'))}</td>"
             f"<td class='num'>{fmt_mb(item.get('rss_peak_mb'))} MB</td>"
             f"<td class='num'>{item.get('success_pct', 0):.2f}%</td>"
-            f"<td class='num muted'>{hf_cell}</td>"
+            f"{hf_cell}"
             "</tr>"
         )
+    hf_header = "<th>hyperfine</th>" if has_hf else ""
 
     success_warning = ""
     for runtime, item in runtimes:
@@ -377,7 +520,24 @@ def render(data: dict, results_dir: Path) -> Path:
             )
             break
 
+    if meta.get("requests"):
+        load_text = f"{meta['requests']:,} requests × {meta['runs']} runs"
+        oha_load = f"oha -c {meta['connections']} -n {meta['requests']:,}"
+    else:
+        load_text = f"{meta['duration_s']}s × {meta['runs']} runs"
+        oha_load = f"oha -c {meta['connections']} -z {meta['duration_s']}s"
+
+    histogram_card = f'<div class="cards">{histogram}</div>' if histogram else ""
     rss_card = f'<div class="cards">{rss}</div>' if rss else ""
+    hf_method = (
+        f"""<li><code>hyperfine --runs {meta['hf_runs']}</code> times the same oha
+        client as an independent wall-clock check; its mean ± σ are shown
+        separately. This includes client startup, so its absolute rate is
+        lower than oha&rsquo;s on short runs.</li>"""
+        if has_hf else ""
+    )
+    client_text = "oha and hyperfine" if has_hf else "oha"
+
     doc = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -393,15 +553,18 @@ body {{ margin: 0; background: {BG}; color: {TEXT}; font-family: {FONT};
 h1 {{ font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }}
 .sub {{ color: {MUTED}; margin: 0 0 24px; font-size: 14px; }}
 .meta {{ display: flex; flex-wrap: wrap; gap: 8px 18px; color: {MUTED};
-         font-size: 12.5px; margin-bottom: 28px; font-family: {MONO}; }}
+         font-size: 12.5px; margin-bottom: 22px; font-family: {MONO}; }}
 .kpis {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
-         margin-bottom: 22px; }}
+         margin-bottom: 18px; }}
 .kpi {{ background: {CARD}; border: 1px solid {GRID}; border-radius: 12px;
         padding: 14px 16px; }}
 .kpi .label {{ color: {MUTED}; font-size: 12px; text-transform: uppercase;
                letter-spacing: .08em; }}
 .kpi .value {{ font-size: 22px; font-weight: 700; margin-top: 2px; }}
 .kpi .note {{ color: {MUTED}; font-size: 12px; }}
+.how {{ background: #0e1a2e; border: 1px solid #1e3a5f; border-radius: 10px;
+        padding: 12px 16px; margin: 0 0 8px; color: #cbd5e1; font-size: 13px; }}
+.how strong {{ color: {TEXT}; }}
 .cards {{ display: grid; gap: 16px; margin: 22px 0; }}
 .card {{ background: {CARD}; border: 1px solid {GRID}; border-radius: 14px;
          padding: 10px; overflow-x: auto; }}
@@ -430,17 +593,18 @@ footer {{ margin-top: 34px; color: {MUTED}; font-size: 12px; }}
 <body>
 <div class="wrap">
   <h1>ff · Deno · Bun — HTTP benchmark</h1>
-  <p class="sub">Same hello-JSON handler on every runtime, driven by oha and
-  hyperfine over loopback keep-alive.</p>
+  <p class="sub">Same hello-JSON handler on every runtime, driven by
+  {client_text} over loopback keep-alive.</p>
   <div class="meta">
     <span>{esc(meta['started_at'])}</span>
     <span>{esc(meta['host'])}</span>
     <span>{esc(meta['os'])}</span>
     <span>{meta['cpu_count']} CPUs</span>
     <span>{meta['connections']} conns</span>
-    <span>{meta['duration_s']}s × {meta['runs']}</span>
+    <span>{load_text}</span>
     <span>oha {esc(meta['oha_version'])}</span>
     <span>hyperfine {esc(meta['hyperfine_version'])}</span>
+    {f"<span>ff {esc(meta['ff_args'])}</span>" if meta.get("ff_args") else ""}
   </div>
 
   <div class="kpis">
@@ -455,18 +619,25 @@ footer {{ margin-top: 34px; color: {MUTED}; font-size: 12px; }}
       <div class="note">{best_rss_note}</div></div>
   </div>
 
+  <div class="how"><strong>How to read:</strong> bars are medians, dots are the
+  individual runs; the percentile curve shows where the tail moves; the
+  distribution panels show the shape of every response; the scatter trades
+  throughput against p99. Hover any element for exact numbers.</div>
+
   {success_warning}
 
   <div class="cards">{throughput}</div>
-  <div class="cards">{latency}</div>
+  <div class="cards">{percentiles}</div>
+  {histogram_card}
   <div class="cards">{scatter}</div>
   {rss_card}
 
   <h2>Raw numbers</h2>
   <table>
     <thead><tr>
-      <th>runtime</th><th>req/s</th><th>min–max</th><th>p50</th><th>p95</th>
-      <th>p99</th><th>peak RSS</th><th>success</th><th>hyperfine mean ± σ</th>
+      <th>runtime</th><th>req/s</th><th>min–max</th><th>p50</th><th>p90</th>
+      <th>p95</th><th>p99</th><th>p99.9</th><th>peak RSS</th><th>success</th>
+      {hf_header}
     </tr></thead>
     <tbody>{''.join(table_rows)}</tbody>
   </table>
@@ -476,19 +647,14 @@ footer {{ margin-top: 34px; color: {MUTED}; font-size: 12px; }}
     <li>Each server is started alone, its port polled until a correct
         <code>200</code> with the expected body arrives, then warmed for
         {meta['warmup_s']}s.</li>
-    <li><code>oha -c {meta['connections']} -z {meta['duration_s']}s</code>
-        runs {meta['runs']} times; the table reports the median of the per-run
-        metrics, plus the min–max range.</li>
-    <li><code>hyperfine --runs {meta['hf_runs']}</code> times the same oha
-        client at a fixed {meta['hf_requests']} requests as an independent
-        wall-clock check; its mean ± σ are shown separately. This includes
-        client startup, so its absolute rate is lower than oha&rsquo;s on short
-        runs; with <code>--skip-hyperfine</code> the cell reads &mdash;.</li>
+    <li><code>{oha_load}</code> runs {meta['runs']} times; the table reports the
+        median of the per-run metrics, plus the min–max range.</li>
+    {hf_method}
     <li>RSS is sampled every 100&nbsp;ms for the server process; the peak is
         reported.</li>
     <li>Latencies are milliseconds. <code>p50/p95/p99</code> come from oha&rsquo;s
-        <code>metrics.latency_ms</code>; older oha builds report seconds in
-        <code>latencyPercentiles</code>, which this report normalizes.</li>
+        <code>metrics.latency_ms</code>; the distribution chart uses oha&rsquo;s
+        response-time histogram, normalized to % of requests.</li>
   </ol>
   <p class="muted">Interpretation: loopback benchmarks measure CPU efficiency
   and HTTP stack overhead, not network throughput. A fast JIT can win a

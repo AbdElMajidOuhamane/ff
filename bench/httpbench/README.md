@@ -76,6 +76,7 @@ so single-run noise is visible rather than hidden.
 | `--runtimes` | `ff,deno,bun` | comma-separated subset |
 | `--connections` | `100` | oha `-c` keep-alive connections |
 | `--duration` | `5` | seconds per oha run |
+| `--requests` | `0` | fixed requests per oha run (`-n`), overrides `--duration` |
 | `--runs` | `3` | oha runs per runtime (median reported) |
 | `--warmup` | `2` | warmup seconds per runtime |
 | `--hf-runs` | `3` | hyperfine timed runs |
@@ -85,6 +86,7 @@ so single-run noise is visible rather than hidden.
 | `--port` | `8787` | loopback port (must be free) |
 | `--path` | `/` | request path |
 | `--ff-bin` | `zig-out/bin/ff` | ff binary |
+| `--ff-args` | none | extra ff flags, e.g. `--ff-args='--max-heap=256MB'` |
 | `--build` | off | run `zig build -Doptimize=ReleaseFast` first |
 | `--skip-hyperfine` | off | oha only |
 | `--quick` | off | `1s × 1 run`, 20k hyperfine requests |
@@ -99,7 +101,8 @@ bench/httpbench/results/
 ├── raw.json               ← everything the report is rendered from
 ├── charts/
 │   ├── throughput.svg     ← median req/s, whiskers = min–max
-│   ├── latency.svg        ← p50 / p95 / p99 grouped bars
+│   ├── percentiles.svg    ← p50 / p90 / p95 / p99 / p99.9 curve
+│   ├── histogram.svg      ← response-time distribution per runtime
 │   ├── scatter.svg        ← throughput vs p99
 │   └── rss.svg            ← peak RSS
 └── <runtime>/
@@ -115,6 +118,43 @@ Regenerate the report from existing data without re-running anything:
 ```sh
 python3 bench/httpbench/report.py bench/httpbench/results
 ```
+
+## ff CLI flags: what actually helps
+
+The harness passes only the permissions ff needs (`--allow-net`, `--allow-env`);
+no performance flag is set, because none measured faster. On this host
+(8 CPUs, 100 keep-alive connections, 5 s runs), an interleaved ABBA A/B of the
+two most plausible knobs gave:
+
+| ff flags | median req/s |
+|---|---:|
+| default (`--max-heap=64MB`, `--cpu-budget=0`) | 89.8k |
+| `--max-heap=1GB` | 89.7k |
+
+Across a second interleaved block, default / `--max-heap=8MB` /
+`--max-heap=1GB` / `--cpu-budget=3600000` all landed between 86.5k and 92.1k —
+the spread between repeated runs is larger than any flag effect. Defaults are
+already the fast path:
+
+- `--cpu-budget=0` (default) leaves the interrupt monitor thread and the
+  QuickJS interrupt handler **off**. Enabling a budget adds work; it is a
+  safety valve for runaway scripts, not a throughput knob.
+- `--max-heap` only caps the JS heap (and the GC trigger ceiling). Hello-world
+  does not need more than the 64 MB default, and raising it did not help.
+- The real levers are **build-time**: `-Doptimize=ReleaseFast` (what `make
+  build` and this harness expect) and, on Linux, the io_uring backend
+  (`-Dio_uring`, default true; `-Dio_uring=false` selects epoll). macOS only
+  has kqueue.
+
+Use `--ff-args` to reproduce an A/B yourself:
+
+```sh
+./bench/httpbench/run.sh --runtimes ff --skip-hyperfine --runs 5 \
+    --ff-args='--max-heap=256MB'
+```
+
+Flag effects smaller than ~5% are not resolvable on a laptop; alternate the
+variants between rounds (as the A/B above did) instead of running one block.
 
 ## Reading the numbers
 

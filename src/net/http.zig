@@ -236,6 +236,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
             // routes table passed as second argument
             http_native.handler_fn = c.dupValue(ctx, handler_val);
             http_native.handler_ctx = ctx;
+            http_native.handler_arity = 5;
         } else {
             throwTypeError(ctx, "handler must be a function or routes object");
             return c.JS_EXCEPTION;
@@ -243,6 +244,25 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
     } else {
         http_native.handler_fn = c.dupValue(ctx, handler_val);
         http_native.handler_ctx = ctx;
+        const len_val = c.getPropertyStr(ctx, handler_val, "length");
+        defer c.freeValue(ctx, len_val);
+        var arity: i32 = 4;
+        if (c.toInt32(ctx, &arity, len_val) == 0 and arity >= 0 and arity <= 4) {
+            // Only use reduced arity when the function doesn't reference `arguments` or `...rest`
+            const str_val = c.toString(ctx, handler_val);
+            defer c.freeValue(ctx, str_val);
+            var slen: usize = 0;
+            if (c.toCStringLen(ctx, &slen, str_val)) |cstr| {
+                defer c.freeCString(ctx, cstr);
+                const src = cstr[0..slen];
+                if (std.mem.indexOf(u8, src, "arguments") != null or std.mem.indexOf(u8, src, "...") != null) {
+                    arity = 4;
+                }
+            }
+            http_native.handler_arity = @intCast(arity);
+        } else {
+            http_native.handler_arity = 4;
+        }
     }
 
     // TLS must be fully configured before the listener starts accepting.

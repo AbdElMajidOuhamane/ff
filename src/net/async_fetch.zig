@@ -700,7 +700,8 @@ fn runJob(slot_id: u16) void {
         defer if (!resp_kept) response_mod.releaseData(resp_data);
         // F1: take ownership of the slot's parsed headers directly — no
         // create+release of a throwaway HeadersData per fetch.
-        resp_data.* = response_mod.ResponseData.initWithHeaders(headers[s].?);
+        const retained_pool = resp_data.pool;
+        resp_data.* = response_mod.ResponseData.initWithHeadersAndPool(headers[s].?, retained_pool);
         headers[s] = null;
         // BUG-2 FIX: the adopted container still holds the REQUEST headers
         // from fetch.zig's in_flight pool. Reset it in place BEFORE the

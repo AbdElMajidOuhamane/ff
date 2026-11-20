@@ -226,6 +226,7 @@ pub var server_running = std.atomic.Value(bool).init(false);
 pub var bound_port: u16 = 0;
 pub var handler_fn: ?c.Value = null;
 pub var handler_ctx: ?*c.Context = null;
+pub var handler_arity: u8 = 4;
 pub var ws_enabled: bool = false;
 pub var ws_on_open: ?c.Value = null;
 pub var ws_on_message: ?c.Value = null;
@@ -799,6 +800,20 @@ fn finishReqSpill(id: usize, l: *xev.Loop) void {
     const body = buf[hdr_end..total];
     if (native_echo) {
         buildResponse(id, 200, "{\"message\":\"ok\"}");
+    } else if (handler_arity < 4) {
+        validateHeadersOnly(buf[0..hdr_end]) catch |err| switch (err) {
+            error.HeadersTooLarge => {
+                resetReqSpill(id);
+                rejectWith(id, l, 431, "Request Header Fields Too Large");
+                return;
+            },
+            error.InvalidHeader => {
+                resetReqSpill(id);
+                rejectWith(id, l, 400, "Bad Request");
+                return;
+            },
+        };
+        callHandlerWithHeaders(id, &pr, body, null);
     } else {
         const hdrs = parseHeaders(buf[0..hdr_end]) catch |err| switch (err) {
             error.HeadersTooLarge => {
@@ -883,6 +898,32 @@ pub fn armWrite(id: usize, l: *xev.Loop) void {
         states[id] = .writing;
         fds[id].write(l, &write_comps[id], .{ .slice = out }, u16, &slot_ids[id], writeCb);
         return;
+    }
+    if (xev.backend != .io_uring and !cflags[id].h2_active and !cflags[id].ws_open and conn_stream[id] == null and body_lens[id] == 0) {
+        const rem_slice = write_bufs[id][write_offsets[id]..write_lens[id]];
+        if (rem_slice.len > 0) {
+            const rc = std.c.write(fds[id].fd, rem_slice.ptr, rem_slice.len);
+            if (rc > 0) {
+                const n: usize = @intCast(rc);
+                write_offsets[id] += n;
+                if (write_offsets[id] >= write_lens[id]) {
+                    write_offsets[id] = 0;
+                    if (cflags[id].keep_alive) {
+                        write_lens[id] = 0;
+                        keepAliveRearm(id, l);
+                    } else {
+                        closeConn(id);
+                    }
+                    return;
+                }
+            } else {
+                const err = std.posix.errno(rc);
+                if (err != .AGAIN and err != .INTR) {
+                    closeConn(id);
+                    return;
+                }
+            }
+        }
     }
     states[id] = .writing;
     fds[id].write(l, &write_comps[id], .{ .slice = write_bufs[id][write_offsets[id]..write_lens[id]] }, u16, &slot_ids[id], writeCb);
@@ -1746,6 +1787,35 @@ pub fn h2StreamReady(id: usize, stream_id: i32) void {
 
 pub const MAX_REQ_HEADER_BYTES: usize = 64 * 1024;
 
+fn validateHeadersOnly(raw: []const u8) !void {
+    var total_bytes: usize = 0;
+    if (raw.len >= 10) {
+        const first_nl = std.mem.indexOfScalar(u8, raw, '\n') orelse raw.len;
+        var i: usize = if (first_nl < raw.len) first_nl + 1 else raw.len;
+        while (i < raw.len) {
+            const line_start = i;
+            while (i < raw.len and raw[i] != '\r' and raw[i] != '\n') i += 1;
+            const line = raw[line_start..i];
+            if (line.len == 0) break;
+            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+                const raw_name = line[0..colon];
+                const name = std.mem.trimEnd(u8, raw_name, " \t");
+                const val = trimOws(line[colon + 1 ..]);
+                if (name.len > 0) {
+                    total_bytes += name.len + val.len;
+                    if (total_bytes > MAX_REQ_HEADER_BYTES) {
+                        return error.HeadersTooLarge;
+                    }
+                    if (!headers_mod.validHeaderPair(name, val)) {
+                        return error.InvalidHeader;
+                    }
+                }
+            }
+            while (i < raw.len and (raw[i] == '\r' or raw[i] == '\n')) i += 1;
+        }
+    }
+}
+
 fn parseHeaders(raw: []const u8) !*headers_mod.HeadersData {
     const data = headers_mod.acquire() orelse return error.OutOfMemory;
     errdefer data.release();
@@ -1832,18 +1902,65 @@ pub fn callHandlerWithHeaders(id: usize, parsed: *const ParsedRequest, body: []c
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
 
+    // Fast path: 0-arity function handler `() => ...` needs no JS string/Headers allocations
+    if (handler_arity == 0 and hdrs == null) {
+        interrupt.enterJsAuto(0);
+        var result = c.call(ctx, handler, global, 0, null);
+        interrupt.leaveJsAuto(0);
+        defer c.freeValue(ctx, result);
+
+        if (c.isException(result) != 0) {
+            const exc = c.getException(ctx);
+            printException(ctx, exc);
+            c.freeValue(ctx, exc);
+            buildResponse(id, 500, "Internal Server Error");
+            return;
+        }
+
+        if (promise_class_id != 0 and c.isObject(result) != 0 and
+            c.getClassID(result) == promise_class_id)
+        {
+            const ps = c.promiseState(ctx, result);
+            if (ps == 0) {
+                if (parkHandler(id, ctx, result)) return;
+                buildResponse(id, 500, "Internal Server Error");
+                return;
+            }
+            if (ps == 2) {
+                const pr = c.promiseResult(ctx, result);
+                c.freeValue(ctx, result);
+                result = pr;
+                printException(ctx, pr);
+                buildResponse(id, 500, "Internal Server Error");
+                return;
+            }
+            const pr = c.promiseResult(ctx, result);
+            c.freeValue(ctx, result);
+            result = pr;
+        }
+
+        stageHandlerResponse(id, result);
+        return;
+    }
+
     const url_val = c.newStringLen(ctx, parsed.url.ptr, @intCast(parsed.url.len));
-    const method_val = c.newStringLen(ctx, parsed.method.ptr, @intCast(parsed.method.len));
-    const body_val = if (body.len > 0)
-        c.newStringLen(ctx, body.ptr, @intCast(body.len))
+    const method_val = if (handler_arity >= 2)
+        c.newStringLen(ctx, parsed.method.ptr, @intCast(parsed.method.len))
     else
-        c.newStringLen(ctx, "", 0);
+        c.JS_UNDEFINED;
+    const body_val = if (handler_arity >= 3)
+        (if (body.len > 0)
+            c.newStringLen(ctx, body.ptr, @intCast(body.len))
+        else
+            c.newStringLen(ctx, "", 0))
+    else
+        c.JS_UNDEFINED;
     const hdrs_val = if (hdrs) |h|
         headers_mod.createJSObject(ctx, h)
-    else blk: {
+    else if (handler_arity >= 4) blk: {
         const empty_h = headers_mod.acquire() orelse break :blk c.JS_UNDEFINED;
         break :blk headers_mod.createJSObject(ctx, empty_h);
-    };
+    } else c.JS_UNDEFINED;
     defer c.freeValue(ctx, url_val);
     defer c.freeValue(ctx, method_val);
     defer c.freeValue(ctx, body_val);
@@ -1946,9 +2063,9 @@ pub fn callHandlerWithHeaders(id: usize, parsed: *const ParsedRequest, body: []c
         if (params_val) |pv| pv else c.JS_UNDEFINED,
     };
     const argc: c_int = if (params_val != null) 5 else 4;
-    interrupt.enterJs(0, interrupt.monotonicNowMs());
+    interrupt.enterJsAuto(0);
     var result = c.call(ctx, target_handler, global, argc, &argv);
-    interrupt.leaveJs(0);
+    interrupt.leaveJsAuto(0);
     defer c.freeValue(ctx, result);
 
     if (c.isException(result) != 0) {
@@ -2758,6 +2875,19 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
     cflags[id].keep_alive = pr.keep_alive and !closing_server;
     if (native_echo) {
         buildResponse(id, 200, "{\"message\":\"ok\"}");
+    } else if (handler_arity < 4) {
+        const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
+        validateHeadersOnly(read_bufs[id][0..headers_end]) catch |err| switch (err) {
+            error.HeadersTooLarge => {
+                rejectWith(id, l, 431, "Request Header Fields Too Large");
+                return;
+            },
+            error.InvalidHeader => {
+                rejectWith(id, l, 400, "Bad Request");
+                return;
+            },
+        };
+        callHandlerWithHeaders(id, &pr, body, null);
     } else {
         const body = read_bufs[id][headers_end .. headers_end + pr.content_length];
         const hdrs = parseHeaders(read_bufs[id][0..headers_end]) catch |err| switch (err) {

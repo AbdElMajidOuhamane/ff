@@ -103,7 +103,7 @@ fn validHeaderValue(value: []const u8) bool {
     return true;
 }
 
-fn validHeaderPair(name: []const u8, value: []const u8) bool {
+pub fn validHeaderPair(name: []const u8, value: []const u8) bool {
     return validHeaderName(name) and validHeaderValue(value);
 }
 

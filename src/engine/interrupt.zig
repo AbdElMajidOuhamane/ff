@@ -59,6 +59,11 @@ pub fn getRuntimeIdx(rt: ?*anyopaque) ?usize {
     return null;
 }
 
+pub inline fn isBudgetEnabled(runtime_idx: usize) bool {
+    if (runtime_idx >= RT_COUNT) return false;
+    return budget_ms[runtime_idx].load(.monotonic) > 0;
+}
+
 /// Mark when JS execution enters a macrotask/handler/microtask pump
 pub inline fn enterJs(runtime_idx: usize, now_ms: u64) void {
     if (runtime_idx >= RT_COUNT) return;
@@ -67,6 +72,12 @@ pub inline fn enterJs(runtime_idx: usize, now_ms: u64) void {
         trip[runtime_idx].store(0, .monotonic);
         entered_ms[runtime_idx].store(now_ms, .release);
     }
+}
+
+/// Mark when JS execution enters, fetching monotonic clock only when budget is enabled
+pub inline fn enterJsAuto(runtime_idx: usize) void {
+    if (!isBudgetEnabled(runtime_idx)) return;
+    enterJs(runtime_idx, monotonicNowMs());
 }
 
 /// Mark when JS execution returns to the event loop
@@ -78,6 +89,11 @@ pub inline fn leaveJs(runtime_idx: usize) void {
         entered_ms[runtime_idx].store(0, .release);
         trip[runtime_idx].store(0, .monotonic);
     }
+}
+
+pub inline fn leaveJsAuto(runtime_idx: usize) void {
+    if (!isBudgetEnabled(runtime_idx)) return;
+    leaveJs(runtime_idx);
 }
 
 pub fn registerRuntime(rt: *qjs.Runtime, idx: usize, budget: u32) void {

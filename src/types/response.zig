@@ -116,27 +116,46 @@ pub const ResponseDataCold = struct {
 // every call site overwrites the shell with init()/initWithHeaders right
 // after acquiring, so no stale fields survive. JS-thread-only.
 const RESP_POOL_MAX: usize = 32;
+const RESP_RETAIN_POOL_BYTES: usize = 4096;
 var resp_pool: [RESP_POOL_MAX]*ResponseData = undefined;
 var resp_pool_n: usize = 0;
 
-/// Pooled shell (uninitialized — caller must assign init()/initWithHeaders).
+/// Pooled shell (caller must assign initWithPool() or init()/initWithHeaders()).
 /// Null only on OOM.
 pub fn acquire() ?*ResponseData {
     if (resp_pool_n > 0) {
         resp_pool_n -= 1;
         return resp_pool[resp_pool_n];
     }
-    return gpa.create(ResponseData) catch null;
+    const d = gpa.create(ResponseData) catch return null;
+    d.pool = std.ArrayList(u8).empty;
+    return d;
 }
 
 /// deinit + return shell to the pool (destroy when full).
-/// Mirrors the old responseFinalizer body (response.zig:504).
+/// Retains `pool` capacity (up to RESP_RETAIN_POOL_BYTES) so repeated
+/// `new Response(body)` calls are zero-alloc on the Zig heap.
 pub fn releaseData(d: *ResponseData) void {
-    d.deinit();
     if (resp_pool_n < RESP_POOL_MAX) {
+        if (d.owned_body) |b| {
+            gpa.free(b);
+            d.owned_body = null;
+        }
+        if (d.cold) |cd| {
+            gpa.destroy(cd);
+            d.cold = null;
+        }
+        d.headers.release();
+        if (d.pool.capacity > RESP_RETAIN_POOL_BYTES) {
+            d.pool.deinit(gpa);
+            d.pool = std.ArrayList(u8).empty;
+        } else {
+            d.pool.clearRetainingCapacity();
+        }
         resp_pool[resp_pool_n] = d;
         resp_pool_n += 1;
     } else {
+        d.deinit();
         gpa.destroy(d);
     }
 }
@@ -145,9 +164,11 @@ pub fn releaseData(d: *ResponseData) void {
 /// partway: calling `deinit()` on it would touch uninitialized fields.
 fn releaseShell(d: *ResponseData) void {
     if (resp_pool_n < RESP_POOL_MAX) {
+        d.pool.clearRetainingCapacity();
         resp_pool[resp_pool_n] = d;
         resp_pool_n += 1;
     } else {
+        d.pool.deinit(gpa);
         gpa.destroy(d);
     }
 }
@@ -160,7 +181,9 @@ fn acquireInitialized(ctx: ?*c.Context) ?*ResponseData {
         _ = c.throwOutOfMemory(ctx);
         return null;
     };
-    data.* = ResponseData.init() catch {
+    const retained_pool = data.pool;
+    data.* = ResponseData.initWithPool(retained_pool) catch {
+        data.pool = retained_pool;
         releaseShell(data);
         _ = c.throwOutOfMemory(ctx);
         return null;
@@ -202,12 +225,17 @@ pub const ResponseData = struct {
     }
 
     pub fn init() error{OutOfMemory}!ResponseData {
+        return initWithPool(std.ArrayList(u8).empty);
+    }
+    pub fn initWithPool(retained_pool: std.ArrayList(u8)) error{OutOfMemory}!ResponseData {
         // C1 FIX: pooled headers shell (headers.zig freelist). OOM is an
         // operational error, not a programmer error: return it so the
         // constructor can throw instead of aborting the runtime.
         const h = headers_mod.acquire() orelse return error.OutOfMemory;
+        var p = retained_pool;
+        p.clearRetainingCapacity();
         var self = ResponseData{
-            .pool = std.ArrayList(u8).empty,
+            .pool = p,
             .status = 200,
             .status_text = .{},
             .headers = h,
@@ -226,8 +254,13 @@ pub const ResponseData = struct {
         return self;
     }
     pub fn initWithHeaders(h: *headers_mod.HeadersData) ResponseData {
+        return initWithHeadersAndPool(h, std.ArrayList(u8).empty);
+    }
+    pub fn initWithHeadersAndPool(h: *headers_mod.HeadersData, retained_pool: std.ArrayList(u8)) ResponseData {
+        var p = retained_pool;
+        p.clearRetainingCapacity();
         return ResponseData{
-            .pool = std.ArrayList(u8).empty,
+            .pool = p,
             .status = 200,
             .status_text = .{},
             .headers = h,
@@ -400,27 +433,22 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     var p: [*c]c.PropertyEnum = null;
     var count: c_uint = 0;
     if (c.getOwnPropertyNames(ctx, &p, &count, init_val, c.GPN_STRING_MASK | c.GPN_ENUM_ONLY) == 0) {
+        defer c.freePropertyEnum(ctx, p, count);
         // FIX: batch reserve — one growth for the whole object load.
         if (count > 0) target.reserveEntries(count);
         for (0..count) |idx| {
             const name_atom = p[idx].atom;
-            const name_val = c.atomToString(ctx, name_atom);
-            defer c.freeValue(ctx, name_val);
+            var nlen: usize = 0;
+            const name_cstr = c.atomToCStringLen(ctx, &nlen, name_atom) orelse continue;
+            defer c.freeCString(ctx, name_cstr);
             const val_val = c.getProperty(ctx, init_val, name_atom);
             defer c.freeValue(ctx, val_val);
-            var nbuf: [128]u8 = undefined;
-            var vbuf: [256]u8 = undefined;
-            const n = extractStringAuto(ctx, name_val, &nbuf);
-            const v = extractStringAuto(ctx, val_val, &vbuf);
-            if (n) |nn| {
-                defer nn.deinit();
-                if (v) |vv| {
-                    defer vv.deinit();
-                    try target.appendEntry(nn.slice, vv.slice);
-                }
+            var vlen: usize = 0;
+            if (c.toCStringLen(ctx, &vlen, val_val)) |val_cstr| {
+                defer c.freeCString(ctx, val_cstr);
+                try target.appendEntry(name_cstr[0..nlen], val_cstr[0..vlen]);
             }
         }
-        c.freePropertyEnum(ctx, p, count);
     }
 }
 
@@ -437,16 +465,47 @@ fn createEmbeddedHeaders(ctx: ?*c.Context, src: *headers_mod.HeadersData) c.Valu
     return headers_mod.createJSObject(ctx, src);
 }
 
-fn setResponseProps(ctx: ?*c.Context, obj: c.Value, data: *ResponseData) void {
-    _ = c.definePropertyValueStr(ctx, obj, "bodyUsed", if (data.body_used) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "ok", if (data.status >= 200 and data.status <= 299) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "redirected", if (data.redirected) c.JS_TRUE else c.JS_FALSE, c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "status", c.newInt32(ctx, @intCast(data.status)), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "statusText", zigStringToJS(ctx, data.statusText()), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "url", zigStringToJS(ctx, data.url()), c.PROP_C_W_E);
-    _ = c.definePropertyValueStr(ctx, obj, "type", zigStringToJS(ctx, data.responseType()), c.PROP_C_W_E);
+fn responseBodyUsedGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_FALSE;
+    return if (data.body_used) c.JS_TRUE else c.JS_FALSE;
+}
+
+fn responseOkGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_FALSE;
+    return if (data.status >= 200 and data.status <= 299) c.JS_TRUE else c.JS_FALSE;
+}
+
+fn responseRedirectedGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_FALSE;
+    return if (data.redirected) c.JS_TRUE else c.JS_FALSE;
+}
+
+fn responseStatusGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return c.newInt32(ctx, 200);
+    return c.newInt32(ctx, @intCast(data.status));
+}
+
+fn responseStatusTextGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return zigStringToJS(ctx, "");
+    return zigStringToJS(ctx, data.statusText());
+}
+
+fn responseUrlGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return zigStringToJS(ctx, "");
+    return zigStringToJS(ctx, data.url());
+}
+
+fn responseTypeGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return zigStringToJS(ctx, "basic");
+    return zigStringToJS(ctx, data.responseType());
+}
+
+fn responseHeadersGetter(ctx: ?*c.Context, this_val: c.Value, _: c_int, _: [*c]c.Value) callconv(.c) c.Value {
+    const data = extractResponseData(ctx, this_val) orelse return c.JS_UNDEFINED;
     const hdr_obj = createEmbeddedHeaders(ctx, data.headers);
-    _ = c.definePropertyValueStr(ctx, obj, "headers", hdr_obj, c.PROP_C_W_E);
+    // Memoize on the instance so repeated `res.headers` returns the same JS object
+    _ = c.definePropertyValueStr(ctx, this_val, "headers", c.dupValue(ctx, hdr_obj), c.PROP_C_W_E);
+    return hdr_obj;
 }
 
 fn responseBodyGetter(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
@@ -844,9 +903,10 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
                 }
             }
         } else {
-            if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
-                defer owned.deinit();
-                data.setBody(owned.slice) catch |err|
+            var slen: usize = 0;
+            if (c.toCStringLen(ctx, &slen, body_val)) |cstr| {
+                defer c.freeCString(ctx, cstr);
+                data.setBody(cstr[0..slen]) catch |err|
                     return failResponse(ctx, data, err);
             }
         }
@@ -871,14 +931,12 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
 
     const obj = c.newObjectClass(ctx, @intCast(response_class_id));
     c.setOpaque(obj, data);
-    setResponseProps(ctx, obj, data);
     return obj;
 }
 
 pub fn buildResponseJSObject(ctx: ?*c.Context, data: *ResponseData) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(response_class_id));
     c.setOpaque(obj, data);
-    setResponseProps(ctx, obj, data);
     return obj;
 }
 
@@ -904,9 +962,22 @@ pub fn setup(ctx: ?*c.Context) void {
         const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
         _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
-    const body_atom = c.newAtom(ctx, "body");
-    defer c.freeAtom(ctx, body_atom);
-    _ = c.definePropertyGetSet(ctx, proto, body_atom, c.newCFunction(ctx, responseBodyGetter, "body", 0), c.JS_UNDEFINED, c.PROP_CONFIGURABLE | c.PROP_ENUMERABLE);
+    const getters = [_]struct { name: [*:0]const u8, func: *const c.CFunction }{
+        .{ .name = "body", .func = &responseBodyGetter },
+        .{ .name = "bodyUsed", .func = &responseBodyUsedGetter },
+        .{ .name = "ok", .func = &responseOkGetter },
+        .{ .name = "redirected", .func = &responseRedirectedGetter },
+        .{ .name = "status", .func = &responseStatusGetter },
+        .{ .name = "statusText", .func = &responseStatusTextGetter },
+        .{ .name = "url", .func = &responseUrlGetter },
+        .{ .name = "type", .func = &responseTypeGetter },
+        .{ .name = "headers", .func = &responseHeadersGetter },
+    };
+    for (getters) |g| {
+        const atom = c.newAtom(ctx, g.name);
+        defer c.freeAtom(ctx, atom);
+        _ = c.definePropertyGetSet(ctx, proto, atom, c.newCFunction(ctx, g.func, g.name, 0), c.JS_UNDEFINED, c.PROP_CONFIGURABLE | c.PROP_ENUMERABLE);
+    }
     c.setClassProto(ctx, response_class_id, proto);
 
     const global = c.getGlobalObject(ctx);

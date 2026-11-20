@@ -29,9 +29,10 @@ pub fn reportUncaught(ctx: *c.Context, where: []const u8) void {
 // message and the exit status on the <0 path.
 pub fn pumpMicrotasks(ctx: *c.Context) void {
     const rt = c.getRuntime(ctx);
+    if (!c.isJobPending(rt)) return;
     const idx = interrupt.getRuntimeIdx(rt) orelse 0;
-    interrupt.enterJs(idx, interrupt.monotonicNowMs());
-    defer interrupt.leaveJs(idx);
+    interrupt.enterJsAuto(idx);
+    defer interrupt.leaveJsAuto(idx);
 
     var pctx: ?*c.Context = undefined;
     while (true) {

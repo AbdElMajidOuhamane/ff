@@ -107,6 +107,7 @@ class Context:
     path: str
     connections: int
     duration_s: int
+    requests: int
     runs: int
     warmup_s: int
     hf_runs: int
@@ -315,14 +316,19 @@ def oha_base(ctx: Context) -> list[str]:
 
 
 def run_oha_json(ctx: Context, out_path: Path) -> None:
-    cmd = oha_base(ctx) + [
-        "-z", f"{ctx.duration_s}s",
+    if ctx.requests > 0:
+        load = ["-n", str(ctx.requests)]
+        timeout = 600
+    else:
+        load = ["-z", f"{ctx.duration_s}s"]
+        timeout = ctx.duration_s + 90
+    cmd = oha_base(ctx) + load + [
         "--output-format", "json",
         "-o", str(out_path),
         ctx.url,
     ]
     proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=ctx.duration_s + 90,
+        cmd, capture_output=True, text=True, timeout=timeout,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"oha failed ({proc.returncode}): {proc.stderr.strip()[:300]}")
@@ -361,6 +367,16 @@ def parse_oha(path: Path) -> dict:
         fallback = number(percentiles.get(percentile_key))
         return 0.0 if fallback is None else fallback * 1000.0
 
+    latency_percentiles = {}
+    for key in ("p10", "p50", "p75", "p90", "p95", "p99", "p99.9", "p99.99"):
+        value = number(percentiles.get(key))
+        latency_percentiles[key] = None if value is None else value * 1000.0
+    histogram = sorted(
+        (float(bucket), int(count))
+        for bucket, count in (data.get("responseTimeHistogram") or {}).items()
+        if count and float(bucket) > 0
+    )
+
     status = data.get("statusCodeDistribution") or {}
     total = sum(int(v) for v in status.values())
     ok = sum(int(v) for k, v in status.items() if str(k).startswith("2"))
@@ -376,6 +392,10 @@ def parse_oha(path: Path) -> dict:
         "mean_ms": latency("mean", "p50"),
         "max_ms": latency("max", "p99.9"),
         "requests": total,
+        "p90_ms": latency("p90", "p90"),
+        "p99_9_ms": latency("p99.9", "p99.9"),
+        "percentiles_ms": latency_percentiles,
+        "histogram": [[bucket * 1000.0, count] for bucket, count in histogram],
         "success_pct": (100.0 * ok / total) if total else 0.0,
         "errors": max(0, total - ok),
         "deadline_aborts": deadline,
@@ -488,8 +508,11 @@ def bench_runtime(name: str, ctx: Context, skip_hyperfine: bool) -> dict:
         "rps_min": min(rps_values),
         "rps_max": max(rps_values),
         "p50_ms": statistics.median(r["p50_ms"] for r in runs),
+        "p90_ms": statistics.median(r["p90_ms"] for r in runs),
         "p95_ms": statistics.median(r["p95_ms"] for r in runs),
         "p99_ms": statistics.median(r["p99_ms"] for r in runs),
+        "p99_9_ms": statistics.median(r["p99_9_ms"] for r in runs),
+        "requests_per_run": ctx.requests,
         "mean_ms": statistics.median(r["mean_ms"] for r in runs),
         "max_ms": max(r["max_ms"] for r in runs),
         "success_pct": statistics.median(r["success_pct"] for r in runs),
@@ -519,6 +542,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--connections", type=int, default=100,
                         help="oha -c keep-alive connections")
     parser.add_argument("--duration", type=int, default=5, help="seconds per oha run")
+    parser.add_argument("--requests", type=int, default=0,
+                        help="fixed requests per oha run (-n), overrides --duration; "
+                             "e.g. 1000000")
     parser.add_argument("--runs", type=int, default=3, help="oha runs per runtime")
     parser.add_argument("--warmup", type=int, default=2, help="warmup seconds per runtime")
     parser.add_argument("--hf-runs", type=int, default=3,
@@ -547,6 +573,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--quick", action="store_true",
                         help="1s × 1 run, 20k hyperfine requests (smoke test)")
     return parser.parse_args(argv)
+
+
+def raise_fd_limit(connections: int) -> None:
+    """500 keep-alive connections plus the server need >512 fds."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = min(hard, max(soft, connections * 4 + 256))
+        if want > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ImportError, ValueError, OSError):
+        pass
 
 
 def preflight(args: argparse.Namespace, runtimes: list[str]) -> None:
@@ -590,6 +628,7 @@ def main(argv: list[str]) -> int:
         subprocess.run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=ROOT, check=True)
 
     preflight(args, runtimes)
+    raise_fd_limit(args.connections)
     args.out.mkdir(parents=True, exist_ok=True)
 
     ctx = Context(
@@ -597,6 +636,7 @@ def main(argv: list[str]) -> int:
         path=args.path,
         connections=args.connections,
         duration_s=args.duration,
+        requests=args.requests,
         runs=args.runs,
         warmup_s=args.warmup,
         hf_runs=args.hf_runs,
@@ -618,6 +658,7 @@ def main(argv: list[str]) -> int:
         "git": git_rev(),
         "connections": ctx.connections,
         "duration_s": ctx.duration_s,
+        "requests": ctx.requests,
         "runs": ctx.runs,
         "warmup_s": ctx.warmup_s,
         "hf_runs": ctx.hf_runs,
@@ -637,8 +678,11 @@ def main(argv: list[str]) -> int:
     print("HTTP benchmark — ff · Deno · Bun")
     print(f"  host     {meta['host']} ({meta['cpu_count']} CPUs, {meta['os']})")
     print(f"  client   oha {meta['oha_version']}, hyperfine {meta['hyperfine_version']}")
-    print(f"  load     {ctx.connections} conns, {ctx.duration_s}s × {ctx.runs} runs, "
-          f"warmup {ctx.warmup_s}s")
+    if ctx.requests > 0:
+        load_text = f"{ctx.requests:,} requests × {ctx.runs} runs"
+    else:
+        load_text = f"{ctx.duration_s}s × {ctx.runs} runs"
+    print(f"  load     {ctx.connections} conns, {load_text}, warmup {ctx.warmup_s}s")
     print(f"  workload {ctx.url}")
 
     results: dict[str, dict] = {}
@@ -650,10 +694,12 @@ def main(argv: list[str]) -> int:
 
     print("\n── summary ─────────────────────────────────────────────")
     for name, item in results.items():
+        rss_peak = item.get("rss_peak_mb")
+        rss_str = "   — MB" if rss_peak is None else f"{rss_peak:5.1f} MB"
         print(
             f"  {name:<5} {item['rps_median'] / 1000:7.1f}k req/s  "
             f"p50 {item['p50_ms']:5.2f} ms  p99 {item['p99_ms']:5.2f} ms  "
-            f"RSS {item['rss_peak_mb']:5.1f} MB"
+            f"RSS {rss_str}"
         )
 
     import report  # local module
