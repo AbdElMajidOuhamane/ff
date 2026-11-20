@@ -1,9 +1,13 @@
-.PHONY: build install uninstall fixtures fmt test ci fuzz fuzz-one fuzz-canary cov doctor
+.PHONY: build install uninstall fixtures fmt test ci fuzz fuzz-one fuzz-canary cov doctor bench-http
 
 # Extra flags forwarded to `zig build`, e.g.:
 #   make ci ZIGFLAGS="-Dtarget=x86_64-linux-musl -Dffi=false"
 # CI Linux jobs are musl static; see .github/workflows/ci.yml.
 ZIGFLAGS ?=
+
+# Extra flags forwarded to bench/httpbench/run.sh, e.g.
+#   make bench-http BENCH_ARGS="--connections 256 --duration 10"
+BENCH_ARGS ?=
 
 # Defaults for `make fuzz-one` (overridable: make fuzz-one FUZZ=ws_frame SEED=7 EVENTS=50000)
 FUZZ ?= ws_frame
@@ -93,6 +97,11 @@ cov:
 	$(KCOV) --include-path=./src kcov-output ./zig-out/bin/fuzz bogus || true
 	$(KCOV) --include-path=./src kcov-output ./zig-out/bin/fuzz canary 1 || true
 	@echo "coverage: open kcov-output/index.html and follow the [merged] link"
+
+# HTTP server comparison (ff / Deno / Bun) with oha + hyperfine.
+# Writes bench/httpbench/results/report.html. Needs oha, hyperfine, deno, bun.
+bench-http: build
+	./bench/httpbench/run.sh $(BENCH_ARGS)
 
 # Diagnoses both toolchain traps:
 #   1. cc + macOS 26/27 CLT SDK  -> "unknown architecture arm64e.x1"

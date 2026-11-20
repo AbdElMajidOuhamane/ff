@@ -562,13 +562,13 @@ fn runJob(slot_id: u16) void {
         if (protocol == .tls) {
             if (tls.httpsProxyFor(hop_host.bytes, hop_port)) |proxy| {
                 tunnel_conn = tls_tunnel.connect(req_client, proxy, hop_host, hop_port) catch |err| {
-                    std.debug.print("[fetch] tunnel failed: {s} url={s}\n", .{ @errorName(err), current_url });
+                    if (builtin.mode == .Debug) std.debug.print("[fetch] tunnel failed: {s} url={s}\n", .{ @errorName(err), current_url });
                     failSlot(s, "Network error");
                     return;
                 };
             } else if (std.Io.net.IpAddress.parse(hop_host.bytes, 0)) |_| {
                 tunnel_conn = tls_tunnel.connectDirect(req_client, hop_host, hop_port) catch |err| {
-                    std.debug.print("[fetch] TLS connect failed: {s} url={s}\n", .{ @errorName(err), current_url });
+                    if (builtin.mode == .Debug) std.debug.print("[fetch] TLS connect failed: {s} url={s}\n", .{ @errorName(err), current_url });
                     failSlot(s, "Network error");
                     return;
                 };
@@ -578,7 +578,7 @@ fn runJob(slot_id: u16) void {
             .extra_headers = hop_hdrs,
             .connection = tunnel_conn,
         }) catch |err| {
-            std.debug.print("[fetch] request failed: {s} url={s}\n", .{ @errorName(err), current_url });
+            if (builtin.mode == .Debug) std.debug.print("[fetch] request failed: {s} url={s}\n", .{ @errorName(err), current_url });
             // request() did not adopt the tunnel connection; release it here
             // or it stays pinned in the pool's used list forever.
             if (tunnel_conn) |cn| {
@@ -718,9 +718,15 @@ fn runJob(slot_id: u16) void {
         // per storeString). Body reserves separately below (size known later).
         const phrase = response.head.status.phrase() orelse "OK";
         resp_data.pool.ensureTotalCapacity(gpa, phrase.len + current_url.len + 64) catch {};
-        resp_data.setStatusText(phrase);
+        resp_data.setStatusText(phrase) catch {
+            failSlot(s, "Out of memory");
+            return;
+        };
         resp_data.redirected = redirected;
-        resp_data.setUrl(current_url);
+        resp_data.setUrl(current_url) catch {
+            failSlot(s, "Out of memory");
+            return;
+        };
         // Batch reserve: single growth for response headers.
         {
             var hn: usize = 0;
@@ -729,7 +735,16 @@ fn runJob(slot_id: u16) void {
             if (hn > 0) resp_data.headers.reserveEntries(hn);
             var header_it2 = response.head.iterateHeaders();
             while (header_it2.next()) |h| {
-                resp_data.headers.appendEntry(h.name, h.value);
+                resp_data.headers.appendEntry(h.name, h.value) catch |err| switch (err) {
+                    error.InvalidHeader => {
+                        failSlot(s, "Invalid response header");
+                        return;
+                    },
+                    else => {
+                        failSlot(s, "Out of memory");
+                        return;
+                    },
+                };
             }
         }
         if (has_body) {
@@ -751,7 +766,7 @@ fn runJob(slot_id: u16) void {
                     else => 0,
                 };
                 if (window_len == 0) {
-                    std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
+                    if (builtin.mode == .Debug) std.debug.print("[fetch] unsupported content-encoding: {s}\n", .{@tagName(content_encoding)});
                     break :dec response.reader(&transfer_buf);
                 }
                 // Reuse per-slot flate window (32K); heap spill only for zstd/large.
@@ -780,7 +795,7 @@ fn runJob(slot_id: u16) void {
                     if (len <= body_stage_bufs[s].len) {
                         const b = body_stage_bufs[s][0..len];
                         const n = reader.readSliceShort(b) catch |err| read_b: {
-                            std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
+                            if (builtin.mode == .Debug) std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
                             break :read_b 0;
                         };
                         if (n == 0) {
@@ -800,12 +815,12 @@ fn runJob(slot_id: u16) void {
                     } else {
                         _ = stat_body_heap.fetchAdd(1, .release);
                         const buf = gpa.alloc(u8, len) catch |err| alloc_b: {
-                            std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
+                            if (builtin.mode == .Debug) std.debug.print("[fetch] body alloc error: {s}\n", .{@errorName(err)});
                             break :alloc_b null;
                         };
                         if (buf) |b| {
                             const n = reader.readSliceShort(b) catch |err| read_b: {
-                                std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
+                                if (builtin.mode == .Debug) std.debug.print("[fetch] body read error: {s}\n", .{@errorName(err)});
                                 break :read_b 0;
                             };
                             if (n == 0) {
@@ -838,7 +853,7 @@ fn runJob(slot_id: u16) void {
                 defer if (heap_used) heap_acc.deinit(gpa);
                 while (true) {
                     const n = reader.readSliceShort(chunk[0..]) catch |err| acc_b: {
-                        std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
+                        if (builtin.mode == .Debug) std.debug.print("[fetch] body read error: {s} after {d} bytes\n", .{ @errorName(err), total });
                         break :acc_b 0;
                     };
                     if (n == 0) break;
@@ -854,13 +869,13 @@ fn runJob(slot_id: u16) void {
                             _ = stat_body_heap.fetchAdd(1, .release);
                             heap_acc.ensureTotalCapacity(gpa, 64 * 1024) catch {};
                             heap_acc.appendSlice(gpa, body_stage_bufs[s][0..total]) catch |err| {
-                                std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
+                                if (builtin.mode == .Debug) std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
                                 break;
                             };
                             heap_used = true;
                         }
                         heap_acc.appendSlice(gpa, chunk[0..n]) catch |err| {
-                            std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
+                            if (builtin.mode == .Debug) std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
                             break;
                         };
                         total += n;
@@ -869,7 +884,7 @@ fn runJob(slot_id: u16) void {
                 if (total > 0) {
                     if (heap_used) {
                         owned_body = heap_acc.toOwnedSlice(gpa) catch |err| fin_b: {
-                            std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
+                            if (builtin.mode == .Debug) std.debug.print("[fetch] body finalize error: {s}\n", .{@errorName(err)});
                             break :fin_b null;
                         };
                         owned_heap = owned_body != null;
@@ -894,10 +909,16 @@ fn runJob(slot_id: u16) void {
                 // growth). Skipped for the owned_heap path above — that one
                 // transfers the buffer without touching the pool.
                 resp_data.pool.ensureTotalCapacity(gpa, resp_data.pool.items.len + b.len) catch {};
-                resp_data.setBody(b);
+                resp_data.setBody(b) catch {
+                    failSlot(s, "Out of memory");
+                    return;
+                };
             }
         } else if (response.head.content_length != null and has_body) {
-            resp_data.setBody("");
+            resp_data.setBody("") catch {
+                failSlot(s, "Out of memory");
+                return;
+            };
         }
         if (builtin.mode == .Debug) {
             std.debug.print("[allocs] job {d}: allocs={d} frees={d} +{d}B -{d}B shells={d}\n", .{

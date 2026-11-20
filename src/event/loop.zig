@@ -53,7 +53,10 @@ pub const EventLoop = struct {
             std.process.exit(1);
         }
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
-        self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch unreachable };
+        self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch |err| {
+            std.debug.print("ff: event loop init failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        } };
     }
     pub fn initHeap(allocator: std.mem.Allocator) !*EventLoop {
         const ptr = try allocator.create(EventLoop);

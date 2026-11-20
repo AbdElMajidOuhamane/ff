@@ -129,35 +129,53 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
         }
         qjs.freeValue(ctx, d);
     }
-    errdefer if (initial) |b| gpa.free(b);
 
+    // Every failure below is an explicit cleanup: this function returns
+    // qjs.Value (not an error union), so `errdefer` cannot fire. Leaking the
+    // serialized payload (up to MAX_FRAME) or a pipe pair on a constructible
+    // failure is a bug a JS try/catch loop can repeat without bound.
     const slot = allocSlot() orelse {
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwTypeError(ctx, "too many workers (max 8)");
         return qjs.JS_EXCEPTION;
     };
+    std.debug.assert(slot < MAX_WORKERS);
 
     const abs = resolveWorkerPath(path) catch {
         freeSlot(slot);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwTypeError(ctx, "Worker module not found");
         return qjs.JS_EXCEPTION;
     };
-    errdefer gpa.free(abs);
 
     var ch = port_mod.MessagePort.create() catch {
         freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwInternalError(ctx, "Worker pipe creation failed");
         return qjs.JS_EXCEPTION;
     };
-    errdefer ch.closeAll();
+    std.debug.assert(ch.parent.send_fd >= 0);
+    std.debug.assert(ch.child.send_fd >= 0);
 
     const wdata = gpa.create(WorkerData) catch {
+        ch.closeAll();
+        freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwOutOfMemory(ctx);
         return qjs.JS_EXCEPTION;
     };
     wdata.* = .{ .slot = slot, .module_path = abs, .initial_payload = initial, .channel = ch.child };
 
     slots[slot].thread = std.Thread.spawn(.{ .stack_size = limits.get().worker_stack_bytes }, workerMain, .{wdata}) catch {
+        // workerMain never ran, so it will not free (wdata, abs, initial,
+        // ch.*): undo the ownership transfer here.
         gpa.destroy(wdata);
+        ch.closeAll();
+        freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwInternalError(ctx, "Worker thread spawn failed");
         return qjs.JS_EXCEPTION;
     };

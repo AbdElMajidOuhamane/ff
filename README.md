@@ -308,7 +308,9 @@ RSS** on this workload.
 medians per runtime. Server-side numbers use `ReleaseFast` builds
 (`make build`). Broader interpreter and I/O comparisons live in
 [`bench/run-bench.sh`](bench); memory comparisons use `bench/mem-bench.sh`
-(maintainer-local, not in the repo).
+(maintainer-local, not in the repo). For a visual HTTP-server comparison
+driven by oha + hyperfine, run [`bench/httpbench/run.sh`](bench/httpbench)
+and open `results/report.html` (throughput, percentile, and RSS charts).
 
 ---
 

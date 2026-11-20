@@ -532,25 +532,32 @@ fn sharedWorkerMain() void {
         var nfds: usize = 1;
         var slots: [MAX_WS]u16 = undefined;
         var nslots: usize = 0;
-        var tls_ready_any = false;
+        // Readiness of already-decrypted TLS bytes, computed once per sweep.
+        // Re-probing each TLS slot in the post-poll loop issued one extra
+        // poll(2) per slot (64 sockets = 64 wasted syscalls/wake); raw socket
+        // readiness is already covered by pfd[].
+        var tls_ready_mask: u64 = 0;
         for (0..MAX_WS) |s| {
             if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
             if (w_conns[s]) |cn| {
-                if (wflags[s].tls_active and tlsReadReady(s, cn)) tls_ready_any = true;
+                if (wflags[s].tls_active and cn.reader().bufferedLen() > 0) {
+                    tls_ready_mask |= @as(u64, 1) << @intCast(s);
+                }
                 pfd[nfds] = .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 };
                 slots[nslots] = @intCast(s);
                 nfds += 1;
                 nslots += 1;
             }
         }
+        comptime std.debug.assert(MAX_WS == 64); // readiness mask is a u64
         // No live sockets: block in poll until the next submit/send/close.
-        const rc = std.posix.poll(pfd[0..nfds], if (nfds == 1) -1 else (if (tls_ready_any) 0 else 50)) catch 0;
+        const rc = std.posix.poll(pfd[0..nfds], if (nfds == 1) -1 else (if (tls_ready_mask != 0) 0 else 50)) catch 0;
         _ = rc;
         for (0..nslots) |k| {
             const s: usize = slots[k];
             if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
             const cn = w_conns[s] orelse continue;
-            const readable = (wflags[s].tls_active and tlsReadReady(s, cn)) or pfd[1 + k].revents != 0;
+            const readable = ((tls_ready_mask >> @intCast(s)) & 1 == 1) or pfd[1 + k].revents != 0;
             if (readable) {
                 if (rd_len[s] >= RDBUF) {
                     closeExit(s, cn, &w_reqs[s]);
@@ -670,20 +677,6 @@ fn findHeaderValueCI(haystack: []const u8, name: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[colon + 1 ..], " \t");
     }
     return null;
-}
-
-fn sockReadable(s: usize, timeout_ms: i32) bool {
-    if (sock_fds[s] < 0) return false;
-    var pfd = [_]std.posix.pollfd{
-        .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 },
-    };
-    const rc = std.posix.poll(&pfd, timeout_ms) catch return false;
-    return rc != 0 and pfd[0].revents != 0;
-}
-
-fn tlsReadReady(s: usize, cn: *http.Client.Connection) bool {
-    if (cn.reader().bufferedLen() > 0) return true;
-    return sockReadable(s, 0);
 }
 
 fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {

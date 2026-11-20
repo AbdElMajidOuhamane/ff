@@ -239,7 +239,7 @@ two apex domains.
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | 5 hops max, each re-checked | Rejects with `"Too many redirects"` or a permission string |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
-| Header validation | RFC 7230 character validation | Invalid header pairs (bad name token or CR/LF/NUL/CTL in value) are silently dropped without throwing |
+| Header validation | RFC 7230 character validation | Invalid header pairs (bad name token or CR/LF/NUL/CTL in value) throw `TypeError` |
 | Abort | `AbortController` / `AbortSignal` (`signal` init key) | Rejects with `signal.reason` and closes the socket (`AbortSignal.timeout` shares the 128-timer table) |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 

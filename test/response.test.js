@@ -46,6 +46,36 @@ function check(name, cond) {
   const j6 = await r6.json();
   check("response json after heap churn", j6.n === 42);
 
+  // 7. Header validation is reported, not silently dropped (TigerStyle:
+  // every error handled). CRLF injection attempts must throw TypeError.
+  let badAppend = false;
+  try {
+    new Headers().append("x-bad", "a\r\nX-Injected: 1");
+  } catch (e) {
+    badAppend = e instanceof TypeError;
+  }
+  check("headers append rejects CRLF value", badAppend);
+
+  let badName = false;
+  try {
+    new Headers().set("bad name", "v");
+  } catch (e) {
+    badName = e instanceof TypeError;
+  }
+  check("headers set rejects invalid name", badName);
+
+  const hOk = new Headers({ "x-good": "1" });
+  hOk.append("x-multi", "a");
+  hOk.append("x-multi", "b");
+  check("headers valid append", hOk.get("x-good") === "1" && hOk.getAll("x-multi").length === 2);
+
+  // 8. clone() copies headers and body independently.
+  const rc = new Response("clone-body", { headers: { "x-a": "1" } });
+  const rcc = rc.clone();
+  check("clone body", (await rcc.text()) === "clone-body");
+  check("clone headers", rcc.headers.get("x-a") === "1");
+  check("clone leaves source readable", (await rc.text()) === "clone-body");
+
   if (fail) {
     console.log("FAIL", fail, "checks");
     process.exit(1);

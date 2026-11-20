@@ -224,7 +224,7 @@ h.size();              // header count
 | `entries()` / `keys()` / `values()` / `forEach()` | Iterate (`entries()`/`values()` return raw entry arrays; `keys()` deduplicates names) |
 | `toString()` / `size()` | Debug string (`\r\n`-joined) / raw entry count |
 
-Invalid RFC 7230 header names or values containing CR/LF/NUL/CTLs are silently dropped without throwing.
+Invalid RFC 7230 header names or values containing CR/LF/NUL/CTLs throw a `TypeError`.
 
 ## Redirects
 
@@ -302,7 +302,7 @@ ff client.js --allow-net=api.example.com:443
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches (the 17th rejects immediately with `"Failed to start fetch"`), 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`; `AbortSignal.timeout` shares the 128-timer table), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token`), RFC 7230 header validation (invalid pairs silently dropped), HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches (the 17th rejects immediately with `"Failed to start fetch"`), 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`; `AbortSignal.timeout` shares the 128-timer table), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token`), RFC 7230 header validation (invalid pairs throw `TypeError`), HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
 

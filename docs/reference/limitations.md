@@ -71,7 +71,7 @@ boundary for hostile code.
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | Followed, max 5 hops | Rejects with `"Too many redirects"`; every hop is re-checked against `--allow-net` |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
-| Header validation | RFC 7230 character validation | Invalid header names or values containing CR/LF/NUL/CTLs are silently dropped (no throw/reject) |
+| Header validation | RFC 7230 character validation | Invalid header names or values containing CR/LF/NUL/CTLs throw `TypeError` |
 | Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (`AbortSignal.timeout(ms)` uses 1 slot in the 128-timer table) |
 | TLS hostnames | DNS SAN verification only | IP-literal TLS hosts (`https://127.0.0.1:...`) fail closed; connect using DNS hostnames |
 | Protocol | HTTP/1.1 | No HTTP/2 client |

@@ -429,7 +429,16 @@ pub fn appendReqHeader(st: Slot, n: []const u8, v: []const u8) void {
             break :blk nh;
         };
         st.p.req_hdrs_bytes += n.len + v.len;
-        h.appendEntry(n, v); // validates + lowercases the name
+        h.appendEntry(n, v) catch |err| {
+            // Invalid octets in a regular header are a malformed request
+            // (400), not a server fault; allocation failure is a 503.
+            if (err == error.InvalidHeader) {
+                st.f.bad = true;
+            } else {
+                st.f.internal_error = true;
+            }
+            return;
+        };
     }
 }
 

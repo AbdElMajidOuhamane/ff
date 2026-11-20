@@ -184,7 +184,7 @@ h.toString();            // "accept: application/json\r\naccept: text/plain"
 | `forEach(fn)` | `((value, key, parent) => void)` | |
 | `toString()` | `() → string` | Raw `name: value` entries joined with `\r\n` (duplicates not merged) |
 
-Names are case-insensitive; invalid RFC 7230 header names or values containing CR/LF/NUL/CTLs are silently dropped without throwing. `delete()` and duplicate-collapsing `set()` use swap-remove internally, so order is not preserved after deletions.
+Names are case-insensitive. Invalid RFC 7230 header names or values containing CR/LF/NUL/CTLs throw a `TypeError` (allocation failure throws instead of dropping); a header is never silently discarded. `delete()` and duplicate-collapsing `set()` use swap-remove internally, so order is not preserved after deletions.
 
 ### Iterating
 
@@ -204,8 +204,7 @@ res.headers.forEach((v, k) => console.log(k, v));
 - **HTTP/2 stream responses** — Returning a `ReadableStream` body over HTTP/2 returns `501 Not Implemented`.
 - **`headers.size` is a function** — `h.size` is `undefined`;
   `h.size()` is the number. Same for `URLSearchParams.size`.
-- `clone()` corrupts the copy (`"OKABCDEFGH"` → `"OKOKABCDEF"`) — re-read
-  the original instead of cloning.
+- `clone()` snapshots headers and body; the source stays readable.
 - `new Response(body)` copies the bytes; mutating the original afterwards
   does not change the response.
 - `Response.redirect(url)` without a URL **throws** — and with one it still sends no `Location` header, so clients never follow it.

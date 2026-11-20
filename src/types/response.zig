@@ -98,7 +98,7 @@ pub const ResponseType = enum(u8) {
             .err => "error",
             .opaque_type => "opaque",
             .opaqueredirect => "opaqueredirect",
-            .other => unreachable,
+            .other => "other",
         };
     }
 };
@@ -141,6 +141,43 @@ pub fn releaseData(d: *ResponseData) void {
     }
 }
 
+/// Return an *uninitialized* shell to the pool. Used when `init()` failed
+/// partway: calling `deinit()` on it would touch uninitialized fields.
+fn releaseShell(d: *ResponseData) void {
+    if (resp_pool_n < RESP_POOL_MAX) {
+        resp_pool[resp_pool_n] = d;
+        resp_pool_n += 1;
+    } else {
+        gpa.destroy(d);
+    }
+}
+
+/// Pooled shell + initialized payload, or null with a JS exception pending.
+/// `init()` is fallible (headers shell + the "OK" status text can OOM), and a
+/// constructor that cannot report that must not abort the whole process.
+fn acquireInitialized(ctx: ?*c.Context) ?*ResponseData {
+    const data = acquire() orelse {
+        _ = c.throwOutOfMemory(ctx);
+        return null;
+    };
+    data.* = ResponseData.init() catch {
+        releaseShell(data);
+        _ = c.throwOutOfMemory(ctx);
+        return null;
+    };
+    return data;
+}
+
+/// Unwind a half-built response and turn `err` into the matching JS throw.
+fn failResponse(ctx: ?*c.Context, data: *ResponseData, err: anyerror) c.Value {
+    releaseData(data);
+    return switch (err) {
+        error.OutOfMemory => c.throwOutOfMemory(ctx),
+        error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        else => c.throwInternalError(ctx, "response construction failed"),
+    };
+}
+
 pub const ResponseData = struct {
     pool: std.ArrayList(u8),
     headers: *headers_mod.HeadersData,
@@ -164,9 +201,11 @@ pub const ResponseData = struct {
         std.debug.assert(@alignOf(ResponseData) >= 8);
     }
 
-    pub fn init() ResponseData {
-        // C1 FIX: pooled headers shell (headers.zig freelist).
-        const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
+    pub fn init() error{OutOfMemory}!ResponseData {
+        // C1 FIX: pooled headers shell (headers.zig freelist). OOM is an
+        // operational error, not a programmer error: return it so the
+        // constructor can throw instead of aborting the runtime.
+        const h = headers_mod.acquire() orelse return error.OutOfMemory;
         var self = ResponseData{
             .pool = std.ArrayList(u8).empty,
             .status = 200,
@@ -180,7 +219,10 @@ pub const ResponseData = struct {
             .response_type = .basic,
             .cold = null,
         };
-        self.storeString("OK", &self.status_text);
+        self.storeString("OK", &self.status_text) catch |err| {
+            h.release();
+            return err;
+        };
         return self;
     }
     pub fn initWithHeaders(h: *headers_mod.HeadersData) ResponseData {
@@ -222,17 +264,17 @@ pub const ResponseData = struct {
         }
         return self.response_type.string();
     }
-    fn storeString(self: *ResponseData, s: []const u8, dst: *PoolSlice) void {
+    fn storeString(self: *ResponseData, s: []const u8, dst: *PoolSlice) error{OutOfMemory}!void {
         if (s.len == 0) {
             dst.* = .{};
             return;
         }
         const off = self.pool.items.len;
-        self.pool.appendSlice(gpa, s) catch return;
+        try self.pool.appendSlice(gpa, s);
         dst.* = .{ .off = @intCast(off), .len = @intCast(s.len) };
     }
-    pub fn setStatusText(self: *ResponseData, s: []const u8) void {
-        self.storeString(s, &self.status_text);
+    pub fn setStatusText(self: *ResponseData, s: []const u8) error{OutOfMemory}!void {
+        try self.storeString(s, &self.status_text);
     }
     pub fn setBodyOwned(self: *ResponseData, b: []u8) void {
         if (self.owned_body) |old| gpa.free(old);
@@ -244,10 +286,10 @@ pub const ResponseData = struct {
             self.owned_body = null;
         }
     }
-    pub fn setBody(self: *ResponseData, s: ?[]const u8) void {
+    pub fn setBody(self: *ResponseData, s: ?[]const u8) error{OutOfMemory}!void {
         if (s) |b| {
             // Reserve the body and JS_ParseJSON's NUL before retaining either.
-            if (b.len > 0) self.pool.ensureUnusedCapacity(gpa, b.len + 1) catch return;
+            if (b.len > 0) try self.pool.ensureUnusedCapacity(gpa, b.len + 1);
         }
         if (self.owned_body) |old| gpa.free(old);
         self.owned_body = null;
@@ -264,28 +306,34 @@ pub const ResponseData = struct {
             self.has_body = false;
         }
     }
-    pub fn setUrl(self: *ResponseData, s: []const u8) void {
-        self.storeString(s, &self._url);
+    pub fn setUrl(self: *ResponseData, s: []const u8) error{OutOfMemory}!void {
+        try self.storeString(s, &self._url);
     }
-    fn ensureCold(self: *ResponseData) ?*ResponseDataCold {
+    fn ensureCold(self: *ResponseData) error{OutOfMemory}!*ResponseDataCold {
         if (self.cold) |cd| return cd;
-        const cd = gpa.create(ResponseDataCold) catch return null;
+        const cd = gpa.create(ResponseDataCold) catch return error.OutOfMemory;
         cd.* = .{ .response_type_other = .{} };
         self.cold = cd;
         return cd;
     }
-    pub fn setResponseType(self: *ResponseData, s: []const u8) void {
+    pub fn setResponseType(self: *ResponseData, s: []const u8) error{OutOfMemory}!void {
         const t = ResponseType.fromSlice(s);
         self.response_type = t;
         if (t == .other) {
-            if (self.ensureCold()) |cd| self.storeString(s, &cd.response_type_other);
+            const cd = try self.ensureCold();
+            try self.storeString(s, &cd.response_type_other);
         }
     }
-    pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) void {
+    pub fn cloneFrom(self: *ResponseData, src: *const ResponseData) !void {
         // FIX: reserve the pool BEFORE appendSlice (was after → no-op warm).
         // Single growth for the whole copy instead of per-chunk growth.
-        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
-        self.pool.appendSlice(gpa, src.pool.items) catch {};
+        // The pool must start EMPTY: init() writes "OK" at offset 0, and
+        // src.status_text/_body are offsets into the source pool. Appending
+        // after that header shifted every copied offset by 2 bytes (clone
+        // returned "OK" as the body). clearRetainingCapacity keeps capacity.
+        self.pool.clearRetainingCapacity();
+        try self.pool.ensureTotalCapacity(gpa, src.pool.items.len);
+        try self.pool.appendSlice(gpa, src.pool.items);
         self.status = src.status;
         self.status_text = src.status_text;
         self._body = src._body;
@@ -295,20 +343,19 @@ pub const ResponseData = struct {
         self.redirected = src.redirected;
         self.response_type = src.response_type;
         self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
-        self.owned_body = if (src.owned_body) |b| gpa.dupe(u8, b) catch null else null;
+        self.owned_body = if (src.owned_body) |b| try gpa.dupe(u8, b) else null;
         if (src.cold) |sc| {
-            if (self.ensureCold()) |dc| {
-                dc.response_type_other = sc.response_type_other;
-            }
+            const dc = try self.ensureCold();
+            dc.response_type_other = sc.response_type_other;
         }
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
-            self.headers.appendEntry(p.name, p.value);
+            try self.headers.appendEntry(p.name, p.value);
         }
     }
 };
 
-fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) void {
+fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) !void {
     if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) return;
     if (c.isObject(init_val) == 0) return;
     if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
@@ -316,7 +363,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         target.reserveEntries(src.len());
         for (0..src.len()) |i| {
             const p = src.getPair(i);
-            target.appendEntry(p.name, p.value);
+            try target.appendEntry(p.name, p.value);
         }
         return;
     }
@@ -344,7 +391,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
                 defer nn.deinit();
                 if (v) |vv| {
                     defer vv.deinit();
-                    target.appendEntry(nn.slice, vv.slice);
+                    try target.appendEntry(nn.slice, vv.slice);
                 }
             }
         }
@@ -369,7 +416,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
                 defer nn.deinit();
                 if (v) |vv| {
                     defer vv.deinit();
-                    target.appendEntry(nn.slice, vv.slice);
+                    try target.appendEntry(nn.slice, vv.slice);
                 }
             }
         }
@@ -377,11 +424,11 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
     }
 }
 
-fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers_mod.HeadersData) void {
+fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers_mod.HeadersData) !void {
     const headers_val = c.getPropertyStr(ctx, init_obj, "headers");
     defer c.freeValue(ctx, headers_val);
     if (c.isUndefined(headers_val) == 0 and c.isNull(headers_val) == 0) {
-        parseHeadersInit(ctx, headers_val, target);
+        try parseHeadersInit(ctx, headers_val, target);
     }
 }
 
@@ -614,17 +661,15 @@ fn responseClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     _ = argv;
     const data = extractResponseData(ctx, this_val) orelse return c.JS_EXCEPTION;
     // C1 FIX: pooled shell (was gpa.create per clone).
-    const new_data = acquire() orelse return c.throwOutOfMemory(ctx);
-    new_data.* = ResponseData.init();
-    new_data.cloneFrom(data);
+    const new_data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
+    new_data.cloneFrom(data) catch |err| return failResponse(ctx, new_data, err);
     return buildResponseJSObject(ctx, new_data);
 }
 
 fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     var scratch: [256]u8 = undefined;
     // C1 FIX: pooled shell (was gpa.create per call).
-    const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = ResponseData.init();
+    const data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
     if (argc > 0) {
         const json_str = c.jsonStringify(ctx, argv[0], c.JS_UNDEFINED, c.JS_UNDEFINED);
         if (c.isException(json_str) != 0) {
@@ -636,9 +681,11 @@ fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         defer c.freeValue(ctx, json_str);
         if (extractStringAuto(ctx, json_str, &scratch)) |owned| {
             defer owned.deinit();
-            data.setBody(owned.slice);
+            data.setBody(owned.slice) catch |err|
+                return failResponse(ctx, data, err);
         }
-        data.headers.appendEntry("content-type", "application/json");
+        data.headers.appendEntry("content-type", "application/json") catch |err|
+            return failResponse(ctx, data, err);
     }
     if (argc > 1 and c.isObject(argv[1]) != 0) {
         const init_val = argv[1];
@@ -650,10 +697,12 @@ fn responseStaticJson(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) {
             if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
                 defer st.deinit();
-                data.setStatusText(st.slice);
+                data.setStatusText(st.slice) catch |err|
+                    return failResponse(ctx, data, err);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers) catch |err|
+            return failResponse(ctx, data, err);
     }
     return buildResponseJSObject(ctx, data);
 }
@@ -665,14 +714,15 @@ fn responseStaticRedirect(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c
     }
     var url_buf: [512]u8 = undefined;
     // C1 FIX: pooled shell (was gpa.create per call).
-    const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = ResponseData.init();
+    const data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
     if (extractStringAuto(ctx, argv[0], &url_buf)) |u| {
         defer u.deinit();
-        data.setUrl(u.slice);
+        data.setUrl(u.slice) catch |err|
+            return failResponse(ctx, data, err);
     }
     data.status = 302;
-    data.setStatusText("Found");
+    data.setStatusText("Found") catch |err|
+        return failResponse(ctx, data, err);
     data.redirected = true;
     if (argc > 1) {
         data.status = extractIntFromVal(ctx, argv[1], 302);
@@ -684,11 +734,12 @@ fn responseStaticError(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Va
     _ = argc;
     _ = argv;
     // C1 FIX: pooled shell (was gpa.create per call).
-    const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = ResponseData.init();
+    const data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
     data.status = 0;
-    data.setStatusText("");
-    data.setResponseType("error");
+    data.setStatusText("") catch |err|
+        return failResponse(ctx, data, err);
+    data.setResponseType("error") catch |err|
+        return failResponse(ctx, data, err);
     return buildResponseJSObject(ctx, data);
 }
 
@@ -706,10 +757,10 @@ fn responseStaticFile(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         return deny.throw(ctx, "Response.file", .read, path);
     }
 
-    const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = ResponseData.init();
+    const data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
     data.status = 200;
-    data.setStatusText("OK");
+    data.setStatusText("OK") catch |err|
+        return failResponse(ctx, data, err);
 
     const file_bytes = std.Io.Dir.cwd().readFileAllocOptions(
         std.Io.Threaded.global_single_threaded.io(),
@@ -728,7 +779,8 @@ fn responseStaticFile(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Val
         return c.JS_EXCEPTION;
     };
 
-    data.headers.setEntry("content-type", guessContentType(path));
+    data.headers.setEntry("content-type", guessContentType(path)) catch |err|
+        return failResponse(ctx, data, err);
     data.setBodyOwned(file_bytes);
     return buildResponseJSObject(ctx, data);
 }
@@ -751,21 +803,22 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     var body_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
     // C1 FIX: pooled shell (was gpa.create per `new Response()`).
-    const data = acquire() orelse return c.throwOutOfMemory(ctx);
-    data.* = ResponseData.init();
+    const data = acquireInitialized(ctx) orelse return c.JS_EXCEPTION;
 
     if (argc > 0 and c.isUndefined(argv[0]) == 0 and c.isNull(argv[0]) == 0) {
         const body_val = argv[0];
         if (readable_stream.isStream(ctx, body_val)) {
             data.has_body = true;
-            const cold = gpa.create(ResponseDataCold) catch return c.throwOutOfMemory(ctx);
+            const cold = gpa.create(ResponseDataCold) catch
+                return failResponse(ctx, data, error.OutOfMemory);
             cold.* = .{ .response_type_other = .{}, .stream = c.dupValue(ctx, body_val) };
             data.cold = cold;
         } else if (c.isObject(body_val) != 0) {
             var ab_size: usize = 0;
             if (c.getArrayBuffer(ctx, &ab_size, body_val)) |ab_ptr| {
                 const bytes: []const u8 = if (ab_size == 0) "" else ab_ptr[0..ab_size];
-                const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
+                const owned = gpa.dupe(u8, bytes) catch
+                    return failResponse(ctx, data, error.OutOfMemory);
                 data.setBodyOwned(owned);
             } else {
                 if (c.hasException(ctx)) {
@@ -775,7 +828,8 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
                 var u8_size: usize = 0;
                 if (c.getUint8Array(ctx, &u8_size, body_val)) |u8_ptr| {
                     const bytes: []const u8 = if (u8_size == 0) "" else u8_ptr[0..u8_size];
-                    const owned = gpa.dupe(u8, bytes) catch return c.throwOutOfMemory(ctx);
+                    const owned = gpa.dupe(u8, bytes) catch
+                        return failResponse(ctx, data, error.OutOfMemory);
                     data.setBodyOwned(owned);
                 } else {
                     if (c.hasException(ctx)) {
@@ -784,14 +838,16 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
                     }
                     if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
                         defer owned.deinit();
-                        data.setBody(owned.slice);
+                        data.setBody(owned.slice) catch |err|
+                            return failResponse(ctx, data, err);
                     }
                 }
             }
         } else {
             if (extractStringAuto(ctx, body_val, &body_buf)) |owned| {
                 defer owned.deinit();
-                data.setBody(owned.slice);
+                data.setBody(owned.slice) catch |err|
+                    return failResponse(ctx, data, err);
             }
         }
     }
@@ -805,10 +861,12 @@ fn responseConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
         if (c.isUndefined(status_text_val) == 0 and c.isNull(status_text_val) == 0) {
             if (extractStringAuto(ctx, status_text_val, &scratch)) |st| {
                 defer st.deinit();
-                data.setStatusText(st.slice);
+                data.setStatusText(st.slice) catch |err|
+                    return failResponse(ctx, data, err);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers) catch |err|
+            return failResponse(ctx, data, err);
     }
 
     const obj = c.newObjectClass(ctx, @intCast(response_class_id));
@@ -873,32 +931,32 @@ pub fn setup(ctx: ?*c.Context) void {
 // byte after the body was stale heap data → layout-dependent
 // "unexpected data at the end" (see bench/fetch.js ipify repro).
 test "setBody keeps pool-backed bodies NUL-terminated" {
-    var d = ResponseData.init();
+    var d = try ResponseData.init();
     defer d.deinit();
-    d.setBody("{\"ip\":\"1.2.3.4\"}");
+    try d.setBody("{\"ip\":\"1.2.3.4\"}");
     const b = d.body().?;
     try std.testing.expectEqualStrings("{\"ip\":\"1.2.3.4\"}", b);
     const end = @as(usize, d._body.off) + @as(usize, d._body.len);
     try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
     // Sentinel is position-stable: later pool writes append past it.
-    d.setStatusText("still-ok");
+    try d.setStatusText("still-ok");
     try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
     try std.testing.expectEqualStrings("{\"ip\":\"1.2.3.4\"}", d.body().?);
     // The null branch leaves no body (covers the has_body=false path).
-    d.setBody(null);
+    try d.setBody(null);
     try std.testing.expect(d.body() == null);
-    d.setBody("");
+    try d.setBody("");
     try std.testing.expect(d.body() == null);
 }
 
 test "bodyForParse: zero-copy pool body, NUL copy for owned body" {
-    var d = ResponseData.init();
+    var d = try ResponseData.init();
     defer d.deinit();
     var scratch: [16]u8 = undefined;
     var heap_z: ?[]u8 = null;
     defer if (heap_z) |h| gpa.free(h);
 
-    d.setBody("abc");
+    try d.setBody("abc");
     const pool_body = d.body().?;
     const z1 = (try bodyForParse(&d, &scratch, &heap_z)).?;
     try std.testing.expectEqualStrings("abc", z1);

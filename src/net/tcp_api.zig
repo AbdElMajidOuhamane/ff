@@ -39,6 +39,27 @@ pub var slot_ctx: [MAX_TCP]?*c.Context = [_]?*c.Context{null} ** MAX_TCP;
 
 var tcp_class_id: c.ClassID = 0;
 
+/// Completion userdata: slot number plus the generation it was armed for.
+/// A completion that fires after its slot was closed and reused is discarded
+/// instead of consuming the new owner's promise resolvers. udp_native.zig
+/// uses the same fencing for the same reason.
+const SlotCtx = extern struct {
+    slot: u16,
+    gen: u16,
+};
+
+var slot_ud: [MAX_TCP]SlotCtx = undefined;
+
+/// Resolve completion userdata to a live slot, or null when stale.
+inline fn completionSlot(ud: ?*anyopaque) ?usize {
+    const ptr = ud orelse return null;
+    const ctx_ptr: *const SlotCtx = @ptrCast(@alignCast(ptr));
+    const slot: usize = ctx_ptr.slot;
+    if (slot >= MAX_TCP) return null;
+    if (ctx_ptr.gen != gens[slot]) return null;
+    return slot;
+}
+
 inline fn packHandle(slot: u16, gen: u16) ?*anyopaque {
     const raw = (@as(usize, gen) << 16) | @as(usize, slot);
     return @ptrFromInt(raw + 1);
@@ -72,8 +93,9 @@ fn onConnect(
     _ = comp;
     _ = l;
     _ = tcp;
-    const slot = @intFromPtr(ud);
-    if (slot >= MAX_TCP) return .disarm;
+    const slot = completionSlot(ud) orelse return .disarm;
+    std.debug.assert(slot < MAX_TCP);
+    std.debug.assert(states[slot] == .connecting);
     const ctx = slot_ctx[slot] orelse return .disarm;
     const res_fn = connect_resolves[slot];
     const rej_fn = connect_rejects[slot];
@@ -89,8 +111,11 @@ fn onConnect(
 
         if (rej_fn) |rf| {
             defer c.freeValue(ctx, rf);
-            const err_msg = std.fmt.allocPrint(std.heap.page_allocator, "connect failed: {s}", .{@errorName(err)}) catch "connect failed";
-            defer std.heap.page_allocator.free(err_msg);
+            // Error text is built on the stack: no allocator call in a
+            // completion callback (TigerStyle: no dynamic allocation on I/O
+            // paths, and page_allocator would cost mmap/munmap per failure).
+            var err_buf: [96]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "connect failed: {s}", .{@errorName(err)}) catch "connect failed";
             const err_str = c.newStringLen(ctx, err_msg.ptr, @intCast(err_msg.len));
             var argv = [_]c.Value{err_str};
             _ = c.call(ctx, rf, c.JS_UNDEFINED, 1, &argv);
@@ -125,8 +150,9 @@ fn onRead(
     _ = l;
     _ = tcp;
     _ = buf;
-    const slot = @intFromPtr(ud);
-    if (slot >= MAX_TCP) return .disarm;
+    const slot = completionSlot(ud) orelse return .disarm;
+    std.debug.assert(slot < MAX_TCP);
+    std.debug.assert(states[slot] != .free);
     const ctx = slot_ctx[slot] orelse return .disarm;
     const res_fn = read_resolves[slot];
     const rej_fn = read_rejects[slot];
@@ -136,8 +162,8 @@ fn onRead(
     const n = r catch |err| {
         if (rej_fn) |rf| {
             defer c.freeValue(ctx, rf);
-            const err_msg = std.fmt.allocPrint(std.heap.page_allocator, "read failed: {s}", .{@errorName(err)}) catch "read failed";
-            defer std.heap.page_allocator.free(err_msg);
+            var err_buf: [96]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "read failed: {s}", .{@errorName(err)}) catch "read failed";
             const err_str = c.newStringLen(ctx, err_msg.ptr, @intCast(err_msg.len));
             var argv = [_]c.Value{err_str};
             _ = c.call(ctx, rf, c.JS_UNDEFINED, 1, &argv);
@@ -175,8 +201,9 @@ fn onWrite(
     _ = l;
     _ = tcp;
     _ = buf;
-    const slot = @intFromPtr(ud);
-    if (slot >= MAX_TCP) return .disarm;
+    const slot = completionSlot(ud) orelse return .disarm;
+    std.debug.assert(slot < MAX_TCP);
+    std.debug.assert(states[slot] != .free);
     const ctx = slot_ctx[slot] orelse return .disarm;
     const res_fn = write_resolves[slot];
     const rej_fn = write_rejects[slot];
@@ -186,8 +213,8 @@ fn onWrite(
     const n = r catch |err| {
         if (rej_fn) |rf| {
             defer c.freeValue(ctx, rf);
-            const err_msg = std.fmt.allocPrint(std.heap.page_allocator, "write failed: {s}", .{@errorName(err)}) catch "write failed";
-            defer std.heap.page_allocator.free(err_msg);
+            var err_buf: [96]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "write failed: {s}", .{@errorName(err)}) catch "write failed";
             const err_str = c.newStringLen(ctx, err_msg.ptr, @intCast(err_msg.len));
             var argv = [_]c.Value{err_str};
             _ = c.call(ctx, rf, c.JS_UNDEFINED, 1, &argv);
@@ -226,8 +253,9 @@ fn socketReadCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     read_resolves[slot] = resolving_funcs[0];
     read_rejects[slot] = resolving_funcs[1];
     slot_ctx[slot] = ctx;
+    slot_ud[slot] = .{ .slot = @intCast(slot), .gen = gens[slot] };
 
-    fds[slot].read(&loop_ptr.loop, &read_comps[slot], .{ .slice = read_bufs[slot][0..] }, anyopaque, @ptrFromInt(slot), onRead);
+    fds[slot].read(&loop_ptr.loop, &read_comps[slot], .{ .slice = read_bufs[slot][0..] }, anyopaque, &slot_ud[slot], onRead);
     return promise;
 }
 
@@ -265,9 +293,10 @@ fn socketWriteCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [
     write_resolves[slot] = resolving_funcs[0];
     write_rejects[slot] = resolving_funcs[1];
     slot_ctx[slot] = ctx;
+    slot_ud[slot] = .{ .slot = @intCast(slot), .gen = gens[slot] };
 
     // Fix 4: Use xev write completions for correctness under backpressure
-    fds[slot].write(&loop_ptr.loop, &write_comps[slot], .{ .slice = write_bufs[slot][0..slice.len] }, anyopaque, @ptrFromInt(slot), onWrite);
+    fds[slot].write(&loop_ptr.loop, &write_comps[slot], .{ .slice = write_bufs[slot][0..slice.len] }, anyopaque, &slot_ud[slot], onWrite);
     return promise;
 }
 
@@ -302,22 +331,31 @@ fn cleanupSlot(ctx: ?*c.Context, slot: usize) void {
         write_rejects[slot] = null;
     }
 
-    // Fix: Cancel read, write, and connect watchers before close
+    // Fix: Cancel read, write, and connect watchers before close.
+    // Cancel only completions that are actually active, and reuse a cancel
+    // completion only while it is dead: overwriting one that is still in the
+    // loop's intrusive queue corrupts that queue.
     if (engine.getEventLoop()) |loop_ptr| {
-        read_cancel_comps[slot] = .{
-            .op = .{ .cancel = .{ .c = &read_comps[slot] } },
-        };
-        loop_ptr.loop.add(&read_cancel_comps[slot]);
+        if (read_comps[slot].state() == .active and read_cancel_comps[slot].state() == .dead) {
+            read_cancel_comps[slot] = .{
+                .op = .{ .cancel = .{ .c = &read_comps[slot] } },
+            };
+            loop_ptr.loop.add(&read_cancel_comps[slot]);
+        }
 
-        write_cancel_comps[slot] = .{
-            .op = .{ .cancel = .{ .c = &write_comps[slot] } },
-        };
-        loop_ptr.loop.add(&write_cancel_comps[slot]);
+        if (write_comps[slot].state() == .active and write_cancel_comps[slot].state() == .dead) {
+            write_cancel_comps[slot] = .{
+                .op = .{ .cancel = .{ .c = &write_comps[slot] } },
+            };
+            loop_ptr.loop.add(&write_cancel_comps[slot]);
+        }
 
-        connect_cancel_comps[slot] = .{
-            .op = .{ .cancel = .{ .c = &connect_comps[slot] } },
-        };
-        loop_ptr.loop.add(&connect_cancel_comps[slot]);
+        if (connect_comps[slot].state() == .active and connect_cancel_comps[slot].state() == .dead) {
+            connect_cancel_comps[slot] = .{
+                .op = .{ .cancel = .{ .c = &connect_comps[slot] } },
+            };
+            loop_ptr.loop.add(&connect_cancel_comps[slot]);
+        }
     }
 
     _ = std.c.close(fds[slot].fd);
@@ -395,6 +433,7 @@ fn tcpConnectCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     fds[slot] = tcp_sock;
     states[slot] = .connecting;
     slot_ctx[slot] = ctx;
+    slot_ud[slot] = .{ .slot = @intCast(slot), .gen = gens[slot] };
 
     var resolving_funcs: [2]c.Value = undefined;
     const promise = c.newPromiseCapability(ctx, &resolving_funcs);
@@ -407,7 +446,7 @@ fn tcpConnectCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     connect_resolves[slot] = resolving_funcs[0];
     connect_rejects[slot] = resolving_funcs[1];
 
-    tcp_sock.connect(&loop_ptr.loop, &connect_comps[slot], addr, anyopaque, @ptrFromInt(slot), onConnect);
+    tcp_sock.connect(&loop_ptr.loop, &connect_comps[slot], addr, anyopaque, &slot_ud[slot], onConnect);
     return promise;
 }
 

@@ -4,7 +4,9 @@ zig-out
 zig-pkg
 .DS_Store
 vendor/quickjs/
-bench
+bench/*
+!bench/httpbench/
+bench/httpbench/results/
 examples
 vendor/bearssl 
 tests
@@ -13,3 +15,5 @@ vendor/nghttp2
 test/fixtures/libaddon_probe.so
 test/fixtures/libaddon_probe.dylib
 kcov-output
+__pycache__/
+*.pyc

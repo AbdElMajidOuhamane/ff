@@ -140,6 +140,33 @@ var body_bufs: [MAX_CONN][BODY_BUF_SIZE]u8 = undefined;
 // Retained across responses on the same slot; freed at closeConn/setupSlot
 // or at drain end when a spill exceeds BODY_SPILL_RETAIN_MAX.
 var body_heap: [MAX_CONN]?[]u8 = [_]?[]u8{null} ** MAX_CONN; // heap spill for >64KB
+// Aggregate retained response spill. The per-slot cap alone allows
+// MAX_CONN x BODY_SPILL_RETAIN_MAX (128 MiB) of retained heap; requests
+// already have a global budget, responses must too.
+const BODY_SPILL_GLOBAL_MAX: usize = 64 * 1024 * 1024;
+var body_spill_bytes: std.atomic.Value(usize) = .{ .raw = 0 };
+
+fn bodySpillReserve(delta: usize) bool {
+    var cur = body_spill_bytes.load(.monotonic);
+    while (true) {
+        if (cur > BODY_SPILL_GLOBAL_MAX or delta > BODY_SPILL_GLOBAL_MAX - cur) return false;
+        if (body_spill_bytes.cmpxchgStrong(cur, cur + delta, .acq_rel, .acquire) == null) return true;
+        cur = body_spill_bytes.load(.acquire);
+    }
+}
+
+fn bodySpillRelease(n: usize) void {
+    _ = body_spill_bytes.fetchSub(n, .monotonic);
+}
+
+/// Free one slot's retained response spill and give its budget back.
+fn freeBodySpill(id: usize) void {
+    if (body_heap[id]) |old| {
+        bodySpillRelease(old.len);
+        gpa.free(old);
+        body_heap[id] = null;
+    }
+}
 var body_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // Spill telemetry for the >64KB response path (mirrors async_fetch stat_*).
 pub var stat_body_spill: std.atomic.Value(u64) = .{ .raw = 0 };
@@ -407,6 +434,10 @@ fn validWsKey(k: []const u8) bool {
 ///   * obs-fold, whitespace-before-colon, colon-less lines: refused
 ///   * WebSocket handshake validated by header table, not a buffer scan
 pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
+    // The caller locates headers_end from this same buffer; parsing outside
+    // it would read adjacent slot memory.
+    std.debug.assert(headers_end >= 4);
+    std.debug.assert(headers_end <= buf.len);
     var pr = ParsedRequest{
         .method = "",
         .method_tag = .none,
@@ -540,6 +571,11 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     }
 
     pr.keep_alive = if (is_11) !has_close else has_keepalive;
+    // Contract every downstream consumer relies on (see ParsedRequest):
+    // a framing-valid request's body is bounded, so headers_end + length
+    // cannot leave the slot's static buffer budget.
+    std.debug.assert(!pr.framing_ok or pr.content_length <= REQ_BODY_MAX);
+    std.debug.assert(pr.ws_key.len == 0 or pr.ws_bad == false);
     return pr;
 }
 fn statusReason(status: u16) []const u8 {
@@ -773,6 +809,11 @@ fn finishReqSpill(id: usize, l: *xev.Loop) void {
             error.OutOfMemory => {
                 resetReqSpill(id);
                 rejectWith(id, l, 503, "Service Unavailable");
+                return;
+            },
+            error.InvalidHeader => {
+                resetReqSpill(id);
+                rejectWith(id, l, 400, "Bad Request");
                 return;
             },
         };
@@ -1051,8 +1092,7 @@ fn printException(ctx: ?*c.Context, exc: c.Value) void {
 fn releaseSpillIfOversized(id: usize) void {
     if (body_heap[id]) |old| {
         if (old.len > BODY_SPILL_RETAIN_MAX) {
-            gpa.free(old);
-            body_heap[id] = null;
+            freeBodySpill(id);
         }
     }
 }
@@ -1078,10 +1118,13 @@ pub fn stageBodyBytes(id: usize, src: []const u8) ?[]const u8 {
             cflags[id].body_from_heap = true;
             return old[0..src.len];
         }
-        gpa.free(old);
-        body_heap[id] = null;
+        freeBodySpill(id);
     }
-    const buf = gpa.dupe(u8, src) catch return null;
+    if (!bodySpillReserve(src.len)) return null;
+    const buf = gpa.dupe(u8, src) catch {
+        bodySpillRelease(src.len);
+        return null;
+    };
     body_heap[id] = buf;
     cflags[id].body_from_heap = true;
     return buf;
@@ -1125,10 +1168,14 @@ fn stageLargeResponse(id: usize, header_len: usize, body_ptr: [*]const u8, blen:
                 cflags[id].body_from_heap = true;
                 return;
             }
-            gpa.free(old);
-            body_heap[id] = null;
+            freeBodySpill(id);
+        }
+        if (!bodySpillReserve(blen)) {
+            buildResponse(id, 503, "Service Unavailable");
+            return;
         }
         body_heap[id] = gpa.dupe(u8, body_ptr[0..blen]) catch {
+            bodySpillRelease(blen);
             buildResponse(id, 500, "Internal Server Error");
             return;
         };
@@ -1559,17 +1606,32 @@ fn stageHandlerResponse(id: usize, result: c.Value) void {
 // and handler_parked is re-checked on the slot actually found.
 var park_seq: u16 = 0; // 15-bit, 0 reserved for "no token"
 var park_token: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
+// Reverse index: token -> slot + 1 (0 = empty). 15-bit token space is 64 KiB of
+// static storage and turns claimParkedSlot's 512-entry scan into one load per
+// async completion.
+var parked_slot_by_token: [0x8000]u16 = [_]u16{0} ** 0x8000;
+
+/// Invalidate a slot's park token in both directions.
+fn clearParkToken(id: usize) void {
+    const token = park_token[id];
+    if (token != 0) {
+        parked_slot_by_token[token] = 0;
+        park_token[id] = 0;
+    }
+}
 
 fn claimParkedSlot(magic: c_int) ?usize {
     const token: u16 = @intCast(@as(c_uint, @bitCast(magic)) & 0x7FFF);
     if (token == 0) return null;
-    for (0..MAX_CONN) |id| {
-        if (park_token[id] != token) continue;
-        if (!cflags[id].handler_parked) return null;
-        park_token[id] = 0; // one-shot: a duplicated reaction cannot re-claim
-        return id;
-    }
-    return null;
+    const packed_slot = parked_slot_by_token[token];
+    if (packed_slot == 0) return null;
+    const id: usize = packed_slot - 1;
+    std.debug.assert(id < MAX_CONN);
+    if (park_token[id] != token) return null;
+    if (!cflags[id].handler_parked) return null;
+    parked_slot_by_token[token] = 0;
+    park_token[id] = 0; // one-shot: a duplicated reaction cannot re-claim
+    return id;
 }
 
 fn completeParked(magic: c_int, argc: c_int, argv: [*c]c.Value, rejected: bool) c.Value {
@@ -1658,7 +1720,9 @@ fn parkHandler(id: usize, ctx: ?*c.Context, promise: c.Value) bool {
         return false;
     }
     cflags[id].handler_parked = true;
+    clearParkToken(id);
     park_token[id] = token;
+    parked_slot_by_token[token] = @intCast(id + 1);
     parked_since_ms[id] = nowMs();
     return true;
 }
@@ -1706,7 +1770,7 @@ fn parseHeaders(raw: []const u8) !*headers_mod.HeadersData {
                     if (total_bytes > MAX_REQ_HEADER_BYTES) {
                         return error.HeadersTooLarge;
                     }
-                    data.appendEntry(name, val);
+                    try data.appendEntry(name, val);
                 }
             }
             while (i < raw.len and (raw[i] == '\r' or raw[i] == '\n')) i += 1;
@@ -2278,17 +2342,14 @@ fn closeConn(id: usize) void {
     }
     cleanupConnChunk(id);
     http2_mod.removeSession(id);
-    if (body_heap[id]) |old| {
-        gpa.free(old);
-        body_heap[id] = null;
-    } // ← FIX
+    freeBodySpill(id); // ← FIX
     destroyReqSpill(id);
     body_remaining[id] = 0;
     body_source_off[id] = 0;
     body_lens[id] = 0;
     cflags[id].body_from_heap = false;
     cflags[id].handler_parked = false; // NEW
-    park_token[id] = 0; // a token from this incarnation must not be claimable
+    clearParkToken(id); // a token from this incarnation must not be claimable
     parked_since_ms[id] = 0; // NEW
     deadline_ms[id] = 0;
     wsShutdown(id);
@@ -2402,7 +2463,7 @@ fn watchdogCb(
         if (!cflags[id].handler_parked) continue;
         if (now -% parked_since_ms[id] < HANDLER_TIMEOUT_MS) continue;
         cflags[id].handler_parked = false;
-        park_token[id] = 0;
+        clearParkToken(id);
         parked_since_ms[id] = 0;
         buildResponse(id, 504, "Gateway Timeout");
         if (cflags[id].h2_active) {
@@ -2454,7 +2515,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     fds[id] = tcp;
     slot_gen[id] +%= 1; // NEW
     parked_since_ms[id] = 0; // NEW
-    park_token[id] = 0; // the new incarnation owns no park token
+    clearParkToken(id); // the new incarnation owns no park token
     deadline_ms[id] = nowMs() + CONN_TIMEOUT_MS;
     const nodelay: c_int = 1;
     std.posix.setsockopt(
@@ -2470,10 +2531,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     hdr_scan_off[id] = 0;
     write_lens[id] = 0;
     write_offsets[id] = 0;
-    if (body_heap[id]) |old| {
-        gpa.free(old);
-        body_heap[id] = null;
-    } // ← FIX
+    freeBodySpill(id); // ← FIX
     destroyReqSpill(id);
     body_remaining[id] = 0;
     body_source_off[id] = 0;
@@ -2638,6 +2696,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
         return;
     }
     const headers_end = he_found.? + 4;
+    std.debug.assert(headers_end <= buf_lens[id]);
     hdr_scan_off[id] = 0;
     const pr = parseRequest(read_bufs[id][0..buf_lens[id]], headers_end);
     methods[id] = pr.method_tag;
@@ -2710,6 +2769,10 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
                 rejectWith(id, l, 503, "Service Unavailable");
                 return;
             },
+            error.InvalidHeader => {
+                rejectWith(id, l, 400, "Bad Request");
+                return;
+            },
         };
         callHandlerWithHeaders(id, &pr, body, hdrs);
     }
@@ -2767,6 +2830,8 @@ pub fn writeCb(
 ) xev.CallbackAction {
     const raw = ud orelse return .disarm;
     const id: usize = @intCast(raw.*);
+    std.debug.assert(id < MAX_CONN);
+    std.debug.assert(write_offsets[id] <= write_lens[id]);
     const written = r catch {
         closeConn(id);
         return .disarm;
@@ -2915,6 +2980,7 @@ pub fn writeCb(
     }
 
     write_offsets[id] += written;
+    std.debug.assert(write_offsets[id] <= write_lens[id]);
 
     if (conn_stream[id]) |stream_idx| {
         if (write_offsets[id] < write_lens[id]) {
@@ -2931,6 +2997,8 @@ pub fn writeCb(
     }
 
     if (body_lens[id] > 0) {
+        // Offset + remaining always reconstructs the staged length.
+        std.debug.assert(body_source_off[id] + body_remaining[id] == body_lens[id]);
         if (write_offsets[id] >= write_lens[id]) {
             const n = @min(WRITE_BUF_SIZE, body_remaining[id]);
             if (n == 0) {
