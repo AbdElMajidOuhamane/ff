@@ -50,23 +50,28 @@ var states: [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB
 // http_native ConnFlags). `want_connect`/`tx_pending` stay separate plain
 // columns: they are cross-thread hints written by main while the worker
 // reads/writes sibling flags — sharing a byte would tear on RMW.
-// Packing is safe here because for any slot, at most one thread writes
-// wflags at a time: main writes pre-publish (submit) or on CLAIMED slots
-// (completeEvent/releaseSlot, which the worker skips as non-BUSY), the
-// worker writes only on BUSY slots it owns. `tls_active` is written once
-// pre-publish, then read-only.
+// Main-thread-only flags (never read or written by the worker thread).
+const MainFlags = packed struct(u8) {
+    ws_open: bool = false,
+    ws_closing: bool = false,
+    _pad: u6 = 0,
+};
+// Worker-owned flags after submit() publishes JOB_BUSY. Main writes only
+// pre-publish in submit() (before JOB_BUSY .release) and reads rx_binary
+// only while CLAIMED (after JOB_DONE .acquire, when worker skips the slot).
 const WsFlags = packed struct(u8) {
     tls_active: bool = false,
-    ws_open: bool = false,
     ws_sent_close: bool = false,
     rx_binary: bool = false,
     partial_binary: bool = false,
     conn_live: bool = false,
-    _pad: u2 = 0,
+    _pad: u3 = 0,
 };
 comptime {
+    std.debug.assert(@sizeOf(MainFlags) == 1);
     std.debug.assert(@sizeOf(WsFlags) == 1);
 }
+var main_flags: [MAX_WS]MainFlags = [_]MainFlags{.{}} ** MAX_WS;
 var wflags: [MAX_WS]WsFlags = [_]WsFlags{.{}} ** MAX_WS;
 var sock_fds: [MAX_WS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** MAX_WS;
 var hosts: [MAX_WS][:0]const u8 = [_][:0]const u8{""} ** MAX_WS;
@@ -153,7 +158,6 @@ fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
     const s: usize = free_list[free_count];
-    states[s].store(JOB_BUSY, .release);
     return s;
 }
 
@@ -166,7 +170,7 @@ fn releaseSlot(s: usize) void {
     hosts[s] = "";
     paths[s] = "";
     want_connect[s] = false;
-    wflags[s].ws_open = false;
+    main_flags[s] = .{};
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
     tx_lock[s].lockUncancelable(lockIo());
@@ -242,12 +246,11 @@ pub fn submit(
     @memcpy(path_bufs[s][0..path.len], path);
     paths[s] = path_bufs[s][0..path.len];
     ports[s] = port;
-    wflags[s].tls_active = tls_flag;
+    main_flags[s] = .{};
+    wflags[s] = .{ .tls_active = tls_flag };
     var key16: [16]u8 = undefined;
     getRandomBytes(&key16);
     _ = std.base64.standard.Encoder.encode(keys[s][0..24], &key16);
-    wflags[s].ws_open = false;
-    wflags[s].ws_sent_close = false;
     rd_len[s] = 0;
     partial_len[s] = 0;
     tx_pending[s] = .{ .raw = false };
@@ -268,6 +271,7 @@ pub fn submit(
         return error.SpawnFailed;
     };
     want_connect[s] = true;
+    states[s].store(JOB_BUSY, .release);
     wakeWorker();
     ensureArmed();
     return .{ .slot = @intCast(s), .gen = gens[s] };
@@ -345,7 +349,7 @@ fn appendFrameLocked(s: usize, opcode: u8, payload: []const u8) bool {
 pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) bool {
     if (!isValid(h)) return false;
     const s: usize = h.slot;
-    if (!wflags[s].ws_open) return false;
+    if (!main_flags[s].ws_open) return false;
     if (bytes.len > WS_MSG_SIZE) return false;
     const io = lockIo();
     tx_lock[s].lockUncancelable(io);
@@ -359,7 +363,8 @@ pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) bool {
 pub fn closeWs(h: Handle, code: u16, reason: []const u8) void {
     if (!isValid(h)) return;
     const s: usize = h.slot;
-    if (wflags[s].ws_sent_close) return;
+    if (main_flags[s].ws_closing) return;
+    main_flags[s].ws_closing = true;
     const io = lockIo();
     tx_lock[s].lockUncancelable(io);
     defer tx_lock[s].unlock(io);
@@ -970,10 +975,6 @@ fn claimSlot(s: usize) bool {
 
 pub fn drainCompleted(ctx: ?*c.Context) void {
     var mask = doneMask();
-    // F7-B: one wake per batch so the worker promptly resumes polling slots
-    // the dispatch just flipped back to BUSY (replaces the old per-message
-    // spin handshake).
-    if (mask != 0) wakeWorker();
     while (mask != 0) {
         const s: usize = @ctz(mask);
         mask &= mask - 1;
@@ -1062,6 +1063,15 @@ fn makeErrorEvent(ctx: ?*c.Context, s: usize) c.Value {
     return obj;
 }
 
+fn markBusy(s: usize) void {
+    // Release the slot back to the worker BEFORE writing the wake byte so
+    // the worker is guaranteed to observe JOB_BUSY for both RX polling
+    // (including buffered rd_buf frames) and any TX/close queued during
+    // onopen/onmessage.
+    states[s].store(JOB_BUSY, .release);
+    wakeWorker();
+}
+
 fn completeEvent(ctx: ?*c.Context, s: usize) void {
     const ev = rx_event[s];
 
@@ -1079,20 +1089,20 @@ fn completeEvent(ctx: ?*c.Context, s: usize) void {
     }
 
     const sv = socks[s] orelse {
-        states[s].store(JOB_BUSY, .release);
+        markBusy(s);
         return;
     };
     switch (ev) {
         EV_OPEN => {
-            wflags[s].ws_open = true;
+            main_flags[s].ws_open = true;
             setReadyState(ctx, sv, 1);
             dispatchEvent(ctx, sv, "onopen", makeOpenEvent(ctx));
-            states[s].store(JOB_BUSY, .release);
+            markBusy(s);
         },
         EV_MESSAGE => {
             dispatchEvent(ctx, sv, "onmessage", makeMessageEvent(ctx, s));
-            states[s].store(JOB_BUSY, .release);
+            markBusy(s);
         },
-        else => states[s].store(JOB_BUSY, .release),
+        else => markBusy(s),
     }
 }
