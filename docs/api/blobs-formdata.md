@@ -24,7 +24,7 @@ console.log(res.status);
 ```
 
 ```sh
-ff upload.js
+ff upload.js --allow-net=api.example.com:443
 ```
 
 > **Known issue:** that `body: form` does **not** send multipart data — `fetch` coerces the `FormData` with `String()`, so the server receives the literal text `"[object Object]"`. Build the payload as an explicit string (JSON, urlencoded, or a hand-built multipart body with a `content-type` header) until form/binary bodies are serialized natively.
@@ -39,7 +39,7 @@ const b2 = new Blob(["<svg/>"], { type: "image/svg+xml" });
 
 | Member | Description |
 |--------|-------------|
-| `new Blob(parts?, options?)` | `parts`: array of strings / buffers / blobs; `options.type`: MIME string (sniffed when omitted) |
+| `new Blob(parts?, options?)` | `parts`: array of strings / buffers / blobs; `options.type`: MIME string (normalized: lowercase, `; params` stripped; `""` when omitted — never sniffed) |
 | `size` | Byte length (number property) |
 | `type` | MIME type string (property, `""` when unknown) |
 | `slice(start?, end?, type?)` | New `Blob` windowed over the bytes |
@@ -79,13 +79,14 @@ form.append("avatar", blob, "avatar.png");
 
 | Method | Description |
 |--------|-------------|
-| `append(name, value, filename?)` | Add a field (third arg names a `Blob` part) |
-| `set(name, value, filename?)` | Replace all values for the field |
-| `get(name)` | First value, or `null` |
+| `append(name, value, filename?)` | Add a field (third arg names a `Blob` part; file parts read back as plain `Blob` — no `File` class or `.name`) |
+| `set(name, value)` | Replace all values for the field (uses swap-remove; any 3rd arg is ignored) |
+| `get(name)` | First value (`string` or `Blob`), or `null` |
 | `getAll(name)` | All values as an array |
 | `has(name)` | Presence check |
-| `delete(name)` | Remove the field |
-| `entries()` / `keys()` / `values()` / `forEach()` | Iterate |
+| `delete(name)` | Remove the field (uses swap-remove) |
+| `entries()` / `keys()` / `values()` | Return plain **Arrays** (not iterators; `FormData` is not iterable) |
+| `forEach(fn)` | Iterate `(value, key, formData)` |
 | `size()` | Field count — a **method**, not a property (unlike `Blob.size`); call it |
 
 ```js
@@ -97,15 +98,21 @@ form.size(); // 2
 form.forEach((value, key) => console.log(key, value));
 ```
 
+Note: `delete()` and `set()` use swap-remove internally, so field order is not preserved after deletions.
+
 ## Round-tripping: `res.blob()` / `res.formData()`
 
 Both readers work on `Request` and `Response`, and are re-readable like every body reader in Fairyfly:
 
 ```js
 // server.js — echo an upload back as JSON
-http.serve({ port: 3000 }, async (url, method, body) => {
+http.serve({ port: 3000 }, async (url, method, body, headers) => {
   if (url === "/upload" && method === "POST") {
-    const req = new Request("http://localhost/upload", { method: "POST", body });
+    const req = new Request("http://localhost/upload", {
+      method: "POST",
+      headers,
+      body,
+    });
     const form = await req.formData().catch(() => null);
     if (!form) return Response.json({ error: "need multipart form" }, { status: 400 });
     return Response.json({
@@ -158,7 +165,7 @@ http.serve({ port: 3000 }, async (url, method, body) => {
 ```
 
 ```sh
-ff drop.js
+ff drop.js --allow-net=0.0.0.0:3000 --allow-write=.
 curl -X POST http://127.0.0.1:3000/drop --data-binary @photo.png
 # {"received":12345}
 ```

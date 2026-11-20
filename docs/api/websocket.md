@@ -14,7 +14,7 @@ Both sides are network operations, gated by `--allow-net`:
 
 | Side | What needs the grant |
 |---|---|
-| Server | The underlying `http.serve({ port })` — always checked as `0.0.0.0:<port>`. The `websocket` block adds **no** separate flag. |
+| Server | The underlying `http.serve({ hostname, port })` — checked as `<hostname>:<port>` (default `0.0.0.0:<port>`). The `websocket` block adds **no** separate flag. |
 | Client | The URL passed to `new WebSocket(...)` — checked as `host:port`. |
 
 ```sh
@@ -62,7 +62,10 @@ http.serve(
         peers.add(socket);
         socket.send("welcome");
       },
-      message: (socket, data) => socket.send(data),
+      message: (socket, data) => {
+        if (typeof data === "string") socket.send(data);
+        else socket.sendBinary(data);
+      },
       close: (socket) => peers.delete(socket),
     },
   },
@@ -130,7 +133,10 @@ http.serve(
     websocket: {
       open: (socket) => peers.add(socket),
       message: (socket, data) => {
-        for (const peer of peers) peer.send(data);
+        for (const peer of peers) {
+          if (typeof data === "string") peer.send(data);
+          else peer.sendBinary(data);
+        }
       },
       close: (socket) => peers.delete(socket),
     },
@@ -144,13 +150,15 @@ ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/   # online: 0  (peers counted via Set size)
 ```
 
-Send binary with `sendBinary`:
+Send binary with `sendBinary` (`Uint8Array` / any `TypedArray` or `ArrayBuffer`):
 
 ```js
-socket.sendBinary(new Uint8Array([1, 2, 3]).buffer);
+socket.sendBinary(new Uint8Array([1, 2, 3]));
 ```
 
-> **Caution:** `socket.send` after the client disconnected fails — always remove sockets in `close`, and never store an index or id on them (none exists).
+Note: `socket.send(data)` sends UTF-8 strings only (binary payloads passed to `socket.send` and empty `""` strings are silently ignored).
+
+> **Caution:** `socket.send` after the client disconnected is a silent no-op (generation-checked so retained handles never touch recycled slots), but still remove sockets in `close` to avoid leaking dead references — and never store an index or id on them (none exists).
 
 ## Client: connecting and messaging
 

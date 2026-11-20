@@ -9,7 +9,7 @@ Fairyfly is a fast backend JavaScript runtime — one `ff` binary, batteries
 included (HTTP, fetch, WebSocket, SQLite, Postgres, workers). Scripts and
 ES modules both work — the runtime auto-detects per file.
 
-46 pages in five sections. If you're new: read the three getting-started
+49 pages in five sections. If you're new: read the three getting-started
 pages in order, then read [Permissions](/docs/concepts/permissions) before
 your first server — it explains the deny-by-default flags. Keep **Concepts**
 open while you build; it explains *why* the runtime behaves the way it does.
@@ -50,13 +50,13 @@ open while you build; it explains *why* the runtime behaves the way it does.
 | [TLS](/docs/guides/tls) | Serve HTTPS/WSS with cert + key |
 | [HTTP/2](/docs/guides/http2) | HTTP/2 over TLS with ALPN — same handler, same port |
 | [Workers](/docs/guides/workers) | CPU-bound work on up to 8 threads |
-| [Timers](/docs/guides/timers) | `setTimeout`, `setInterval`, `unref`, microtasks |
+| [Timers](/docs/guides/timers) | `setTimeout`, `setInterval`, `ff.cron`, `unref`, microtasks |
 | [Logging](/docs/guides/logging) | `console`, colored output, timers, stderr redirection |
 | [Modules](/docs/guides/modules) | ESM resolution rules, extensions, `import.meta.url` |
-| [Process](/docs/guides/process) | argv, env, cwd, exit, pid — and what's missing on purpose |
-| [Environment variables](/docs/guides/env) | Every `FF_` variable and `process.env` |
+| [Process](/docs/guides/process) | argv, env, `stdout`/`stdin`, cwd, exit, pid — and what's missing on purpose |
+| [Environment variables](/docs/guides/env) | Every `FF_` variable, `--env-file`, and `process.env` |
 | [Packages](/docs/guides/packages) | `ff imprint` / `ff sever` for ESM dependencies |
-| [Bytecode](/docs/guides/bytecode) | Ship without source via `ff compile` |
+| [Bytecode](/docs/guides/bytecode) | Ship without source via `ff compile` / `--standalone` |
 | [Testing](/docs/guides/testing) | `ff test` + `test/run.sh` with the `check`/`done` pattern |
 | [Deploy](/docs/guides/deploy) | Build, Docker, `ff start`, smoke-test, production TLS |
 
@@ -65,17 +65,20 @@ open while you build; it explains *why* the runtime behaves the way it does.
 | Page | What it covers |
 |------|----------------|
 | [Overview](/docs/api/overview) | Every global on one page, each linking to its reference |
-| [`http`](/docs/api/http) | `http.serve` signatures, options, handler contract |
+| [`http`](/docs/api/http) | `http.serve` signatures, `hostname`, routes, chunked streaming, handler contract |
 | [`fetch`](/docs/api/fetch) | `fetch()` — init keys, redirects, limits |
-| [Request / Response / Headers](/docs/api/request-response) | Constructors, statics, body readers, `Headers` |
+| [Request / Response / Headers](/docs/api/request-response) | Constructors, `Response.file`, `res.body`, body readers, `Headers` |
+| [`ReadableStream`](/docs/api/streams) | `ReadableStream`, reader, controller, HTTP/1.1 chunked streaming |
 | [`WebSocket`](/docs/api/websocket) | Client API and server socket API |
+| [`tcp`](/docs/api/tcp) | Direct TCP client sockets (`tcp.connect`) |
 | [`udp`](/docs/api/udp) | Datagram sockets — bind, sendto, recvfrom, connected send/recv |
+| [Cron (`ff.cron`)](/docs/api/cron) | In-process UTC cron & `@every` interval scheduler |
 | [`fs`](/docs/api/fs) | Sync and Promise-based filesystem calls |
 | [`console`](/docs/api/console) | Every method, aliases, `time`/`timeLog`/`timeEnd` |
-| [`process`](/docs/api/process) | `argv`, `env`, `pid`, `on`/`kill`, `memoryUsage`, `stats` |
+| [`process`](/docs/api/process) | `argv`, `env`, `stdout`, `stdin`, `pid`, `on`/`kill`, `memoryUsage`, `stats` |
 | [`child_process`](/docs/api/child-process) | `spawn` / `exec` / `execSync`, output capture, signals |
 | [`URL`](/docs/api/url) | `URL`, `URLSearchParams`, `URL.parse`, `URL.canParse` |
-| [`crypto`](/docs/api/crypto) | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), `btoa`/`atob` |
+| [`crypto`](/docs/api/crypto) | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), `bcrypt`, `btoa`/`atob` |
 | [Text encoding](/docs/api/text-encoding) | `TextEncoder` / `TextDecoder` |
 | [`performance`](/docs/api/performance) | `performance.now()` |
 | [`Worker`](/docs/api/worker) | `postMessage`, `terminate`, worker-side globals |
@@ -98,28 +101,29 @@ open while you build; it explains *why* the runtime behaves the way it does.
 | Feature | Page |
 |---------|------|
 | `console` (11 methods, colored aliases, timers) | [API: console](/docs/api/console) · [Logging](/docs/guides/logging) |
-| `setTimeout` / `setInterval` / `queueMicrotask` | [Timers](/docs/guides/timers) · [Event loop](/docs/concepts/event-loop) |
+| `setTimeout` / `setInterval` / `ff.cron` / `queueMicrotask` | [API: Cron](/docs/api/cron) · [Timers](/docs/guides/timers) · [Event loop](/docs/concepts/event-loop) |
 | `performance.now()` | [API: performance](/docs/api/performance) |
-| `http.serve` (HTTP, TLS, HTTP/2, WebSocket) | [API: http](/docs/api/http) · [HTTP Server](/docs/guides/http-server) |
-| `fetch`, `Request`, `Response`, `Headers` | [API: fetch](/docs/api/fetch) · [API: Request/Response](/docs/api/request-response) |
+| `http.serve` (HTTP, TLS, HTTP/2, WebSocket, routes, streaming) | [API: http](/docs/api/http) · [HTTP Server](/docs/guides/http-server) |
+| `fetch`, `Request`, `Response`, `Headers`, `ReadableStream` | [API: fetch](/docs/api/fetch) · [API: Request/Response](/docs/api/request-response) · [API: ReadableStream](/docs/api/streams) |
 | `WebSocket` client | [API: WebSocket](/docs/api/websocket) · [WebSocket](/docs/guides/websocket) |
-| UDP datagram sockets | [API: UDP](/docs/api/udp) |
+| `tcp` client & UDP datagram sockets | [API: tcp](/docs/api/tcp) · [API: UDP](/docs/api/udp) |
 | `fs` sync + `*Async` | [API: fs](/docs/api/fs) |
 | `Database` (SQLite) | [API: SQLite](/docs/api/sqlite) |
 | `sql` / `SQL` / `Tx` (Postgres) | [API: Postgres](/docs/api/postgres) |
 | `Worker` | [API: Worker](/docs/api/worker) · [Workers](/docs/guides/workers) |
 | `URL` / `URLSearchParams` | [API: URL](/docs/api/url) |
-| `crypto`, `btoa`, `atob` | [API: crypto](/docs/api/crypto) |
+| `crypto` (including `bcrypt`), `btoa`, `atob` | [API: crypto](/docs/api/crypto) |
 | `TextEncoder` / `TextDecoder` | [API: Text encoding](/docs/api/text-encoding) |
 | `Blob` / `FormData` | [Blob and FormData](/docs/api/blobs-formdata) |
-| `process` | [API: process](/docs/api/process) · [Process](/docs/guides/process) |
+| `process` (`env`, `stdout`, `stdin`, signals) | [API: process](/docs/api/process) · [Process](/docs/guides/process) |
 | `child_process` | [API: child_process](/docs/api/child-process) |
 | `ffi` (needs `--allow-ffi`) | [API: FFI](/docs/api/ffi) |
-| Permission flags (`--allow-*`) | [Permissions](/docs/concepts/permissions) · [CLI](/docs/reference/cli) |
+| Permission flags (`--allow-*`, `--deny-*`, `permissions.revoke`) | [Permissions](/docs/concepts/permissions) · [CLI](/docs/reference/cli) |
+| Runtime limits (`--max-heap`, `--max-stack`, `--worker-heap`, `--cpu-budget`) | [CLI](/docs/reference/cli) · [Limitations](/docs/reference/limitations) |
 | ESM resolution, `import.meta.url` | [Modules](/docs/guides/modules) |
 | Packages: `ff imprint` / `ff sever` | [Packages](/docs/guides/packages) |
-| Bytecode: `ff compile` | [Bytecode](/docs/guides/bytecode) |
-| Environment variables | [Environment](/docs/guides/env) |
+| Bytecode & standalone: `ff compile` / `--standalone` | [Bytecode](/docs/guides/bytecode) |
+| Environment variables & `--env-file` | [Environment](/docs/guides/env) |
 | CLI commands | [CLI](/docs/reference/cli) |
 | Hard limits | [Limitations](/docs/reference/limitations) |
 | Node/browser gaps | [Compatibility](/docs/reference/compatibility) |

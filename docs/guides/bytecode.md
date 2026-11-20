@@ -6,7 +6,7 @@ order: 15
 
 # Bytecode
 
-`ff compile` turns an ES module into QuickJS bytecode (`.ffbc`) with **source and debug info stripped**. Run the result with plain `ff` — the loader detects the `.ffbc` magic.
+`ff compile` turns an ES module into QuickJS bytecode (`.ffbc`) with **source and debug info stripped**, or packages a self-contained script into a standalone executable (`--standalone`). Run `.ffbc` files with plain `ff` — detected by the `.ffbc` filename extension.
 
 ## Quick look
 
@@ -18,7 +18,7 @@ http.serve({ port: 3000 }, () => new Response("hello from bytecode"));
 ```sh
 ff compile app.js
 # ✓ Compiled app.js → app.ffbc (12345 bytes)
-ff app.ffbc
+ff app.ffbc --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/
 # hello from bytecode
 ```
@@ -29,6 +29,7 @@ curl http://127.0.0.1:3000/
 ff compile app.js
 ff compile app.js -o app.ffbc
 ff compile app.js --output dist/app.ffbc
+ff compile app.js --standalone
 ff compile app.js --standalone -o app
 ```
 
@@ -37,24 +38,33 @@ ff compile app.js --standalone -o app
 | `ff compile app.js` | `app.ffbc` (extension replaced) |
 | `ff compile app.js -o out.ffbc` | `out.ffbc` |
 | `ff compile app.js --output dist/app.ffbc` | `dist/app.ffbc` |
-| `ff compile app.js --standalone -o app` | `app` (self-executable binary, no runtime needed) |
+| `ff compile app.js --standalone` | `app` (extension stripped, `chmod 0755`) |
+| `ff compile app.js --standalone -o dist/app` | `dist/app` (self-executable binary) |
 
 Rules:
 
-- Input must be an ES module; a syntax error prints `compile error in '<path>'` and writes nothing.
+- Input must be an ES module; a syntax error prints `error: compile failed in '<path>': <reason>` and writes nothing.
 - Input cap is 20MB — larger files fail.
 - Output embeds bytecode only: no source text, no debug info. Stack traces from `.ffbc` won't show original line names.
+
+### Standalone executables (`--standalone`)
+
+`--standalone` copies the `ff` binary, appends the compiled bytecode plus a 24-byte `FFSTANDA` trailer (bytecode length + Wyhash integrity check of the binary prefix), sets mode `0755`, and prints `✓ Compiled standalone binary <in> → <out> (<N> bytes)`:
+
+- **Single-file only**: files containing `"import "` or `"import("` are rejected (`error: standalone compilation does not support imports yet` — bundle to a single file first).
+- **Default output**: omitting `-o`/`--output` strips the input extension (`app.js` → `app`).
+- **Permissions and limits**: standalone executables stay deny-by-default and accept `--allow-*`, `--deny-*`, `--env-file`, and runtime limit flags on their CLI (e.g. `./app --allow-net=0.0.0.0:3000`).
 
 ## Running bytecode
 
 ```sh
-ff app.ffbc
+ff app.ffbc --allow-net=0.0.0.0:3000
 ```
 
-No flag needed — `ff` sniffs the file magic and loads bytecode instead of source. Everything else behaves identically: `ff test`-style harnesses, `FF_ECHO`, TLS flags, and env vars all work the same.
+No special flag is needed — `ff` checks for the `.ffbc` filename extension and loads bytecode instead of source (while `--standalone` executables detect their appended `FFSTANDA` trailer). `--ca`, `FF_CA_FILE`, `FF_ECHO`, `http.serve({ tls })`, permission flags, and env vars all work the same; CLI `--cert`/`--key` and `FF_CERT`/`FF_KEY` are `ff start`-only and do not apply to `ff app.ffbc` (or `ff start` itself — see below).
 
 ```sh
-FF_ECHO=1 ff app.ffbc
+FF_ECHO=1 ff app.ffbc --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/x
 # {"message":"ok"}
 ```
@@ -77,13 +87,13 @@ http.serve({ port }, (url) => {
 EOF
 ff compile main.js -o main.ffbc
 ls -la main.ffbc
-PORT=8080 ff main.ffbc &
+PORT=8080 ff main.ffbc --allow-env=PORT --allow-net=0.0.0.0:8080 &
 curl http://127.0.0.1:8080/health
 # {"ok":true}
 kill %1
 ```
 
-Deploy `main.ffbc` (+ `ff.json` if you use `ff start` semantics elsewhere) instead of `main.js`. Recipients get a working binary artifact with no readable source.
+Run `.ffbc` files directly with `ff main.ffbc` (`ff start` expects JS source in `ff.json` and does not detect `.ffbc`). Recipients get a working bytecode artifact with no readable source.
 
 ## When to use it (and when not to)
 
@@ -95,9 +105,9 @@ Deploy `main.ffbc` (+ `ff.json` if you use `ff start` semantics elsewhere) inste
 
 ## Troubleshooting
 
-**`compile error in 'x.js'`** — the module has a syntax error. Run it first with `ff x.js` to see the real parse error, fix, recompile.
+**`error: compile failed in 'x.js': <reason>`** — the module has a syntax error (or unsupported imports for `--standalone`). Run it first with `ff x.js` to see the real parse error, fix, recompile.
 
-**Output missing after compile** — check the printed path (`Compiled a -> b (N bytes)`); with `-o` a typo'd directory fails the write. Create the dir first.
+**Output missing after compile** — check the printed path (`✓ Compiled a → b (N bytes)` or `✓ Compiled standalone binary a → b (N bytes)`); with `-o` a typo'd directory fails the write. Create the dir first.
 
 **Stack traces look stripped** — expected. Bytecode drops source + debug info by design; reproduce against the `.js` for real traces.
 

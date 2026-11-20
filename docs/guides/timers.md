@@ -42,9 +42,9 @@ console.log("cancelled");
 cancelled
 ```
 
-`setTimeout` returns a `Timeout` handle (also usable as a numeric id); `clearTimeout(id)` cancels it. Clearing an unknown or expired id is a safe no-op — it never throws. Same pair for intervals: `setInterval` / `clearInterval`.
+`setTimeout` returns a `Timeout` handle on the main thread (or a numeric ID inside `Worker`s); `clearTimeout(id)` accepts either. Clearing an unknown or expired id is a safe no-op — it never throws. Same pair for intervals: `setInterval` / `clearInterval`.
 
-You can also cancel a timer or interval with an `AbortSignal` by passing `{ signal }` (or the `AbortSignal` directly) as the third argument:
+You can also cancel a timer or interval with an `AbortSignal` by passing `{ signal }` (or the `AbortSignal` directly) as the third argument (if already aborted, the timer is never scheduled; otherwise that third argument is also passed through to the callback):
 
 ```js
 const ac = new AbortController();
@@ -137,7 +137,23 @@ console.log("exits immediately");
 exits immediately
 ```
 
-`setTimeout`/`setInterval` return a `Timeout` object (usable as a numeric id too). `t.unref()` keeps the timer armed but lets the process exit without waiting; `t.ref()` re-arms the hold; `t.hasRef()` reports the state; `t.refresh()` restarts the countdown. Use `unref` for background housekeeping that must not keep a CLI alive.
+`setTimeout`/`setInterval` return a `Timeout` object on the main thread (or a numeric ID inside `Worker`s); `clearTimeout`/`clearInterval` accept either. `t.unref()` keeps the timer armed but lets the process exit without waiting; `t.ref()` re-arms the hold; `t.hasRef()` reports the state; `t.refresh()` restarts the countdown. Use `unref` for background housekeeping that must not keep a CLI alive.
+
+## Scheduled jobs (`ff.cron`)
+
+For recurring calendar schedules or named intervals, use `ff.cron(name, schedule, callback)`:
+
+```js
+ff.cron("cleanup", "@every 30s", () => {
+  console.log("tick");
+});
+
+ff.cron("nightly", "0 3 * * *", () => {
+  console.log("03:00 UTC");
+});
+```
+
+`ff.cron` shares the **128-slot** timer table (up to 32 cron jobs) and keeps the event loop alive until exit. See the [Cron API reference](/docs/api/cron) for `@every` units, 5-field UTC syntax, and limits.
 
 ## Practical example: polling with backoff
 
@@ -169,19 +185,20 @@ Unhealthy stretches back off to 5s; the `.unref()` keeps the reschedule timer fr
 
 | API | Description |
 |-----|-------------|
-| `setTimeout(fn, ms, ...args≤8)` | Run once; returns `Timeout` (also accepts `{ signal }` as 3rd arg) |
-| `clearTimeout(id)` | Cancel; unknown/expired ids are no-ops |
-| `setInterval(fn, ms, ...args≤8)` | Repeat; returns `Timeout` (also accepts `{ signal }` as 3rd arg) |
+| `setTimeout(fn, ms, ...args≤8)` | Run once; returns `Timeout` on main thread / number in Worker (accepts `{ signal }` as 3rd arg) |
+| `clearTimeout(id)` | Cancel by `Timeout` handle or numeric ID; unknown/expired ids are no-ops |
+| `setInterval(fn, ms, ...args≤8)` | Repeat; returns `Timeout` on main thread / number in Worker (accepts `{ signal }` as 3rd arg) |
 | `clearInterval(id)` | Stop repeating |
-| `t.unref()` / `t.ref()` / `t.hasRef()` / `t.refresh()` | Exit-hold control on the handle |
+| `ff.cron(name, schedule, fn)` | Register UTC cron or `@every` job ([Cron API](/docs/api/cron)) |
+| `t.unref()` / `t.ref()` / `t.hasRef()` / `t.refresh()` | Exit-hold control on main-thread `Timeout` handles |
 | `queueMicrotask(fn)` | Run before next timer/I/O; the `nextTick` replacement |
 
-Limits: max 128 live timers (the 129th throws `TypeError: too many timers`), max 8 extra args, negative delay → 0. When no server, work, or referenced timers remain, the loop exits on its own.
+Limits: max 128 live timers shared across `setTimeout`, `setInterval`, `AbortSignal.timeout`, and `ff.cron` (the 129th throws `TypeError: too many timers (max 128)`), max 8 extra args, negative delay → 0. When no server, work, or referenced timers remain, the loop exits on its own.
 
 ## Troubleshooting
 
-**Process never exits** — a live interval or referenced timer holds the loop. `clearInterval` what you own, or `unref` housekeeping timers.
+**Process never exits** — a live interval, `ff.cron` job, or referenced timer holds the loop. `clearInterval` what you own, or `unref` housekeeping timers.
 
-**`too many timers`** — over 128 live. You leak `setInterval`s or schedule per-request timers without clearing; reuse or debounce.
+**`too many timers (max 128)`** — over 128 live across timers, `AbortSignal.timeout`, and `ff.cron`. You leak `setInterval`s or schedule per-request timers without clearing; reuse or debounce.
 
 **Timer fires late under load** — delays are *minimums*. A blocked loop (CPU-heavy handler, 512 full connections) delays everything; move work to `Worker`s.

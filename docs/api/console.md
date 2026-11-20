@@ -30,9 +30,9 @@ console.log("multiple", 1, true, null);   // multiple 1 true null
 | `console.slops(...)` | **yellow** | alias of `warn` |
 | `console.detail(...)` | **green** | success / detail line |
 | `console.redbal(...)` | **red** | alias of `error` |
-| `console.time(label)` | — | start or restart a named timer |
-| `console.timeLog(label)` | `label: Nms` | read elapsed without stopping |
-| `console.timeEnd(label)` | `label: Nms` | read elapsed and remove the label |
+| `console.time(label?)` | — | start or restart a named timer (defaults to `"default"`) |
+| `console.timeLog(label?)` | `label: Nms` | read elapsed without stopping (defaults to `"default"`; ignores extra arguments) |
+| `console.timeEnd(label?)` | `label: Nms` | read elapsed and remove the label (defaults to `"default"`) |
 
 ## Timers
 
@@ -97,6 +97,7 @@ console.log(JSON.stringify({ ok: true }, null, 2));  // use this instead
 - No `console.table`, `console.trace`, `console.assert`, `console.count` —
   they're not defined; calling them throws `TypeError`.
 - Colours are raw ANSI escapes; piping to a file keeps the escape codes.
+- `console.timeLog(label?)` ignores any extra data arguments after `label` (`time`, `timeLog`, and `timeEnd` all default omitted `label` to `"default"`).
 - Timers use wall-clock time, so an NTP step can make a duration look
   negative or huge. For measurements, prefer
   [`performance.now()`](/docs/api/performance).

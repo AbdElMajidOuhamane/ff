@@ -123,7 +123,7 @@ if (!res.ok) {
 ff client.js --allow-net=api.example.com:443
 ```
 
-`string` bodies — and `URLSearchParams`, which coerces to its query string — reach the wire intact. Everything else is coerced with JS `String()` semantics: a `FormData` or `Blob` arrives as `"[object Object]"`, an `ArrayBuffer` as `"[object ArrayBuffer]"`, a `Uint8Array([104, 105])` as `"104,105"`.
+`string` bodies — and `URLSearchParams`, which coerces to its query string — reach the wire intact. Passing `body` with omitted `method` (or `method: "GET"`) auto-promotes the request method to `"POST"`, and body-carrying methods (`POST`, `PUT`, `PATCH`) with no body explicitly send `Content-Length: 0`. Everything else is coerced with JS `String()` semantics: a `FormData` or `Blob` arrives as `"[object Object]"`, an `ArrayBuffer` as `"[object ArrayBuffer]"`, a `Uint8Array([104, 105])` as `"104,105"`.
 
 > **Known issue:** `fetch` does not multipart-encode `FormData` or send binary bodies as bytes. Build the payload yourself:
 
@@ -138,10 +138,11 @@ await fetch("https://api.example.com/submit", {
 
 ## Reading the response
 
-Every reader works on `Response` (and `Request`). Bodies can be re-read freely (and `bodyUsed` stays `false`):
+Every reader works on `Response` (and `Request`). Bodies can be re-read freely (and `bodyUsed` stays `false`), and `res.body` returns a closed single-chunk `ReadableStream` (or `null` if empty):
 
-| Reader | Returns |
-|--------|---------|
+| Reader / Property | Returns |
+|---|---|
+| `res.body` | `ReadableStream \| null` |
 | `await res.text()` | `string` |
 | `await res.json()` | parsed JSON |
 | `await res.arrayBuffer()` | `ArrayBuffer` |
@@ -159,7 +160,7 @@ console.log((await res.bytes()).byteLength);
 
 ## Redirects
 
-Redirects are followed automatically, up to **5 hops**. After that `fetch` throws `Too many redirects`:
+Redirects are followed automatically, up to **5 hops**. After that `fetch` rejects the promise with `"Too many redirects"`:
 
 ```js
 const res = await fetch("https://example.com/old-path");
@@ -185,15 +186,15 @@ Public CAs work out of the box. For private/self-signed CAs:
 
 | Setup | How |
 |-------|-----|
-| One-off script | `ff client.js --ca ./ca.pem` (`--ca` works with `ff <file>` and `ff -e` only) |
+| Scripts & watcher | `ff client.js --ca ./ca.pem` (`--ca` works with `ff <file>`, `ff -e`, and `ff --watch <file>`) |
 | Any run, incl. `ff start` | `FF_CA_FILE=./ca.pem ff start` |
-| Dev TLS pairing | Starting TLS with `--cert`/`FF_CERT` also trusts that cert for `fetch` |
+| Dev TLS pairing | Starting TLS with `--cert`/`FF_CERT` (or `http.serve({ tls: { cert: "<path>" } })`) also trusts that cert for `fetch` |
 
 ```sh
 FF_CA_FILE=./ca.pem ff client.js --allow-net=api.example.com:443
 ```
 
-> **Note:** `--ca` is **not** accepted by `ff start`. Use `FF_CA_FILE` (or `FF_CERT`) there.
+> **Note:** `--ca` is silently ignored by `ff start`. Use `FF_CA_FILE` (or `FF_CERT`) there.
 
 Trust and permission are independent: neither `--ca` nor `FF_CA_FILE` grants
 network access, and `--allow-net` does not make an untrusted certificate
@@ -232,14 +233,14 @@ two apex domains.
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent fetches | 16 | The 17th waits for a free slot |
+| Concurrent fetches | 16 | The 17th rejects immediately with `"Failed to start fetch"` |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
-| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject |
+| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
 | I/O timeout | 30s | Slow servers fail |
-| Redirects | 5 hops max, each re-checked | Throws `Too many redirects` or rejects with a permission string |
-| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
-| Header validation | RFC 7230 character validation | CRLF or invalid header characters reject before sending |
-| Abort | `AbortController` / `AbortSignal` (`signal` init key) | Rejects with `signal.reason` and closes the socket |
+| Redirects | 5 hops max, each re-checked | Rejects with `"Too many redirects"` or a permission string |
+| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
+| Header validation | RFC 7230 character validation | Invalid header pairs (bad name token or CR/LF/NUL/CTL in value) are silently dropped without throwing |
+| Abort | `AbortController` / `AbortSignal` (`signal` init key) | Rejects with `signal.reason` and closes the socket (`AbortSignal.timeout` shares the 128-timer table) |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 
 ## Troubleshooting
@@ -259,13 +260,13 @@ the chain, or make the redirect target stay within one host.
 
 **`FormData` / `Blob` / `Uint8Array` body arrives mangled** — bodies are string-coerced, not serialized (`"[object Object]"`, `"104,105"`). Send `string`, `URLSearchParams`, or a hand-built multipart string instead.
 
-**Caught fetch error has no `.message`** — most failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`, and the redirect-hop permission string). Log `String(e)`. The initial permission denial is the exception: it is an `Error` with `.message`.
+**Caught fetch error has no `.message`** — most failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`, `"Failed to start fetch"`, and the redirect-hop permission string). Log `String(e)`. The initial permission denial is the exception: it is an `Error` with `.message`.
 
 **`Too many redirects`** — the chain exceeded 5 hops. Inspect `res.url` on the last good hop or fix the redirect loop server-side.
 
-**TLS verify fails on a private CA** — pass `--ca` (scripts) or `FF_CA_FILE` (`ff start`). Confirm the PEM path is readable. Trust does not replace `--allow-net`.
+**TLS verify fails on a private CA** — pass `--ca` (scripts/`--watch`) or `FF_CA_FILE` (`ff start`). Confirm the PEM path is readable. Trust does not replace `--allow-net`.
 
-**Hanging with 17+ parallel fetches** — the 16-slot pool is full. Await in batches or raise concurrency by sequencing.
+**`"Failed to start fetch"` under concurrency** — all 16 concurrent fetch slots are in use. Limit in-flight calls to <= 16 batches instead of launching 17+ at once.
 
 ## See also
 

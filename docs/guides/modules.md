@@ -6,7 +6,7 @@ order: 12
 
 # Modules
 
-A file containing `import`/`export` runs as an ES module; a plain file runs as a classic script (and `ff -e` code is a classic script too — no top-level `await` there). `import` is the only loader — there is no `require()`, no CommonJS, and no URL imports. Three specifier shapes resolve: relative (`./`, `../`), absolute (`/`), and bare (`lodash`).
+Files ending in `.mjs` always run as ES modules. For `.js` files, Fairyfly tries classic-script compilation and falls back to ES module evaluation when `import`, `export`, or top-level `await` is present (`ff -e` code always runs as a classic script — no `import`/`export` or top-level `await`). `import` is the only loader — there is no `require()`, no CommonJS, and no URL imports. Three specifier shapes resolve: relative (`./`, `../`), absolute (`/`), and bare (`marked`).
 
 ## Quick look
 
@@ -57,7 +57,7 @@ import { db } from "../shared/db.js";     // up one, then down
 > extensions (`.mjs`, `.json`, …) must be written out. If neither probe
 > hits, the loader error names `X.js`.
 
-`..` segments normalize against the importer dir (`./a/../b.js` → `./b.js`); escaping past the filesystem root resolves to the joined remainder and fails to load.
+`..` segments normalize against the importer dir (`./a/../b.js` → `./b.js`); leading `/` on absolute paths is preserved so excess `..` segments clamp cleanly at `/`.
 
 ## Bare imports: packages
 
@@ -94,13 +94,17 @@ ff imprint marked@18.0.11
 
 ## Absolute paths
 
-A leading `/` loads literally from the filesystem root:
+A leading `/` resolves from the filesystem root (`..` segments normalize cleanly and clamp at `/`). Extensionless absolute specifiers probe `X.js` then `X/index.js` just like relative imports:
 
 ```js
 import { cfg } from "/etc/myapp/config.js";
 ```
 
-No lookup, no fallback. Missing file = load error.
+Missing file = load error.
+
+## `import.meta.url`
+
+Inside any imported ES module, `import.meta.url` is populated as `file://<resolved_path>`. *(In entry modules executed directly by `ff <file>` or `ff start`, `import.meta.url` is currently `undefined`.)*
 
 ## Practical example: tiny multi-file API
 
@@ -145,7 +149,7 @@ http.serve({ port: 3000 }, (url) => {
 ```
 
 ```sh
-ff start
+ff start --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/              # rendered list
 curl http://127.0.0.1:3000/api/products  # JSON
 ```

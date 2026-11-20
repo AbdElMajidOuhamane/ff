@@ -60,8 +60,7 @@ curl http://127.0.0.1:3000/
 # hello
 ```
 
-`http.serve` always binds `0.0.0.0`; `--allow-net=127.0.0.1:3000` does not
-match the listener.
+`http.serve` binds `0.0.0.0` by default (pass `{ hostname: "127.0.0.1" }` to bind loopback); `--allow-net` must match the bound `<hostname>:<port>`.
 
 Routing, JSON REST API, SQLite-backed notes API: [HTTP Server guide](/docs/guides/http-server). Method/options tables: [`http` API](/docs/api/http).
 
@@ -149,14 +148,14 @@ Dev certs, self-trust cases, WSS echo: [TLS guide](/docs/guides/tls). ALPN negot
 const db = Database.open("notes.db");
 db.execNoArgs("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT)");
 db.exec("INSERT INTO notes (text) VALUES (?)", ["buy milk"]);
-console.log(db.rows("SELECT * FROM notes"));
+console.log(JSON.stringify(db.rows("SELECT * FROM notes")));
 db.close();
-// [ { id: 1, text: "buy milk" } ]
+// [{"id":1,"text":"buy milk"}]
 ```
 
 ```sh
 ff notes.js --allow-read=notes.db --allow-write=.
-# [ { id: 1, text: "buy milk" } ]
+# [{"id":1,"text":"buy milk"}]
 ```
 
 `--allow-write=.` is required even though only `notes.db` was named: SQLite
@@ -170,7 +169,10 @@ Transactions, `lastInsertRowId()`, busy timeout: [SQLite API](/docs/api/sqlite).
 ```js
 // main.js
 const w = new Worker("./hasher.js", { data: { rounds: 50000 } });
-w.onmessage = (e) => console.log("hash:", e.data);
+w.onmessage = (e) => {
+  console.log("hash:", e.data.hex);
+  w.terminate();
+};
 w.postMessage({ password: "hunter2" });
 ```
 
@@ -188,9 +190,7 @@ onmessage = (e) => {
 ff main.js
 ```
 
-No flags: loading `hasher.js` is a program-loading carve-out. The worker inherits
-the parent's policy, so a worker that calls `fs.readFile` needs the parent to
-hold `--allow-read`.
+No flags: loading `hasher.js` is a program-loading carve-out. Workers run a restricted CPU/crypto/timers/console global set (no `fs`, `fetch`, `http.serve`, `crypto.bcrypt`, or nested workers), so file/network I/O happens on the parent thread.
 
 Spawn rules, `{ data }` vs `workerData`, terminate, pool pattern: [Workers guide](/docs/guides/workers).
 
@@ -246,13 +246,11 @@ done("notes");
 ```
 
 ```sh
-ff test notes --allow-net=0.0.0.0:3902,127.0.0.1:3902
-# OK   test/notes.test.js
+ff test/notes.test.js --allow-net=0.0.0.0:3902,127.0.0.1:3902
+# [notes] pass:1 fail:0
 ```
 
-The grant applies to every test file in the run. Loading test files needs no
-`--allow-read`; reads inside a test do. Both net scopes are required here:
-`0.0.0.0:3902` for the listener and `127.0.0.1:3902` for the client.
+Run `done()`-based test suites directly with `ff test/<file>.test.js` or `./test/run.sh` (`ff test` runs all files in one process and exits on the first `done()` call before printing its summary). Loading test files needs no `--allow-read`; reads inside a test do. Both net scopes are required here: `0.0.0.0:3902` for the listener and `127.0.0.1:3902` for the client.
 
 `check`/`done`, server fixtures, `run.sh`: [Testing guide](/docs/guides/testing).
 
@@ -307,19 +305,26 @@ Sleep, intervals, unref, microtasks: [Timers guide](/docs/guides/timers). argv/e
 ## Blobs and forms
 
 ```js
-// form.js
+// form.js — explicit urlencoded string or Request/Response round-trip
+const params = new URLSearchParams({ name: "ada" });
+await fetch("https://api.example.com/submit", {
+  method: "POST",
+  headers: { "content-type": "application/x-www-form-urlencoded" },
+  body: params,
+});
+
+// Parsing a Blob / FormData locally:
 const form = new FormData();
 form.append("name", "ada");
 form.append("avatar", new Blob(["<bytes>"], { type: "image/png" }), "avatar.png");
-await fetch("https://api.example.com/submit", { method: "POST", body: form });
+console.log(form.get("name"), form.get("avatar").size);
 ```
 
 ```sh
 ff form.js --allow-net=api.example.com:443
 ```
 
-The blob is in-memory, so no `--allow-read`. If you load the upload with
-`fs.readFile`, add `--allow-read` for that path.
+`fetch` currently coerces `FormData` / `Blob` bodies via `String()` (`"[object Object]"`), so send explicit strings (JSON, `URLSearchParams`, or hand-built multipart bodies) on outbound requests. `Blob` is in-memory and needs no `--allow-read`; add `--allow-read` if loading files from disk.
 
 `slice`, round-tripping, file-drop endpoint: [Blob and FormData](/docs/api/blobs-formdata).
 

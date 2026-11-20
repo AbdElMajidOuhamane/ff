@@ -7,8 +7,7 @@ order: 15
 # `Worker`
 
 CPU-bound JavaScript on up to **8** OS threads. Each Worker has its own
-JS runtime, event loop, and heap (**32 MB**) — no shared state, only
-messages.
+JS runtime, event loop, and isolated heap (**32 MB** default, configurable via `--worker-heap`) — no shared state, only messages.
 
 ```js
 const w = new Worker("./hash-worker.js", { data: { rounds: 1e6 } });
@@ -22,7 +21,7 @@ w.postMessage({ password: "hunter2" });
 | | |
 |---|---|
 | Signature | `new Worker(path, options?)` |
-| `path` | Path to a JS file, resolved from the cwd |
+| `path` | Path to a JS file, resolved from `process.cwd()` (auto-probes `<path>.js` if omitted) |
 | `options.data` | Any **structured-cloneable** value → `workerData` in the worker |
 
 Throws `TypeError: Worker requires a module path` with no argument.
@@ -69,14 +68,13 @@ Globals available inside the worker file:
 | `onmessage` | `(ev) => void` — `ev.data` from the parent |
 | `self` | The worker global object |
 | `console` | Same `console` as the parent, same stderr |
-| `setTimeout` / `setInterval` / clear\* | Timers work |
+| `setTimeout` / `setInterval` / clear\* | Timers return numeric IDs (`0..127`; no `.ref()`/`.unref()`/`AbortSignal`) |
 | `queueMicrotask` | |
 | `structuredClone` | Deep binary structured clone (max 4 MB) |
-| `crypto`, `btoa`, `atob` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), and Base64 helpers (`crypto.bcrypt` is main-thread only) |
+| `crypto`, `btoa`, `atob` | `randomUUID`, `getRandomValues`, `subtle` (`digest`, HMAC `importKey`/`sign`/`verify`/`exportKey`), and Base64 helpers (`crypto.bcrypt` throws) |
 | `performance` | `performance.now()` — **own** origin |
 
-Not available: `fetch`, `fs`, `http`, `Database`, `sql`, `process`,
-`crypto.bcrypt`, `import`.
+Not available: `fetch`, `fs`, `http`, `Database`, `sql`, `process`, `crypto.bcrypt`, `import`, `TextEncoder`/`TextDecoder`, `URL`/`URLSearchParams`, `Headers`/`Request`/`Response`, `Blob`/`FormData`, `ReadableStream`, `AbortController`/`AbortSignal`, `WebSocket`, `tcp`, `udp`, `ff`, `child_process`, `ffi`, `permissions`, `Worker`.
 
 ```js
 // hash-worker.js
@@ -94,13 +92,12 @@ onmessage = (ev) => {
 
 Values are **structured-cloned** across the boundary:
 
-| Cloneable | Not cloneable (throws `value could not be cloned`) |
+| Cloneable | Not cloneable (throws `TypeError: value could not be cloned`) |
 |---|---|
-| primitives, `null`, `undefined` | functions |
-| `Array`, plain objects | class instances (methods lost) |
-| `Map`, `Set` | `WeakMap` / `WeakSet` |
-| `ArrayBuffer`, `TypedArray`, `DataView` | DOM-ish objects |
-| `Blob` | objects with cycles **are** fine — cycles clone |
+| primitives, `null`, `undefined`, `BigInt`, boxed primitives | functions, `Promise` |
+| `Date`, `RegExp`, `Error` (subclasses + stack preserved) | `WeakMap` / `WeakSet`, non-registered `Symbol` |
+| `Array`, plain objects (incl. class instances as plain objects, methods lost) | objects with getter/setter accessors, `SharedArrayBuffer` |
+| cyclic object graphs, `Map`, `Set`, `ArrayBuffer`, `TypedArray`, `DataView` | native objects (`Blob`, `Headers`, `Request`, `Response`, `URL`, `FormData`, `ReadableStream`, `AbortSignal`, `CryptoKey`, `FfiPtr`, etc.) |
 
 Cloning copies: the receiver gets a snapshot, not a reference. Mutations
 after `postMessage` do not propagate.
@@ -110,9 +107,12 @@ after `postMessage` do not propagate.
 | Resource | Cap |
 |---|---|
 | Concurrent workers | 8 |
+| Script file cap | 10 MiB |
 | Per-message size | 4 MB |
-| Worker heap | 32 MB |
-| Worker threads | OS threads, not the loop's I/O pool |
+| Worker heap | `min(32 MB, max-heap)` default, configurable via `--worker-heap` (`1 MB`–`max-heap`) |
+| Worker JS stack / native stack | JS stack inherits `--max-stack` (`1 MB` default, `128 KB`–`native/2`); OS thread stack auto-scales `>= max(8 MB, 2 * JS stack)` |
+| CPU budget | Inherits `--cpu-budget=<ms>` (enforced on top-level eval and `onmessage`) |
+| Worker threads | Dedicated OS threads, not the main loop's I/O pool |
 
 ```js
 try {
@@ -149,12 +149,9 @@ w.postMessage("go");
 w.terminate();
 ```
 
-- A worker **never exits on its own** — even an empty script keeps its
-  thread alive, so the main process waits. Call `terminate()`.
+- A worker with an idle loop (timers/handlers) or a live slot **does not auto-release** — call `w.terminate()` when finished so the main process exits and the slot frees.
 - `terminate()` is immediate; pending `postMessage`s in flight are lost.
-- An uncaught throw, timer callback error, or microtask error in the worker
-  immediately wakes the parent loop and fires `onerror` on the parent; the
-  worker thread keeps running unless you terminate it.
+- An uncaught throw during **top-level script evaluation** fires `onerror` on the parent and terminates the worker thread immediately (the parent still holds the worker slot open until `w.terminate()` is called). Uncaught errors inside `onmessage`, timer callbacks, or microtasks also fire `onerror` on the parent, while leaving the worker thread running until `terminate()`.
 
 ## Gotchas
 

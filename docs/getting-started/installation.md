@@ -116,11 +116,12 @@ ff addon.js --allow-ffi
 ff test --allow-all
 ```
 
-- Flags are CLI-only. There is no `ff.json` field and no environment variable
-  that grants access.
+- Prebuilt release binaries and the Docker image are compiled with `-Dffi=false`; build from source if you need `ffi.dlopen` / `ffi.callback`.
+- Flags are CLI-only (`--allow-*` and `--deny-read`/`--deny-write`/`--deny-net`). There is no `ff.json` field and no environment variable
+  that grants access. Permissions cannot be granted at runtime, only dropped or narrowed one-way via `permissions.revoke()`.
 - Scopes are comma-split and repeatable: `--allow-read=src,views`.
-- A bare flag grants the whole category: `--allow-net` means any host and port.
-- `ff start` takes the flags after `start`; `ff --watch` forwards them to the
+- A bare flag grants the whole category: `--allow-net` means any host and port. (`--deny-*` flags always require `=<scope>`.)
+- `ff start` takes the flags after `start`; `ff --watch` forwards flags that follow `--watch` to the
   child it restarts.
 - `ff test` applies the flags to every test file in that run. The repo's
   `test/run.sh` uses `--allow-all` because the suite exercises every category.
@@ -130,7 +131,7 @@ ff test --allow-all
 - `--allow-run` and `--allow-ffi` are trust-equivalent to full access.
   Permissions catch mistakes; they are not an OS sandbox.
 
-`globalThis.permissions` reports the six enabled categories as booleans:
+`globalThis.permissions` reports the six enabled categories as live booleans and provides `permissions.revoke()`:
 
 ```sh
 ff -e 'console.log(JSON.stringify(permissions))' --allow-read=.
@@ -138,7 +139,7 @@ ff -e 'console.log(JSON.stringify(permissions))' --allow-read=.
 ```
 
 It does not expose the scopes, and reassigning its properties does not change
-enforcement. Full model: [Permissions](/docs/concepts/permissions).
+enforcement (only `permissions.revoke()` changes policy at runtime). Full model: [Permissions](/docs/concepts/permissions).
 
 ## Install on PATH
 
@@ -186,8 +187,8 @@ a derived image:
 ```sh
 docker build -t fairyfly .
 
-# terminal 1 — mount the current directory as /app
-docker run --rm -p 3000:3000 -v "$PWD":/app \
+# terminal 1 — mount the current directory as /app (default Docker image uses io_uring)
+docker run --rm --security-opt seccomp=unconfined -p 3000:3000 -v "$PWD":/app \
   fairyfly ff server.js --allow-net=0.0.0.0:3000
 
 # terminal 2
@@ -218,6 +219,9 @@ runtime has no `FF_PORT` or `--port` override. If the app reads `PORT`, add
 | `make fmt` | `zig fmt --check build.zig src/` (the CI `tidy` job) |
 | `make test` | Build + fixtures + `zig build test` + `test/run.sh` |
 | `make ci` | `fmt` + build + fixtures + `zig build test` + `test/run.sh` + fuzz smoke |
+| `make fuzz` | Run parser fuzzers in `ReleaseSafe` (`smoke`) |
+| `make fuzz-one` | Run one fuzzer (`FUZZ=ws_frame SEED=123 EVENTS=1000000`) |
+| `make fuzz-canary` | Verify fuzzer failure propagation (`canary 1` must fail) |
 | `make cov` | kcov line coverage into `kcov-output/` (requires `kcov`) |
 | `make doctor` | Print Xcode/SDK/DEVELOPER_DIR/zig state and probe Zig's libc++ build |
 

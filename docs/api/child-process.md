@@ -105,15 +105,16 @@ ff quick.js --allow-run=/bin/sh,ffmpeg
 | Member | Description |
 |---|---|
 | `child_process.spawn(command, args?, options?)` | Starts a child; returns a `Child` object. Throws `TypeError` on bad arguments, `Error` when the command cannot start, and when 8 children are already running |
-| `child_process.exec(command, options?)` | Runs `command` through `/bin/sh -c`; resolves `{ stdout, stderr, code, signal }` with `stdout`/`stderr` as strings. A non-zero exit still resolves — it rejects only on launch failure or `maxBuffer` overflow |
-| `child_process.execSync(command, options?)` | Blocking variant of `exec`; same result shape, returns directly instead of a Promise |
-| `child.kill(signal?)` | Sends a signal — default `"SIGTERM"`; accepts a name (`"SIGKILL"`) or a number. Returns `false` when the child already exited |
-| `child.wait()` | `Promise<{ code, signal }>` that resolves once the child exited **and** its pipes closed. Safe to call repeatedly (the same promise is returned) |
+| `child_process.exec(command, options?)` | Runs `command` through `/bin/sh -c` (forces `stdio: "pipe"`, though invalid `stdio` strings throw); permission/arg errors throw **synchronously**; resolves `{ stdout, stderr, code, signal }` with `stdout`/`stderr` as strings, rejecting only on launch failure or `maxBuffer` overflow |
+| `child_process.execSync(command, options?)` | Blocking variant of `exec` (`std.process.run`, does **not** use the 8-slot pool); same result shape, returns directly instead of a Promise |
+| `child.kill(signal?)` | Sends a signal — default `"SIGTERM"`; accepts a name (`"SIGKILL"`, `"kill"`, case-insensitive, `SIG` prefix optional) or a number. Returns `false` when the child already exited |
+| `child.wait()` | `Promise<{ code, signal }>` that resolves once the child exited **and** its pipes closed (returns the same promise while running, or an already-resolved promise once exited) |
 
 Options (all functions): `cwd` (string), `env` (object — **replaces** the
 environment), `maxBuffer` (bytes per stream, default `1 MB`, `Infinity`
 allowed). `spawn` additionally takes `stdio: "pipe" | "inherit"` (default
-`"pipe"`; `"inherit"` passes ff's stdio through and captures nothing).
+`"pipe"`; `"inherit"` passes ff's `stdout` and `stderr` through — `stdin` is
+always ignored — and captures nothing).
 
 `cwd` and `env` affect only the child. They do not widen or narrow ff's
 permission scopes.

@@ -10,8 +10,7 @@ Fairyfly is **deny-by-default** for native capabilities. A script cannot read
 files, open sockets, inspect the environment, spawn processes, or load native
 libraries unless the launch command grants it.
 
-There is no `ff.json` section, no environment variable, and no runtime toggle.
-The only input is `--allow-*` on the command line.
+There is no `ff.json` section and no permission environment variable. Initial policy comes solely from `--allow-*` and `--deny-*` CLI flags; permissions can never be *granted* at runtime, only *narrowed/revoked* via `permissions.revoke()`.
 
 ## Quick look
 
@@ -28,26 +27,25 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 
 | Flag | Grants / Restrictions | Scope |
 |---|---|---|
-| `--allow-read` | `fs` reads, `process.chdir`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
+| `--allow-read` | `fs` reads, `process.chdir`, `Response.file`, `Database.open`, TLS file paths in `http.serve`, Postgres `sslrootcert` | paths |
 | `--allow-write` | `fs` writes, SQLite database files and their parent directory | paths |
 | `--allow-net` | `fetch`, `WebSocket`, `http.serve`, TCP (`tcp.connect`), UDP, Postgres | `host`, `host:port`, `*.domain` |
 | `--allow-env` | `process.env`, Postgres DSN and TLS variables (`PG*`, `DATABASE_URL`, `PGSSL*`) for the global `sql` | exact names |
 | `--allow-run` | `child_process.spawn` / `exec` / `execSync`, `process.kill` (external PIDs) | basenames or absolute paths (`kill` for `process.kill`) |
 | `--allow-ffi` | every `ffi` entry point except `ffi.allowed` | none — bare only |
 | `--allow-all` | every category above, **including FFI** | none |
-| `--deny-read` | explicitly deny file paths even when covered by `--allow-read` | paths |
-| `--deny-write` | explicitly deny file paths even when covered by `--allow-write` | paths |
-| `--deny-net` | explicitly block hosts/ports even when `--allow-net` is active | `host`, `host:port`, `*.domain` |
+| `--deny-read=<paths>` | explicitly deny file paths even when covered by `--allow-read` (`=<paths>` required) | paths |
+| `--deny-write=<paths>` | explicitly deny file paths even when covered by `--allow-write` (`=<paths>` required) | paths |
+| `--deny-net=<hosts>` | explicitly block hosts/ports even when `--allow-net` is active (`=<hosts>` required) | `host`, `host:port`, `*.domain` |
 
 Rules:
 
 - Flags are repeatable and comma-split: `--allow-read=src,test`.
-- A bare flag grants the whole category: `--allow-net` means any host, any port.
+- A bare `--allow-*` flag grants the whole category: `--allow-net` means any host, any port. `--deny-*` flags require `=<scope>` (bare `--deny-read` or unknown `--deny-*` categories such as `--deny-env`/`--deny-run`/`--deny-ffi` fail at startup).
 - An empty scope is invalid: `--allow-read=` or `--deny-read=` fails at startup.
 - `--deny-*` flags take precedence over `--allow-*` grants (e.g. `--allow-read=. --deny-read=./secrets`).
-- Scopes are parsed once before the JS runtime starts. Runtime dynamic revocation is available via `permissions.revoke()`.
-- Flags are scanned across the whole argv. A script argument that begins with
-  `--allow-` or `--deny-` is interpreted as a permission flag, not passed to the script.
+- Initial scopes are parsed before the JS runtime starts, and permissions can be dropped/narrowed at runtime via `permissions.revoke()`.
+- Any argument starting with `--allow-` or `--deny-` is parsed as a permission flag (unknown ones abort startup), though raw arguments still appear in `process.argv`.
 
 ## Path scopes
 
@@ -89,8 +87,9 @@ Rules:
   it; use `*.example.com` for a scoped wildcard.
 - When the port is omitted, any port is allowed. `fetch` and `WebSocket`
   default to 80/443 when the URL has no explicit port.
-- `http.serve()` always binds `0.0.0.0`, so its scope must be
-  `--allow-net=0.0.0.0:<port>` — not `127.0.0.1:<port>`.
+- `http.serve()` binds `0.0.0.0` by default (configurable via `{ hostname }`),
+  so match `--allow-net` to the bound `<hostname>:<port>` (default
+  `--allow-net=0.0.0.0:<port>`, not `127.0.0.1:<port>`).
 - IPv6 literals use brackets: `[::1]:3000`.
 
 ## Environment scopes
@@ -102,11 +101,13 @@ Rules:
 ```
 
 - Names are exact and case-sensitive. There is no wildcard.
-- `process.env` is built once at startup with disallowed keys omitted. Reading
-  a disallowed name returns `undefined`; it does not throw.
-- The runtime still reads its own `FF_*` configuration (`FF_ECHO`, `FF_CERT`,
-  `FF_KEY`, `FF_CA_FILE`). That is CLI/runtime configuration, not application
-  access to `process.env`.
+- `process.env` is built once at startup (from OS env plus any `--env-file`)
+  with disallowed keys omitted. Reading a disallowed name returns `undefined`;
+  it does not throw.
+- The runtime still reads its own CLI/runtime configuration (`FF_ECHO`,
+  `FF_CERT`, `FF_KEY`, `FF_CA_FILE`, `FF_MAX_HEAP`, `FF_CPU_BUDGET`,
+  `FF_WATCH_PARENT`, `NO_COLOR`, and proxy env vars) outside `--allow-env`.
+  That does not expose those keys in JavaScript `process.env`.
 
 ## Run scopes
 
@@ -145,16 +146,18 @@ Rules:
 |---|---|---|
 | `fs.readFile` / `exists` / `readdir` | `read` | before the syscall or fs job |
 | `fs.writeFile` / `mkdir` / `rm` | `write` | before the syscall or fs job |
+| `Response.file(path)` | `read` | before reading the file |
 | `process.env` | `env` | when the global is built |
 | `process.chdir` | `read` on the target | before `chdir` |
 | `fetch` | `net` on `host:port` | before the request is submitted, and on every redirect hop |
 | `new WebSocket` | `net` on `host:port` | before the socket is created |
-| `http.serve` | `net` on `0.0.0.0:port` | before the listener starts |
+| `http.serve` | `net` on `<hostname>:<port>` (default `0.0.0.0:port`) | before the listener starts |
 | `http.serve({ tls })` | `read` for file paths | before the TLS files are loaded |
+| `tcp.connect(host, port)` | `net` on `host:port` | before connecting |
 | `udp.bind` / `connect` / `sendto` | `net` on the address | before the syscall |
 | `Database.open` | `read` + `write` on the file, `write` on the parent | before `sqlite3_open` |
 | `new SQL(dsn \| options)` | `net` on host/port, plus `read` on `sslrootcert` if TLS is enabled | before the pool is created |
-| global `sql` | `net`, `read` on `sslrootcert` (if TLS enabled), plus `env` for `PG_*` / `DATABASE_URL` / `PGSSL*` | before the first query |
+| global `sql` | `net`, `read` on `sslrootcert` (if TLS enabled), plus `env` for `PG*` / `PG_TEST_DSN` / `DATABASE_URL` / `PGSSL*` | before the first query |
 | `child_process.spawn` / `exec` / `execSync` | `run` on `argv[0]` | before the child is created |
 | `process.kill(pid, sig?)` | `run` on `"kill"` (when `pid !== process.pid`) | before the signal is sent |
 | `ffi.dlopen` / `ffi.callback` / `ffi.*` memory helpers | `ffi` | before `dlopen`, closure creation, pointer creation, or memory access |
@@ -198,20 +201,27 @@ Details:
 
 ## Lifetime and inheritance
 
-- The policy is parsed before any runtime object exists and never changes.
+- The initial policy is parsed before any runtime object exists; grants can never be added at runtime, only dropped or narrowed one-way via `permissions.revoke()`.
 - `globalThis.permissions` exposes dynamic booleans for the six categories:
   `read`, `write`, `net`, `env`, `run`, `ffi`. A category is `true` when it has
   any active grant.
-- `permissions.revoke(descriptor)` allows an application to drop privileges at runtime after initialization:
+- `permissions.revoke(descriptor)` synchronously returns `undefined` and updates the process-global atomic policy (shared with workers):
   ```js
   permissions.revoke({ name: "read" }); // drops all read permissions
   permissions.revoke({ name: "write", path: "/tmp/init" }); // revokes specific path scope
   permissions.revoke({ name: "net", host: "169.254.169.254" }); // revokes specific network scope
-  permissions.revoke({ name: "env", variable: "SECRET_KEY" }); // revokes specific env variable
+  permissions.revoke({ name: "env", variable: "SECRET_KEY" }); // revokes env scope (see caveats)
+  permissions.revoke({ name: "run" }); // revokes all run permissions (category-only)
+  permissions.revoke({ name: "ffi" }); // revokes all FFI permissions (category-only)
   ```
-- Workers inherit the parent process's policy.
-- `ff --watch` forwards permission flags to the child it restarts.
-- `ff start` accepts the flags after `start`; `--cert` / `--key` are CLI
+  Revocation caveats:
+  - Scoped revocation works for `read`/`write` (`path`), `net` (`host`), and `env` (`variable`); `run` and `ffi` revoke whole-category only.
+  - Under bare `--allow-env`, revoking `{ name: "env", variable: "X" }` drops **all** `env` permissions (per-variable removal only applies when `--allow-env=A,B` was scoped).
+  - Because `process.env` is built once at startup, revoking `env` does not delete keys already on `process.env` — it affects `permissions.env` and subsequent runtime `checkEnv` calls (such as lazy global `sql` init).
+  - `ffi.allowed` is a startup snapshot boolean and stays `true` after `permissions.revoke({ name: "ffi" })`, whereas `permissions.ffi` flips to `false` and `ffi.*` calls throw `PermissionDenied`.
+- Workers share the process-global policy dynamically.
+- `ff --watch` forwards permission flags (placed after `--watch`) to the child it restarts.
+- `ff start` accepts permission flags anywhere in argv; `--cert` / `--key` are CLI
   configuration reads and are not gated by `--allow-read`.
 
 ## Program-loading carve-out
@@ -223,9 +233,7 @@ Loading code is not a `read` operation:
 - `ff test` loading `test/*.test.js`.
 - `new Worker("./worker.js")` loading the worker file.
 
-These work without `--allow-read`. Permissions gate what the loaded code does
-at runtime, not whether it can be loaded. A worker that calls `fs.readFile`
-still needs its own `--allow-read` grant (inherited from the parent).
+These work without `--allow-read`. Permissions gate what loaded code does at runtime, not whether it can be loaded. (Workers expose a restricted CPU/crypto/timers/console global set without `fs` or native I/O APIs; `permissions.*` is not exposed in workers, though shared policy state applies across the runtime.)
 
 `ff imprint`, `ff fmt`, `ff upgrade`, and `ff compile` are CLI operations, not
 runtime APIs. They are not gated by these flags.

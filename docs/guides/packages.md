@@ -6,7 +6,7 @@ order: 10
 
 # Packages
 
-Fairyfly installs pure-JS ESM packages into `node_modules/`, pinned in `ff.json` and locked in `ff.lock` (v2, with integrity hashes). Dependencies can come from npm or directly from GitHub, Codeberg, or a `.tar.gz` URL. Two commands cover everything: `ff imprint` adds, `ff sever` removes.
+Fairyfly installs pure-JS ESM packages into `node_modules/`, pinned in `ff.json` and locked in `ff.lock` (reported as v2 by the CLI; stored with `"lockfileVersion": 1` in JSON, with integrity hashes). Dependencies can come from npm or directly from GitHub, Codeberg, or a `.tar.gz` URL. Two commands cover everything: `ff imprint` adds, `ff sever` removes.
 
 ## Quick look
 
@@ -30,7 +30,7 @@ http.serve({ port: 3000 }, (url, method, body) => {
 ```
 
 ```sh
-ff start
+ff start --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/readme
 # <h1>Hello</h1>
 ```
@@ -50,12 +50,12 @@ ff imprint                   # rebuild from the lock (CI-like)
 | `ff imprint github:owner/repo[#ref] …` | Install a GitHub repository archive; name/version come from its root `package.json` |
 | `ff imprint codeberg:owner/repo[#ref] …` | Same for Codeberg |
 | `ff imprint https://…/pkg.tar.gz` | Install an explicit archive URL |
-| `ff imprint` (v2 lock present) | Exact rebuild from `ff.lock` — nothing re-resolved |
+| `ff imprint` (lockfile present) | Exact rebuild from `ff.lock` — nothing re-resolved |
 | `ff imprint` (no lock) | Resolve everything in `ff.json`, then write the lock |
 
 Only ESM-compatible packages pass the pure-ESM gate — CommonJS-only packages are rejected at install time.
 
-> **Note:** Commit both `ff.json` and `ff.lock`. The lock carries integrity hashes; without it a fresh clone re-resolves and may drift.
+> **Note:** Commit both `ff.json` and `ff.lock`. The lock carries integrity hashes (CLI output calls it a v2 lock; the JSON field is `"lockfileVersion": 1`); without it a fresh clone re-resolves and may drift.
 
 ## Direct sources: GitHub, Codeberg, archives
 
@@ -73,8 +73,8 @@ ff imprint https://example.com/pkg.tar.gz
 |------|-------------|
 | `github:owner/repo[#ref]` | `https://codeload.github.com/owner/repo/tar.gz/<ref>` |
 | `codeberg:owner/repo[#ref]` | `https://codeberg.org/owner/repo/archive/<ref>.tar.gz` |
-| `https://github.com/owner/repo[#ref]` | Same as `github:` |
-| `https://codeberg.org/owner/repo[#ref]` | Same as `codeberg:` |
+| `[git+]https://github.com/owner/repo[.git][#ref]` | Same as `github:` |
+| `[git+]https://codeberg.org/owner/repo[.git][#ref]` | Same as `codeberg:` |
 | `https://…/pkg.tar.gz` or `.tgz` | Used as-is |
 
 Omit `#ref` to use `HEAD` (the forge's default branch).
@@ -119,7 +119,7 @@ After install, import by bare specifier (resolved through `node_modules/`):
 
 ```js
 import { marked } from "marked";
-import lodash from "lodash";
+import { nanoid } from "nanoid";
 ```
 
 Your own files use relative imports — extensions are optional (omitting
@@ -179,7 +179,7 @@ http.serve({ port: 3000 }, (url) => {
   return new Response("not found", { status: 404 });
 });
 EOF
-ff start
+ff start --allow-net=0.0.0.0:3000
 ```
 
 ```sh
@@ -191,8 +191,8 @@ curl http://127.0.0.1:3000/p/hello # <h1>Hello</h1>...
 
 ```sh
 git clone <repo> && cd <repo>
-ff imprint        # exact rebuild from ff.lock, no re-resolve
-ff test
+ff imprint                   # exact rebuild from ff.lock, no re-resolve
+ff test --allow-net=...      # pass any permission flags your tests need
 ```
 
 ## Troubleshooting
@@ -203,7 +203,7 @@ ff test
 
 **Direct source fails the integrity check** — the branch or tag moved since `ff.lock` was written. Re-run `ff imprint <source>` to accept the new archive, or pin a tag/commit.
 
-**`Cannot find module 'x'`** — you forgot `ff imprint x`, or ran from the wrong directory (resolution is relative to cwd's `node_modules/`).
+**`could not load module filename '...'`** — you forgot `ff imprint x`, omitted the relative extension if not `.js`/directory, or ran from the wrong directory (resolution is relative to cwd's `node_modules/`).
 
 **Lock keeps changing** — someone runs bare `ff imprint` without a lock present, which re-resolves. Commit `ff.lock` and use no-args `ff imprint` for rebuilds.
 

@@ -22,7 +22,7 @@ const text = dec.decode(bytes);           // "héllo"
 | Member | Type | Description |
 |---|---|---|
 | `encoding` | `string` | Always `"utf-8"` |
-| `encode(input)` | `(string) → Uint8Array` | UTF-8 bytes |
+| `encode(input)` | `(string) → Uint8Array` | UTF-8 bytes (`encode()` / `encode(undefined)` coerces `undefined` to `"undefined"`) |
 
 ```js
 const enc = new TextEncoder();
@@ -44,20 +44,20 @@ function encodeInto(str) {                 // poor man's encodeInto
 
 | Member | Type | Description |
 |---|---|---|
-| `encoding` | `string` | Always `"utf-8"` |
-| `decode(input?)` | `(ArrayBuffer \| TypedArray) → string` | UTF-8 → string |
+| `encoding` | `string` | Always `"utf-8"` (`.fatal` and `.ignoreBOM` are not defined / `undefined`) |
+| `decode(input?)` | `(ArrayBuffer \| TypedArray) → string` | UTF-8 → string (`decode()` returns `""`; passing explicit `undefined` throws `TypeError`) |
 
 ```js
 const dec = new TextDecoder();
 dec.encoding;                          // "utf-8"
-dec.decode();                          // ""  (no input)
+dec.decode();                          // ""  (0 arguments)
 dec.decode(enc.encode("ok"));          // "ok"
 dec.decode(new Uint8Array([0xff, 0x41]));  // "\uFFFDA"  — never throws
 ```
 
 ### Invalid bytes are replaced, never fatal
 
-Malformed UTF-8 becomes U+FFFD (``) — byte by byte:
+Malformed UTF-8 becomes U+FFFD (`\uFFFD`) — byte by byte:
 
 ```js
 dec.decode(new Uint8Array([0x41, 0xff, 0x42]));
@@ -106,10 +106,11 @@ console.log(new TextDecoder().decode(bytes));
 
 ## Gotchas
 
-- Both classes are **UTF-8 only**; labels don't change behaviour.
-- `decode()` is **lossy by design** — invalid sequences become ``. If you
+- Both classes are **UTF-8 only**; labels don't change behaviour, and `TextDecoder` instances do not define `.fatal` or `.ignoreBOM` (`undefined`).
+- `decode()` is **lossy by design** — invalid sequences become U+FFFD (`\uFFFD`). If you
   need to detect corruption, validate the bytes yourself
   (`TextDecoder` won't tell you).
+- `encode()` or `encode(undefined)` coerces `undefined` to the 9-byte string `"undefined"` (rather than an empty `Uint8Array`); 0-arg `decode()` returns `""`, whereas `decode(undefined)` throws `TypeError`.
 - `encode()` allocates a fresh `Uint8Array` per call — don't call it in a
   hot loop with large strings.
 - No streaming: `decode(chunk, { stream: true })` ignores the option and

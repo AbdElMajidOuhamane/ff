@@ -21,14 +21,19 @@ codebase makes the rest of the documentation predictable.
 └──────────────────┬───────────────────────────────┘
                    │ C ABI (src/c.zig → quickjs_shim.zig)
 ┌──────────────────▼───────────────────────────────┐
-│ Zig API layer                                    │
-│   api/     console, fs, process, crypto, url,    │
-│            fetch, websocket, sqlite, sql, ffi    │
+│ Zig runtime & API layer                          │
+│   engine/  engine, quickjs_shim, interrupt       │
+│   util/    cli, limits, env_file                 │
+│   api/     console, fs, process, stdio, crypto,  │
+│            url, text_encoding, fetch, websocket, │
+│            udp, cron, child_process, sqlite,     │
+│            sql, ffi, permissions                 │
 │   net/     http_native (512-slot server),        │
-│            http2_server, pg_client, async_fetch  │
+│            http2_server, pg_client, async_fetch, │
+│            tcp_api, udp_native, ws_*, tls*, proxy│
 │   event/   loop, timers, microtasks              │
 │   types/   Headers, Request, Response, Blob,     │
-│            FormData, PoolSlice                   │
+│            FormData, ReadableStream, PoolSlice   │
 │   worker/  worker, message_port, serialize       │
 │   commands/ init, imprint, sever, start, test,   │
 │            repl, compile, fmt, upgrade, watch    │
@@ -43,12 +48,14 @@ codebase makes the rest of the documentation predictable.
 
 | Directory | Contents | Read when |
 |---|---|---|
-| `src/api/` | Every JS global | Looking up a global's behaviour |
+| `src/engine/` | QuickJS runtime init, C shims, `--cpu-budget` monitor | Startup limits or JS interrupt watchdog |
+| `src/util/` | CLI UI helpers, `--max-heap`/`--max-stack` limits, `--env-file` | Flag parsing, limits, or `.env` loading |
+| `src/api/` | Every JS global (`cron`, `stdio`, `fs`, `process`, `ffi`, …) | Looking up a global's behaviour |
 | `src/crypto/` | Dedicated `crypto.bcrypt` worker pool (`bcrypt_pool.zig`) | Password hashing pool and job slots |
-| `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket | Networking limits or protocol details |
-| `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` flag parsing and scope checks |
+| `src/net/` | HTTP server, HTTP/2, fetch, TCP, UDP, Postgres, TLS, WebSocket | Networking limits or protocol details |
+| `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` / `--deny-*` parsing, `permissions.revoke`, scope checks |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
-| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData` | Fetch API semantics |
+| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData`, `ReadableStream` | Fetch/stream API semantics |
 | `src/worker/` | Workers + structured clone | Worker limits |
 | `src/commands/` | CLI subcommands | CLI flags |
 | `src/modules/` | ESM resolver | Import resolution rules |
@@ -60,11 +67,15 @@ codebase makes the rest of the documentation predictable.
 |---|---|---|
 | JS thread | 1 | All JavaScript, all Promise settlements |
 | Event-loop pool (`libxev`) | 4 | General loop work |
-| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job waits |
+| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job throws `OutOfMemory` immediately |
 | `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
-| `ffi` pool | 4 | Each native call parks a pool thread |
-| `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound connections |
-| Postgres / TLS | none | Event-driven on the loop thread |
+| `ffi` pool | 4 + 32 job slots | `nonblocking: true` native calls (33rd throws `OutOfMemory`; sync calls run on JS thread) |
+| `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound HTTP connections |
+| `std.Io.Threaded` pool | up to 32 (1 MB stack each) | Backing I/O for `fetch` / client TLS DNS, connect, and reads |
+| WebSocket client worker | 1 (1 MB stack, lazy) | Drives all 64 client `WebSocket` connections (`ws://` / `wss://`) |
+| `--cpu-budget` monitor | 1 (64 KB stack, 20 ms poll) | Interrupts runaway JS when `--cpu-budget > 0` |
+| `--watch` parent watchdog | 1 (64 KB stack, 500 ms poll) | Exits watched children if supervisor dies |
+| Postgres / server TLS | none | Event-driven on the loop thread |
 | `Worker` | up to 8 | Your CPU-bound JS, each with its own runtime |
 
 There is no single shared pool — loop, `fs`, and `ffi` each own a

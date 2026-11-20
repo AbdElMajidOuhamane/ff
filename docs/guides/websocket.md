@@ -14,7 +14,7 @@ Both sides need `--allow-net`:
 
 | Side | Scope checked |
 |---|---|
-| Server | The underlying `http.serve({ port })` — always `0.0.0.0:<port>`. The `websocket` block adds no separate flag. |
+| Server | The underlying `http.serve({ hostname, port })` — `<hostname>:<port>` (default `0.0.0.0:<port>`). The `websocket` block adds no separate flag. |
 | Client | The URL passed to `new WebSocket(...)` — `host:port`. |
 
 ```sh
@@ -62,7 +62,10 @@ http.serve(
         peers.add(socket);
         socket.send("welcome");
       },
-      message: (socket, data) => socket.send(data),
+      message: (socket, data) => {
+        if (typeof data === "string") socket.send(data);
+        else socket.sendBinary(data);
+      },
       close: (socket) => peers.delete(socket),
     },
   },
@@ -129,7 +132,10 @@ http.serve(
     websocket: {
       open: (socket) => peers.add(socket),
       message: (socket, data) => {
-        for (const peer of peers) peer.send(data);
+        for (const peer of peers) {
+          if (typeof data === "string") peer.send(data);
+          else peer.sendBinary(data);
+        }
       },
       close: (socket) => peers.delete(socket),
     },
@@ -143,13 +149,15 @@ ff server.js --allow-net=0.0.0.0:3000
 curl http://127.0.0.1:3000/   # online: 0  (peers counted via Set size)
 ```
 
-Send binary with `sendBinary`:
+Send binary with `sendBinary` (`Uint8Array` / any `TypedArray` or `ArrayBuffer`):
 
 ```js
-socket.sendBinary(new Uint8Array([1, 2, 3]).buffer);
+socket.sendBinary(new Uint8Array([1, 2, 3]));
 ```
 
-> **Caution:** `socket.send` after the client disconnected fails — always remove sockets in `close`, and never store an index or id on them (none exists).
+Note: `socket.send(data)` sends UTF-8 strings only (binary payloads passed to `socket.send` and empty `""` strings are silently ignored).
+
+> **Caution:** `socket.send` after the client disconnected is a silent no-op (generation-checked so retained handles never touch recycled slots), but still remove sockets in `close` to avoid leaking dead references — and never store an index or id on them (none exists).
 
 ## Client: connecting and messaging
 
@@ -180,10 +188,10 @@ ff client.js --allow-net=api.example.com:443
 
 | Member | Description |
 |--------|-------------|
-| `send(data)` | Send text (`string`) or binary (`ArrayBuffer` / `Uint8Array`) |
-| `sendBinary(buf)` | Send bytes (`ArrayBuffer` / `Uint8Array`) |
-| `close(code?, reason?)` | Graceful close, e.g. `ws.close(1000, "done")` |
-| `readyState` | `0` connecting, `1` open, `2` closing, `3` closed |
+| `send(data)` | Send text (`string`) or binary (`ArrayBuffer` / `Uint8Array`); empty `""` ignored; before `OPEN` throws `TypeError: WebSocket: send buffer full` |
+| `sendBinary(buf)` | Send bytes (`ArrayBuffer` / `Uint8Array` / `TypedArray`) |
+| `close(code?, reason?)` | Graceful close (`code` defaults to `1000`, `reason` truncates at `123` bytes) |
+| `readyState` | `0` (`CONNECTING`), `1` (`OPEN`), `2` (`CLOSING`), `3` (`CLOSED`) — also constants on `WebSocket` and each instance |
 | `onopen` / `onmessage` / `onclose` / `onerror` | Event handlers; `ev.data` is `string` or `Uint8Array` |
 
 Only `ws://` and `wss://` URLs are accepted. For `wss://` to private CAs, the same trust rules as `fetch` apply (`--ca` for scripts, `FF_CA_FILE` for `ff start`). Trust does not replace `--allow-net` — you need both.
@@ -208,11 +216,7 @@ new WebSocket("ws://127.0.0.1:3000/");
 // e.name === "PermissionDenied", e.code === "PERMISSION_DENIED"
 ```
 
-A failed connection at runtime (refused, unreachable) does **not** throw
-and does **not** fire `onerror` — you get a bare `onclose`. When the close
-does carry an error, `onerror` fires first with an event whose `.message`
-is a string (not an `Error`), immediately followed by `onclose`, whose
-event carries numeric `.code` and string `.reason`:
+At runtime, `onclose` fires with numeric `.code` and string `.reason`. *(Known issue: `onerror` currently does not fire on connection/handshake failures because internal error length stays `0`; failures surface via `onclose` with `code: 1006`.)*
 
 ```js
 ws.onerror = (ev) => console.error("ws error:", ev.message);
@@ -263,15 +267,15 @@ Connect the clients with `--allow-net=127.0.0.1:3000`.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | 16384 bytes | Larger frames truncate |
-| Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
+| Message size | `16384` bytes (`16 KB`) | Server RX/TX and client fragmented RX close with `1009` (server single inbound frame also limited to 4 KB `READ_BUF_SIZE`; server TX drops silently past `16384` write buf); client TX and single-frame RX truncate at `16384` bytes |
+| Handshake validation | 512 B path, `GET`, `HTTP/1.1`, `Content-Length: 0`, `Sec-WebSocket-Version: 13`, 24-char key ending `==` | Malformed handshake fails (`400 Bad Request` on server) |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
-| Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |
+| Control frames | Max 125 bytes payload (`123` B close reason), no reserved opcodes | Malformed control frames close connection; long close reasons truncate |
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
-| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
-| Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` server-side |
-| Client send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full throws `TypeError: WebSocket: send buffer full` |
-| Permission scope | Listener: `0.0.0.0:<port>`; client: URL host and port | Denied before the socket opens |
+| Socket handles | Generation-tagged `{slot, gen}` | Retained handles cannot address recycled slots; post-close `send` is a silent no-op |
+| Server socket API | `send` (string) / `sendBinary` only | No `id`, `readyState`, or `close` server-side |
+| Client send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full or sending before `OPEN` throws `TypeError: WebSocket: send buffer full` |
+| Permission scope | Listener: `<hostname>:<port>` (default `0.0.0.0:<port>`); client: URL host and port | Denied before the socket opens |
 
 ## Troubleshooting
 
@@ -281,8 +285,8 @@ outside every `--allow-net` scope. Add the target exactly as written:
 not match `127.0.0.1`.
 
 **Server starts but clients cannot connect** — the listener is checked as
-`0.0.0.0:<port>`, even for loopback clients. Grant
-`--allow-net=0.0.0.0:3000`, not `127.0.0.1:3000`.
+`<hostname>:<port>` (default `0.0.0.0:<port>`), even for loopback clients.
+Grant `--allow-net=0.0.0.0:3000` unless `{ hostname: "127.0.0.1" }` is set.
 
 **Upgrade never fires** — the `websocket` block must be present, and the client must send the handshake headers (`Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Key` — any real WS client does). No handler branch is needed: the upgrade happens before the handler runs.
 

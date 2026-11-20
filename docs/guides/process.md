@@ -30,8 +30,10 @@ ff info.js hello --allow-env=HOME
 
 | Member | Type | Description |
 |--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and `--allow-*` flags (`["ff", "main.js", …]`) |
-| `process.env` | `object` | Filtered environment snapshot — only names granted by `--allow-env` appear |
+| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and `--allow-*` / `--deny-*` flags (`["ff", "main.js", …]`) |
+| `process.env` | `object` | Filtered environment snapshot (OS env + optional `--env-file`) — only names granted by `--allow-env` appear |
+| `process.stdout` | `{ write, isTTY }` | Synchronous unbuffered writer to fd 1 (`write(str \| Uint8Array) -> boolean`, `isTTY: boolean`) |
+| `process.stdin` | `{ read, readSync, isTTY }` | 64 KiB reader on fd 0 (`read() -> Promise<Uint8Array \| null>`, `readSync() -> Uint8Array \| null`, `isTTY: boolean`) |
 | `process.cwd()` | `() => string` | Current working directory |
 | `process.chdir(path)` | `(path) => void` | Change directory — throws `PermissionDenied` outside `--allow-read`; a missing/unreachable path is a silent no-op |
 | `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
@@ -39,14 +41,14 @@ ff info.js hello --allow-env=HOME
 | `process.platform` | `string` | `"darwin"`, `"linux"`, `"win32"`, `"freebsd"`, or `"unknown"` |
 | `process.arch` | `string` | `"arm64"`, `"x64"`, `"ia32"`, `"riscv64"`, or `"unknown"` |
 | `process.on(signal, fn)` / `once` / `off` | `(string, Function) => process` | Register or remove a signal listener (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`) |
-| `process.kill(pid, signal?)` | `(number, string?) => boolean` | Send a signal (default `"SIGTERM"`). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
-| `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
+| `process.kill(pid, signal?)` | `(number, (string \| number)?) => boolean` | Send a signal (default `"SIGTERM"`; 5 named signals or numeric signal). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
+| `process.memoryUsage()` | `() => { rss: number }` | Peak Resident Set Size (`ru_maxrss`) in bytes |
 | `process.stats()` | `() => object` | Internal allocator, spill, and pool counters (`fetch`, `http`, `pg`, `child`) |
 
 > **Permissions:** `process.env` needs `--allow-env`; `process.chdir` needs
 > `--allow-read` on the target; `process.kill` to a PID other than `process.pid`
-> needs `--allow-run=kill`. Everything else in this table is ungated. See
-> [Permissions](/docs/concepts/permissions).
+> needs `--allow-run=kill`. Everything else (`stdout`, `stdin`, `argv`, `cwd`,
+> `exit`, etc.) is ungated. See [Permissions](/docs/concepts/permissions).
 
 ## Arguments: `argv`
 
@@ -103,15 +105,25 @@ http.serve({ port }, () => new Response("ok"));
 ```sh
 PORT=4242 API_TOKEN=secret ff config.js \
   --allow-env=PORT,API_TOKEN \
-  --allow-net=0.0.0.0:3000
+  --allow-net=0.0.0.0:4242
 ```
 
-> **Note:** `process.env` is a startup snapshot and there is no `.env` loader.
-> Export variables (or prefix the command, as above) before starting `ff`.
-> Only granted names are copied into the object; bare `--allow-env` grants all
-> of them. The `FF_*` variables (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`)
-> are read by the runtime itself, but the application sees them only if
-> `--allow-env` includes them. See the [env guide](/docs/guides/env).
+> **Note:** `process.env` is a startup snapshot; `.env` files are opt-in via
+> `--env-file <path>` (max 2 MiB, OS env takes precedence, still filtered by
+> `--allow-env`). Only granted names are copied into `process.env`; bare
+> `--allow-env` grants all of them. Runtime `FF_*` variables (`FF_ECHO`,
+> `FF_CERT`, `FF_KEY`, `FF_CA_FILE`, `FF_MAX_HEAP`, `FF_CPU_BUDGET`) are read
+> by the runtime itself, but the application sees them only if `--allow-env`
+> includes them. See the [env guide](/docs/guides/env).
+
+## Standard I/O: `stdout` / `stdin`
+
+`process.stdout` and `process.stdin` are ungated plain objects:
+
+- `process.stdout.write(str | Uint8Array) -> boolean` writes synchronously and unbuffered to fd 1; `process.stdout.isTTY` reports TTY status.
+- `process.stdin.read() -> Promise<Uint8Array | null>` (up to 64 KiB, 1 concurrent `read()` allowed) and `process.stdin.readSync() -> Uint8Array | null` read from fd 0; `process.stdin.isTTY` reports TTY status.
+
+Neither is a Node EventEmitter stream (and `process.stderr` is not provided; `console.*` writes stderr).
 
 ## Working directory: `cwd` / `chdir`
 
@@ -187,7 +199,7 @@ should read `PORT`.
 | `spawn` / `exec` / `execFile` | Separate global: [child_process](/docs/api/child-process) — `spawn`, `exec`, `execSync` |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
-| `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
+| Node `stdin` / `stdout` / `stderr` EventEmitter streams | Use `process.stdout.write` and `process.stdin.read` / `readSync` (`console.*` writes **stderr**) |
 
 (`process.memoryUsage()` does exist — its `rss` is a peak counter from
 `getrusage`, see the [API page](/docs/api/process).)
@@ -196,9 +208,10 @@ Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver
 
 ## Troubleshooting
 
-**`process.env.X` is undefined** — either the variable wasn't exported in the
-launching shell, or `--allow-env` does not include it. Check both:
-`X=1 ff app.js --allow-env=X`. No `.env` file is read.
+**`process.env.X` is undefined** — either the variable wasn't exported (and
+not loaded via `--env-file`), or `--allow-env` does not include it. Check both:
+`X=1 ff app.js --allow-env=X` (or `--env-file=.env --allow-env=X`). Note that
+`.env` files are only read when explicitly passed via `--env-file`.
 
 **`chdir` threw `PermissionDenied`** — the target is outside every `read`
 scope. Add `--allow-read=<target>` (or a parent directory). This is different

@@ -16,52 +16,63 @@ designing are:
 
 | Constraint | Detail |
 |---|---|
-| Policy lifetime | Parsed once before the runtime starts; immutable for the process; workers inherit it |
+| Policy lifetime | Initial policy parsed at startup; can be narrowed one-way at runtime via `permissions.revoke(...)`, never expanded; read atomically by workers |
 | Scope roots | Resolved against the launch cwd and fixed; `process.chdir()` does not move them |
-| Path scopes | Canonicalized and symlink-resolved; 4096-byte limit; no globs or extensions |
-| Network scopes | Literal host match with no DNS; `localhost` ≠ `127.0.0.1`; bind is always `0.0.0.0` |
+| Path scopes | Canonicalized and symlink-resolved; OS `PATH_MAX` (4096 B Linux, 1024 B macOS); no globs or extensions |
+| Network scopes | Host/port match with no DNS (supports `*` and `*.domain` wildcards; `localhost` ≠ `127.0.0.1`); `http.serve` defaults to `0.0.0.0` unless `hostname` is passed |
 | Environment scopes | Exact, case-sensitive names; disallowed keys are absent from `process.env` |
 | Run scopes | Basename or absolute path; `exec` / `execSync` also need `/bin/sh` |
-| FFI | Bare `--allow-ffi` only; gates every `ffi` entry point except `ffi.allowed`; trust-equivalent to full access |
+| FFI | Bare `--allow-ffi` only; gates every `ffi` entry point except startup snapshot `ffi.allowed`; trust-equivalent to full access |
 | Module loading | `import` and `new Worker(path)` do not need `read`; loaded code runs with the process policy |
 | Isolation | In-process policy, not an OS sandbox; a symlink swapped between check and syscall can escape a path scope |
-| Granularity | Process-global; no per-request or per-user scopes |
-| Deny flags | None; the default is deny, and only `--allow-*` changes it |
+| Granularity | Process-global (dynamically updatable via `permissions.revoke`); no per-request or per-user scopes |
+| Deny flags | `--deny-read=<paths>`, `--deny-write=<paths>`, `--deny-net=<hosts>` override matching `--allow-*` / `--allow-all` grants (scope required; no `--deny-env` / `--deny-run` / `--deny-ffi`) |
 
 `run` and `ffi` execute arbitrary code with the process's authority. Use
 permissions to reduce mistakes in code you mostly trust, not as the only
 boundary for hostile code.
 
+## Runtime limits
+
+| Flag / env | Default | Valid range |
+|---|---|---|
+| `--max-heap` (`FF_MAX_HEAP`) | `64MB` | `8MB`–`4GB` |
+| `--worker-heap` | `min(32MB, max-heap)` | `1MB`–`max-heap` |
+| `--max-stack` | `1MB` | `128KB`–`native/2` (requires native stack >= 256 KB) |
+| `--cpu-budget` (`FF_CPU_BUDGET`) | `0` (disabled) | `0`–`3600000` ms |
+
 ## HTTP server
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent connections | 512 | The 513th waits for a free slot |
+| Concurrent connections | 512 | The 513th connection is accepted and immediately closed (no internal wait queue beyond the OS `listen(128)` backlog) |
 | Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
 | Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
-| Response body | 10 MB hard cap (64 KB stage buffer spills to the heap) | Beyond 10 MB → `500` |
-| Response headers | 2048 bytes | Headers beyond the cap are dropped |
+| Response body | 10 MB hard cap (64 KB HTTP/1.1 stage buffer spills to the heap) | Beyond 10 MB → `500`; `Response.file(path)` reads up to 50 MB (still subject to 10 MB cap when sent over `http.serve`) |
+| Response headers | 2048 bytes (HTTP/1.1 status line + user headers); HTTP/2: 128 headers (name <= 64 B, value <= 4096 B) | Extra headers beyond the cap are dropped |
 | Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
 | Hung handler | 30s | Connection fails with `504` |
+| Graceful drain | `SHUTDOWN_DRAIN_MS = 5000` ms | Remaining active sockets force-closed after 5s on `server.close()` |
 | Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Terminated with `400 Bad Request` |
-| Response status | 100..999 | Clamped/validated to 100..999 |
-| Bind address | Always `0.0.0.0` | No host option, no `FF_PORT`; the net scope must be `0.0.0.0:<port>` |
+| Response status | 100..999 | Values outside 100..999 fall back to default (`200`, or `302` in `Response.redirect`) |
+| Bind address | Defaults to `0.0.0.0`; `hostname` accepts IPv4/IPv6 literals (optional `reusePort`) | No DNS hostnames, no `FF_PORT`; `--allow-net` must match `<hostname>:<port>` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
-| HTTP/2 | TLS + ALPN only (nghttp2); pseudo-headers validated (`:path` ≤ 512 B, `:method` ≤ 16 B); request body ≤ 10 MB/stream and ≤ 16 MB/session | Plain sockets stay HTTP/1.1 |
+| Routes object | Up to 16 `:param` captures/route; route key `< 512` B; URL `<= 4096` B | URL > 4096 B → `414 URI Too Long` |
+| HTTP/2 | TLS + ALPN (nghttp2); `MAX_STREAMS = 100`/conn; req headers `<= 64 KB` (`431`); `:path <= 512 B`, `:method <= 16 B`, `:authority <= 255 B` (`400`); req body `<= 10 MB/stream`, `16 MB/session` | Plain sockets stay HTTP/1.1; `ReadableStream` response body returns `501` |
 | `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
 
 ## Fetch (client)
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent fetches | 16 | The 17th waits for a free slot |
+| Concurrent fetches | 16 | The 17th rejects immediately with `"Failed to start fetch"` |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
-| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject |
+| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
 | I/O timeout | 30s | Slow servers fail |
-| Redirects | Followed, max 5 hops | Throws `Too many redirects`; every hop is re-checked against `--allow-net` |
-| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `x-api-key` dropped when changing origin |
-| Header validation | RFC 7230 character validation | CRLF or invalid header names/values reject before sending |
-| Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (use `AbortSignal.timeout(ms)`) |
+| Redirects | Followed, max 5 hops | Rejects with `"Too many redirects"`; every hop is re-checked against `--allow-net` |
+| Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
+| Header validation | RFC 7230 character validation | Invalid header names or values containing CR/LF/NUL/CTLs are silently dropped (no throw/reject) |
+| Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (`AbortSignal.timeout(ms)` uses 1 slot in the 128-timer table) |
 | TLS hostnames | DNS SAN verification only | IP-literal TLS hosts (`https://127.0.0.1:...`) fail closed; connect using DNS hostnames |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
 | Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
@@ -71,15 +82,24 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | 16384 bytes | Larger frames truncate |
+| Message size | `16384` bytes (`16 KB`) | Server RX/TX and client fragmented RX close with `1009` (server single inbound frame capped at 4 KB `READ_BUF_SIZE`); client TX and single-frame RX truncate at `16384` bytes |
 | Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
-| Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |
+| Control frames | Max 125 bytes payload (`123` B close reason), no reserved opcodes | Malformed control frames close connection |
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |
-| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots |
-| Server socket API | `send` / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
-| Send buffer | 32 KB per socket (`TX_BUF_SIZE = 32768`) | Outbound queue full throws `TypeError: WebSocket: send buffer full` |
+| Socket handles | Generation-tagged `{slot, gen}` | Retained JS handles cannot address recycled slots (post-close `send` is a silent no-op) |
+| Server socket API | `send` (string) / `sendBinary` only | No `id`, `readyState`, or `close` on server sockets |
+| Send buffer | Client: 32 KB (`TX_BUF_SIZE = 32768`); Server: 16 KB | Client throws `TypeError: WebSocket: send buffer full`; server drops outbound frames silently when full |
 | Proxy | Same env vars as `fetch` | `ws://` needs a CONNECT-capable proxy |
+
+## Raw TCP (`tcp`)
+
+| Area | Limit | When hit |
+|------|-------|----------|
+| Concurrent sockets | 128 (`MAX_TCP`) | `TypeError: max TCP connections exceeded (128)` |
+| Read / write buffers | `16384` bytes (`16 KB`) each | Larger `write()` throws `TypeError: write payload exceeds buffer size (16KB)` |
+| Pending I/O | 1 concurrent `read()` + 1 concurrent `write()` per socket | Throws `TypeError: concurrent read/write already in progress` |
+| Addresses / scope | IPv4/IPv6 literals only (no DNS); client-only; `--allow-net` | Hostnames rejected with `TypeError`; no server/listen or TLS upgrade |
 
 ## UDP
 
@@ -92,15 +112,16 @@ boundary for hostile code.
 | Addresses | IP literals only | Hostnames rejected (`...: invalid address`) |
 | `setsockopt` / multicast | Missing | No socket options |
 
-## Timers and workers
+## Timers, cron, and workers
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Live timers | 128 | `TypeError: too many timers (max 128)` |
+| Live timers | 128 (shared across `setTimeout`, `setInterval`, `AbortSignal.timeout`, and `ff.cron`) | `TypeError: too many timers (max 128)` |
 | Extra timer args | 8 after `ms` | Beyond 8 throws `TypeError: setTimeout accepts at most 8 callback arguments` (also accepts `{ signal }` or `AbortSignal` as 3rd arg) |
+| Cron jobs (`ff.cron`) | 32 jobs (`MAX_CRON`), no cancel/unref | `TypeError: Max cron jobs (32) exceeded`; `@every` supports `ms`/`s`/`m`; 5-field cron rejects expressions with no match in 366 days |
 | Workers | 8 | `too many workers (max 8)` |
-| Worker scope | `console`, timers, `postMessage`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `performance` (`performance.now()`), `workerData`, `self` | No `fs`, `fetch`, `http.serve`, `crypto.bcrypt`, or nested workers |
-| Worker heap | 32 MB default JS heap + `--max-stack` JS stack (thread stack >= max(8 MB, 2 * `--max-stack`)) | — |
+| Worker scope | `console`, numeric timers, `queueMicrotask`, `postMessage`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`; `crypto.bcrypt` throws), `btoa`, `atob`, `performance` (`performance.now()`), `workerData`, `self` | No `fs`, `fetch`, `http.serve`, `crypto.bcrypt`, `TextEncoder`, `URL`, `Blob`, `process`, `ffi`, `tcp`, `udp`, `ff`, or nested workers; 10 MiB script cap |
+| Worker heap / stack | `min(32 MB, --max-heap)` default (configurable via `--worker-heap`), `--max-stack` JS stack (`>= max(8 MB, 2 * --max-stack)` OS thread stack) | — |
 | Worker message | 4 MB per message | Larger `postMessage` payloads are rejected |
 | `process.nextTick` | Missing | Use `queueMicrotask` |
 
