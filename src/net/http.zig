@@ -29,10 +29,16 @@ fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
     _ = c.throwTypeError(ctx, "http.serve: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
 }
 
-fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
+/// Extract a TCP port. Returns null when the value is present but not an
+/// integer in 0..65535, so the caller can throw instead of binding a
+/// silently wrapped port: `@intCast(i32 -> u16)` traps in ReleaseSafe and
+/// is undefined behavior in ReleaseFast, so `port: 70000` used to do
+/// different wrong things per optimize mode.
+fn extractPortFromVal(ctx: ?*c.Context, val: c.Value, default: u16) ?u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
-    if (c.toInt32(ctx, &out, val) == -1) return default;
+    if (c.toInt32(ctx, &out, val) == -1) return null;
+    if (out < 0 or out > std.math.maxInt(u16)) return null;
     return @intCast(out);
 }
 
@@ -157,7 +163,11 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
 
     if (c.isObject(opts_val) != 0) {
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
-        port = extractIntFromVal(ctx, port_val, 3000);
+        port = extractPortFromVal(ctx, port_val, 3000) orelse {
+            c.freeValue(ctx, port_val);
+            throwTypeError(ctx, "http.serve: port must be an integer in 0..65535");
+            return c.JS_EXCEPTION;
+        };
         c.freeValue(ctx, port_val);
 
         const host_val = c.getPropertyStr(ctx, opts_val, "hostname");
@@ -199,7 +209,10 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
             }
         }
     } else if (c.isNumber(opts_val) != 0) {
-        port = extractIntFromVal(ctx, opts_val, 3000);
+        port = extractPortFromVal(ctx, opts_val, 3000) orelse {
+            throwTypeError(ctx, "http.serve: port must be an integer in 0..65535");
+            return c.JS_EXCEPTION;
+        };
     }
 
     const parsed_addr = if (std.Io.net.IpAddress.parseIp4(hostname, port)) |a4|

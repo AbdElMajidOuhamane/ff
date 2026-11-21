@@ -595,7 +595,11 @@ fn arrayLength(ctx: ?*c.Context, v: c.Value) !usize {
     return @intCast(n);
 }
 
-fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool) !void {
+fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool, depth: u8) !void {
+    // Nested arrays are walked recursively. Cap the depth: a JS-supplied
+    // [[[[...]]]] used to recurse until the stack overflowed. Same bound as
+    // appendArrayElem's encoder, so what can be classified can be encoded.
+    if (depth > 8) return error.EncodeFailed;
     if (c.isNull(v) != 0 or c.isUndefined(v) != 0) return;
     if (c.isArray(ctx, v) != 0) {
         const n = try arrayLength(ctx, v);
@@ -604,7 +608,7 @@ fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool) !
             const el = c.getPropertyUint32(ctx, v, @intCast(i));
             if (c.isException(el) != 0) return error.EncodeFailed;
             defer c.freeValue(ctx, el);
-            try classifyValue(ctx, el, kind, decided);
+            try classifyValue(ctx, el, kind, decided, depth + 1);
             if (decided.* and kind.* == .text) return;
         }
         return;
@@ -774,7 +778,7 @@ fn encodeArrayParam(ctx: ?*c.Context, alloc: std.mem.Allocator, arr: c.Value) !E
             const el = c.getPropertyUint32(ctx, arr, @intCast(i));
             if (c.isException(el) != 0) return error.EncodeFailed;
             defer c.freeValue(ctx, el);
-            try classifyValue(ctx, el, &kind, &decided);
+            try classifyValue(ctx, el, &kind, &decided, 0);
             if (decided and kind == .text) break;
         }
     }

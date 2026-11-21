@@ -434,27 +434,33 @@ fn validWsKey(k: []const u8) bool {
 ///     one framing while a proxy accepts another is request smuggling)
 ///   * obs-fold, whitespace-before-colon, colon-less lines: refused
 ///   * WebSocket handshake validated by header table, not a buffer scan
-pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
-    // The caller locates headers_end from this same buffer; parsing outside
-    // it would read adjacent slot memory.
-    std.debug.assert(headers_end >= 4);
-    std.debug.assert(headers_end <= buf.len);
-    var pr = ParsedRequest{
-        .method = "",
-        .method_tag = .none,
-        .url = "",
-        .ws_key = "",
-        .content_length = 0,
-        .keep_alive = true,
-        .framing_ok = true,
-        .ws_bad = false,
-        .too_large = false,
-    };
-    const region = buf[0..headers_end];
-    if (region.len < 10) return pr;
-    const sp1 = std.mem.indexOfScalar(u8, region, ' ') orelse return pr;
-    if (sp1 + 1 >= region.len) return pr;
-    const sp2 = std.mem.indexOfScalarPos(u8, region, sp1 + 1, ' ') orelse return pr;
+/// Header fields parseRequest cares about, filled by one pass over the header
+/// block. A stack transient for a single request, so a plain struct is the
+/// right shape here (an SoA split would only add noise).
+const HeaderScan = struct {
+    has_close: bool = false,
+    has_keepalive: bool = false,
+    seen_cl: bool = false,
+    seen_te: bool = false,
+    upgrading: bool = false,
+    conn_upgrade: bool = false,
+    ws_ver_ok: bool = false,
+    ws_key_seen: u32 = 0,
+    ws_key_val: []const u8 = "",
+};
+
+const RequestLine = struct {
+    headers_start: usize,
+    is_11: bool,
+};
+
+/// Parse the request line and locate the first header byte. Returns null when
+/// the buffer does not contain a request line at all.
+fn parseRequestLine(region: []const u8, pr: *ParsedRequest) ?RequestLine {
+    if (region.len < 10) return null;
+    const sp1 = std.mem.indexOfScalar(u8, region, ' ') orelse return null;
+    if (sp1 + 1 >= region.len) return null;
+    const sp2 = std.mem.indexOfScalarPos(u8, region, sp1 + 1, ' ') orelse return null;
     pr.method = region[0..sp1];
     pr.method_tag = classifyMethod(pr.method);
     pr.url = region[sp1 + 1 .. sp2];
@@ -467,23 +473,19 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
     while (plen < proto_full.len and proto_full[plen] != '\r' and proto_full[plen] != '\n') plen += 1;
     const is_11 = std.mem.eql(u8, std.mem.trim(u8, proto_full[0..plen], " \t"), "HTTP/1.1");
 
-    var has_close = false;
-    var has_keepalive = false;
-    var seen_cl = false;
-    var seen_te = false;
-    var upgrading = false;
-    var conn_upgrade = false;
-    var ws_ver_ok = false;
-    var ws_key_seen: u32 = 0;
-    var ws_key_val: []const u8 = "";
-
-    // Skip the request line (protocol token + CRLF) so the loop below sees
+    // Skip the request line (protocol token + CRLF) so the header loop sees
     // ONLY header lines. The old loop started at the protocol token and
     // treated "HTTP/1.1" as a header line.
     var i: usize = sp2 + 1;
     while (i < region.len and region[i] != '\r' and region[i] != '\n') i += 1;
     while (i < region.len and (region[i] == '\r' or region[i] == '\n')) i += 1;
+    return .{ .headers_start = i, .is_11 = is_11 };
+}
 
+/// Scan every header line into `hs`. Framing violations clear pr.framing_ok;
+/// no allocation and no copying happens here.
+fn parseHeaderLines(region: []const u8, start: usize, pr: *ParsedRequest, hs: *HeaderScan) void {
+    var i = start;
     while (i < region.len) {
         const line_start = i;
         while (i < region.len and region[i] != '\r' and region[i] != '\n') i += 1;
@@ -513,16 +515,16 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
             const value = trimOws(hline[colon + 1 ..]);
 
             if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                if (!has_close and ciListHas(value, "close")) has_close = true;
-                if (!has_keepalive and ciListHas(value, "keep-alive")) has_keepalive = true;
-                if (ciListHas(value, "upgrade")) conn_upgrade = true;
+                if (!hs.has_close and ciListHas(value, "close")) hs.has_close = true;
+                if (!hs.has_keepalive and ciListHas(value, "keep-alive")) hs.has_keepalive = true;
+                if (ciListHas(value, "upgrade")) hs.conn_upgrade = true;
             } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                if (seen_cl) {
+                if (hs.seen_cl) {
                     // Duplicate CL: folding is ambiguous across intermediaries,
                     // so refuse rather than pick a winner.
                     pr.framing_ok = false;
                 } else {
-                    seen_cl = true;
+                    hs.seen_cl = true;
                     var all_digits = value.len > 0;
                     for (value) |ch| {
                         if (ch < '0' or ch > '9') all_digits = false;
@@ -543,40 +545,73 @@ pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
                     }
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                seen_te = true;
+                hs.seen_te = true;
             } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-                if (ciListHas(value, "websocket")) upgrading = true;
+                if (ciListHas(value, "websocket")) hs.upgrading = true;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-                ws_key_seen +%= 1;
-                ws_key_val = value;
+                hs.ws_key_seen +%= 1;
+                hs.ws_key_val = value;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-                if (std.mem.eql(u8, value, "13")) ws_ver_ok = true;
+                if (std.mem.eql(u8, value, "13")) hs.ws_ver_ok = true;
             }
         }
 
         while (i < region.len and (region[i] == '\r' or region[i] == '\n')) i += 1;
     }
+}
 
+/// Turn the scanned fields into the ParsedRequest contract every downstream
+/// consumer relies on.
+fn finishRequest(pr: *ParsedRequest, hs: HeaderScan, is_11: bool) void {
     // Transfer codings are not implemented: honouring one system and not the
     // other is exactly how request smuggling starts.
-    if (seen_te) pr.framing_ok = false;
+    if (hs.seen_te) pr.framing_ok = false;
 
-    if (ws_key_seen != 0) {
-        const ok = ws_key_seen == 1 and
+    if (hs.ws_key_seen != 0) {
+        const ok = hs.ws_key_seen == 1 and
             pr.method_tag == .get and
             is_11 and
             pr.content_length == 0 and
-            upgrading and conn_upgrade and ws_ver_ok and
-            validWsKey(ws_key_val);
-        if (ok) pr.ws_key = ws_key_val else pr.ws_bad = true;
+            hs.upgrading and hs.conn_upgrade and hs.ws_ver_ok and
+            validWsKey(hs.ws_key_val);
+        if (ok) pr.ws_key = hs.ws_key_val else pr.ws_bad = true;
     }
 
-    pr.keep_alive = if (is_11) !has_close else has_keepalive;
-    // Contract every downstream consumer relies on (see ParsedRequest):
-    // a framing-valid request's body is bounded, so headers_end + length
+    pr.keep_alive = if (is_11) !hs.has_close else hs.has_keepalive;
+    // A framing-valid request's body is bounded, so headers_end + length
     // cannot leave the slot's static buffer budget.
     std.debug.assert(!pr.framing_ok or pr.content_length <= REQ_BODY_MAX);
     std.debug.assert(pr.ws_key.len == 0 or pr.ws_bad == false);
+}
+
+/// Strict request parse. Security-relevant rules, all enforced here so the
+/// hot path never has to re-check them:
+///   * Content-Length: digits only, single occurrence, <= REQ_BODY_MAX
+///   * Transfer-Encoding: refused (chunked is not implemented — accepting
+///     one framing while a proxy accepts another is request smuggling)
+///   * obs-fold, whitespace-before-colon, colon-less lines: refused
+///   * WebSocket handshake validated by header table, not a buffer scan
+pub fn parseRequest(buf: []const u8, headers_end: usize) ParsedRequest {
+    // The caller locates headers_end from this same buffer; parsing outside
+    // it would read adjacent slot memory.
+    std.debug.assert(headers_end >= 4);
+    std.debug.assert(headers_end <= buf.len);
+    var pr = ParsedRequest{
+        .method = "",
+        .method_tag = .none,
+        .url = "",
+        .ws_key = "",
+        .content_length = 0,
+        .keep_alive = true,
+        .framing_ok = true,
+        .ws_bad = false,
+        .too_large = false,
+    };
+    const region = buf[0..headers_end];
+    const line = parseRequestLine(region, &pr) orelse return pr;
+    var hs = HeaderScan{};
+    parseHeaderLines(region, line.headers_start, &pr, &hs);
+    finishRequest(&pr, hs, line.is_11);
     return pr;
 }
 fn statusReason(status: u16) []const u8 {
@@ -861,6 +896,7 @@ pub fn disableTls() void {
 }
 
 fn armRead(id: usize, l: *xev.Loop) void {
+    std.debug.assert(buf_lens[id] <= READ_BUF_SIZE);
     if (tls_on and cflags[id].tls) {
         if (cflags[id].tls_read_armed) return; // already pending — prevent libxev double-push
         const sp = tls_mod.recvRecSpace(&tls_ctxs[id]);
@@ -1145,6 +1181,9 @@ fn releaseSpillIfOversized(id: usize) void {
 //   larger         → the retained heap spill (reused when capacity fits)
 // Sets cflags.body_from_heap so the drain never has to re-derive the column.
 pub fn stageBodyBytes(id: usize, src: []const u8) ?[]const u8 {
+    // Callers gate on MAX_BODY_SIZE; a larger body here would be staged and
+    // then partially written.
+    std.debug.assert(src.len <= MAX_BODY_SIZE);
     if (src.len == 0) return &[_]u8{};
     if (src.len <= BODY_BUF_SIZE) {
         @memcpy(body_bufs[id][0..src.len], src);
@@ -2629,6 +2668,10 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
         _ = std.c.close(tcp.fd);
         return false;
     };
+    // The freelist only holds slots returned by closeCb/hardClose, which set
+    // .idle first; a slot reused in any other state would alias an in-flight
+    // completion.
+    std.debug.assert(states[id] == .idle);
     fds[id] = tcp;
     slot_gen[id] +%= 1; // NEW
     parked_since_ms[id] = 0; // NEW
@@ -2762,6 +2805,7 @@ fn readCb(
 /// HTTP/WS state machine over bytes in read_bufs[0..buf_lens]
 /// (plaintext for plain HTTP, decrypted app-data when TLS is active).
 fn processPlaintext(id: usize, l: *xev.Loop) void {
+    std.debug.assert(buf_lens[id] <= READ_BUF_SIZE);
     // HTTP/2 path runs BEFORE the handler_parked early-return so multiplexed
     // streams keep flowing while one stream's promise is parked.
     if (cflags[id].h2_active) {
@@ -2924,6 +2968,9 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
 // re-read from offset 0, silently discarding them). Mirrors the WS leftover
 // handling in wsConsume.
 fn keepAlivePreserve(id: usize) void {
+    // req_consumed is set to headers_end + content_length only after
+    // buf_lens covered it; a violation here would slice out of bounds.
+    std.debug.assert(req_consumed[id] <= buf_lens[id]);
     const leftover = read_bufs[id][req_consumed[id]..buf_lens[id]];
     @memmove(read_bufs[id][0..leftover.len], leftover);
     buf_lens[id] = leftover.len;

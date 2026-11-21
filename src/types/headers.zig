@@ -32,6 +32,11 @@ const ExtractedStr = struct {
     }
 };
 
+/// Upper bound on headers accepted from one JS init value. Without it a
+/// sparse array (`new Array(2**31)`) reserves ~90 GB and then walks 2^31
+/// properties: two unbounded quantities driven by JS input.
+pub const MAX_HEADERS_INIT: c_uint = 2048;
+
 fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
     const cstr = c.toCString(ctx, val) orelse return null;
     defer c.freeCString(ctx, cstr);
@@ -201,6 +206,17 @@ comptime {
 const HDR_POOL_MAX: usize = 32;
 var hdr_pool: [HDR_POOL_MAX]*HeadersData = undefined;
 var hdr_pool_n: usize = 0;
+// async_fetch releases fetch-owned header containers from 16 worker threads
+// (ResponseData.releaseData -> HeadersData.release), so the index is shared.
+// Guard the index only; a shell at refcount 0 has no other owner.
+var hdr_pool_mutex: std.atomic.Mutex = .unlocked;
+
+inline fn hdrPoolLock() void {
+    while (!hdr_pool_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+inline fn hdrPoolUnlock() void {
+    hdr_pool_mutex.unlock();
+}
 
 pub var stat_pool_hit: std.atomic.Value(usize) = .{ .raw = 0 };
 pub var stat_pool_miss: std.atomic.Value(usize) = .{ .raw = 0 };
@@ -212,15 +228,18 @@ const HDR_RETAIN_SLICES: usize = 64;
 /// Pooled HeadersData shell, freshly cleared (refcount = 1).
 /// Null only on OOM — callers use `orelse` like the old gpa.create path.
 pub fn acquire() ?*HeadersData {
+    hdrPoolLock();
     if (hdr_pool_n > 0) {
         hdr_pool_n -= 1;
         if (builtin.is_test or builtin.mode == .Debug) {
             _ = stat_pool_hit.fetchAdd(1, .monotonic);
         }
         const h = hdr_pool[hdr_pool_n];
+        hdrPoolUnlock();
         h.refcount.store(1, .release);
         return h;
     }
+    hdrPoolUnlock();
     if (builtin.is_test or builtin.mode == .Debug) {
         _ = stat_pool_miss.fetchAdd(1, .monotonic);
     }
@@ -230,24 +249,28 @@ pub fn acquire() ?*HeadersData {
 }
 
 fn releaseToPool(h: *HeadersData) void {
+    // Refcount 0 means no other owner: shrink or clear outside the index lock.
+    if (h.entries.capacity > HDR_RETAIN_ENTRIES or
+        h.names.capacity > HDR_RETAIN_BYTES or
+        h.values.capacity > HDR_RETAIN_BYTES or
+        h.merge_buf.capacity > HDR_RETAIN_BYTES or
+        h.view_buf.capacity > HDR_RETAIN_SLICES)
+    {
+        h.deinit();
+        h.* = HeadersData.init();
+    } else {
+        h.clear();
+    }
+    hdrPoolLock();
     if (hdr_pool_n < HDR_POOL_MAX) {
-        if (h.entries.capacity > HDR_RETAIN_ENTRIES or
-            h.names.capacity > HDR_RETAIN_BYTES or
-            h.values.capacity > HDR_RETAIN_BYTES or
-            h.merge_buf.capacity > HDR_RETAIN_BYTES or
-            h.view_buf.capacity > HDR_RETAIN_SLICES)
-        {
-            h.deinit();
-            h.* = HeadersData.init();
-        } else {
-            h.clear();
-        }
         hdr_pool[hdr_pool_n] = h;
         hdr_pool_n += 1;
-    } else {
-        h.deinit();
-        gpa.destroy(h);
+        hdrPoolUnlock();
+        return;
     }
+    hdrPoolUnlock();
+    h.deinit();
+    gpa.destroy(h);
 }
 
 // Hot data: `entries` (16B stride, scanned by every get/has/forEach).
@@ -579,6 +602,7 @@ pub fn headersHas(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
 fn throwHeaderError(ctx: ?*c.Context, err: anyerror) c.Value {
     return switch (err) {
         error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        error.HeadersTooLarge => c.throwTypeError(ctx, "too many headers (max 2048)"),
         error.OutOfMemory => c.throwOutOfMemory(ctx),
         else => c.throwInternalError(ctx, "header update failed"),
     };
@@ -729,9 +753,14 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 defer c.freeValue(ctx, len_val);
                 var len: c_int = 0;
                 _ = c.toInt32(ctx, &len, len_val);
-                if (len > 0) data.reserveEntries(@intCast(len));
+                // JS_ToInt32 returns a negative c_int for length > 2^31;
+                // @intCast of a negative value is UB in ReleaseFast (trap in
+                // ReleaseSafe). Clamp, then bound the work as well.
+                const count: c_uint = @intCast(@max(len, 0));
+                if (count > MAX_HEADERS_INIT) return failHeaders(ctx, data, error.HeadersTooLarge);
+                if (count > 0) data.reserveEntries(count);
                 var i: c_uint = 0;
-                while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+                while (i < count) : (i += 1) {
                     const item = c.getPropertyUint32(ctx, init_val, i);
                     defer c.freeValue(ctx, item);
                     if (c.isObject(item) == 0) continue;

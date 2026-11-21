@@ -418,9 +418,13 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
-        if (len > 0) target.reserveEntries(@intCast(len));
+        // Negative c_int for length > 2^31: clamp before @intCast (UB in
+        // ReleaseFast), and bound the property walk like every other input.
+        const count: c_uint = @intCast(@max(len, 0));
+        if (count > headers_mod.MAX_HEADERS_INIT) return error.HeadersTooLarge;
+        if (count > 0) target.reserveEntries(count);
         var i: c_uint = 0;
-        while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+        while (i < count) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
             defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;
@@ -698,6 +702,7 @@ fn failRequest(ctx: ?*c.Context, data: *RequestData, err: anyerror) c.Value {
     return switch (err) {
         error.OutOfMemory => c.throwOutOfMemory(ctx),
         error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        error.HeadersTooLarge => c.throwTypeError(ctx, "too many headers (max 2048)"),
         else => c.throwInternalError(ctx, "request construction failed"),
     };
 }

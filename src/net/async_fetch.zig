@@ -105,6 +105,7 @@ const AsyncT = xev.Async;
 var async_h: AsyncT = undefined;
 var async_comp: xev.Completion = .{};
 var async_armed = false;
+var async_initialized = false;
 var g_ctx: ?*c.Context = null;
 var g_loop: ?*xev.Loop = null;
 
@@ -182,13 +183,21 @@ fn wakeAllWorkers() void {
 pub fn init(ctx: ?*c.Context) void {
     g_ctx = ctx;
     poolInit();
-    async_h = AsyncT.init() catch unreachable;
+    // A failed eventfd is a real (if unlikely) error: `catch unreachable` was
+    // UB in ReleaseFast. Leave the pool unstarted; fetch() then fails with a
+    // normal JS error instead of crashing the process.
+    async_h = AsyncT.init() catch {
+        if (builtin.mode == .Debug) std.debug.print("[fetch] async init failed\n", .{});
+        return;
+    };
+    async_initialized = true;
     async_armed = false;
     ring_head = 0;
     ring_tail = 0;
     shutdown_requested = false;
     makeJobPipe() catch {
         async_h.deinit();
+        async_initialized = false;
         return;
     };
     for (&worker_threads) |*t| {
@@ -205,6 +214,14 @@ pub fn deinit() void {
         shutdown_requested = true;
         ringUnlock();
         wakeAllWorkers();
+        // Close the write end so every worker's next read returns EOF. With
+        // the old 16-byte budget, a worker that consumed a wake byte while
+        // jobs were still queued stayed alive and later blocked in read()
+        // forever, so join() never returned.
+        if (job_pipe[1] >= 0) {
+            _ = std.c.close(job_pipe[1]);
+            job_pipe[1] = -1;
+        }
         for (&worker_threads) |*t| {
             if (t.*) |*tt| {
                 tt.join();
@@ -216,7 +233,10 @@ pub fn deinit() void {
     if (job_pipe[0] >= 0) _ = std.c.close(job_pipe[0]);
     if (job_pipe[1] >= 0) _ = std.c.close(job_pipe[1]);
     job_pipe = .{ -1, -1 };
-    async_h.deinit();
+    if (async_initialized) {
+        async_h.deinit();
+        async_initialized = false;
+    }
     for (0..MAX_FETCH) |s| {
         // BUG-5 FIX: a slot retired while JOB_DONE/JOB_CLAIMED still holds a
         // heap ResponseData that no JS object ever wrapped — release it, else
@@ -355,6 +375,10 @@ pub fn submit(
     }
     job_ring[ring_tail % RING_CAP] = @intCast(s);
     ring_tail +%= 1;
+    // A slot is enqueued at most once while outstanding and RING_CAP is
+    // MAX_FETCH, so occupancy can never exceed capacity; assert the property
+    // that makes the monotonic head/tail encoding unambiguous.
+    std.debug.assert(ring_tail -% ring_head <= RING_CAP);
     ringUnlock();
     _ = std.c.write(job_pipe[1], &[_]u8{1}, 1);
     ensureArmed();
@@ -871,13 +895,17 @@ fn runJob(slot_id: u16) void {
                             heap_acc.ensureTotalCapacity(gpa, 64 * 1024) catch {};
                             heap_acc.appendSlice(gpa, body_stage_bufs[s][0..total]) catch |err| {
                                 if (builtin.mode == .Debug) std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
-                                break;
+                                // Truncating here resolved the promise with a
+                                // short body and a 200: fail the request.
+                                failSlot(s, "Out of memory");
+                                return;
                             };
                             heap_used = true;
                         }
                         heap_acc.appendSlice(gpa, chunk[0..n]) catch |err| {
                             if (builtin.mode == .Debug) std.debug.print("[fetch] body accumulate error: {s}\n", .{@errorName(err)});
-                            break;
+                            failSlot(s, "Out of memory");
+                            return;
                         };
                         total += n;
                     }

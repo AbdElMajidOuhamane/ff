@@ -114,19 +114,35 @@ pub const ResponseDataCold = struct {
 // (async_fetch.runJob) and per `new Response()` otherwise. The ~96B shell is
 // pooled; pools/bodies are freed by deinit, so idle RSS never grows. Safe:
 // every call site overwrites the shell with init()/initWithHeaders right
-// after acquiring, so no stale fields survive. JS-thread-only.
+// after acquiring, so no stale fields survive.
+// THREAD SAFETY: async_fetch settles jobs on 16 worker threads and each job
+// acquires/releases a shell there, so the pool index is shared state. It used
+// to say "JS-thread-only", which let two workers pop one shell. The mutex
+// guards the index only: a popped shell is owned exclusively, so resource
+// frees stay outside the critical section.
 const RESP_POOL_MAX: usize = 32;
 const RESP_RETAIN_POOL_BYTES: usize = 4096;
 var resp_pool: [RESP_POOL_MAX]*ResponseData = undefined;
 var resp_pool_n: usize = 0;
+var resp_pool_mutex: std.atomic.Mutex = .unlocked;
+
+inline fn respPoolLock() void {
+    while (!resp_pool_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+inline fn respPoolUnlock() void {
+    resp_pool_mutex.unlock();
+}
 
 /// Pooled shell (caller must assign initWithPool() or init()/initWithHeaders()).
 /// Null only on OOM.
 pub fn acquire() ?*ResponseData {
-    if (resp_pool_n > 0) {
+    respPoolLock();
+    const pooled: ?*ResponseData = if (resp_pool_n > 0) blk: {
         resp_pool_n -= 1;
-        return resp_pool[resp_pool_n];
-    }
+        break :blk resp_pool[resp_pool_n];
+    } else null;
+    respPoolUnlock();
+    if (pooled) |d| return d;
     const d = gpa.create(ResponseData) catch return null;
     d.pool = std.ArrayList(u8).empty;
     return d;
@@ -136,41 +152,48 @@ pub fn acquire() ?*ResponseData {
 /// Retains `pool` capacity (up to RESP_RETAIN_POOL_BYTES) so repeated
 /// `new Response(body)` calls are zero-alloc on the Zig heap.
 pub fn releaseData(d: *ResponseData) void {
+    // The caller owns `d` exclusively, so release its resources before
+    // contending for the shared index.
+    if (d.owned_body) |b| {
+        gpa.free(b);
+        d.owned_body = null;
+    }
+    if (d.cold) |cd| {
+        gpa.destroy(cd);
+        d.cold = null;
+    }
+    d.headers.release();
+    if (d.pool.capacity > RESP_RETAIN_POOL_BYTES) {
+        d.pool.deinit(gpa);
+        d.pool = std.ArrayList(u8).empty;
+    } else {
+        d.pool.clearRetainingCapacity();
+    }
+    respPoolLock();
     if (resp_pool_n < RESP_POOL_MAX) {
-        if (d.owned_body) |b| {
-            gpa.free(b);
-            d.owned_body = null;
-        }
-        if (d.cold) |cd| {
-            gpa.destroy(cd);
-            d.cold = null;
-        }
-        d.headers.release();
-        if (d.pool.capacity > RESP_RETAIN_POOL_BYTES) {
-            d.pool.deinit(gpa);
-            d.pool = std.ArrayList(u8).empty;
-        } else {
-            d.pool.clearRetainingCapacity();
-        }
         resp_pool[resp_pool_n] = d;
         resp_pool_n += 1;
-    } else {
-        d.deinit();
-        gpa.destroy(d);
+        respPoolUnlock();
+        return;
     }
+    respPoolUnlock();
+    gpa.destroy(d);
 }
 
 /// Return an *uninitialized* shell to the pool. Used when `init()` failed
 /// partway: calling `deinit()` on it would touch uninitialized fields.
 fn releaseShell(d: *ResponseData) void {
+    respPoolLock();
     if (resp_pool_n < RESP_POOL_MAX) {
         d.pool.clearRetainingCapacity();
         resp_pool[resp_pool_n] = d;
         resp_pool_n += 1;
-    } else {
-        d.pool.deinit(gpa);
-        gpa.destroy(d);
+        respPoolUnlock();
+        return;
     }
+    respPoolUnlock();
+    d.pool.deinit(gpa);
+    gpa.destroy(d);
 }
 
 /// Pooled shell + initialized payload, or null with a JS exception pending.
@@ -197,6 +220,7 @@ fn failResponse(ctx: ?*c.Context, data: *ResponseData, err: anyerror) c.Value {
     return switch (err) {
         error.OutOfMemory => c.throwOutOfMemory(ctx),
         error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        error.HeadersTooLarge => c.throwTypeError(ctx, "too many headers (max 2048)"),
         else => c.throwInternalError(ctx, "response construction failed"),
     };
 }
@@ -405,10 +429,14 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
-        // FIX: batch reserve — one growth for the whole array load.
-        if (len > 0) target.reserveEntries(@intCast(len));
+        // FIX: batch reserve — one growth for the whole array load. Clamp
+        // before @intCast: a length above 2^31 arrives as a negative c_int,
+        // which is UB to cast in ReleaseFast.
+        const count: c_uint = @intCast(@max(len, 0));
+        if (count > headers_mod.MAX_HEADERS_INIT) return error.HeadersTooLarge;
+        if (count > 0) target.reserveEntries(count);
         var i: c_uint = 0;
-        while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+        while (i < count) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
             defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;

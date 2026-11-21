@@ -794,6 +794,9 @@ fn recordClose(s: usize, payload: []const u8) void {
 }
 
 fn emitMessage(s: usize, msg: []const u8, binary: bool) void {
+    // Callers must reject oversized messages (close 1009); a silent @min here
+    // delivered a truncated message to JS indistinguishable from a full one.
+    std.debug.assert(msg.len <= WS_MSG_SIZE);
     const n = @min(msg.len, WS_MSG_SIZE);
     @memcpy(rx_msg[s][0..n], msg[0..n]);
     rx_len[s] = n;
@@ -826,15 +829,45 @@ fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: 
         @memcpy(partial[s][partial_len[s]..][0..payload.len], payload);
         partial_len[s] += payload.len;
         if (!hdr.fin) return true;
-        emitMessage(s, partial[s][0..partial_len[s]], wflags[s].partial_binary);
+        const msg = partial[s][0..partial_len[s]];
+        // RFC 6455 §5.6: validate the assembled text message once, not each
+        // fragment, and fail with 1007 instead of handing JS broken UTF-8.
+        if (!wflags[s].partial_binary and !ws.validUtf8(msg)) {
+            partial_len[s] = 0;
+            _ = initiateClose(s, cn, 1007, "");
+            return false;
+        }
+        emitMessage(s, msg, wflags[s].partial_binary);
         partial_len[s] = 0;
         return true;
+    }
+    // Single-frame message. emitMessage copies into a WS_MSG_SIZE buffer, so
+    // an oversized frame used to be truncated to 16 KiB and delivered as if
+    // complete (rd_buf holds up to 64 KiB). Fail closed instead.
+    if (payload.len > WS_MSG_SIZE) {
+        _ = initiateClose(s, cn, 1009, "");
+        return false;
+    }
+    if (op == ws.OP_TEXT and !ws.validUtf8(payload)) {
+        _ = initiateClose(s, cn, 1007, "");
+        return false;
     }
     emitMessage(s, payload, op == ws.OP_BINARY);
     return true;
 }
 
 fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: []const u8) bool {
+    // The predicates in ws_native existed but were only wired into the server
+    // path, so reserved opcodes reached JS as text and oversized/fragmented
+    // PINGs were echoed (an amplification primitive). Enforce them here.
+    if (!ws.isValidOpcode(hdr.opcode)) {
+        _ = initiateClose(s, cn, 1002, "");
+        return false;
+    }
+    if (!ws.controlFrameOk(hdr)) {
+        _ = initiateClose(s, cn, 1002, "");
+        return false;
+    }
     if (ws.isControl(hdr.opcode)) {
         switch (hdr.opcode) {
             ws.OP_PING => return sendFrame(s, cn, ws.OP_PONG, payload),
@@ -854,6 +887,8 @@ fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload:
 }
 
 fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
+    std.debug.assert(rd_len[s] <= RDBUF);
+    std.debug.assert(partial_len[s] <= WS_MSG_SIZE);
     var off: usize = 0;
     const buf = rd_buf[s][0..rd_len[s]];
     while (off < buf.len) {
@@ -876,6 +911,7 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
 }
 
 fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
+    std.debug.assert(tx_len[s] <= TX_BUF_SIZE);
     if (!tx_pending[s].load(.acquire)) return true;
     var to_write: usize = 0;
     var had_close = false;
