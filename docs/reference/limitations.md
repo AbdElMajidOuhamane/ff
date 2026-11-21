@@ -46,20 +46,20 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | The 513th connection is accepted and immediately closed (no internal wait queue beyond the OS `listen(128)` backlog) |
-| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request head (HTTP/1.1) | 4 KB (request line + header block) | Beyond → `431 Request Header Fields Too Large` |
 | Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` |
-| Response body | 10 MB hard cap (64 KB HTTP/1.1 stage buffer spills to the heap) | Beyond 10 MB → `500`; `Response.file(path)` reads up to 50 MB (still subject to 10 MB cap when sent over `http.serve`) |
-| Response headers | 2048 bytes (HTTP/1.1 status line + user headers); HTTP/2: 128 headers (name <= 64 B, value <= 4096 B) | Extra headers beyond the cap are dropped |
-| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
+| Response body | 10 MB hard cap (64 KB HTTP/1.1 stage buffer spills to the heap; 64 MB process-wide spill budget; up to 256 KB retained per slot) | Beyond 10 MB → `500`; spill budget exhausted → `503` for `Response`/`ArrayBuffer` bodies and `500` for plain `{status, body}` objects; `Response.file(path)` reads up to 50 MB (still subject to the 10 MB cap when sent over `http.serve`) |
+| Response headers | 2048 bytes (HTTP/1.1 status line + user headers); HTTP/2: 128 total Nv slots per response including `:status` and `content-length` (so <= 126 user headers; name <= 64 B, value <= 4096 B) | Extra headers beyond the cap, and HTTP/2 pairs over 64 B name / 4096 B value, are dropped silently |
+| Read/idle deadline | 30s without progress | A connection that receives no bytes for 30s while waiting for headers/body is closed; the deadline restarts on every read, so a trickling client is never expired. The same 30s is the keep-alive idle timeout. Sockets stalled mid-write are not timed out. |
 | Hung handler | 30s | Connection fails with `504` |
 | Graceful drain | `SHUTDOWN_DRAIN_MS = 5000` ms | Remaining active sockets force-closed after 5s on `server.close()` |
 | Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Terminated with `400 Bad Request` |
 | Response status | 100..999 | Values outside 100..999 fall back to default (`200`, or `302` in `Response.redirect`) |
-| Bind address | Defaults to `0.0.0.0`; `hostname` accepts IPv4/IPv6 literals (optional `reusePort`) | No DNS hostnames, no `FF_PORT`; `--allow-net` must match `<hostname>:<port>` |
+| Bind address | Defaults to `0.0.0.0`; `hostname` accepts IPv4/IPv6 literals (optional `reusePort`); `port` must be an integer `0..65535` | No DNS hostnames, no `FF_PORT`; out-of-range ports throw `TypeError`; `--allow-net` must match `<hostname>:<port>` |
 | Plain listener protocol | HTTP/1.1 | No HTTP/2 framing without TLS |
-| Routes object | Up to 16 `:param` captures/route; route key `< 512` B; URL `<= 4096` B | URL > 4096 B → `414 URI Too Long` |
-| HTTP/2 | TLS + ALPN (nghttp2); `MAX_STREAMS = 100`/conn; req headers `<= 64 KB` (`431`); `:path <= 512 B`, `:method <= 16 B`, `:authority <= 255 B` (`400`); req body `<= 10 MB/stream`, `16 MB/session` | Plain sockets stay HTTP/1.1; `ReadableStream` response body returns `501` |
-| `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every request gets canned `200 {"message":"ok"}` |
+| Routes object | Up to 16 `:param` captures/route; route key `< 512` B | Oversized URLs never reach routing: the request head is bounded first (`431` on HTTP/1.1, `400` on HTTP/2) |
+| HTTP/2 | TLS + ALPN (nghttp2); `MAX_STREAMS = 100`/conn — a 101st concurrent stream is refused with `RST_STREAM(REFUSED_STREAM)`; req headers `<= 64 KB` (`431`); `:path <= 512 B`, `:method <= 16 B`, `:authority <= 255 B` (`400`); req body `<= 10 MB/stream` (`413`), `16 MB/session` (session failed, connection closed); staged response bytes `<= 16 MiB/session` (connection closed on overflow) | Plain sockets stay HTTP/1.1; `ReadableStream` response body returns `501` |
+| `FF_ECHO` | Any value set (even empty — only *unsetting* disables) | Every **HTTP/1.1** request gets canned `200 {"message":"ok"}`; HTTP/2 requests still run the handler |
 
 ## Fetch (client)
 
@@ -67,7 +67,7 @@ boundary for hostile code.
 |------|-------|----------|
 | Concurrent fetches | 16 | The 17th rejects immediately with `"Failed to start fetch"` |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
-| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
+| Response body cap | 16 MB (decompressed output; the declared `Content-Length` is only pre-checked for identity responses) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | Followed, max 5 hops | Rejects with `"Too many redirects"`; every hop is re-checked against `--allow-net` |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
@@ -75,15 +75,15 @@ boundary for hostile code.
 | Abort / `signal` | `AbortSignal` supported (`init.signal` / `req.signal`) | `timeout` and `redirect` init keys are ignored (`AbortSignal.timeout(ms)` uses 1 slot in the 128-timer table) |
 | TLS hostnames | DNS SAN verification only | IP-literal TLS hosts (`https://127.0.0.1:...`) fail closed; connect using DNS hostnames |
 | Protocol | HTTP/1.1 | No HTTP/2 client |
-| Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; no `https://` proxy URLs (TLS to the proxy); env is read once at launch |
+| Proxy | HTTP proxies via env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`); `NO_PROXY` bypass | No SOCKS support; `https://` targets do not support `https://` proxy URLs (TLS-to-proxy; plain `http://` targets do); env is read once at launch |
 
 ## WebSocket
 
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | `16384` bytes (`16 KB`) | Server RX/TX and client fragmented RX close with `1009` (server single inbound frame capped at 4 KB `READ_BUF_SIZE`); client TX and single-frame RX truncate at `16384` bytes |
-| Handshake URL path | 512 bytes | Longer paths fail; CRLF/control characters rejected |
+| Message size | `16384` bytes (`16 KB`) per message | Server and client RX close with `1009` when a frame or assembled message exceeds `16384` bytes (client frames over the 64 KiB `RDBUF` die with `1006` first). On the server a single frame is additionally bounded by the 4 KiB `READ_BUF_SIZE` staging buffer, so a 4 KB-16 KB frame kills the connection without a Close frame. Server TX fits at most 16,370 B of payload (16 KiB write buffer minus the frame header); larger sends close `1009`. Client TX silently truncates at `16384` bytes |
+| Handshake URL path (client) | 512 bytes | Longer paths fail; CRLF/control characters rejected. The server has no 512-byte path limit — the whole request head must fit 4 KiB |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
 | Control frames | Max 125 bytes payload (`123` B close reason), no reserved opcodes | Malformed control frames close connection |
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |

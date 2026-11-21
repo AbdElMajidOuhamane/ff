@@ -306,7 +306,7 @@ Sleep, intervals, unref, microtasks: [Timers guide](/docs/guides/timers). argv/e
 
 ```js
 // form.js — explicit urlencoded string or Request/Response round-trip
-const params = new URLSearchParams({ name: "ada" });
+const params = new URLSearchParams("name=ada");
 await fetch("https://api.example.com/submit", {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },

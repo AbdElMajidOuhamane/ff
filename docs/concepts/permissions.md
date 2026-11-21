@@ -62,7 +62,7 @@ Rules:
 - Symlinks are resolved before matching. The resolved target must be inside a
   scope. A symlink inside an allowed directory that points outside is denied.
 - Writes through a dangling symlink are denied.
-- `..` traversal, NUL bytes, and paths at or beyond 4096 bytes are denied.
+- `..` traversal, NUL bytes, and paths at or beyond `PATH_MAX` (`4096` bytes on Linux, `1024` bytes on macOS) are denied.
 - `process.chdir()` does **not** move the scope roots. After a `chdir`, a
   relative API path resolves against the new cwd and must still land inside a
   scope captured at startup.

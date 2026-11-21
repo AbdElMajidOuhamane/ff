@@ -125,8 +125,8 @@ const res = await fetch("https://example.com/api", {
 |--------|-------------|
 | `new AbortController()` | Creates `{ signal, abort(reason?) }` |
 | `AbortSignal.abort(reason?)` | Returns an already-aborted `AbortSignal` (`AbortSignal` is a namespace object, not a constructor) |
-| `AbortSignal.timeout(ms)` | Returns an `AbortSignal` that aborts with `"TimeoutError"` after `ms` (uses 1 slot in the 128-timer table once a listener is attached) |
-| `signal.aborted` / `signal.reason` | Boolean state and rejection reason (defaults to `"AbortError"`) |
+| `AbortSignal.timeout(ms)` | Returns an `AbortSignal` that aborts with an `Error` named `TimeoutError` after `ms`. It consumes one of the 128 timer slots as soon as it is created (a 129th live `AbortSignal.timeout()` throws `TypeError: too many timers (max 128)`); the timer is unref'd until a listener is attached, so it does not hold the process open |
+| `signal.aborted` / `signal.reason` | Boolean state and rejection reason. With no argument the reason is an `Error` with `name: "AbortError"` and `message: "The operation was aborted"` (not a bare string) |
 | `signal.throwIfAborted()` | Throws `signal.reason` if `signal.aborted` is `true` |
 | `signal.onabort` / `addEventListener("abort", fn)` / `removeEventListener("abort", fn)` | Abort listeners (takes 2 args; listeners fire at most once and clear on abort) |
 
@@ -137,15 +137,15 @@ The object `fetch` resolves with — and the object your `http.serve` handler re
 | Member | Type | Description |
 |--------|------|-------------|
 | `status` | `number` | e.g. `200`, `404` |
-| `statusText` | `string` | HTTP reason phrase |
+| `statusText` | `string` | Reason phrase. Fetched responses derive it from `status`; a constructed response keeps the default `"OK"` unless `init.statusText` is given (`new Response("x", { status: 404 }).statusText === "OK"`) |
 | `ok` | `boolean` | `true` when status is 200–299 |
 | `url` | `string` | Final URL after redirects |
 | `redirected` | `boolean` | `true` when a redirect was followed |
 | `type` | `string` | `"basic"` (or `"error"` for `Response.error()`) |
 | `headers` | `Headers` | Response headers |
 | `body` | `ReadableStream \| null` | Stream passed to `new Response(stream)`, `null` if empty, or closed single-chunk stream for buffered responses |
-| `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
-| `clone()` | `() => Response` | Known issue: corrupts copy (`Request.clone()` works cleanly) |
+| `bodyUsed` | `boolean` | `true` after any body reader has run (`text()`, `json()`, `arrayBuffer()`, `bytes()`, `blob()`, `formData()`). Informational only: a second read still returns the body |
+| `clone()` | `() => Response` | Copies headers and buffered body; the source stays readable. A `ReadableStream` body is not carried over (the clone's body is an empty, already-closed stream) |
 | `text()` | `() => Promise<string>` | Body as text |
 | `json()` | `() => Promise<any>` | Body parsed as JSON |
 | `arrayBuffer()` | `() => Promise<ArrayBuffer>` | Body as bytes |
@@ -153,20 +153,20 @@ The object `fetch` resolves with — and the object your `http.serve` handler re
 | `blob()` | `() => Promise<Blob>` | Body as `Blob` |
 | `formData()` | `() => Promise<FormData>` | Body parsed as multipart/urlencoded form |
 
-Bodies can be re-read freely (`bodyUsed` remains `false`):
+Bodies can be re-read freely (`bodyUsed` flips to `true` after the first read, but never blocks subsequent reads):
 
 ```js
 const res = await fetch("https://example.com/");
 console.log(await res.text());
 console.log(await res.json()); // re-reading the body is supported
-console.log(res.bodyUsed);     // false
+console.log(res.bodyUsed);     // true
 ```
 
 Construction + statics (for handlers and tests):
 
 | Helper | Signature | Notes |
 |--------|-----------|-------|
-| `new Response(body, init?)` | body: `string \| ArrayBuffer \| Uint8Array \| ReadableStream \| null`; init: `{ status?, statusText?, headers? }` | Defaults to `200`, `content-type: text/plain` when the body has none |
+| `new Response(body, init?)` | body: `string \| ArrayBuffer \| Uint8Array \| ReadableStream \| null`; init: `{ status?, statusText?, headers? }` | Defaults to `200`/`OK`; the constructor adds **no** `content-type`. The HTTP/1.1 server supplies `Content-Type: text/plain` for a body-bearing response that has none |
 | `Response.json(data, init?)` | any JSON-serializable data | Sets JSON content-type; supports `{ status?, statusText?, headers? }` |
 | `Response.file(path)` | `(string) → Response` | Synchronously reads file (`--allow-read`, 50 MB read cap; `http.serve` enforces 10 MB wire cap) |
 | `Response.redirect(url, status?)` | target + status (default 302) | Known issue: sets the status but **no `Location` header**, so no client follows it (see Gotchas) |
@@ -256,8 +256,10 @@ refuses it); `https://` targets always tunnel through `CONNECT` and carry
 real end-to-end TLS to the target. `NO_PROXY` entries match the host itself
 and its subdomains (`example.com` also matches `api.example.com`); append
 `:port` to scope an entry, and `*` bypasses every host. Only HTTP proxies
-are supported (no SOCKS), and the proxy URL itself must be `http://` — an
-`https://` proxy URL (TLS to the proxy) is rejected.
+are supported (no SOCKS). For `https://` targets the proxy URL must be
+`http://`: a TLS (`https://`) proxy URL is rejected in the `CONNECT` tunnel
+and the request fails with `"Network error"`; `http://` targets go through
+the std proxy path, which also accepts a TLS proxy URL.
 
 ```sh
 HTTP_PROXY=http://127.0.0.1:8080 ff client.js --allow-net=api.example.com:443
@@ -302,7 +304,7 @@ ff client.js --allow-net=api.example.com:443
 
 ## Limits (summary)
 
-Full table lives in the Limitations reference: 16 concurrent fetches (the 17th rejects immediately with `"Failed to start fetch"`), 64KB body stage per slot, 16 MB max response body (both Content-Length and decompressed output), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`; `AbortSignal.timeout` shares the 128-timer table), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token`), RFC 7230 header validation (invalid pairs throw `TypeError`), HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
+Full table lives in the Limitations reference: 16 concurrent fetches (the 17th rejects immediately with `"Failed to start fetch"`), 64KB body stage per slot, 16 MB max response body (decompressed output, plus the declared Content-Length for identity responses), 30s I/O timeout, `AbortSignal` cancellation (`init.signal` / `req.signal`; `AbortSignal.timeout` shares the 128-timer table), 5 redirect hops, every hop re-checked against `--allow-net`, cross-origin redirect credential stripping (`authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token`), RFC 7230 header validation (invalid pairs throw `TypeError`), HTTP/1.1 only, HTTP proxies via env vars only (no SOCKS).
 
 ## Gotchas
 
@@ -314,7 +316,7 @@ both, and log with `String(e)` so string rejections print something useful.
 
 **Cross-origin redirects strip credentials.** If a redirect crosses to a different origin (different scheme, host, or port), Fairyfly automatically strips sensitive headers (`authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token`) to prevent credential leakage.
 
-**Response body limit is 16 MB.** Both the declared Content-Length and decompressed (`gzip`, `deflate`, `zstd`) body data are capped at 16 MiB. Larger responses fail and reject with `"ResponseTooLarge: body exceeds limit"`.
+**Response body limit is 16 MB.** Decompressed body data (`gzip`, `deflate`, `zstd`) is capped at 16 MiB, and for identity responses the declared `Content-Length` is checked up front too. A compressed response's wire `Content-Length` is not pre-checked — only its decompressed output is bounded. Larger responses reject with `"ResponseTooLarge: body exceeds limit"`.
 
 **Method names, empty-body framing, and `GET` promotion.** `fetch` matches `init.method` against standard tokens verbatim — `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"`. Anything else, including lowercase (`"post"`), is sent as `GET`. Passing `body` when `method` is omitted or `"GET"` auto-promotes the request to `"POST"`, and body-carrying methods (`POST`, `PUT`, `PATCH`) with no `body` explicitly send `Content-Length: 0`. Your `http.serve` handler likewise sees the method exactly as the client sent it, so normalize before comparing (`method.toUpperCase() === "POST"`).
 
@@ -326,7 +328,7 @@ both, and log with `String(e)` so string rejections print something useful.
 return new Response(null, { status: 302, headers: { Location: "/new-path" } });
 ```
 
-**Rejections are plain strings.** Network failures reject with `"Network error"`, full 16-slot concurrency with `"Failed to start fetch"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"`, oversized bodies with `"ResponseTooLarge: body exceeds limit"` — `e.message` is `undefined`, so log `String(e)`. The initial permission denial is the exception: it throws an `Error` and never reaches the promise.
+**Rejections are mostly plain strings.** Network failures reject with `"Network error"`, full 16-slot concurrency with `"Failed to start fetch"`, bad URLs with `"Invalid URL"`, long chains with `"Too many redirects"`, oversized bodies with `"ResponseTooLarge: body exceeds limit"`, unparseable/oversized response heads with `"Failed to receive response"`, and body-send failures with `"Failed to send request body"` / `"Failed to write request body"` — those have `e.message === undefined`, so log `String(e)`. Two exceptions carry an `Error`: an abort rejects with `signal.reason` (by default name `AbortError`, so `e.message` is set), and the initial permission denial throws synchronously.
 
 ## See also
 

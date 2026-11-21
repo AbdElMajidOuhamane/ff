@@ -55,7 +55,7 @@ zig version
 ## Build from source
 
 The vendors (QuickJS, BearSSL, SQLite, nghttp2) are gitignored — fetch them
-first (pinned versions, SHA-256 verified), then build:
+first (pinned versions; BearSSL is SHA-256 verified), then build:
 
 ```sh
 git clone <repo-url>
@@ -223,6 +223,7 @@ runtime has no `FF_PORT` or `--port` override. If the app reads `PORT`, add
 | `make fuzz-one` | Run one fuzzer (`FUZZ=ws_frame SEED=123 EVENTS=1000000`) |
 | `make fuzz-canary` | Verify fuzzer failure propagation (`canary 1` must fail) |
 | `make cov` | kcov line coverage into `kcov-output/` (requires `kcov`) |
+| `make bench-http` | Build + run the `bench/httpbench` comparison suite (`ff` vs Deno vs Bun) |
 | `make doctor` | Print Xcode/SDK/DEVELOPER_DIR/zig state and probe Zig's libc++ build |
 
 ## Troubleshooting

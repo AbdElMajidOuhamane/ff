@@ -53,7 +53,7 @@ Rules:
 
 - **Single-file only**: files containing `"import "` or `"import("` are rejected (`error: standalone compilation does not support imports yet` — bundle to a single file first).
 - **Default output**: omitting `-o`/`--output` strips the input extension (`app.js` → `app`).
-- **Permissions and limits**: standalone executables stay deny-by-default and accept `--allow-*`, `--deny-*`, `--env-file`, and runtime limit flags on their CLI (e.g. `./app --allow-net=0.0.0.0:3000`).
+- **Permissions and limits**: standalone executables stay deny-by-default and accept `--allow-*`, `--deny-*`, `--env-file`, and runtime limit flags on their CLI (e.g. `./app --allow-net=0.0.0.0:3000`). Note that `--cpu-budget` is not enforced during top-level `.ffbc` / `--standalone` module evaluation (only inside subsequent handlers, timers, microtasks, streams, and workers).
 
 ## Running bytecode
 

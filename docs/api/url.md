@@ -50,7 +50,7 @@ new URL("//cdn.x.dev/a.js", "https://x.dev").href; // "https://cdn.x.dev/a.js"
 | `hash` | yes | Includes leading `#` |
 | `username` | yes | Before `@` |
 | `password` | yes | After `@` |
-| `searchParams` | no | Read view of the query — reflects URL edits, but edits to it never flow back (see below) |
+| `searchParams` | yes (own property) | Read view of the query — reflects URL edits, but edits to it never flow back (see below) |
 
 Setting a component updates the whole URL:
 

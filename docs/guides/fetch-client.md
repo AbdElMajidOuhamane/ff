@@ -128,7 +128,7 @@ ff client.js --allow-net=api.example.com:443
 > **Known issue:** `fetch` does not multipart-encode `FormData` or send binary bodies as bytes. Build the payload yourself:
 
 ```js
-const params = new URLSearchParams({ name: "ada" });
+const params = new URLSearchParams("name=ada"); // string form only — the record form yields ""
 await fetch("https://api.example.com/submit", {
   method: "POST",
   headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -138,7 +138,7 @@ await fetch("https://api.example.com/submit", {
 
 ## Reading the response
 
-Every reader works on `Response` (and `Request`). Bodies can be re-read freely (and `bodyUsed` stays `false`), and `res.body` returns a closed single-chunk `ReadableStream` (or `null` if empty):
+Every reader works on `Response` (and `Request`). Bodies can be re-read freely (`bodyUsed` becomes `true` after the first read but does not prevent another), and `res.body` returns a closed single-chunk `ReadableStream` (or `null` if empty):
 
 | Reader / Property | Returns |
 |---|---|
@@ -235,7 +235,7 @@ two apex domains.
 |------|-------|----------|
 | Concurrent fetches | 16 | The 17th rejects immediately with `"Failed to start fetch"` |
 | Body stage per slot | 64KB | Larger bodies spill to chunks/heap |
-| Response body cap | 16 MB hard cap (Content-Length and decompression) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
+| Response body cap | 16 MB (decompressed output; Content-Length pre-checked only for identity responses) | Responses beyond 16 MB reject with `"ResponseTooLarge: body exceeds limit"` |
 | I/O timeout | 30s | Slow servers fail |
 | Redirects | 5 hops max, each re-checked | Rejects with `"Too many redirects"` or a permission string |
 | Cross-origin credentials | Stripped on cross-origin redirect | `authorization`, `cookie`, `proxy-authorization`, `www-authenticate`, `x-api-key`, `x-auth-token` dropped when changing origin |
@@ -260,7 +260,7 @@ the chain, or make the redirect target stay within one host.
 
 **`FormData` / `Blob` / `Uint8Array` body arrives mangled** — bodies are string-coerced, not serialized (`"[object Object]"`, `"104,105"`). Send `string`, `URLSearchParams`, or a hand-built multipart string instead.
 
-**Caught fetch error has no `.message`** — most failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`, `"Failed to start fetch"`, and the redirect-hop permission string). Log `String(e)`. The initial permission denial is the exception: it is an `Error` with `.message`.
+**Caught fetch error usually has no `.message`** — most failures reject with plain strings (`"Network error"`, `"Invalid URL"`, `"Too many redirects"`, `"Failed to start fetch"`, and the redirect-hop permission string). Log `String(e)`. Two exceptions carry an `Error`: an abort rejects with `signal.reason` (so `.message` is set), and the initial permission denial throws synchronously.
 
 **`Too many redirects`** — the chain exceeded 5 hops. Inspect `res.url` on the last good hop or fix the redirect loop server-side.
 

@@ -7,7 +7,7 @@
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 
 A lightweight, backend-focused JavaScript runtime built with Zig and powered by
-[QuickJS](https://bellard.org/quickjs/). Designed for fast startup, low memory,
+[quickjs-ng](https://github.com/quickjs-ng/quickjs). Designed for fast startup, low memory,
 and a small readable codebase.
 
 > **138k req/sec · 0.66 ms p50 · 5 MB RSS** on Apple silicon (8-thread wrk, 100 conn).
@@ -146,7 +146,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~38k lines of Zig across 82 files
+- **The whole codebase should fit in your head** — ~39k lines of Zig across 82 files
 
 It's *not* aimed at:
 
@@ -246,11 +246,12 @@ Every global, one line each — full signatures live in the [API overview](docs/
 | `console` | Prints **every** argument, joined with spaces — to **stderr** |
 | `fetch` | 16 slots, HTTP/1.1, 16 MB response cap; needs `--allow-net` on target `host:port`; supports `AbortSignal` cancellation; strips credentials on cross-origin redirects; `string` / `URLSearchParams` bodies survive, `FormData` / `Blob` / binary do not; exact-case methods; rejections are plain strings |
 | `http.serve` | `(url, method, body, headers)` handler or declarative routes object `(..., params)`; `headers` is a web-standard `Headers` instance; binds `0.0.0.0` by default (or `{ hostname }` IP literal) and checks `--allow-net`; returns `{ port, close }` with 5 s drain; options accept `{ hostname, port, tls, reusePort }`; return a `Response` (including `ReadableStream` on HTTP/1.1) or `{ status, body }`; WebSocket upgrades are automatic |
-| `Response` / `Request` | Bodies re-read freely (`bodyUsed` stays `false`); `Response.file(path)` serves files synchronously (up to 50 MB read, `--allow-read`); `res.body` exposes `ReadableStream \| null`; status validated `100`–`999` (default `200`); `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header |
+| `Response` / `Request` / `Headers` | Bodies re-read freely (`Response.bodyUsed` flips to `true` after first read; `Request.bodyUsed` stays `false`); `Response.file(path)` serves files synchronously (up to 50 MB read, `--allow-read`); `res.body` exposes `ReadableStream \| null`; status validated `100`–`999` (default `200`); `bytes()` returns `ArrayBuffer`; `Response.redirect()` sets no `Location` header; `Headers` is case-insensitive with `getAll` and `size()` |
 | `ReadableStream` | WHATWG stream with `start`/`pull`, `getReader()`, `cancel()`, `locked`, `desiredSize`; 1024 live streams, 8-chunk queue; HTTP/1.1 chunked responses (HTTP/2 stream bodies return `501`) |
 | `AbortController` / `AbortSignal` | Web-standard cancellation; `AbortSignal.timeout(ms)`, `throwIfAborted()`, abort events; integrates with `fetch` and timers |
+| `setTimeout` / `setInterval` / `clear*` / `queueMicrotask` | 128-slot shared timer table (with `ref`/`unref`/`refresh`/`hasRef` on main-thread `Timeout` handles) and microtask queue |
 | `structuredClone` | Deep clones JS values via serialization; max 4 MB per clone |
-| `performance` | `performance.now()` — monotonic milliseconds since startup |
+| `performance` | `performance.now()` — monotonic milliseconds since the first call (first call returns `0`) |
 | `Database` | `Database.open(path)`; needs `--allow-read` + `--allow-write` on the file and `--allow-write` on the parent; synchronous; SQL failures throw plain strings |
 | `sql` / `SQL` | Postgres tagged templates; needs `--allow-net` on the host:port, `--allow-read` on `sslrootcert` when TLS (`sslmode=verify-full`) is enabled, and `--allow-env` for DSN variables; failures reject with real `Error`s (`code` / `severity` / `message`) |
 | `fs` | Sync calls return `undefined` on I/O failure; writes > 10 MB write nothing (`writeFileSync`-style sync returns `undefined`, `writeFileAsync` throws `TypeError`); permission denial throws `PermissionDenied`; six `*Async` Promise variants |
@@ -327,13 +328,17 @@ and open `results/report.html` (throughput, percentile, and RSS charts).
                    │ C ABI (src/c.zig → quickjs_shim.zig)
 ┌──────────────────▼───────────────────────────────┐
 │ Zig API layer                                    │
-│   api/     console, fs, process, crypto, url,    │
-│            fetch, websocket, sqlite, sql, ffi    │
+│   api/     console, fs, process, permissions,    │
+│            crypto, url, fetch, text_encoding,    │
+│            websocket, websocket_client, udp,     │
+│            sqlite, sql, child_process, cron,     │
+│            stdio, ffi                            │
 │   net/     http_native (512-slot server),        │
-│            http2_server, pg_client, async_fetch  │
+│            http2_server, pg_client, async_fetch, │
+│            tcp_api, ws_client, ws_native         │
 │   event/   loop, timers, microtasks              │
 │   types/   Headers, Request, Response, Blob,     │
-│            FormData, PoolSlice                   │
+│            FormData, ReadableStream, PoolSlice   │
 │   worker/  worker, message_port, serialize       │
 │   commands/ init, imprint, sever, start, test,   │
 │            repl, compile, fmt, upgrade, watch    │
@@ -362,7 +367,7 @@ Vendors (`quickjs-ng` 0.16.2, BearSSL 0.6, SQLite 3.53.4, nghttp2 1.70.0)
 are **gitignored** — fetch them first:
 
 ```sh
-./scripts/fetch-vendors.sh   # pinned, SHA-256 verified (same script CI uses)
+./scripts/fetch-vendors.sh   # pinned versions, BearSSL SHA-256 verified (same script CI uses)
 make install                 # build + install to ~/.local/bin/ff
 ff -e 'console.log("hello")'
 ```

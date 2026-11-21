@@ -44,7 +44,7 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 
 | API | Behaviour |
 |---|---|
-| `setTimeout(fn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` |
+| `setTimeout(nonFn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` (`setTimeout(fn)` with an omitted delay defaults `ms` to `0`) |
 | `Database.open()` without a path | **throws** `Database.open requires a file path` |
 | `new Request()` without a URL | **throws** `Request requires a URL string as first argument` |
 | `new Worker()` without a path | **throws** `Worker requires a module path` |
@@ -177,7 +177,7 @@ Strings you'll see in practice — useful for assertions in tests:
 | Message | Thrown by |
 |---|---|
 | `setTimeout requires a function as first argument` | timers |
-| `too many timers (max 128)` | timers (`setTimeout`, `setInterval`, `AbortSignal.timeout`, `ff.cron`) |
+| `too many timers (max 128)` | timers (`setTimeout`, `setInterval`, `AbortSignal.timeout`); `ff.cron` throws `failed to schedule cron timer (timer table full)` when the shared 128-slot table is full |
 | `setTimeout accepts at most 8 callback arguments` | timers |
 | `queueMicrotask requires a function argument` | microtasks |
 | `WebSocket: WebSocket constructor requires a URL` | `new WebSocket` |

@@ -116,7 +116,7 @@ The handler receives `(url, method, body, headers)` (or `(url, method, body, hea
 - `url`: request path + query string (string)
 - `method`: HTTP method string exactly as sent by the client (`curl -X post` yields `"post"` — normalize with `.toUpperCase()` if needed)
 - `body`: request text (string, empty when none)
-- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2)
+- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2). On HTTP/1.1 it is parsed only when the handler declares four or more parameters: a handler whose `fn.length < 4` receives `undefined` and the runtime only validates the headers (`arguments` or a rest parameter forces full parsing). On HTTP/2 regular headers are always parsed and passed when present
 
 ### Working with request headers
 
@@ -124,7 +124,7 @@ The `headers` parameter provides standard `Headers` methods:
 - `headers.get(name)`: returns the header value (case-insensitive), or `null` if absent. Multi-value headers are comma-joined (`"a, b"`), except `Cookie` which joins with `"; "` per RFC 9113 §8.2.3, and `Set-Cookie` which returns the first value (use `getAll` to retrieve all).
 - `headers.has(name)`: returns `true` if present, `false` otherwise.
 - `headers.getAll(name)`: returns an array of all values for the header name.
-- Total request header size is capped at 4 KB for HTTP/1.1 (`READ_BUF_SIZE`) and 64 KiB for HTTP/2. Requests exceeding the limit receive `431 Request Header Fields Too Large`.
+- The HTTP/1.1 request **head** (request line plus header block) must fit the 4 KB read buffer; HTTP/2 caps header name+value bytes at 64 KiB (pseudo-headers excluded). Exceeding either limit returns `431 Request Header Fields Too Large`.
 
 ```js
 // server.js
@@ -208,7 +208,7 @@ http.serve(
 );
 ```
 
-Route keys (`< 512` B) support `"METHOD /path"`, `"/path"` (any method), and `"*"` (wildcard fallback), with up to 16 `:param` segments passed as the 5th arg `params` to `(url, method, body, headers, params)`. Query strings are stripped before matching; request URLs `> 4096` bytes get `414`, method mismatches get `405`, and unmatched routes get `404` (both HTTP/1.1 and HTTP/2).
+Route keys (`< 512` B) support `"METHOD /path"`, `"/path"` (any method), and `"*"` (wildcard fallback), with up to 16 `:param` segments passed as the 5th arg `params` to `(url, method, body, headers, params)`. Query strings are stripped before matching. Oversized URLs never reach routing — the request head is bounded first (`431` on HTTP/1.1, `400` on HTTP/2). Method mismatches get `405`, and unmatched routes get `404` (both protocols).
 
 Or match `url` (and `method`) manually:
 
@@ -253,7 +253,7 @@ http.serve({ port: 3000 }, () => {
 });
 ```
 
-Chunks larger than `16352` bytes are sliced zero-copy across consecutive writes; over HTTP/2, `ReadableStream` responses return `501` status only.
+Chunks larger than `16352` bytes (the 16 KB write buffer minus chunk framing) are emitted one slice per write, copied into the write buffer. The JS buffer is retained until its last slice drains, so mutating a `Uint8Array` before then affects the not-yet-written slices. Over HTTP/2, `ReadableStream` responses return `501` status only.
 
 ## Practical example: JSON REST API
 
@@ -314,7 +314,7 @@ file needs both grants and the parent directory needs `write`.
 
 ## Smoke-testing with FF_ECHO
 
-Set `FF_ECHO` to any value and every request returns canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
+Set `FF_ECHO` to any value and every HTTP/1.1 request returns canned `200 {"message":"ok"}` without running your handler (HTTP/2 requests still run the handler). Use it to verify the port mapping and deployment before debugging app logic:
 
 ```sh
 FF_ECHO=1 ff server.js --allow-net=0.0.0.0:3000
@@ -330,11 +330,11 @@ needs the listener grant.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Concurrent connections | 512 | 513th connection is accepted and immediately closed (does not wait) |
-| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Request head (HTTP/1.1) | 4 KB (request line + header block) | Beyond → `431 Request Header Fields Too Large` |
 | Request headers (HTTP/2) | 64 KiB | Beyond → `431 Request Header Fields Too Large` |
 | Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` (HTTP/2 allows 10 MB/stream, 16 MB/session) |
-| Response body | 10 MB hard cap (buffered) | 64 KB HTTP/1.1 stage buffer spills to the heap; beyond 10 MB → `500` (`ReadableStream` chunked on HTTP/1.1, `501` on HTTP/2) |
-| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
+| Response body | 10 MB hard cap (buffered) | 64 KB HTTP/1.1 stage buffer spills to the heap (64 MB process-wide spill budget, up to 256 KB retained per slot); beyond 10 MB → `500`; spill budget exhausted → `503` for `Response`/`ArrayBuffer` bodies, `500` for plain `{status, body}` objects (`ReadableStream` is chunked on HTTP/1.1, `501` on HTTP/2) |
+| Read/idle deadline | 30s without progress | A connection that receives no bytes for 30s while waiting for request headers/body is closed; the deadline restarts on every read, so a trickling client is never expired. The same 30s budget is the keep-alive idle timeout. Sockets stalled during a response write are not timed out. |
 | Hung handler | 30s | Connection fails with `504` |
 | Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Connection terminated with `400 Bad Request` |
 | Response status | 100..999 | Out-of-range falls back to default (`200`, or `302` for `Response.redirect`) |

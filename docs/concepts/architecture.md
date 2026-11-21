@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: Layers from QuickJS down to libxev, where each subsystem lives, and how the hot path stays allocation-free.
+description: Layers from QuickJS down to libxev, where each subsystem lives, and how the fast path (0-arity handlers, small requests and responses) stays allocation-free.
 order: 4
 ---
 
@@ -97,6 +97,13 @@ the full inventory.
 - **Worker messages** — one small allocation plus a `memcpy` per message.
 - **Postgres arenas** — per-job arena with a 32 KB retain cap plus a job
   freelist, so a warm query path allocates nothing.
+
+"Allocation-free" above means the fast path: a 0-arity handler (`() => ...`)
+with a request head <= 4 KB and a response <= 64 KB makes no Zig heap call.
+Everything outside it uses the documented pooled/gpa paths: `headers`
+parsing for handlers with arity >= 4 allocates a pooled `HeadersData`,
+request bodies above 4 KB spill to the heap, response bodies above 64 KB
+spill to the heap, and every HTTP/2 connection allocates a `Session`.
 
 ## Build options
 

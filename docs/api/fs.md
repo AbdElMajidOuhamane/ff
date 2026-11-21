@@ -38,7 +38,7 @@ ff script.js --allow-read=. --allow-write=./out
 - Symlinks are resolved before matching. The target must be inside a scope; a
   symlink inside an allowed directory that points outside is denied. Writes
   through a dangling symlink are denied.
-- `..` traversal, NUL bytes, and paths at or beyond `PATH_MAX` (`4096` bytes on Linux, `1024` bytes on macOS) are denied.
+- `..` traversal outside the scope is denied with `PermissionDenied`. NUL bytes and paths at or beyond `PATH_MAX` (`4096` bytes on Linux, `1024` bytes on macOS) are rejected before permission checking with a synchronous string throw (`"path contains a NUL byte"` / `"path too long"`).
 - Bare `--allow-read` / `--allow-write` grant every path.
 - There are no globs or per-extension rules.
 
@@ -125,7 +125,7 @@ await fs.rmAsync("out.txt");
 const names = await fs.readdirAsync(".");
 ```
 
-Failures **reject** instead of being swallowed (permission denial, invalid args, and `fs.writeFileAsync` with data > 10 MiB throw `TypeError` **synchronously** before creating a Promise):
+Failures **reject** instead of being swallowed (permission denial throws `PermissionDenied`, NUL bytes / over-long paths throw a plain string, and invalid args or `fs.writeFileAsync` with data > 10 MiB throw `TypeError` — all **synchronously** before creating a Promise):
 
 ```js
 try {

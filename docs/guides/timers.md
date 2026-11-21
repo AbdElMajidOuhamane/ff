@@ -193,12 +193,12 @@ Unhealthy stretches back off to 5s; the `.unref()` keeps the reschedule timer fr
 | `t.unref()` / `t.ref()` / `t.hasRef()` / `t.refresh()` | Exit-hold control on main-thread `Timeout` handles |
 | `queueMicrotask(fn)` | Run before next timer/I/O; the `nextTick` replacement |
 
-Limits: max 128 live timers shared across `setTimeout`, `setInterval`, `AbortSignal.timeout`, and `ff.cron` (the 129th throws `TypeError: too many timers (max 128)`), max 8 extra args, negative delay → 0. When no server, work, or referenced timers remain, the loop exits on its own.
+Limits: max 128 live timers shared across `setTimeout`, `setInterval`, `AbortSignal.timeout`, and `ff.cron` (the 129th throws `TypeError: too many timers (max 128)`, or `TypeError: failed to schedule cron timer (timer table full)` from `ff.cron`), max 8 extra args, negative delay → 0. When no server, work, or referenced timers remain, the loop exits on its own.
 
 ## Troubleshooting
 
 **Process never exits** — a live interval, `ff.cron` job, or referenced timer holds the loop. `clearInterval` what you own, or `unref` housekeeping timers.
 
-**`too many timers (max 128)`** — over 128 live across timers, `AbortSignal.timeout`, and `ff.cron`. You leak `setInterval`s or schedule per-request timers without clearing; reuse or debounce.
+**`too many timers (max 128)` / `failed to schedule cron timer (timer table full)`** — over 128 live across timers, `AbortSignal.timeout`, and `ff.cron`. You leak `setInterval`s or schedule per-request timers without clearing; reuse or debounce.
 
 **Timer fires late under load** — delays are *minimums*. A blocked loop (CPU-heavy handler, 512 full connections) delays everything; move work to `Worker`s.

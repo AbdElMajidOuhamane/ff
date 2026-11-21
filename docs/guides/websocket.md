@@ -104,7 +104,7 @@ http.serve(
 | Handler | Fires | Arguments |
 |---------|-------|-----------|
 | `open` | Client completes the upgrade | `(socket)` |
-| `message` | Per frame | `(socket, data)` — `string` for text, `Uint8Array` for binary |
+| `message` | Per complete message (fragments assembled first) | `(socket, data)` — `string` for text, `Uint8Array` for binary |
 | `close` | Client disconnects | `(socket)` |
 
 Always check the type of `data` first — text and binary arrive differently:
@@ -267,8 +267,8 @@ Connect the clients with `--allow-net=127.0.0.1:3000`.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | `16384` bytes (`16 KB`) | Server RX/TX and client fragmented RX close with `1009` (server single inbound frame also limited to 4 KB `READ_BUF_SIZE`; server TX drops silently past `16384` write buf); client TX and single-frame RX truncate at `16384` bytes |
-| Handshake validation | 512 B path, `GET`, `HTTP/1.1`, `Content-Length: 0`, `Sec-WebSocket-Version: 13`, 24-char key ending `==` | Malformed handshake fails (`400 Bad Request` on server) |
+| Message size | `16384` bytes (`16 KB`) per message | Server RX and client RX close with `1009` when a frame or assembled fragmented message exceeds `16384` bytes (client frames over the 64 KiB `RDBUF` die with `1006` first); on the server a single inbound frame is additionally bounded by the 4 KiB `READ_BUF_SIZE` staging buffer, so a 4 KB-16 KB frame kills the connection without a Close frame. Server TX fits at most 16,370 B of payload (16 KiB write buffer minus the frame header); larger sends close `1009`. Client TX silently truncates at `16384` bytes |
+| Handshake validation | Server: `GET`, `HTTP/1.1`, no request body (`Content-Length` absent or `0`), `Connection: Upgrade`, `Upgrade: websocket`, `Sec-WebSocket-Version: 13`, single 24-char base64 key ending `==`; no server path-length limit (any path that fits the 4 KiB head). Client: path capped at 512 bytes | Malformed handshake fails (`400 Bad Request` on server; client constructor/connect fails) |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
 | Control frames | Max 125 bytes payload (`123` B close reason), no reserved opcodes | Malformed control frames close connection; long close reasons truncate |
 | Text encoding | Strict UTF-8 validation | Invalid UTF-8 text message closes connection |

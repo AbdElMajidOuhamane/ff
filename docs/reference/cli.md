@@ -68,7 +68,7 @@ launch command grants it with a `--allow-*` flag.
 | `--max-heap[=]<size>` | Set max JavaScript main heap size (`64MB` default, range `8MB`–`4GB`; overrides `FF_MAX_HEAP`) |
 | `--worker-heap[=]<size>` | Set per-worker JS heap size (`min(32MB, max-heap)` default, range `1MB`–`max-heap`) |
 | `--max-stack[=]<size>` | Set max JS execution stack size (`1MB` default, range `128KB`–`native/2`; requires native stack >= 256 KB) |
-| `--cpu-budget[=]<ms>` | Set consecutive JS execution budget in ms before interrupt (`0` disabled by default, range `0`–`3600000`; overrides `FF_CPU_BUDGET`) |
+| `--cpu-budget[=]<ms>` | Set consecutive JS execution budget in ms before interrupt (`0` disabled by default, range `0`–`3600000`; overrides `FF_CPU_BUDGET`). Enforced on `ff <file.js>`, `ff -e`, HTTP handlers, timers, microtasks, streams, and worker eval/`onmessage` (not top-level eval in `ff start`, `ff test`, `ff repl`, `.ffbc`, or `--standalone`) |
 
 `--deny-*` exists only for `read`, `write`, and `net` (there are no `--deny-env`, `--deny-run`, or `--deny-ffi` flags, and bare `--deny-read`/`--deny-write`/`--deny-net` without `=<scope>` fail at startup). Byte sizes accept integer values with optional case-insensitive `K`/`KB`, `M`/`MB`, or `G`/`GB` suffixes (or raw bytes); runtime limit flags and `--env-file` accept both `--flag=val` and `--flag val` forms.
 

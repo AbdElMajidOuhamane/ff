@@ -2202,9 +2202,20 @@ fn wsNotifyMessage(id: usize, msg: []const u8, binary: bool) void {
 /// legal maximum of 16374, buf[MAX_HDR..] landed 2 bytes past the column and
 /// into the neighbouring slot's buffer.
 fn wsReserve(id: usize, n: usize) ?[]u8 {
+    // Guard the subtraction itself: `WRITE_BUF_SIZE - n` wraps in ReleaseFast
+    // when n exceeds the buffer, and the slice then runs past the column.
+    // A 16384-byte message plus its header is exactly that case.
+    if (n > WRITE_BUF_SIZE) return null;
     const tail = write_lens[id];
     if (tail > WRITE_BUF_SIZE - n) return null;
     return write_bufs[id][tail..][0..n];
+}
+
+/// Largest payload one TX frame can carry: the write buffer minus the frame
+/// header (16374 with a 16 KiB buffer). WS_MSG_SIZE is the protocol limit and
+/// the buffer is the same size, so the practical cap is the smaller one.
+inline fn wsMaxTxPayload() usize {
+    return WRITE_BUF_SIZE - ws.MAX_HDR;
 }
 
 pub fn wsSendTextUtf8(id: usize, str_val: c.Value, ctx: ?*c.Context) void {
@@ -2214,7 +2225,7 @@ pub fn wsSendTextUtf8(id: usize, str_val: c.Value, ctx: ?*c.Context) void {
     defer c.freeCString(ctx, cstr);
     const ulen = std.mem.len(cstr);
     if (ulen == 0) return;
-    if (ulen > ws.WS_MSG_SIZE) {
+    if (ulen > wsMaxTxPayload()) {
         wsSendClose(id, 1009);
         return;
     }
@@ -2233,7 +2244,7 @@ pub fn wsSendTextUtf8(id: usize, str_val: c.Value, ctx: ?*c.Context) void {
 
 pub fn wsSendBinary(id: usize, bytes: []const u8) void {
     if (!cflags[id].ws_open or states[id] == .closing) return;
-    if (bytes.len > ws.WS_MSG_SIZE) {
+    if (bytes.len > wsMaxTxPayload()) {
         wsSendClose(id, 1009);
         return;
     }

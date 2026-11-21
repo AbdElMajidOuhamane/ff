@@ -165,7 +165,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
         port = extractPortFromVal(ctx, port_val, 3000) orelse {
             c.freeValue(ctx, port_val);
-            throwTypeError(ctx, "http.serve: port must be an integer in 0..65535");
+            throwTypeError(ctx, "port must be an integer in 0..65535");
             return c.JS_EXCEPTION;
         };
         c.freeValue(ctx, port_val);
@@ -210,7 +210,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
     } else if (c.isNumber(opts_val) != 0) {
         port = extractPortFromVal(ctx, opts_val, 3000) orelse {
-            throwTypeError(ctx, "http.serve: port must be an integer in 0..65535");
+            throwTypeError(ctx, "port must be an integer in 0..65535");
             return c.JS_EXCEPTION;
         };
     }

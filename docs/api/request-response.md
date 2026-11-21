@@ -44,14 +44,14 @@ new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "applicatio
 | Property | Type | Description |
 |---|---|---|
 | `status` | `number` | HTTP status |
-| `statusText` | `string` | Reason phrase |
+| `statusText` | `string` | Reason phrase. Fetched responses derive it from `status`; a constructed response keeps the default `"OK"` unless `init.statusText` is given |
 | `ok` | `boolean` | `200 ≤ status ≤ 299` |
 | `headers` | `Headers` | Live header collection |
 | `body` | `ReadableStream \| null` | Stream passed to `new Response(stream)`, `null` for empty bodies, or a closed single-chunk `ReadableStream` for buffered responses |
 | `url` | `string` | Final URL (after redirects) — for `fetch` results |
 | `redirected` | `boolean` | Whether `fetch` followed a redirect |
 | `type` | `string` | `"basic"` (or `"error"` from `Response.error()`) |
-| `bodyUsed` | `boolean` | Always `false` — never flips, even after reading (see Gotchas) |
+| `bodyUsed` | `boolean` | Flips to `true` after the first body reader (`text()`, `json()`, `arrayBuffer()`, `bytes()`, `blob()`, `formData()`); it never blocks a later read |
 
 ### Body readers
 
@@ -65,9 +65,9 @@ For buffered responses (including `fetch()` and `Response.file()`), readers do *
 | `bytes()` | `Promise<ArrayBuffer>` — same bytes as `arrayBuffer()`, despite the name; **not** a `Uint8Array` |
 | `blob()` | `Promise<Blob>` — a `Blob` instance (`size`, `type`, `slice()`, `text()`, `arrayBuffer()`, `bytes()`) |
 | `formData()` | `Promise<FormData>` |
-| `clone()` | `Response` — Known issue: the copy comes back **corrupted**, so don't use it; just re-read the original |
+| `clone()` | `Response` — copies headers and buffered body; the original stays readable. A `ReadableStream` body is not carried over (the clone's `body` is an empty, already-closed stream) |
 
-> **Streaming body note:** When `new Response(stream)` is constructed directly with a [`ReadableStream`](/docs/api/streams), `res.text()` only pops chunks already queued synchronously (it does not invoke `pull()` or await async chunks), and `json()`, `arrayBuffer()`, `bytes()`, `blob()`, `formData()`, and `clone()` read only buffered bytes (`""`) without consuming the stream. Use `res.body.getReader()` (or stream via `http.serve`) instead.
+> **Streaming body note:** When `new Response(stream)` is constructed directly with a [`ReadableStream`](/docs/api/streams), `res.text()` only pops chunks already queued synchronously (it does not invoke `pull()` or await async chunks). `arrayBuffer()`, `bytes()`, `blob()`, `formData()`, and `clone()` read only buffered bytes (`""`/empty) without consuming the stream, while `json()` rejects with `Unexpected end of JSON input`. Use `res.body.getReader()` (or stream via `http.serve`) instead.
 
 ```js
 const res = await fetch(url);
@@ -76,11 +76,11 @@ console.log(await res.text());   // "hello" — re-readable
 console.log((await res.bytes()).byteLength); // 5 — ArrayBuffer, not Uint8Array
 ```
 
-`clone()` corrupts instead of teeing — observed verbatim:
+`clone()` copies the buffered body; the source stays intact (it does not tee a stream):
 
 ```js
 const res = new Response("OKABCDEFGH");
-console.log(await res.clone().text()); // "OKOKABCDEF" — corrupted
+console.log(await res.clone().text()); // "OKABCDEFGH"
 console.log(await res.text());         // "OKABCDEFGH" — original intact
 ```
 
@@ -150,7 +150,7 @@ new Request(otherRequest);                 // clone
 ### Methods
 
 `text()`, `json()`, `arrayBuffer()`, `blob()`, `formData()`, `bytes()`,
-`clone()` — same re-readable contract as `Response`, except `Request.clone()` works cleanly (only `Response.clone()` has the pool-offset bug; note `Request` has no `.body` getter). Plus:
+`clone()` — same re-readable contract as `Response` (note `Request` has no `.body` getter). Plus:
 
 ```js
 req.toString();   // the URL
@@ -197,14 +197,16 @@ res.headers.forEach((v, k) => console.log(k, v));
 
 ## Gotchas
 
-- **`bodyUsed` never flips** — it stays `false` before, during, and after
-  every read. Don't branch on it; bodies are simply re-readable.
+- **`bodyUsed` never prevents a second read** — on `Response` it flips to
+  `true` once a body reader has run, while on `Request` it stays `false`. In
+  neither case does it block subsequent reads, so don't use it to guard against
+  re-reading.
 - **Status code range (100–999)** — `status` is bounded to valid 3-digit HTTP status codes. Out-of-range numbers (negative, `< 100`, or `> 999`) fall back to default (`200`, or `302` for `Response.redirect`).
-- **Stream body zero-copy borrow** — In HTTP/1.1 chunked streaming, oversized binary chunks (>16 KB) are sliced zero-copy by borrowing the `Uint8Array` / `ArrayBuffer` backing buffer across consecutive writes until drained. If the producer mutates the buffer in-place while streaming, later slices reflect the mutation.
+- **Stream body borrow** — In HTTP/1.1 chunked streaming, oversized binary chunks (>16 KB) are emitted one slice per write, copied into the write buffer, and the `Uint8Array` / `ArrayBuffer` backing buffer is retained until the last slice drains. If the producer mutates the buffer in-place while streaming, not-yet-written slices reflect the mutation.
 - **HTTP/2 stream responses** — Returning a `ReadableStream` body over HTTP/2 returns `501 Not Implemented`.
-- **`headers.size` is a function** — `h.size` is `undefined`;
-  `h.size()` is the number. Same for `URLSearchParams.size`.
-- `clone()` snapshots headers and body; the source stays readable.
+- **`headers.size` is a method** — `h.size` evaluates to a function, not a
+  number; call `h.size()` for the count. Same for `URLSearchParams.size`.
+- `clone()` snapshots headers and buffered body; the source stays readable. A `ReadableStream` body is not carried over — the clone's `body` is an empty, already-closed stream.
 - `new Response(body)` copies the bytes; mutating the original afterwards
   does not change the response.
 - `Response.redirect(url)` without a URL **throws** — and with one it still sends no `Location` header, so clients never follow it.

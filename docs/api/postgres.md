@@ -189,8 +189,8 @@ ff app.js \
 ### Root certificate rules
 
 - `sslrootcert` points to a PEM-encoded CA bundle (capped at 512 KB, up to 24 anchors).
-- `sslmode=verify-full` requires a DNS hostname — IP literals (`127.0.0.1`, `::1`) are rejected.
-- When `sslmode=verify-full`, reading `sslrootcert` is checked against `--allow-read`. In `new SQL(...)`, a denied path wraps into `TypeError: SQL: TLS setup failed (PermissionDenied)` (not `PermissionDenied`).
+- `sslmode=verify-full` requires a DNS hostname — IP literals (`127.0.0.1`, `::1`) are rejected (currently `new SQL(...)` throws `InternalError: out of memory` for IP literals due to an error-wrapping quirk).
+- When `sslmode=verify-full`, reading `sslrootcert` is checked against `--allow-read`. In `new SQL(...)`, a denied path wraps into `TypeError: SQL: TLS setup failed (PermissionDenied)` (not `PermissionDenied`). On the global `sql` instance, the first call reports `PermissionDenied: sql requires --allow-net for 'configured host'` (and subsequent calls throw `TypeError: PoolFailed` / `TypeError: no database pool`).
 - **Anchor sealing:** The CA trust store is process-global and sealed after the first TLS pool initializes it. Subsequent pools silently reuse the sealed anchor store and ignore differing `sslrootcert` values.
 - Environment variables: `PGSSLMODE` and `PGSSLROOTCERT` configure TLS for the global `sql` instance (when permitted by `--allow-env`).
 
@@ -279,7 +279,7 @@ try {
 Network and host permission failures are local `Error` objects with
 `name: "PermissionDenied"` and `code: "PERMISSION_DENIED"`, thrown before a
 connection is attempted (they have no SQLSTATE `severity` or `detail`).
-*(Exception: an `sslrootcert` read denial in `new SQL` currently throws `TypeError: SQL: TLS setup failed (PermissionDenied)`.)*
+*(Exceptions: an `sslrootcert` read denial throws `TypeError: SQL: TLS setup failed (PermissionDenied)` in `new SQL(...)`, and on the global `sql` instance reports `PermissionDenied: sql requires --allow-net for 'configured host'` on the first call.)*
 
 ## Transactions: `begin` + `transaction(fn)`
 
@@ -376,7 +376,7 @@ the defaults. `process.env.PG_TEST_DSN` is also `undefined` without the grant.
 
 **`password authentication failed`** — credentials in the DSN don't match the server. Check `PGUSER` / `PGPASSWORD`; environment variables override nothing once a DSN argument is passed.
 
-**Unsupported `sslmode`** — only `disable` and `verify-full` (or `verify_full`) are supported (`sslmode=verify-full` also requires a DNS hostname, rejecting IP literals). Options objects throw `TypeError: sslmode must be 'disable' or 'verify-full'`, DSN URLs throw `TypeError: invalid database URL`, and global `sql` throws `TypeError: UnsupportedSslMode` / `TypeError: no database pool`.
+**Unsupported `sslmode`** — only `disable` and `verify-full` (or `verify_full`) are supported (`sslmode=verify-full` also requires a DNS hostname, rejecting IP literals — `new SQL(...)` currently surfaces an IP literal as `InternalError: out of memory`). Options objects throw `TypeError: sslmode must be 'disable' or 'verify-full'`, DSN URLs throw `TypeError: invalid database URL`, and global `sql` throws `TypeError: UnsupportedSslMode` / `TypeError: no database pool`.
 
 **`TypeError: SQL: TLS setup failed (PermissionDenied)`** — the path specified by `sslrootcert` is outside your `--allow-read` scope. Add the path to `--allow-read`.
 

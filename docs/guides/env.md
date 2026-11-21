@@ -94,7 +94,7 @@ An explicit `--max-heap` flag on the command line overrides `FF_MAX_HEAP`.
 
 ### `FF_CPU_BUDGET` — JS CPU interrupt watchdog
 
-Interrupts consecutive synchronous JS execution after `N` milliseconds (`0`–`3600000`, default `0` = disabled):
+Interrupts consecutive synchronous JS execution after `N` milliseconds (`0`–`3600000`, default `0` = disabled) on `ff <file.js>`, `ff -e`, HTTP handlers, timers, microtasks, streams, and worker eval/`onmessage` (top-level eval in `ff start`, `ff test`, `ff repl`, `.ffbc`, and `--standalone` is not guarded):
 
 ```sh
 FF_CPU_BUDGET=1000 ff worker-heavy.js

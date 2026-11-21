@@ -123,7 +123,7 @@ Returns a library object:
 | Property | What it does |
 |---|---|
 | `lib.symbols.name(...args)` | Call the C function (returns a `Promise` if `nonblocking: true`) |
-| `lib.close()` | `dlclose`; further calls throw. Idempotent |
+| `lib.close()` | Marks the library closed immediately so further calls throw, and calls `dlclose` once any in-flight `nonblocking` calls finish. Idempotent |
 
 A closed library throws `TypeError: ffi: library is closed`. If the
 library object is garbage-collected, the handle is closed for you.
@@ -137,7 +137,7 @@ library object is garbage-collected, the handle is closed for you.
 | `f32 f64` | `number` | `number` | |
 | `void` | — | `undefined` | Results only |
 | `pointer` | `FfiPtr`, `bigint`, `null`, `undefined` | `FfiPtr` \| `null` | `null`/`undefined` coerce to `NULL` |
-| `buffer` | `TypedArray`, `ArrayBuffer`, `null`, `undefined` | `FfiPtr` \| `null` | Passes the data pointer (view-adjusted); a result is a pointer, not a copy |
+| `buffer` | `TypedArray`, `ArrayBuffer`, `null`, `undefined` (sync calls also accept `FfiPtr` / `bigint`) | `FfiPtr` \| `null` | Passes the data pointer (view-adjusted); a result is a pointer, not a copy |
 | `cstring` | `string`, `null`, `undefined` | `string` \| `null` | In: NUL-terminated copy, valid for the call. Out: cloned JS string |
 | `function` | `FfiCallback` `.pointer`, `FfiPtr`, `bigint`, `null`, `undefined` | `FfiPtr` \| `null` | JS→C callback or function pointer — see [Callbacks](#callbacks) |
 | struct | `TypedArray`, `ArrayBuffer` (≥ `size` bytes) | `Uint8Array` (`size` bytes) | Byte image in C layout — see [Structs](#structs) |
@@ -154,9 +154,9 @@ const p = ffi.ptr(typedArray);     // pointer to buffer data
 const q = ffi.ptr(p, 16);          // p + 16 bytes (offset applies only when 1st arg is an FfiPtr)
 const r = ffi.ptr(0x1000n);        // raw address
 
-p.addr;        // 140234n (BigInt)
+p.addr;        // 140234n (BigInt; null for 0-address FfiPtr)
 p.toString();  // "FfiPtr(0x224b0)"
-ffi.isNull(p); // true for null/undefined and for 0-address pointers
+ffi.isNull(p); // true for null, undefined, and 0n (note: returns false for ffi.ptr(0n))
 ffi.cstring(p);        // read a C string → JS string | null
 ffi.cstring(typedArray); // same, from a buffer
 ```
@@ -190,7 +190,7 @@ v.getArrayBuffer(byteLength, off?);   // → ArrayBuffer copy
 v.copyInto(destination, off?);        // native → TypedArray
 ```
 
-Readable/writable types are the scalars plus `pointer`; `cstring` strings
+Readable/writable types are the scalars plus `pointer` and `function`; `cstring` strings
 are read with `ffi.cstring`/`getCString`, buffers with
 `ffi.copyBytes`/`copyInto`. No bounds checking — C's rules.
 

@@ -100,13 +100,13 @@ Unchanged — write handlers (or declarative routes objects) just like the HTTP 
 
 - Handler signature `(url, method, body, headers)` → `Response | { status, body } | Promise<…>` (or `(url, method, body, headers, params)` in a routes table).
 - `Response.json` / `redirect` / `file` / statics, `Headers`, status codes — all identical.
-- Limits: 512 connections, `MAX_STREAMS = 100` concurrent streams per connection, 64 KiB request headers (`431`; header OOM → `503`), response headers capped at `MAX_NV = 128` pairs (name ≤ 64 B, value ≤ 4096 B), 10 MB per-stream / 16 MB per-session request body caps, 10 MB response body (copied per stream), 30s watchdog, max 512-byte `:path` and 16-byte `:method`, strict pseudo-header validation.
+- Limits: 512 connections, `MAX_STREAMS = 100` concurrent streams per connection (a 101st is refused with `RST_STREAM(REFUSED_STREAM)`), 64 KiB request headers (`431`; header OOM → `503`), response headers capped at 128 total Nv slots including `:status` and `content-length` (so ≤126 user pairs; name > 64 B or value > 4096 B pairs are dropped), 10 MB per-stream request body (`413`) / 16 MB per-session (connection reset, no `413`), 10 MB response body (`500`), 16 MiB staged response output per connection (connection reset on overflow), 30s watchdog, max 512-byte `:path` and 16-byte `:method`, strict pseudo-header validation.
 - WebSocket upgrades ride the HTTP/1.1 connections on the same port; `h2` connections serve normal requests.
 - Permissions are unchanged: the port grant covers HTTP/2 and HTTP/1.1, and TLS file reads are still `read` scopes.
 
 What you get from the protocol (handled by nghttp2, not your code):
 
-- Multiplexed streams — many in-flight requests per connection.
+- Multiplexed streams — many streams can be open per connection, but the runtime runs one handler at a time per connection: completed streams wait in a pending queue and are chained as each handler settles.
 - Header compression (HPACK) — smaller repeated headers.
 - Server framing (Content-Length / Transfer-Encoding) computed for you, as with HTTP/1.1.
 
