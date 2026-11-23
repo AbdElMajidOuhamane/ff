@@ -6,6 +6,7 @@ const tls_tunnel = @import("./tls_tunnel.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig"); // CHANGED
+const perm = @import("../security/permissions.zig");
 const http = std.http;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 fn getRandomBytes(buf: []u8) void {
@@ -393,6 +394,10 @@ fn connectSlot(s: usize) void {
     var conn: ?*http.Client.Connection = null;
     var req: ?http.Client.Request = null;
     defer if (req) |*r| r.deinit();
+    if (perm.global().checkHostNotPrivate(hosts[s], ports[s]) == .denied) {
+        failClose(s, null, "PermissionDenied: private network", &req);
+        return;
+    }
     if (wflags[s].tls_active) {
         var uri_buf: [768]u8 = undefined;
         const uri_str = std.fmt.bufPrint(&uri_buf, "wss://{s}:{d}{s}", .{ hosts[s], ports[s], paths[s] }) catch {

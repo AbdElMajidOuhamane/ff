@@ -537,6 +537,10 @@ fn runJob(slot_id: u16) void {
             failSlot(s, "PermissionDenied: fetch requires --allow-net");
             return;
         }
+        if (perm.global().checkHostNotPrivate(hop_host.bytes, hop_port) == .denied) {
+            failSlot(s, "PermissionDenied: private network access denied (--deny-private-net)");
+            return;
+        }
 
         // Origin tracking + credential stripping. Format is host:port:scheme
         // so a scheme downgrade also counts as crossing the origin.

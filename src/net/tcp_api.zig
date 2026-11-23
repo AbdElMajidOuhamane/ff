@@ -426,6 +426,12 @@ fn tcpConnectCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
         break :blk a6;
     };
 
+    if (perm.global().checkResolvedIp(addr) == .denied) {
+        var detail_buf: [64]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ host, port }) catch "net";
+        return deny.throw(ctx, "tcp.connect", .net, detail);
+    }
+
     const tcp_sock = xev.TCP.init(addr) catch {
         return c.throwTypeError(ctx, "failed to create TCP socket");
     };

@@ -47,6 +47,14 @@ fn allowNet(ctx: ?*c.Context, api: []const u8, addr: []const u8, port: u16) bool
     return false;
 }
 
+fn allowOutboundIp(ctx: ?*c.Context, api: []const u8, addr_s: []const u8, port: u16, ip: std.Io.net.IpAddress) bool {
+    if (perm.global().checkResolvedIp(ip) == .allowed) return true;
+    var detail_buf: [300]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ addr_s, port }) catch addr_s;
+    _ = deny.throw(ctx, api, .net, detail);
+    return false;
+}
+
 fn makeSocketObj(ctx: ?*c.Context, slot: u16, inet6: bool) c.Value {
     const obj = c.newObjectClass(ctx, @intCast(udp_class_id));
     if (c.isException(obj) != 0) {
@@ -161,6 +169,7 @@ fn sockConnect(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Val
         return throwErr(ctx, "connect: invalid address", .{});
 
     if (!allowNet(ctx, "udp.connect", addr_s, port)) return c.JS_EXCEPTION;
+    if (!allowOutboundIp(ctx, "udp.connect", addr_s, port, addr)) return c.JS_EXCEPTION;
 
     udp_native.connectSock(h.slot, addr) catch |err| {
         return throwErr(ctx, "connect: {s}", .{@errorName(err)});
@@ -185,6 +194,7 @@ fn sockSendto(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Valu
         return throwErr(ctx, "sendto: invalid address", .{});
 
     if (!allowNet(ctx, "udp.sendto", addr_s, port)) return c.JS_EXCEPTION;
+    if (!allowOutboundIp(ctx, "udp.sendto", addr_s, port, addr)) return c.JS_EXCEPTION;
 
     return submitSendPromise(ctx, h.slot, argv[0], addr);
 }

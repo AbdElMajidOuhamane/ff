@@ -68,3 +68,15 @@ test {
 test {
     _ = @import("util/limits.zig");
 }
+
+test {
+    _ = @import("engine/interrupt.zig");
+}
+
+test {
+    _ = @import("security/sandbox.zig");
+}
+
+test {
+    _ = @import("api/console.zig");
+}

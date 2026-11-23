@@ -11,6 +11,7 @@ var entered_ms: [RT_COUNT]std.atomic.Value(u64) align(64) = [_]std.atomic.Value(
 var budget_ms: [RT_COUNT]std.atomic.Value(u32) align(64) = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** RT_COUNT;
 var depth: [RT_COUNT]std.atomic.Value(u32) align(64) = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** RT_COUNT;
 var rt_ptrs: [RT_COUNT]?*anyopaque = [_]?*anyopaque{null} ** RT_COUNT;
+var wall_deadline_ms: std.atomic.Value(u64) align(64) = .{ .raw = 0 };
 
 pub const Mutex = struct {
     state: std.atomic.Value(u8) = .init(0),
@@ -111,11 +112,31 @@ pub fn registerRuntime(rt: *qjs.Runtime, idx: usize, budget: u32) void {
     }
 }
 
+pub fn isWallExpired(now_ms: u64, deadline_ms: u64) bool {
+    return deadline_ms != 0 and now_ms >= deadline_ms;
+}
+
+pub fn setWallTimeout(ms: u32) void {
+    if (ms == 0) {
+        wall_deadline_ms.store(0, .release);
+        return;
+    }
+    const now = monotonicNowMs();
+    wall_deadline_ms.store(now + @as(u64, ms), .release);
+    startMonitorIfNeeded();
+}
+
 fn monitorLoop() void {
     const ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * 1_000_000 };
     while (monitor_running.load(.acquire)) {
         _ = std.c.nanosleep(&ts, null);
         const now = monotonicNowMs();
+        const deadline = wall_deadline_ms.load(.acquire);
+        if (isWallExpired(now, deadline)) {
+            const msg = "error: wall-clock timeout exceeded\n";
+            _ = std.c.write(2, msg.ptr, msg.len);
+            std.c._exit(124);
+        }
         for (0..RT_COUNT) |i| {
             const b = budget_ms[i].load(.acquire);
             if (b == 0) continue;
@@ -145,4 +166,38 @@ pub fn stopMonitor() void {
             monitor_thread = null;
         }
     }
+}
+
+test "isWallExpired checks disabled and active deadlines" {
+    try std.testing.expect(!isWallExpired(1000, 0));
+    try std.testing.expect(!isWallExpired(999, 1000));
+    try std.testing.expect(isWallExpired(1000, 1000));
+    try std.testing.expect(isWallExpired(1500, 1000));
+}
+
+test "enterJs and leaveJs nest and clear state" {
+    const idx = RT_COUNT - 1;
+    budget_ms[idx].store(100, .release);
+    defer {
+        budget_ms[idx].store(0, .release);
+        depth[idx].store(0, .release);
+        entered_ms[idx].store(0, .release);
+        trip[idx].store(0, .monotonic);
+    }
+
+    enterJs(idx, 5000);
+    try std.testing.expectEqual(@as(u32, 1), depth[idx].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5000), entered_ms[idx].load(.acquire));
+
+    enterJs(idx, 6000);
+    try std.testing.expectEqual(@as(u32, 2), depth[idx].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5000), entered_ms[idx].load(.acquire));
+
+    leaveJs(idx);
+    try std.testing.expectEqual(@as(u32, 1), depth[idx].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5000), entered_ms[idx].load(.acquire));
+
+    leaveJs(idx);
+    try std.testing.expectEqual(@as(u32, 0), depth[idx].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), entered_ms[idx].load(.acquire));
 }

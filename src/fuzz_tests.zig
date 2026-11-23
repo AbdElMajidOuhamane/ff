@@ -14,6 +14,8 @@ const Fuzzers = .{
     .semver = @import("commands/semver_fuzz.zig"),
     .tls_pem = @import("net/tls_server_fuzz.zig"),
     .utf8 = @import("api/text_encoding_fuzz.zig"),
+    .permissions = @import("security/permissions_fuzz.zig"),
+    .limits = @import("util/limits_fuzz.zig"),
     // A fuzzer that intentionally fails, to test fuzzing infrastructure itself.
     .canary = {},
     // Quickly run all fuzzers as a smoke test.

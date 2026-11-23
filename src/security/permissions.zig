@@ -35,6 +35,7 @@ pub const Config = struct {
     env: NameRule = .denied,
     run: NameRule = .denied,
     ffi: bool = false,
+    deny_private_net: bool = false,
     deny_net: ?[]const NetScope = null,
     deny_read_paths: ?[]const PathScope = null,
     deny_write_paths: ?[]const PathScope = null,
@@ -151,6 +152,65 @@ pub const Config = struct {
         }
     }
 
+    pub fn checkResolvedIp(self: *const Config, addr: std.Io.net.IpAddress) Decision {
+        if (self.deny_private_net and isPrivateIpAddress(addr)) return .denied;
+        return .allowed;
+    }
+
+    pub fn checkHostNotPrivate(self: *const Config, host_in: []const u8, port: u16) Decision {
+        if (!self.deny_private_net) return .allowed;
+        if (host_in.len == 0 or host_in.len >= 256) return .denied;
+        if (std.mem.indexOfScalar(u8, host_in, 0) != null) return .denied;
+
+        const host = if (host_in.len >= 2 and host_in[0] == '[' and host_in[host_in.len - 1] == ']')
+            host_in[1 .. host_in.len - 1]
+        else
+            host_in;
+        if (host.len == 0) return .denied;
+
+        if (std.Io.net.IpAddress.parse(host, port)) |addr| {
+            return self.checkResolvedIp(addr);
+        } else |_| {}
+
+        var host_buf: [256]u8 = undefined;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
+        const host_z: [:0]const u8 = host_buf[0..host.len :0];
+
+        var port_buf: [8]u8 = undefined;
+        const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return .denied;
+        if (port_slice.len >= port_buf.len) return .denied;
+        port_buf[port_slice.len] = 0;
+        const port_z: [:0]const u8 = port_buf[0..port_slice.len :0];
+
+        var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+        hints.family = std.posix.AF.UNSPEC;
+        hints.socktype = std.posix.SOCK.STREAM;
+
+        var res: ?*std.c.addrinfo = null;
+        const eai = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res);
+        if (@intFromEnum(eai) != 0) return .denied;
+        defer if (res) |r| std.c.freeaddrinfo(r);
+
+        var cur: ?*std.c.addrinfo = res;
+        var saw_addr = false;
+        while (cur) |info| : (cur = info.next) {
+            const sa = info.addr orelse continue;
+            saw_addr = true;
+            if (info.family == std.posix.AF.INET) {
+                const sin: *const std.c.sockaddr.in = @ptrCast(@alignCast(sa));
+                const bytes: [4]u8 = @bitCast(sin.addr);
+                if (isPrivateIpv4(bytes)) return .denied;
+            } else if (info.family == std.posix.AF.INET6) {
+                const sin6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sa));
+                if (isPrivateIpv6(sin6.addr)) return .denied;
+            } else {
+                return .denied; // fail closed on unknown family
+            }
+        }
+        return if (saw_addr) .allowed else .denied;
+    }
+
     pub fn checkEnv(self: *const Config, name: []const u8) bool {
         switch (self.env) {
             .denied => return false,
@@ -219,10 +279,15 @@ pub const Config = struct {
         var env_all = false;
         var run_all = false;
         var ffi = false;
+        var deny_private_net = false;
 
         for (args) |arg| {
             if (std.mem.eql(u8, arg, "--allow-all")) {
                 all = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--deny-private-net")) {
+                deny_private_net = true;
                 continue;
             }
             if (std.mem.startsWith(u8, arg, "--deny-net=")) {
@@ -344,6 +409,7 @@ pub const Config = struct {
                 .env = .all,
                 .run = .all,
                 .ffi = true,
+                .deny_private_net = deny_private_net,
                 .deny_net = if (deny_net_list.items.len > 0) try deny_net_list.toOwnedSlice(alloc) else null,
                 .deny_read_paths = if (deny_read_list.items.len > 0) try deny_read_list.toOwnedSlice(alloc) else null,
                 .deny_write_paths = if (deny_write_list.items.len > 0) try deny_write_list.toOwnedSlice(alloc) else null,
@@ -352,6 +418,7 @@ pub const Config = struct {
 
         var cfg = Config{
             .ffi = ffi,
+            .deny_private_net = deny_private_net,
             .deny_net = if (deny_net_list.items.len > 0) try deny_net_list.toOwnedSlice(alloc) else null,
             .deny_read_paths = if (deny_read_list.items.len > 0) try deny_read_list.toOwnedSlice(alloc) else null,
             .deny_write_paths = if (deny_write_list.items.len > 0) try deny_write_list.toOwnedSlice(alloc) else null,
@@ -801,6 +868,55 @@ fn isWithin(root: []const u8, target: []const u8) bool {
     return target.len > root.len and target[root.len] == '/';
 }
 
+/// Pure-bitmask check for private/reserved/loopback/metadata IPv4 ranges.
+pub fn isPrivateIpv4(b: [4]u8) bool {
+    if (b[0] == 0) return true; // 0.0.0.0/8 ("this" network)
+    if (b[0] == 10) return true; // 10.0.0.0/8 (RFC1918)
+    if (b[0] == 100 and (b[1] & 0xC0) == 64) return true; // 100.64.0.0/10 (CGNAT)
+    if (b[0] == 127) return true; // 127.0.0.0/8 (loopback)
+    if (b[0] == 169 and b[1] == 254) return true; // 169.254.0.0/16 (link-local / metadata)
+    if (b[0] == 172 and (b[1] & 0xF0) == 16) return true; // 172.16.0.0/12 (RFC1918)
+    if (b[0] == 192 and b[1] == 0 and b[2] == 0) return true; // 192.0.0.0/24 (IETF protocol)
+    if (b[0] == 192 and b[1] == 168) return true; // 192.168.0.0/16 (RFC1918)
+    if (b[0] == 198 and (b[1] & 0xFE) == 18) return true; // 198.18.0.0/15 (benchmark)
+    if (b[0] >= 224) return true; // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved
+    return false;
+}
+
+/// Pure-bitmask check for private/loopback/link-local/IPv4-mapped IPv6 ranges.
+pub fn isPrivateIpv6(b: [16]u8) bool {
+    var all_zero = true;
+    for (b[0..15]) |byte| {
+        if (byte != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero and (b[15] == 0 or b[15] == 1)) return true; // :: or ::1
+    if ((b[0] & 0xFE) == 0xFC) return true; // fc00::/7 (ULA)
+    if (b[0] == 0xFE and (b[1] & 0xC0) == 0x80) return true; // fe80::/10 (link-local)
+    if (b[0] == 0xFF) return true; // ff00::/8 (multicast)
+    // ::ffff:0:0/96 (IPv4-mapped IPv6)
+    var v4_mapped = b[10] == 0xFF and b[11] == 0xFF;
+    if (v4_mapped) {
+        for (b[0..10]) |byte| {
+            if (byte != 0) {
+                v4_mapped = false;
+                break;
+            }
+        }
+    }
+    if (v4_mapped) return isPrivateIpv4(b[12..16].*);
+    return false;
+}
+
+pub fn isPrivateIpAddress(addr: std.Io.net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |ip4| isPrivateIpv4(ip4.bytes),
+        .ip6 => |ip6| isPrivateIpv6(ip6.bytes),
+    };
+}
+
 // ── tests ───────────────────────────────────────────────────────────
 
 test "path scope is component-exact and blocks traversal" {
@@ -870,4 +986,142 @@ test "env and run scopes" {
     try std.testing.expectEqual(Decision.allowed, cfg.checkRun("/usr/bin/git"));
     try std.testing.expectEqual(Decision.allowed, cfg.checkRun("/bin/sh"));
     try std.testing.expectEqual(Decision.denied, cfg.checkRun("/bin/echo"));
+}
+
+test "isPrivateIpv4 and isPrivateIpv6 classify private, metadata, mapped, and public IPs" {
+    // Private / loopback / metadata IPv4
+    try std.testing.expect(isPrivateIpv4(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 10, 0, 0, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 172, 31, 255, 254 }));
+    try std.testing.expect(!isPrivateIpv4(.{ 172, 32, 0, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 192, 168, 1, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 169, 254, 169, 254 }));
+    try std.testing.expect(isPrivateIpv4(.{ 100, 64, 0, 1 }));
+    try std.testing.expect(isPrivateIpv4(.{ 0, 0, 0, 0 }));
+    try std.testing.expect(isPrivateIpv4(.{ 224, 0, 0, 1 }));
+
+    // Public IPv4
+    try std.testing.expect(!isPrivateIpv4(.{ 1, 1, 1, 1 }));
+    try std.testing.expect(!isPrivateIpv4(.{ 8, 8, 8, 8 }));
+    try std.testing.expect(!isPrivateIpv4(.{ 93, 184, 216, 34 }));
+
+    // Private / mapped IPv6
+    try std.testing.expect(isPrivateIpv6(.{0} ** 16)); // ::
+    try std.testing.expect(isPrivateIpv6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })); // ::1
+    try std.testing.expect(isPrivateIpv6(.{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })); // fe80::1
+    try std.testing.expect(isPrivateIpv6(.{ 0xfd, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })); // fd12::1
+    try std.testing.expect(isPrivateIpv6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 })); // ::ffff:127.0.0.1
+    try std.testing.expect(isPrivateIpv6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254 })); // ::ffff:169.254.169.254
+    try std.testing.expect(!isPrivateIpv6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 })); // ::ffff:8.8.8.8
+    try std.testing.expect(!isPrivateIpv6(.{ 0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11 })); // 2606:4700:4700::1111
+}
+
+test "Config.parse --deny-private-net blocks private IPs even under --allow-all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cfg = try Config.parse(arena.allocator(), &.{ "--allow-all", "--deny-private-net" });
+
+    try std.testing.expect(cfg.deny_private_net);
+    try std.testing.expectEqual(Decision.denied, cfg.checkHostNotPrivate("127.0.0.1", 80));
+    try std.testing.expectEqual(Decision.denied, cfg.checkHostNotPrivate("169.254.169.254", 80));
+    try std.testing.expectEqual(Decision.denied, cfg.checkHostNotPrivate("[::1]", 443));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkHostNotPrivate("1.1.1.1", 443));
+}
+
+test "deny-read, deny-write, and deny-net override allow grants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(getIo(), "secret", .default_dir);
+
+    var path_buf: [max_path]u8 = undefined;
+    const root_len = try tmp.dir.realPath(getIo(), &path_buf);
+    const root = path_buf[0..root_len];
+
+    const allow_r = try std.fmt.allocPrint(alloc, "--allow-read={s}", .{root});
+    const deny_r = try std.fmt.allocPrint(alloc, "--deny-read={s}/secret", .{root});
+    const allow_w = try std.fmt.allocPrint(alloc, "--allow-write={s}", .{root});
+    const deny_w = try std.fmt.allocPrint(alloc, "--deny-write={s}/secret", .{root});
+
+    const cfg = try Config.parse(alloc, &.{
+        allow_r,
+        deny_r,
+        allow_w,
+        deny_w,
+        "--allow-net",
+        "--deny-net=blocked.example.com:443,*.corp.local",
+    });
+
+    const ok_file = try std.fmt.allocPrint(alloc, "{s}/ok.txt", .{root});
+    const secret_file = try std.fmt.allocPrint(alloc, "{s}/secret/a.txt", .{root});
+
+    try std.testing.expectEqual(Decision.allowed, cfg.checkPath(.read, ok_file));
+    try std.testing.expectEqual(Decision.denied, cfg.checkPath(.read, secret_file));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkPath(.write, ok_file));
+    try std.testing.expectEqual(Decision.denied, cfg.checkPath(.write, secret_file));
+
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("api.example.com", 443));
+    try std.testing.expectEqual(Decision.denied, cfg.checkNet("blocked.example.com", 443));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("blocked.example.com", 80));
+    try std.testing.expectEqual(Decision.denied, cfg.checkNet("db.corp.local", 5432));
+}
+
+test "checkHostNotPrivate resolves localhost via DNS and rejects loopback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cfg_deny = try Config.parse(alloc, &.{ "--allow-net", "--deny-private-net" });
+    try std.testing.expectEqual(Decision.denied, cfg_deny.checkHostNotPrivate("localhost", 80));
+    try std.testing.expectEqual(Decision.denied, cfg_deny.checkHostNotPrivate("", 80));
+
+    const cfg_allow = try Config.parse(alloc, &.{"--allow-net"});
+    try std.testing.expectEqual(Decision.allowed, cfg_allow.checkHostNotPrivate("localhost", 80));
+    const lo = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 80);
+    try std.testing.expectEqual(Decision.allowed, cfg_allow.checkResolvedIp(lo));
+}
+
+test "IPv6 bracket scopes, isPermissionFlag, and invalid flag errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cfg = try Config.parse(alloc, &.{"--allow-net=[::1]:8080,[2001:db8::1]"});
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("::1", 8080));
+    try std.testing.expectEqual(Decision.denied, cfg.checkNet("::1", 80));
+    try std.testing.expectEqual(Decision.allowed, cfg.checkNet("2001:db8::1", 443));
+
+    try std.testing.expect(isPermissionFlag("--allow-all"));
+    try std.testing.expect(isPermissionFlag("--allow-ffi"));
+    try std.testing.expect(isPermissionFlag("--allow-net=x"));
+    try std.testing.expect(isPermissionFlag("--deny-net=x"));
+    try std.testing.expect(isPermissionFlag("--deny-private-net"));
+    try std.testing.expect(!isPermissionFlag("--max-heap=64MB"));
+    try std.testing.expect(!isPermissionFlag("--allow-unknown"));
+    try std.testing.expect(!isPermissionFlag("foo.js"));
+
+    try std.testing.expectError(error.InvalidScope, Config.parse(alloc, &.{"--deny-net="}));
+    try std.testing.expectError(error.InvalidScope, Config.parse(alloc, &.{"--deny-read="}));
+    try std.testing.expectError(error.InvalidScope, Config.parse(alloc, &.{"--deny-write="}));
+    try std.testing.expectError(error.InvalidScope, Config.parse(alloc, &.{"--allow-ffi=1"}));
+    try std.testing.expectError(error.InvalidScope, Config.parse(alloc, &.{"--allow-net=[::1"}));
+    try std.testing.expectError(error.UnknownPermissionFlag, Config.parse(alloc, &.{"--deny-foo=bar"}));
+    try std.testing.expectError(error.UnknownPermissionFlag, Config.parse(alloc, &.{"--allow-foo=bar"}));
+}
+
+test "Config.isAllowed and Config.revoke across all categories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = try Config.parse(arena.allocator(), &.{"--allow-all"});
+
+    const kinds = [_]Kind{ .read, .write, .net, .env, .run, .ffi };
+    for (kinds) |k| {
+        try std.testing.expect(cfg.isAllowed(k));
+        cfg.revoke(k);
+        try std.testing.expect(!cfg.isAllowed(k));
+    }
 }

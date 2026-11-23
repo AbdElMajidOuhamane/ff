@@ -10,6 +10,9 @@ pub const RuntimeLimits = struct {
     stack_bytes: usize = 1024 * 1024,
     worker_heap_bytes: usize = 32 * 1024 * 1024,
     cpu_budget_ms: u32 = 0, // 0 = disabled
+    wall_timeout_ms: u32 = 0, // 0 = disabled
+    max_log_bytes: usize = 0, // 0 = unlimited
+    sandbox: bool = false,
     env_file: ?[]const u8 = null,
     // derived once; never recomputed on a hot path
     native_stack_bytes: usize = 0,
@@ -22,12 +25,29 @@ pub const LimitsError = error{
     InvalidStackSize,
     InvalidWorkerHeapSize,
     InvalidCpuBudget,
+    InvalidWallTimeout,
+    InvalidMaxLogBytes,
     MissingEnvFilePath,
     MissingStackSizeValue,
     InvalidByteSize,
     NativeStackTooSmall,
     StackSizeExceedsNative,
 };
+
+pub const WALL_TIMEOUT_MAX_MS: u32 = 3_600_000;
+pub const MAX_LOG_BYTES_CAP: usize = 100 * 1024 * 1024;
+
+pub fn parseWallTimeout(s: []const u8) LimitsError!u32 {
+    const ms = std.fmt.parseInt(u32, s, 10) catch return error.InvalidWallTimeout;
+    if (ms > WALL_TIMEOUT_MAX_MS) return error.InvalidWallTimeout;
+    return ms;
+}
+
+pub fn parseMaxLogBytes(s: []const u8) LimitsError!usize {
+    const bytes = parseByteSize(s) catch return error.InvalidMaxLogBytes;
+    if (bytes > MAX_LOG_BYTES_CAP) return error.InvalidMaxLogBytes;
+    return bytes;
+}
 
 var global_limits: RuntimeLimits = .{};
 var initialized: bool = false;
@@ -88,6 +108,10 @@ pub fn initFromArgs(args: std.process.Args) LimitsError!void {
         const ms = std.fmt.parseInt(u32, span, 10) catch return error.InvalidCpuBudget;
         global_limits.cpu_budget_ms = ms;
     }
+    if (std.c.getenv("FF_WALL_TIMEOUT")) |val| {
+        const span = std.mem.span(val);
+        global_limits.wall_timeout_ms = try parseWallTimeout(span);
+    }
 
     var worker_heap_explicit = false;
     var it = args.iterate();
@@ -122,6 +146,20 @@ pub fn initFromArgs(args: std.process.Args) LimitsError!void {
             const val = it.next() orelse return error.InvalidCpuBudget;
             const ms = std.fmt.parseInt(u32, val, 10) catch return error.InvalidCpuBudget;
             global_limits.cpu_budget_ms = ms;
+        } else if (std.mem.startsWith(u8, a, "--wall-timeout=")) {
+            const val = a["--wall-timeout=".len..];
+            global_limits.wall_timeout_ms = try parseWallTimeout(val);
+        } else if (std.mem.eql(u8, a, "--wall-timeout")) {
+            const val = it.next() orelse return error.InvalidWallTimeout;
+            global_limits.wall_timeout_ms = try parseWallTimeout(val);
+        } else if (std.mem.startsWith(u8, a, "--max-log-bytes=")) {
+            const val = a["--max-log-bytes=".len..];
+            global_limits.max_log_bytes = try parseMaxLogBytes(val);
+        } else if (std.mem.eql(u8, a, "--max-log-bytes")) {
+            const val = it.next() orelse return error.InvalidMaxLogBytes;
+            global_limits.max_log_bytes = try parseMaxLogBytes(val);
+        } else if (std.mem.eql(u8, a, "--simple-sandbox")) {
+            global_limits.sandbox = true;
         } else if (std.mem.eql(u8, a, "--env-file")) {
             const path = it.next() orelse return error.MissingEnvFilePath;
             global_limits.env_file = path;
@@ -220,4 +258,38 @@ test "detectNativeMainStack returns plausible value" {
 test "RuntimeLimits struct layout" {
     try std.testing.expect(@sizeOf(RuntimeLimits) <= 128);
     try std.testing.expect(@alignOf(RuntimeLimits) == @alignOf(usize));
+}
+
+test "parseWallTimeout validates bounds" {
+    try std.testing.expectEqual(@as(u32, 0), try parseWallTimeout("0"));
+    try std.testing.expectEqual(@as(u32, 5000), try parseWallTimeout("5000"));
+    try std.testing.expectEqual(WALL_TIMEOUT_MAX_MS, try parseWallTimeout("3600000"));
+    try std.testing.expectError(error.InvalidWallTimeout, parseWallTimeout("3600001"));
+    try std.testing.expectError(error.InvalidWallTimeout, parseWallTimeout("-1"));
+    try std.testing.expectError(error.InvalidWallTimeout, parseWallTimeout("abc"));
+}
+
+test "parseMaxLogBytes validates size and cap" {
+    try std.testing.expectEqual(@as(usize, 0), try parseMaxLogBytes("0"));
+    try std.testing.expectEqual(@as(usize, 64 * 1024), try parseMaxLogBytes("64KB"));
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), try parseMaxLogBytes("10MB"));
+    try std.testing.expectEqual(MAX_LOG_BYTES_CAP, try parseMaxLogBytes("100MB"));
+    try std.testing.expectError(error.InvalidMaxLogBytes, parseMaxLogBytes("101MB"));
+    try std.testing.expectError(error.InvalidMaxLogBytes, parseMaxLogBytes(""));
+}
+
+test "parseByteSize handles all unit suffixes and rejects invalid input" {
+    try std.testing.expectEqual(@as(usize, 1024), try parseByteSize("1024"));
+    try std.testing.expectEqual(@as(usize, 4 * 1024), try parseByteSize("4k"));
+    try std.testing.expectEqual(@as(usize, 4 * 1024), try parseByteSize("4K"));
+    try std.testing.expectEqual(@as(usize, 4 * 1024), try parseByteSize("4KB"));
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), try parseByteSize("2m"));
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), try parseByteSize("2M"));
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), try parseByteSize("2MB"));
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), try parseByteSize("1g"));
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), try parseByteSize("1G"));
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), try parseByteSize("1GB"));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSize(""));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSize("abc"));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSize("99999999999999999999GB"));
 }

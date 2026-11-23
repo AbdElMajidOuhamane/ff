@@ -6,6 +6,7 @@ const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
 const permissions = @import("security/permissions.zig");
+const sandbox = @import("security/sandbox.zig");
 const child_process_api = @import("api/child_process.zig");
 const process_api = @import("api/process.zig");
 const stdio = @import("api/stdio.zig");
@@ -90,6 +91,8 @@ fn parseLimits(init: std.process.Init) void {
             error.InvalidStackSize => cli.failWithHint("invalid --max-stack value", .{}, "stack limit must be at least 128KB (e.g. --max-stack=1MB)", .{}),
             error.InvalidWorkerHeapSize => cli.failWithHint("invalid --worker-heap value", .{}, "worker heap limit must be between 1MB and main heap size", .{}),
             error.InvalidCpuBudget => cli.failWithHint("invalid --cpu-budget value", .{}, "cpu budget must be between 0 and 3600000 ms", .{}),
+            error.InvalidWallTimeout => cli.failWithHint("invalid --wall-timeout value", .{}, "wall timeout must be between 0 and 3600000 ms", .{}),
+            error.InvalidMaxLogBytes => cli.failWithHint("invalid --max-log-bytes value", .{}, "log cap must be 0..100MB (e.g. --max-log-bytes=64KB)", .{}),
             error.MissingEnvFilePath => cli.failWithHint("--env-file requires a path", .{}, "usage: ff --env-file <path>", .{}),
             error.MissingStackSizeValue => cli.failWithHint("--max-stack requires a value", .{}, "usage: ff --max-stack <size> (e.g. --max-stack=1MB)", .{}),
             error.InvalidByteSize => cli.failWithHint("invalid byte size format", .{}, "use suffixes KB, MB, or GB (e.g. 64MB)", .{}),
@@ -128,7 +131,12 @@ fn isRuntimeFlag(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--worker-heap") or
         std.mem.startsWith(u8, arg, "--worker-heap=") or
         std.mem.eql(u8, arg, "--cpu-budget") or
-        std.mem.startsWith(u8, arg, "--cpu-budget=");
+        std.mem.startsWith(u8, arg, "--cpu-budget=") or
+        std.mem.eql(u8, arg, "--wall-timeout") or
+        std.mem.startsWith(u8, arg, "--wall-timeout=") or
+        std.mem.eql(u8, arg, "--max-log-bytes") or
+        std.mem.startsWith(u8, arg, "--max-log-bytes=") or
+        std.mem.eql(u8, arg, "--simple-sandbox");
 }
 
 fn skipRuntimeFlag(arg: []const u8, it: *std.process.Args.Iterator) void {
@@ -136,7 +144,9 @@ fn skipRuntimeFlag(arg: []const u8, it: *std.process.Args.Iterator) void {
         std.mem.eql(u8, arg, "--max-heap") or
         std.mem.eql(u8, arg, "--max-stack") or
         std.mem.eql(u8, arg, "--worker-heap") or
-        std.mem.eql(u8, arg, "--cpu-budget"))
+        std.mem.eql(u8, arg, "--cpu-budget") or
+        std.mem.eql(u8, arg, "--wall-timeout") or
+        std.mem.eql(u8, arg, "--max-log-bytes"))
     {
         _ = it.next();
     }
@@ -238,28 +248,8 @@ fn run(init: std.process.Init) !void {
                                 if (bc_read == bc_size) {
                                     const runtime = try engine.Runtime.init(init.minimal.args);
                                     defer shutdownRuntime(runtime);
-                                    const obj = qjs.readObject(runtime.ctx, bc.ptr, bc.len, qjs.READ_OBJ_BYTECODE);
-                                    if (qjs.isException(obj) != 0) {
-                                        const exc = qjs.getException(runtime.ctx);
-                                        defer qjs.freeValue(runtime.ctx, exc);
-                                        if (qjs.toCString(runtime.ctx, exc)) |cstr| {
-                                            defer qjs.freeCString(runtime.ctx, cstr);
-                                            cli.fail("standalone execution failed: {s}", .{cstr});
-                                        } else {
-                                            cli.fail("standalone execution failed", .{});
-                                        }
-                                    }
-                                    const eval_res = qjs.evalFunction(runtime.ctx, obj);
-                                    defer qjs.freeValue(runtime.ctx, eval_res);
-                                    if (qjs.isException(eval_res) != 0) {
-                                        microtasks.had_error = true;
-                                        const exc = qjs.getException(runtime.ctx);
-                                        defer qjs.freeValue(runtime.ctx, exc);
-                                        if (qjs.toCString(runtime.ctx, exc)) |cstr| {
-                                            defer qjs.freeCString(runtime.ctx, cstr);
-                                            cli.fail("standalone execution failed: {s}", .{cstr});
-                                        }
-                                    }
+                                    sandbox.applyIfRequested();
+                                    if (!runtime.evalBytecode(bc)) microtasks.had_error = true;
                                     runAndExit(runtime);
                                     return;
                                 }
@@ -365,6 +355,7 @@ fn run(init: std.process.Init) !void {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
+            sandbox.applyIfRequested();
             interrupt.enterJs(0, interrupt.monotonicNowMs());
             if (!runtime.eval(code, "<eval>")) microtasks.had_error = true;
             interrupt.leaveJs(0);
@@ -380,6 +371,7 @@ fn run(init: std.process.Init) !void {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
+            sandbox.applyIfRequested();
             const allocator = std.heap.page_allocator;
             const buf = std.Io.Dir.cwd().readFileAllocOptions(
                 init.io,
@@ -395,28 +387,7 @@ fn run(init: std.process.Init) !void {
             const size = buf.len;
 
             if (std.mem.endsWith(u8, first_arg, ".ffbc")) {
-                const obj = qjs.readObject(runtime.ctx, buf.ptr, size, qjs.READ_OBJ_BYTECODE);
-                defer qjs.freeValue(runtime.ctx, obj);
-                if (qjs.isException(obj) != 0) {
-                    const exc = qjs.getException(runtime.ctx);
-                    defer qjs.freeValue(runtime.ctx, exc);
-                    if (qjs.toCString(runtime.ctx, exc)) |m| {
-                        defer qjs.freeCString(runtime.ctx, m);
-                        std.debug.print("Error: {s}\n", .{m});
-                    }
-                    std.process.exit(1);
-                }
-                const result = qjs.evalFunction(runtime.ctx, obj);
-                defer qjs.freeValue(runtime.ctx, result);
-                if (qjs.isException(result) != 0) {
-                    const exc = qjs.getException(runtime.ctx);
-                    defer qjs.freeValue(runtime.ctx, exc);
-                    if (qjs.toCString(runtime.ctx, exc)) |m| {
-                        defer qjs.freeCString(runtime.ctx, m);
-                        std.debug.print("Error: {s}\n", .{m});
-                    }
-                    std.process.exit(1);
-                }
+                if (!runtime.evalBytecode(buf[0..size])) microtasks.had_error = true;
                 runAndExit(runtime);
             } else {
                 const source: [:0]const u8 = buf;

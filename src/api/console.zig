@@ -1,11 +1,29 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
+const limits = @import("../util/limits.zig");
 const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 const RESET = "\x1b[0m";
 const GREEN = "\x1b[32m";
 
 const LINE_MAX = 4096;
+
+var log_bytes_written: std.atomic.Value(usize) = .{ .raw = 0 };
+var log_truncated_noticed: std.atomic.Value(bool) = .{ .raw = false };
+
+pub fn takeLogBudget(requested: usize, limit: usize, written: *std.atomic.Value(usize)) usize {
+    if (limit == 0) return requested;
+    var cur = written.load(.acquire);
+    while (true) {
+        if (cur >= limit) return 0;
+        const allowed = @min(requested, limit - cur);
+        if (written.cmpxchgWeak(cur, cur + allowed, .acq_rel, .acquire)) |actual| {
+            cur = actual;
+            continue;
+        }
+        return allowed;
+    }
+}
 
 fn appendChunk(buf: []u8, len: *usize, s: []const u8) void {
     const space = buf.len - len.*;
@@ -16,7 +34,14 @@ fn appendChunk(buf: []u8, len: *usize, s: []const u8) void {
 
 fn flush(buf: []u8, len: *usize) void {
     if (len.* == 0) return;
-    std.debug.print("{s}", .{buf[0..len.*]});
+    const requested = len.*;
+    const allowed = takeLogBudget(requested, limits.get().max_log_bytes, &log_bytes_written);
+    if (allowed > 0) {
+        std.debug.print("{s}", .{buf[0..allowed]});
+    }
+    if (allowed < requested and !log_truncated_noticed.swap(true, .acq_rel)) {
+        std.debug.print("\n[console] log limit exceeded; further output suppressed\n", .{});
+    }
     len.* = 0;
 }
 
@@ -173,4 +198,17 @@ pub fn setup(ctx: *c.Context) void {
     _ = c.definePropertyValueStr(ctx, console_obj, "timeEnd", time_end_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "console", console_obj, c.PROP_C_W_E);
+}
+
+test "takeLogBudget enforces cap without overflow" {
+    var written: std.atomic.Value(usize) = .{ .raw = 0 };
+    // limit == 0 is unlimited
+    try std.testing.expectEqual(@as(usize, 500), takeLogBudget(500, 0, &written));
+    try std.testing.expectEqual(@as(usize, 0), written.load(.acquire));
+
+    // exact fit, partial fit, then exhausted
+    try std.testing.expectEqual(@as(usize, 20), takeLogBudget(20, 32, &written));
+    try std.testing.expectEqual(@as(usize, 12), takeLogBudget(20, 32, &written));
+    try std.testing.expectEqual(@as(usize, 0), takeLogBudget(10, 32, &written));
+    try std.testing.expectEqual(@as(usize, 32), written.load(.acquire));
 }

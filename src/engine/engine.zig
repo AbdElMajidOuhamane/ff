@@ -203,6 +203,7 @@ pub const Runtime = struct {
         qjs.setMaxStackSize(rt, lim.stack_bytes);
         qjs.setMemoryLimit(rt, lim.heap_bytes);
         interrupt.registerRuntime(rt, 0, lim.cpu_budget_ms);
+        interrupt.setWallTimeout(lim.wall_timeout_ms);
         qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
 
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
@@ -599,6 +600,36 @@ pub const Runtime = struct {
                 reportAndFail(self, qjs.dupValue(self.ctx, pr));
                 return false;
             }
+        }
+
+        microtasks.pumpMicrotasks(self.ctx);
+        return true;
+    }
+
+    pub fn evalBytecode(self: *Runtime, bc: []const u8) bool {
+        interrupt.enterJs(0, interrupt.monotonicNowMs());
+        defer interrupt.leaveJs(0);
+
+        const obj = qjs.readObject(self.ctx, bc.ptr, bc.len, qjs.READ_OBJ_BYTECODE);
+        if (qjs.isException(obj) != 0) {
+            qjs.freeValue(self.ctx, obj);
+            reportAndFail(self, qjs.getException(self.ctx));
+            return false;
+        }
+
+        // JS_EvalFunction takes ownership of `obj`.
+        const result = qjs.evalFunction(self.ctx, obj);
+        defer qjs.freeValue(self.ctx, result);
+
+        if (qjs.isException(result) != 0) {
+            reportAndFail(self, qjs.getException(self.ctx));
+            return false;
+        }
+
+        if (qjs.promiseState(self.ctx, result) == 2) { // JS_PROMISE_REJECTED
+            const pr = qjs.promiseResult(self.ctx, result);
+            reportAndFail(self, qjs.dupValue(self.ctx, pr));
+            return false;
         }
 
         microtasks.pumpMicrotasks(self.ctx);

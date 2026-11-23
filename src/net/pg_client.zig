@@ -34,6 +34,7 @@ const xev = @import("xev");
 const c = @import("../c.zig").c;
 const counting = @import("../util/counting_allocator.zig");
 const tls_client = @import("tls_client.zig");
+const perm = @import("../security/permissions.zig");
 
 var pg_counter: counting.CountingAllocator = .{ .base = std.heap.smp_allocator };
 const gpa = if (builtin.mode == .Debug)
@@ -505,8 +506,12 @@ pub const Pool = struct {
             return;
         }
         if (self.conns.items.len < self.config.max) {
-            self.startConn(job) catch {
-                settleReject(job, "failed to start connection");
+            self.startConn(job) catch |err| {
+                const msg = if (err == error.PermissionDenied)
+                    "PermissionDenied: private network access denied (--deny-private-net)"
+                else
+                    "failed to start connection";
+                settleReject(job, msg);
             };
             return;
         }
@@ -525,6 +530,7 @@ pub const Pool = struct {
     fn startConn(self: *Pool, job: *Job) !void {
         const loop = g_loop orelse return error.NoLoop;
         const addr = try resolveHost(self.config.host, self.config.port);
+        if (perm.global().checkResolvedIp(addr) == .denied) return error.PermissionDenied;
         const tcp = try xev.TCP.init(addr);
         const conn = try gpa.create(Conn);
         conn.* = .{ .pool = self, .tcp = tcp };
