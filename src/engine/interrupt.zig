@@ -153,7 +153,7 @@ fn startMonitorIfNeeded() void {
     defer thread_mutex.unlock();
     if (!monitor_running.load(.acquire)) {
         monitor_running.store(true, .release);
-        monitor_thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, monitorLoop, .{}) catch null;
+        monitor_thread = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, monitorLoop, .{}) catch null;
     }
 }
 

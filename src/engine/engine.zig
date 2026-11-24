@@ -205,6 +205,7 @@ pub const Runtime = struct {
         interrupt.registerRuntime(rt, 0, lim.cpu_budget_ms);
         interrupt.setWallTimeout(lim.wall_timeout_ms);
         qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
+        qjs.setHostPromiseRejectionTracker(rt, microtasks.hostPromiseRejectionTracker, null);
 
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
 
@@ -512,6 +513,7 @@ pub const Runtime = struct {
         fetch_api.deinitClient();
         process_api.deinit(self.ctx);
         self.timer_manager.cancelAll();
+        microtasks.clearUnhandledRejections(self.ctx);
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
         qjs.freeRuntime(rt);
@@ -596,6 +598,7 @@ pub const Runtime = struct {
         if (is_module) {
             const ps = qjs.promiseState(self.ctx, result);
             if (ps == 2) { // JS_PROMISE_REJECTED
+                microtasks.discardRejection(self.ctx, result);
                 const pr = qjs.promiseResult(self.ctx, result);
                 reportAndFail(self, qjs.dupValue(self.ctx, pr));
                 return false;
@@ -627,6 +630,7 @@ pub const Runtime = struct {
         }
 
         if (qjs.promiseState(self.ctx, result) == 2) { // JS_PROMISE_REJECTED
+            microtasks.discardRejection(self.ctx, result);
             const pr = qjs.promiseResult(self.ctx, result);
             reportAndFail(self, qjs.dupValue(self.ctx, pr));
             return false;

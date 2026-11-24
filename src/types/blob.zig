@@ -381,9 +381,10 @@ pub fn setup(ctx: ?*c.Context) void {
         const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
         _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
-    c.setClassProto(ctx, blob_class_id, proto);
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const ctor = c.newCFunction2(ctx, &blobConstructor, "Blob", 2, c.JS_CFUNC_constructor, 0);
+    _ = c.setConstructor(ctx, ctor, proto);
+    c.setClassProto(ctx, blob_class_id, proto);
     _ = c.definePropertyValueStr(ctx, global, "Blob", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
 }

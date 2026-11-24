@@ -32,7 +32,14 @@ fn timersAlive() bool {
 // legitimately lead active by one.
 inline fn unrefArmed() usize {
     const tm_unref = if (timer_mgr) |tm| tm.unrefScheduledCount() else 0;
-    return tm_unref + process_api.unrefSignalCount() + worker_mod.unrefAsyncCount();
+    return tm_unref +
+        process_api.unrefSignalCount() +
+        worker_mod.unrefAsyncCount() +
+        fs_mod.unrefAsyncCount() +
+        ffi_api.unrefAsyncCount() +
+        bcrypt_pool.unrefAsyncCount() +
+        ws_client.unrefAsyncCount() +
+        async_fetch.unrefAsyncCount();
 }
 
 pub const EventLoop = struct {
@@ -216,5 +223,6 @@ pub const EventLoop = struct {
                 idle_delay_ns = IDLE_MIN_NS;
             }
         }
+        microtasks.flushUnhandledRejections(ctx);
     }
 };

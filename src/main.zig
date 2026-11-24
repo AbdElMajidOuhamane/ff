@@ -177,7 +177,7 @@ fn resetIgnoredInterrupt() void {
 fn maybeStartParentWatchdog() void {
     const env = std.c.getenv("FF_WATCH_PARENT") orelse return;
     const parent = std.fmt.parseInt(std.posix.pid_t, std.mem.span(env), 10) catch return;
-    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parentWatchdog, .{parent}) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, parentWatchdog, .{parent}) catch return;
     t.detach();
 }
 

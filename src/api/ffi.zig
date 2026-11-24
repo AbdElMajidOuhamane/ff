@@ -829,10 +829,18 @@ pub fn ensureArmed() void {
     async_h.wait(l, &async_comp, void, null, asyncCb);
 }
 
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0 and bridge_pending.load(.acquire) == 0) return 1;
+    return 0;
+}
+
 fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!void) xev.CallbackAction {
     _ = ud;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);

@@ -328,5 +328,22 @@ const stCpuPull = await cCpuPull.wait();
 const outCpuPull = decode(cCpuPull.stdout) + decode(cCpuPull.stderr);
 check("cpu budget terminates infinite loop inside pull callback", stCpuPull.code === 0 && outCpuPull.includes("PULL_INTERRUPT_OK"));
 
+// 18. fs.readFileAsync settles and exits cleanly without hanging on idle xev.Async
+const cFsOk = child_process.spawn(process.argv[0], [
+  "--allow-read",
+  "-e",
+  "(async () => { const s = await fs.readFileAsync('build.zig'); if (!s.length) process.exit(2); })()",
+]);
+const stFsOk = await cFsOk.wait();
+check("fs.readFileAsync resolves and process exits 0 cleanly", stFsOk.code === 0);
+
+const cFsErr = child_process.spawn(process.argv[0], [
+  "--allow-read",
+  "-e",
+  "(async () => { await fs.readFileAsync('build.zig'); throw new Error('after_fs'); })()",
+]);
+const stFsErr = await cFsErr.wait();
+check("unhandled error after fs.readFileAsync exits 1 cleanly", stFsErr.code === 1);
+
 done("new_features");
 process.exit(0);

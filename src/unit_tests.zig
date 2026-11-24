@@ -80,3 +80,11 @@ test {
 test {
     _ = @import("api/console.zig");
 }
+
+test {
+    _ = @import("event/microtasks.zig");
+}
+
+test {
+    _ = @import("api/fs.zig");
+}

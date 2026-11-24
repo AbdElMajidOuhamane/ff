@@ -997,13 +997,22 @@ pub fn ensureArmed() void {
     if (async_armed) return;
     if (g_loop) |l| arm(l);
 }
+
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0 and doneMask() == 0) return 1;
+    return 0;
+}
+
 pub fn setLoop(l: *xev.Loop) void {
     g_loop = l;
 }
 fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!void) xev.CallbackAction {
     _ = ud;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);
