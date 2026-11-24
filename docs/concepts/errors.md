@@ -144,7 +144,7 @@ Permission denial is different:
 | Handler never settles | `504 Gateway Timeout` after 30 s |
 | Response body over 10 MB | `500` |
 | HTTP/2 `ReadableStream` response body | `501 Not Implemented` |
-| Route-object URL over 4096 bytes | `414 URI Too Long` |
+| Request head / URL over 4096 bytes (HTTP/1.1) or `:path` over 512 bytes (HTTP/2) | `431 Request Header Fields Too Large` (HTTP/1.1) or `400 Bad Request` (HTTP/2) before routing (route-level `414` is unreachable) |
 | HTTP/1.1 malformed framing | `400 Bad Request` |
 | Request headers over 4 KB (HTTP/1.1) or 64 KB (HTTP/2) | `431 Request Header Fields Too Large` |
 | Request body over 1 MB (HTTP/1.1) | `413 Payload Too Large` (HTTP/2 caps at 10 MB/stream, 16 MB/session) |

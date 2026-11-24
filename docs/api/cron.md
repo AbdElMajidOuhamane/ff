@@ -30,7 +30,7 @@ ff.cron(name: string, schedule: string, callback: () => void) → undefined
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `name` | `string` | Job identifier used in diagnostic messages. |
+| `name` | `string` | Job identifier used in diagnostic messages (truncated to 128 bytes). |
 | `schedule` | `string` | `@every <N><unit>` interval or 5-field UTC cron expression. |
 | `callback` | `() => void` | Function invoked on each trigger (`this` is `undefined`, 0 args). |
 
@@ -70,6 +70,7 @@ minute  hour  day-of-month  month  day-of-week
 | Area | Cap | When hit |
 |---|---|---|
 | Registered cron jobs | `32` | Throws `TypeError: Max cron jobs (32) exceeded` |
+| Job name length | `128` bytes | Silently truncated to 128 bytes |
 | Shared timer table | `128` live slots | Shares slots with `setTimeout` / `setInterval` / `AbortSignal.timeout`; throws `TypeError: failed to schedule cron timer (timer table full)` |
 | Future match window | `366` days | Throws `TypeError: cron schedule will never match in the next 366 days` |
 | Cancellation | None | Jobs remain active for the process lifetime |

@@ -26,15 +26,17 @@ codebase makes the rest of the documentation predictable.
 │   util/    cli, limits, env_file                 │
 │   api/     console, fs, process, stdio, crypto,  │
 │            url, text_encoding, fetch, websocket, │
-│            udp, cron, child_process, sqlite,     │
-│            sql, ffi, permissions                 │
+│            websocket_client, udp, cron,          │
+│            child_process, sqlite, sql, ffi,      │
+│            permissions                           │
 │   net/     http_native (512-slot server),        │
 │            http2_server, pg_client, async_fetch, │
 │            tcp_api, udp_native, ws_*, tls*, proxy│
 │   event/   loop, timers, microtasks              │
 │   types/   Headers, Request, Response, Blob,     │
 │            FormData, ReadableStream, PoolSlice   │
-│   worker/  worker, message_port, serialize       │
+│   worker/  worker, message_port, serialize,      │
+│            thread_marker                         │
 │   commands/ init, imprint, sever, start, test,   │
 │            repl, compile, fmt, upgrade, watch    │
 └──────────────────┬───────────────────────────────┘

@@ -85,7 +85,7 @@ boundary for hostile code.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | `16384` bytes (`16 KB`) per message | Server and client RX close with `1009` when a frame or assembled message exceeds `16384` bytes (client frames over the 64 KiB `RDBUF` die with `1006` first). On the server a single frame is additionally bounded by the 4 KiB `READ_BUF_SIZE` staging buffer, so a 4 KB-16 KB frame kills the connection without a Close frame. Server TX fits at most 16,370 B of payload (16 KiB write buffer minus the frame header); larger sends close `1009`. Client TX silently truncates at `16384` bytes |
+| Message size | `16384` bytes (`16 KB`) per message | Server and client RX close with `1009` when a frame or assembled message exceeds `16384` bytes (server RX streams single frames > 4 KiB across reads into the `16384`-byte message buffer; client frames over the 64 KiB `RDBUF` die with `1006` first). Server TX fits at most 16,370 B of payload (16 KiB write buffer minus the frame header); larger sends close `1009`. Client TX silently truncates at `16384` bytes |
 | Handshake URL path (client) | 512 bytes | Longer paths fail; CRLF/control characters rejected. The server has no 512-byte path limit — the whole request head must fit 4 KiB |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
 | Control frames | Max 125 bytes payload (`123` B close reason), no reserved opcodes | Malformed control frames close connection |

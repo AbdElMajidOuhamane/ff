@@ -193,6 +193,7 @@ ff client.js --allow-net=api.example.com:443
 | `sendBinary(buf)` | Send bytes (`ArrayBuffer` / `Uint8Array`); throws `TypeError: WebSocket: send buffer full` if called before `OPEN` or when the send buffer is full |
 | `close(code?, reason?)` | Graceful close, e.g. `ws.close(1000, "done")` |
 | `readyState` | `0` connecting, `1` open, `2` closing, `3` closed |
+| `CONNECTING` / `OPEN` / `CLOSING` / `CLOSED` | Ready-state constants (`0`, `1`, `2`, `3`) on both the `WebSocket` constructor and instances |
 | `onopen` / `onmessage` / `onclose` / `onerror` | Event handlers; `ev.data` is `string` or `Uint8Array` |
 
 Only `ws://` and `wss://` URLs are accepted. For `wss://` to private CAs, the same trust rules as `fetch` apply (`--ca` for scripts, `FF_CA_FILE` for `ff start`). Trust does not replace the `--allow-net` grant — you need both.
@@ -289,7 +290,7 @@ Connect clients with `--allow-net=127.0.0.1:3000`.
 | Area | Limit | When hit |
 |------|-------|----------|
 | Client sockets | 64 per process | Extra connects fail |
-| Message size | `16384` bytes (`16 KB`) per message | Server and client RX close with `1009` when a frame or assembled fragmented message exceeds `16384` bytes (client frames over the 64 KiB `RDBUF` close with `1006` first). On the server a single inbound frame is additionally bounded by the 4 KiB `READ_BUF_SIZE` staging buffer, so a 4 KB–16 KB frame closes the connection without a Close frame. Server TX fits at most `16370` bytes of payload (16 KiB write buffer minus the 14-byte frame header); larger sends close with `1009`. Client TX silently truncates at `16384` bytes |
+| Message size | `16384` bytes (`16 KB`) per message | Server and client RX close with `1009` when a frame or assembled fragmented message exceeds `16384` bytes (server RX streams single frames > 4 KiB across reads into the `16384`-byte message buffer; client frames over the 64 KiB `RDBUF` close with `1006` first). Server TX fits at most `16370` bytes of payload (16 KiB write buffer minus the 14-byte frame header); larger sends close with `1009`. Client TX silently truncates at `16384` bytes |
 | Handshake URL path (client) | 512 bytes | Longer paths fail; CRLF/control characters rejected. The server has no 512-byte path limit — the whole request head must fit 4 KiB |
 | Frame masking | Required from clients per RFC 6455 | Server rejects unmasked client frames and closes socket |
 | Control frames | Max 125 bytes payload, no reserved opcodes | Malformed control frames close connection |

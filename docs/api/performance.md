@@ -87,7 +87,7 @@ human-visible timings in logs.
   `0.041000000000000002` noise.
 - Sub-millisecond values are real but coarse — single samples are noise;
   average over iterations.
-- In Workers each runtime has its **own** origin.
+- In Workers `performance.now()` shares the process-wide `perf_origin_ns` origin latched on the first call.
 
 ## See also
 

@@ -152,7 +152,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~41k lines of Zig across 85 files
+- **The whole codebase should fit in your head** — ~42k lines of Zig across 90 files
 
 It's *not* aimed at:
 
@@ -514,7 +514,7 @@ Database:
 
 - `fetch`: **16** concurrent slots, HTTP/1.1, **16 MB** response body cap (declared `Content-Length` and decompression), 30 s I/O timeout, max 5 redirects (cross-origin redirects strip `authorization`, `cookie`, `x-api-key`), RFC 7230 header validation
 - `AbortController` and `AbortSignal` supported (`init.signal`, `req.signal`, `AbortSignal.timeout(ms)`, `throwIfAborted()`); `timeout` and `redirect` init keys are ignored
-- WebSocket: **64** client sockets, 16384-byte messages (larger sends truncate), client supports `sendBinary(buf)` as well as text `send(str)`, RFC 6455 client masking required, max 125-byte control frames, strict UTF-8 validation on text frames, generation-tagged `{slot, gen}` socket handles
+- WebSocket: **64** client sockets, 16384-byte messages (client TX truncates above `16384` bytes; server TX closes with `1009` above `16370` bytes), client supports `sendBinary(buf)` as well as text `send(str)`, RFC 6455 client masking required, max 125-byte control frames, strict UTF-8 validation on text frames, generation-tagged `{slot, gen}` socket handles
 - Outbound TLS connection pool: **64**
 - Proxies: HTTP proxies only (no SOCKS), configured via `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
 
