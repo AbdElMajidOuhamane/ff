@@ -177,6 +177,7 @@ pub fn releaseData(d: *ResponseData) void {
         return;
     }
     respPoolUnlock();
+    d.pool.deinit(gpa);
     gpa.destroy(d);
 }
 
@@ -1079,4 +1080,34 @@ test "bodyForParse: zero-copy pool body, NUL copy for owned body" {
     try std.testing.expectEqualStrings("abc", z3);
     try std.testing.expectEqual(@intFromPtr(&scratch), @intFromPtr(z3.ptr));
     try std.testing.expect(heap_z == null);
+}
+
+test "releaseData frees pool buffer on freelist overflow" {
+    const N = RESP_POOL_MAX + 8;
+    var items: [N]*ResponseData = undefined;
+    var count: usize = 0;
+    defer {
+        for (0..count) |i| releaseData(items[i]);
+        while (resp_pool_n > 0) {
+            resp_pool_n -= 1;
+            const d = resp_pool[resp_pool_n];
+            d.pool.deinit(gpa);
+            gpa.destroy(d);
+        }
+    }
+
+    for (0..N) |i| {
+        const d = acquire().?;
+        const retained = d.pool;
+        d.* = try ResponseData.initWithPool(retained);
+        try d.setBody("{\"ok\":true,\"payload\":\"overflow-check\"}");
+        items[i] = d;
+        count += 1;
+    }
+
+    while (count > 0) {
+        count -= 1;
+        releaseData(items[count]);
+    }
+    try std.testing.expectEqual(RESP_POOL_MAX, resp_pool_n);
 }
