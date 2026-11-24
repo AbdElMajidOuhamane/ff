@@ -88,7 +88,7 @@ cov:
 	zig build fuzz:build -Doptimize=ReleaseSafe $(ZIGFLAGS)
 	$(KCOV) --include-path=./src kcov-output ./zig-out/bin/fuzz smoke
 	@for s in 123 124 125 126 127; do \
-		for t in ws_frame http_request semver tls_pem utf8 http2_stream permissions limits; do \
+		for t in ws_frame http_request semver tls_pem utf8 http2_stream permissions limits cron env_file formdata url pg_dsn; do \
 			$(KCOV) --include-path=./src kcov-output ./zig-out/bin/fuzz $$t $$s --events-max=200000 || exit 1; \
 		done; \
 	done

@@ -549,3 +549,85 @@ pub fn parseBody(fd: *FormData, content_type: []const u8, body: []const u8) bool
     }
     return false;
 }
+
+test "FormData CRUD operations" {
+    var fd = FormData.init();
+    defer fd.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), fd.len());
+    try std.testing.expect(fd.firstIndex("missing") == null);
+
+    fd.appendText("k", "v1");
+    fd.appendText("k", "v2");
+    fd.appendFile("upload", "abc", "note.txt", "  Text/Plain ; charset=utf-8 ");
+    try std.testing.expectEqual(@as(usize, 3), fd.len());
+
+    const idx = fd.firstIndex("upload").?;
+    const fe = fd.entries.items[idx];
+    try std.testing.expect(fe.is_file);
+    try std.testing.expectEqualStrings("upload", fd.nameOf(fe));
+    try std.testing.expectEqualStrings("abc", fd.valueOf(fe));
+    try std.testing.expectEqualStrings("note.txt", fd.bytesOf(fe.filename));
+    try std.testing.expectEqualStrings("text/plain", fd.bytesOf(fe.content_type));
+
+    fd.setText("k", "replaced");
+    try std.testing.expectEqual(@as(usize, 2), fd.len());
+    try std.testing.expectEqualStrings("replaced", fd.valueOf(fd.entries.items[fd.firstIndex("k").?]));
+
+    fd.deleteAll("upload");
+    try std.testing.expectEqual(@as(usize, 1), fd.len());
+    try std.testing.expect(fd.firstIndex("upload") == null);
+}
+
+test "parseBody urlencoded, multipart, and error cases" {
+    {
+        var fd = FormData.init();
+        defer fd.deinit();
+        try std.testing.expect(parseBody(&fd, "text/plain", ""));
+        try std.testing.expectEqual(@as(usize, 0), fd.len());
+        try std.testing.expect(!parseBody(&fd, "application/json", "{}"));
+        try std.testing.expect(!parseBody(&fd, ";boundary=x", "abc"));
+        try std.testing.expect(!parseBody(&fd, "multipart/form-data", "abc"));
+        try std.testing.expect(!parseBody(&fd, "multipart/form-data; foo=bar", "abc"));
+    }
+
+    {
+        var fd = FormData.init();
+        defer fd.deinit();
+        try std.testing.expect(parseBody(&fd, "application/x-www-form-urlencoded; charset=utf-8", "a=hello+world%21&&flag&bad=%ZZ%2F"));
+        try std.testing.expectEqual(@as(usize, 3), fd.len());
+        try std.testing.expectEqualStrings("a", fd.nameOf(fd.entries.items[0]));
+        try std.testing.expectEqualStrings("hello world!", fd.valueOf(fd.entries.items[0]));
+        try std.testing.expectEqualStrings("flag", fd.nameOf(fd.entries.items[1]));
+        try std.testing.expectEqualStrings("", fd.valueOf(fd.entries.items[1]));
+        try std.testing.expectEqualStrings("bad", fd.nameOf(fd.entries.items[2]));
+        try std.testing.expectEqualStrings("%ZZ/", fd.valueOf(fd.entries.items[2]));
+    }
+
+    {
+        var fd = FormData.init();
+        defer fd.deinit();
+        const mp =
+            "preamble\r\n" ++
+            "--bnd\r\n" ++
+            "Content-Disposition: form-data; name=\"field\"\r\n\r\n" ++
+            "value1\r\n" ++
+            "--bnd\r\n" ++
+            "Content-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n" ++
+            "Content-Type:   Application/Octet-Stream  \r\n\r\n" ++
+            "BIN\r\n" ++
+            "--bnd\r\n" ++
+            "Content-Disposition: form-data\r\n\r\n" ++
+            "ignored-without-name\r\n" ++
+            "--bnd--\r\n";
+        try std.testing.expect(parseBody(&fd, "multipart/form-data; boundary=\"bnd\" ", mp));
+        try std.testing.expectEqual(@as(usize, 2), fd.len());
+        try std.testing.expectEqualStrings("field", fd.nameOf(fd.entries.items[0]));
+        try std.testing.expectEqualStrings("value1", fd.valueOf(fd.entries.items[0]));
+        try std.testing.expect(!fd.entries.items[0].is_file);
+        try std.testing.expect(fd.entries.items[1].is_file);
+        try std.testing.expectEqualStrings("file", fd.nameOf(fd.entries.items[1]));
+        try std.testing.expectEqualStrings("BIN", fd.valueOf(fd.entries.items[1]));
+        try std.testing.expectEqualStrings("a.bin", fd.bytesOf(fd.entries.items[1].filename));
+    }
+}

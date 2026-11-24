@@ -4,6 +4,7 @@ const loop_mod = @import("../event/loop.zig");
 const microtasks = @import("../event/microtasks.zig");
 
 pub const MAX_CRON = 32;
+pub const MAX_NAME_LEN: usize = 128;
 
 pub const CronSchedule = union(enum) {
     interval_ms: u64,
@@ -19,18 +20,22 @@ pub const CronSchedule = union(enum) {
 };
 
 pub const CronJob = struct {
-    name: []const u8,
-    schedule: []const u8,
+    name_buf: [MAX_NAME_LEN]u8 = undefined,
+    name_len: u8 = 0,
     handler: c.Value,
     sched: CronSchedule,
     timer_slot: ?usize = null,
+
+    pub fn nameSlice(self: *const CronJob) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
 };
 
 pub var cron_jobs: [MAX_CRON]CronJob = undefined;
 pub var cron_count: usize = 0;
 
-fn parseSingleField(field: []const u8, min_val: u8, max_val: u8) ?u64 {
-    if (field.len == 0) return null;
+pub fn parseSingleField(field: []const u8, min_val: u8, max_val: u8) ?u64 {
+    if (field.len == 0 or max_val >= 64) return null;
     var mask: u64 = 0;
     var parts = std.mem.splitScalar(u8, field, ',');
     while (parts.next()) |part| {
@@ -69,7 +74,7 @@ fn parseSingleField(field: []const u8, min_val: u8, max_val: u8) ?u64 {
     return mask;
 }
 
-fn parseSchedule(schedule: []const u8) ?CronSchedule {
+pub fn parseSchedule(schedule: []const u8) ?CronSchedule {
     const trimmed = std.mem.trim(u8, schedule, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed, "@every ")) {
         const rest = std.mem.trim(u8, trimmed["@every ".len..], " \t");
@@ -80,11 +85,13 @@ fn parseSchedule(schedule: []const u8) ?CronSchedule {
         } else if (std.mem.endsWith(u8, rest, "s")) {
             const num = rest[0 .. rest.len - 1];
             const s = std.fmt.parseInt(u64, num, 10) catch return null;
-            return .{ .interval_ms = s * 1000 };
+            const ms = std.math.mul(u64, s, 1000) catch return null;
+            return .{ .interval_ms = ms };
         } else if (std.mem.endsWith(u8, rest, "m")) {
             const num = rest[0 .. rest.len - 1];
             const m = std.fmt.parseInt(u64, num, 10) catch return null;
-            return .{ .interval_ms = m * 60 * 1000 };
+            const ms = std.math.mul(u64, m, 60 * 1000) catch return null;
+            return .{ .interval_ms = ms };
         } else {
             return null;
         }
@@ -120,7 +127,9 @@ fn parseSchedule(schedule: []const u8) ?CronSchedule {
     };
 }
 
-fn computeNextFireDelay(sched_fields: anytype, now_ts: i64) ?u64 {
+pub fn computeNextFireDelay(sched_fields: anytype, now_ts: i64) ?u64 {
+    // EpochSeconds year math uses u16 year (~65535); negative or far-future timestamps cannot schedule safely.
+    if (now_ts < 0 or now_ts > 1_900_000_000_000) return null;
     const cur_min_sec = @divFloor(now_ts, 60) * 60;
     var check_sec: i64 = cur_min_sec + 60;
     const max_sec: i64 = cur_min_sec + (366 * 86400);
@@ -138,7 +147,7 @@ fn computeNextFireDelay(sched_fields: anytype, now_ts: i64) ?u64 {
         const dow = @as(u3, @intCast(@mod(epoch_day.day + 4, 7)));
 
         if (((@as(u16, 1) << @truncate(mon)) & sched_fields.mon) == 0) {
-            check_sec += 86400;
+            check_sec = (@divFloor(check_sec, 86400) + 1) * 86400;
             continue;
         }
 
@@ -157,12 +166,12 @@ fn computeNextFireDelay(sched_fields: anytype, now_ts: i64) ?u64 {
             true;
 
         if (!day_matches) {
-            check_sec += 86400;
+            check_sec = (@divFloor(check_sec, 86400) + 1) * 86400;
             continue;
         }
 
         if (((@as(u32, 1) << @truncate(hour)) & sched_fields.hour) == 0) {
-            check_sec += 3600;
+            check_sec = (@divFloor(check_sec, 3600) + 1) * 3600;
             continue;
         }
 
@@ -204,18 +213,18 @@ fn cronTrampoline(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     switch (job.sched) {
         .fields => |f| {
             const next_delay = computeNextFireDelay(f, getTimestampSec()) orelse {
-                std.debug.print("cron '{s}': no future fire time found\n", .{job.name});
+                std.debug.print("cron '{s}': no future fire time found\n", .{job.nameSlice()});
                 return c.JS_UNDEFINED;
             };
             const tm = loop_mod.timer_mgr orelse {
-                std.debug.print("cron '{s}': timer manager not available\n", .{job.name});
+                std.debug.print("cron '{s}': timer manager not available\n", .{job.nameSlice()});
                 return c.JS_UNDEFINED;
             };
             const trampoline_fn = c.newCFunction(ctx, cronTrampoline, "cronTrampoline", 1);
             defer c.freeValue(ctx, trampoline_fn);
             var tramp_argv = [_]c.Value{c.newInt32(ctx, job_idx)};
             job.timer_slot = tm.setTimeout(ctx.?, trampoline_fn, next_delay, &tramp_argv) catch |err| {
-                std.debug.print("cron '{s}': failed to re-arm timer: {s}\n", .{ job.name, @errorName(err) });
+                std.debug.print("cron '{s}': failed to re-arm timer: {s}\n", .{ job.nameSlice(), @errorName(err) });
                 return c.JS_UNDEFINED;
             };
         },
@@ -250,9 +259,6 @@ fn cronRegisterCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: 
         return c.throwTypeError(ctx, "timer manager not initialized");
     };
 
-    const name = std.heap.page_allocator.dupe(u8, n_cstr[0..n_len]) catch return c.throwOutOfMemory(ctx);
-    const sched_owned = std.heap.page_allocator.dupe(u8, sched_str) catch return c.throwOutOfMemory(ctx);
-
     const job_idx = cron_count;
     var timer_slot: ?usize = null;
 
@@ -275,13 +281,15 @@ fn cronRegisterCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: 
         },
     }
 
+    const raw_name = n_cstr[0..n_len];
+    const copy_len = @min(raw_name.len, MAX_NAME_LEN);
     cron_jobs[cron_count] = .{
-        .name = name,
-        .schedule = sched_owned,
+        .name_len = @intCast(copy_len),
         .handler = c.dupValue(ctx, argv[2]),
         .sched = sched,
         .timer_slot = timer_slot,
     };
+    @memcpy(cron_jobs[cron_count].name_buf[0..copy_len], raw_name[0..copy_len]);
     cron_count += 1;
     return c.JS_UNDEFINED;
 }
@@ -301,4 +309,122 @@ pub fn setup(ctx: *c.Context) void {
     const cron_fn = c.newCFunction(ctx, cronRegisterCallback, "cron", 3);
     _ = c.definePropertyValueStr(ctx, ff_obj, "cron", cron_fn, c.PROP_C_W_E);
     _ = c.definePropertyValueStr(ctx, global, "ff", ff_obj, c.PROP_C_W_E);
+}
+
+test "CronJob inline nameSlice and parseSchedule" {
+    var empty = CronJob{
+        .handler = c.JS_UNDEFINED,
+        .sched = .{ .interval_ms = 10 },
+    };
+    try std.testing.expectEqualStrings("", empty.nameSlice());
+
+    const label = "cleanup-job";
+    @memcpy(empty.name_buf[0..label.len], label);
+    empty.name_len = label.len;
+    try std.testing.expectEqualStrings("cleanup-job", empty.nameSlice());
+
+    const long = "a" ** (MAX_NAME_LEN + 16);
+    const trunc_len = @min(long.len, MAX_NAME_LEN);
+    @memcpy(empty.name_buf[0..trunc_len], long[0..trunc_len]);
+    empty.name_len = @intCast(trunc_len);
+    try std.testing.expectEqual(MAX_NAME_LEN, empty.nameSlice().len);
+
+    const sched = parseSchedule("@every 20ms").?;
+    try std.testing.expectEqual(@as(u64, 20), sched.interval_ms);
+}
+
+test "parseSingleField ranges, steps, lists, and invalid syntax" {
+    // Wildcard
+    const all_dow = parseSingleField("*", 0, 7).?;
+    try std.testing.expectEqual(@as(u64, 0b11111111), all_dow);
+
+    // Step on wildcard
+    const qtr_hour = parseSingleField("*/15", 0, 59).?;
+    try std.testing.expect((qtr_hour & (@as(u64, 1) << 0)) != 0);
+    try std.testing.expect((qtr_hour & (@as(u64, 1) << 15)) != 0);
+    try std.testing.expect((qtr_hour & (@as(u64, 1) << 30)) != 0);
+    try std.testing.expect((qtr_hour & (@as(u64, 1) << 45)) != 0);
+    try std.testing.expect((qtr_hour & (@as(u64, 1) << 10)) == 0);
+
+    // Range + step + comma list
+    const list_mask = parseSingleField("1-5/2,10,12-14", 0, 23).?;
+    for ([_]u6{ 1, 3, 5, 10, 12, 13, 14 }) |b| {
+        try std.testing.expect((list_mask & (@as(u64, 1) << b)) != 0);
+    }
+    try std.testing.expect((list_mask & (@as(u64, 1) << 2)) == 0);
+
+    // Invalid expressions
+    try std.testing.expect(parseSingleField("", 0, 59) == null);
+    try std.testing.expect(parseSingleField("1,,2", 0, 59) == null);
+    try std.testing.expect(parseSingleField("*/0", 0, 59) == null);
+    try std.testing.expect(parseSingleField("*/abc", 0, 59) == null);
+    try std.testing.expect(parseSingleField("5-3", 0, 59) == null);
+    try std.testing.expect(parseSingleField("0-12", 1, 12) == null);
+    try std.testing.expect(parseSingleField("1-32", 1, 31) == null);
+    try std.testing.expect(parseSingleField("0", 1, 31) == null);
+    try std.testing.expect(parseSingleField("60", 0, 59) == null);
+    try std.testing.expect(parseSingleField("abc", 0, 59) == null);
+    try std.testing.expect(parseSingleField("*", 0, 64) == null);
+}
+
+test "parseSchedule @every and 5-field expressions" {
+    try std.testing.expectEqual(@as(u64, 5000), parseSchedule("  @every   5s ").?.interval_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), parseSchedule("@every 2m").?.interval_ms);
+    try std.testing.expect(parseSchedule("@every 99999999999999999s") == null);
+    try std.testing.expect(parseSchedule("@every 99999999999999999m") == null);
+    try std.testing.expect(parseSchedule("@every 10h") == null);
+    try std.testing.expect(parseSchedule("@every badms") == null);
+
+    try std.testing.expect(parseSchedule("* * * *") == null);
+    try std.testing.expect(parseSchedule("* * * * * *") == null);
+    try std.testing.expect(parseSchedule("60 * * * *") == null);
+    try std.testing.expect(parseSchedule("* 24 * * *") == null);
+    try std.testing.expect(parseSchedule("* * 0 * *") == null);
+    try std.testing.expect(parseSchedule("* * * 13 *") == null);
+    try std.testing.expect(parseSchedule("* * * * 8") == null);
+
+    const f1 = parseSchedule("  30   14  *   1   *  ").?.fields;
+    try std.testing.expect(!f1.dom_restricted);
+    try std.testing.expect(!f1.dow_restricted);
+
+    const f2 = parseSchedule("0 12 15 * 1").?.fields;
+    try std.testing.expect(f2.dom_restricted);
+    try std.testing.expect(f2.dow_restricted);
+}
+
+test "computeNextFireDelay handles normal, Vixie OR, Sunday 7, impossible dates, and negative ts" {
+    // 2024-01-01 00:00:30 UTC (Monday; epoch = 1704067230)
+    const base_ts: i64 = 1704067230;
+
+    // Next minute is 00:01:00 -> 30s later = 30_000 ms
+    const every_min = parseSchedule("* * * * *").?.fields;
+    try std.testing.expectEqual(@as(?u64, 30_000), computeNextFireDelay(every_min, base_ts));
+
+    // Month skip: February (* * * 2 *) -> Feb 1 00:00:00 (31 days * 86400 - 30)
+    const feb = parseSchedule("0 0 * 2 *").?.fields;
+    try std.testing.expectEqual(@as(?u64, (31 * 86400 - 30) * 1000), computeNextFireDelay(feb, base_ts));
+
+    // DOM only: 2nd of Jan -> 1 day - 30s
+    const dom_only = parseSchedule("0 0 2 * *").?.fields;
+    try std.testing.expectEqual(@as(?u64, (86400 - 30) * 1000), computeNextFireDelay(dom_only, base_ts));
+
+    // DOW only with Sunday=7: 2024-01-01 is Mon(1), Sunday is Jan 7 (+6 days)
+    const dow_sun7 = parseSchedule("0 0 * * 7").?.fields;
+    try std.testing.expectEqual(@as(?u64, (6 * 86400 - 30) * 1000), computeNextFireDelay(dow_sun7, base_ts));
+
+    // Vixie OR: DOM=15 OR DOW=Tuesday(2). From Mon Jan 1 00:00:30, Tue Jan 2 matches first!
+    const vixie = parseSchedule("0 0 15 * 2").?.fields;
+    try std.testing.expectEqual(@as(?u64, (86400 - 30) * 1000), computeNextFireDelay(vixie, base_ts));
+
+    // Specific minute loop (hour matches, minute advances past base)
+    const min5 = parseSchedule("5 0 1 1 *").?.fields;
+    try std.testing.expectEqual(@as(?u64, (5 * 60 - 30) * 1000), computeNextFireDelay(min5, base_ts));
+
+    // Impossible calendar date (Feb 31) returns null within 366-day horizon
+    const impossible = parseSchedule("0 0 31 2 *").?.fields;
+    try std.testing.expect(computeNextFireDelay(impossible, base_ts) == null);
+
+    // Out-of-bounds timestamps return null safely
+    try std.testing.expect(computeNextFireDelay(every_min, -1) == null);
+    try std.testing.expect(computeNextFireDelay(every_min, 2_000_000_000_000) == null);
 }

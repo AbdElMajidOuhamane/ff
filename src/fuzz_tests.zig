@@ -16,6 +16,11 @@ const Fuzzers = .{
     .utf8 = @import("api/text_encoding_fuzz.zig"),
     .permissions = @import("security/permissions_fuzz.zig"),
     .limits = @import("util/limits_fuzz.zig"),
+    .cron = @import("api/cron_fuzz.zig"),
+    .env_file = @import("util/env_file_fuzz.zig"),
+    .formdata = @import("types/formdata_fuzz.zig"),
+    .url = @import("api/url_fuzz.zig"),
+    .pg_dsn = @import("api/sql_fuzz.zig"),
     // A fuzzer that intentionally fails, to test fuzzing infrastructure itself.
     .canary = {},
     // Quickly run all fuzzers as a smoke test.

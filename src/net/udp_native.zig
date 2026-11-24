@@ -877,3 +877,32 @@ test "udp open/isValid generation fencing" {
     try std.testing.expect(!isOwned(s, g));
     try std.testing.expect(!isValid(s, g));
 }
+
+test "udp SockAddr text, formatIp6 tie-breaking/trailing/single-zero, send op pool, and stale closeCb" {
+    var sa = SockAddr{ .port = 8080, .is_v6 = true };
+    const s1 = formatIp6(.{ 0x20, 0x01, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 3 }, &sa.text_buf);
+    sa.text_len = @intCast(s1.len);
+    try std.testing.expectEqualStrings("2001::1:0:0:2:3", sa.text());
+
+    var buf2: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("2001:db8::", formatIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &buf2));
+
+    var buf3: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("2001:db8:0:1:2:3:4:5", formatIp6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5 }, &buf3));
+
+    const op1 = allocSendOp().?;
+    try std.testing.expect(send_used[op1]);
+    freeSendOp(op1);
+    try std.testing.expect(!send_used[op1]);
+
+    init();
+    const slot = try open(false);
+    const gen = genOf(slot);
+    try std.testing.expect(peerOf(slot) == null);
+
+    var stale = SlotCtx{ .slot = slot, .sock_gen = gen +% 1 };
+    var fake_loop: xev.Loop = undefined;
+    try std.testing.expectEqual(xev.CallbackAction.disarm, closeCb(&stale, &fake_loop, &close_comps[slot], socks[slot], {}));
+    try std.testing.expect(isValid(slot, gen));
+    closeSock(slot, gen);
+}

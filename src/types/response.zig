@@ -1111,3 +1111,74 @@ test "releaseData frees pool buffer on freelist overflow" {
     }
     try std.testing.expectEqual(RESP_POOL_MAX, resp_pool_n);
 }
+
+test "ResponseData covers pool reuse, owned/cold/oversized pool release, clone, and guessContentType" {
+    defer {
+        while (resp_pool_n > 0) {
+            resp_pool_n -= 1;
+            const d = resp_pool[resp_pool_n];
+            d.pool.deinit(gpa);
+            gpa.destroy(d);
+        }
+    }
+
+    // 1. Seed the freelist, then re-acquire to hit resp_pool_n > 0 in acquire().
+    const s1 = acquire().?;
+    s1.* = try ResponseData.initWithPool(s1.pool);
+    const s2 = acquire().?;
+    s2.* = try ResponseData.initWithPool(s2.pool);
+    releaseData(s1);
+    try std.testing.expectEqual(@as(usize, 1), resp_pool_n);
+    const reused = acquire().?;
+    try std.testing.expectEqual(s1, reused);
+    try std.testing.expectEqual(@as(usize, 0), resp_pool_n);
+
+    // Populate reused with owned_body, cold, and oversized pool (> 4096 B) before releaseData.
+    reused.* = try ResponseData.initWithPool(reused.pool);
+    try reused.setUrl("https://example.test/item");
+    try std.testing.expectEqualStrings("https://example.test/item", reused.url());
+    try reused.setResponseType("custom-type");
+    try std.testing.expectEqualStrings("custom-type", reused.responseType());
+    try reused.setResponseType("cors");
+    try std.testing.expectEqualStrings("cors", reused.responseType());
+    const big = try gpa.alloc(u8, RESP_RETAIN_POOL_BYTES + 128);
+    @memset(big, 'x');
+    try reused.setBody(big);
+    gpa.free(big);
+    const owned = try gpa.dupe(u8, "owned");
+    reused.setBodyOwned(owned);
+
+    // Clone from reused into s2 to exercise cloneFrom with cold + owned_body + headers.
+    try reused.headers.appendEntry("x-test", "1");
+    try s2.cloneFrom(reused);
+    try std.testing.expectEqualStrings("owned", s2.body().?);
+    try std.testing.expectEqualStrings("https://example.test/item", s2.url());
+
+    // releaseData drops >4K pool capacity, frees owned_body + cold, and pools shell.
+    releaseData(reused);
+    try std.testing.expectEqual(@as(usize, 1), resp_pool_n);
+    releaseData(s2);
+
+    // Direct initWithHeaders / setBodyOwned empty branch / init failure releaseShell path.
+    const hdrs = headers_mod.acquire().?;
+    hdrs.* = headers_mod.HeadersData.init();
+    var direct = ResponseData.initWithHeaders(hdrs);
+    defer direct.deinit();
+    direct.setBodyOwned(&.{});
+    try std.testing.expect(direct.body() == null);
+
+    const shell = acquire().?;
+    releaseShell(shell);
+
+    // guessContentType variants
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", guessContentType("index.HTML"));
+    try std.testing.expectEqualStrings("text/css; charset=utf-8", guessContentType("a.css"));
+    try std.testing.expectEqualStrings("application/javascript; charset=utf-8", guessContentType("a.mjs"));
+    try std.testing.expectEqualStrings("application/json", guessContentType("a.json"));
+    try std.testing.expectEqualStrings("image/png", guessContentType("a.png"));
+    try std.testing.expectEqualStrings("image/jpeg", guessContentType("a.jpeg"));
+    try std.testing.expectEqualStrings("image/svg+xml", guessContentType("a.svg"));
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", guessContentType("a.txt"));
+    try std.testing.expectEqualStrings("application/wasm", guessContentType("a.wasm"));
+    try std.testing.expectEqualStrings("application/octet-stream", guessContentType("noext"));
+}

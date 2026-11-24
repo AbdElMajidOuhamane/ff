@@ -35,7 +35,7 @@ fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?Extracted
     return .{ .slice = heap_buf, .heap = heap_buf };
 }
 
-fn defaultPortForScheme(scheme: []const u8) ?u16 {
+pub fn defaultPortForScheme(scheme: []const u8) ?u16 {
     if (std.mem.eql(u8, scheme, "http")) return 80;
     if (std.mem.eql(u8, scheme, "https")) return 443;
     if (std.mem.eql(u8, scheme, "ws")) return 80;
@@ -44,7 +44,7 @@ fn defaultPortForScheme(scheme: []const u8) ?u16 {
     return null;
 }
 
-fn isSpecialScheme(scheme: []const u8) bool {
+pub fn isSpecialScheme(scheme: []const u8) bool {
     return defaultPortForScheme(scheme) != null or std.mem.eql(u8, scheme, "file");
 }
 
@@ -52,7 +52,7 @@ fn isSpecialScheme(scheme: []const u8) bool {
 // URLSearchParamsData
 // ============================================================
 const Pair = struct { name: []const u8, value: []const u8 };
-const SPEntry = struct {
+pub const SPEntry = struct {
     name_off: u32,
     name_len: u32,
     val_off: u32,
@@ -61,7 +61,7 @@ const SPEntry = struct {
 comptime {
     std.debug.assert(@sizeOf(SPEntry) == 16);
 }
-const URLSearchParamsData = struct {
+pub const URLSearchParamsData = struct {
     names: std.ArrayList(u8),
     values: std.ArrayList(u8),
     entries: std.ArrayList(SPEntry),
@@ -69,7 +69,7 @@ const URLSearchParamsData = struct {
     view_buf: std.ArrayList([]const u8),
     ser_buf: std.ArrayList(u8),
     block: ?*UrlBlock = null,
-    fn init() URLSearchParamsData {
+    pub fn init() URLSearchParamsData {
         return .{
             .names = std.ArrayList(u8).empty,
             .values = std.ArrayList(u8).empty,
@@ -79,7 +79,7 @@ const URLSearchParamsData = struct {
             .ser_buf = std.ArrayList(u8).empty,
         };
     }
-    fn deinit(self: *URLSearchParamsData) void {
+    pub fn deinit(self: *URLSearchParamsData) void {
         self.names.deinit(gpa);
         self.values.deinit(gpa);
         self.entries.deinit(gpa);
@@ -87,10 +87,10 @@ const URLSearchParamsData = struct {
         self.view_buf.deinit(gpa);
         self.ser_buf.deinit(gpa);
     }
-    fn nameOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
+    pub fn nameOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
         return self.names.items[e.name_off .. e.name_off + e.name_len];
     }
-    fn valueOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
+    pub fn valueOf(self: *const URLSearchParamsData, e: SPEntry) []const u8 {
         return self.values.items[e.val_off .. e.val_off + e.val_len];
     }
     fn appendEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
@@ -112,7 +112,7 @@ const URLSearchParamsData = struct {
             return;
         };
     }
-    fn parseFromString(self: *URLSearchParamsData, str: []const u8) void {
+    pub fn parseFromString(self: *URLSearchParamsData, str: []const u8) void {
         if (str.len == 0) return;
         var rest = str;
         while (rest.len > 0) {
@@ -135,7 +135,7 @@ const URLSearchParamsData = struct {
         if (i != last) self.entries.items[i] = self.entries.items[last];
         self.entries.items.len -= 1;
     }
-    fn deleteEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) void {
+    pub fn deleteEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) void {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             const e = self.entries.items[i];
@@ -148,13 +148,13 @@ const URLSearchParamsData = struct {
             i += 1;
         }
     }
-    fn getFirst(self: *const URLSearchParamsData, name: []const u8) ?[]const u8 {
+    pub fn getFirst(self: *const URLSearchParamsData, name: []const u8) ?[]const u8 {
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, self.nameOf(e), name)) return self.valueOf(e);
         }
         return null;
     }
-    fn getAllValues(self: *URLSearchParamsData, name: []const u8) [][]const u8 {
+    pub fn getAllValues(self: *URLSearchParamsData, name: []const u8) [][]const u8 {
         self.view_buf.clearRetainingCapacity();
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, self.nameOf(e), name)) {
@@ -163,7 +163,7 @@ const URLSearchParamsData = struct {
         }
         return self.view_buf.items;
     }
-    fn hasEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
+    pub fn hasEntry(self: *URLSearchParamsData, name: []const u8, value: ?[]const u8) bool {
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, self.nameOf(e), name)) {
                 if (value == null or std.mem.eql(u8, self.valueOf(e), value.?)) return true;
@@ -171,7 +171,7 @@ const URLSearchParamsData = struct {
         }
         return false;
     }
-    fn setEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
+    pub fn setEntry(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         var found = false;
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -192,17 +192,17 @@ const URLSearchParamsData = struct {
         }
         if (!found) self.appendEntry(name, value);
     }
-    fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
+    pub fn appendPair(self: *URLSearchParamsData, name: []const u8, value: []const u8) void {
         self.appendEntry(name, value);
     }
-    fn sortPairs(self: *URLSearchParamsData) void {
+    pub fn sortPairs(self: *URLSearchParamsData) void {
         std.mem.sort(SPEntry, self.entries.items, self, struct {
             fn lessThan(ctx: *URLSearchParamsData, a: SPEntry, b: SPEntry) bool {
                 return std.mem.order(u8, ctx.nameOf(a), ctx.nameOf(b)) == .lt;
             }
         }.lessThan);
     }
-    fn serialize(self: *URLSearchParamsData) []const u8 {
+    pub fn serialize(self: *URLSearchParamsData) []const u8 {
         self.ser_buf.clearRetainingCapacity();
         for (self.entries.items, 0..) |pair, i| {
             if (i > 0) self.ser_buf.append(gpa, '&') catch break;
@@ -425,7 +425,7 @@ fn poolBound(len_a: usize, len_b: usize) !usize {
     return std.math.add(usize, four, 64) catch error.OutOfPool;
 }
 
-const UrlData = struct {
+pub const UrlData = struct {
     block: *UrlBlock, // ownership handle — released by urlFinalizer, never freed here
     pool: [*]u8,
     port: ?u16 = null,
@@ -448,7 +448,7 @@ const UrlData = struct {
     }
 };
 
-const UrlBlock = struct {
+pub const UrlBlock = struct {
     mem_len: u32,
     refs: u32,
     sp: URLSearchParamsData,
@@ -473,10 +473,10 @@ const UrlBlock = struct {
         const hdr = std.mem.alignForward(usize, @sizeOf(UrlBlock), 8);
         return (@as([*]u8, @ptrCast(self)) + hdr)[0 .. self.mem_len - hdr];
     }
-    fn retain(self: *UrlBlock) void {
+    pub fn retain(self: *UrlBlock) void {
         self.refs += 1;
     }
-    fn release(self: *UrlBlock) void {
+    pub fn release(self: *UrlBlock) void {
         self.refs -= 1;
         if (self.refs == 0) {
             self.sp.deinit();
@@ -994,7 +994,7 @@ fn setPassword(ctx: ?*c.Context, this_val: c.Value, val: c.Value) callconv(.c) c
     return c.JS_UNDEFINED;
 }
 
-fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
+pub fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     const uri = try std.Uri.parse(input);
     const block = try UrlBlock.create(try poolBound(input.len, 0));
     errdefer block.release();
@@ -1017,7 +1017,7 @@ fn parseUrlAbsolute(input: []const u8) !*UrlBlock {
     if (w.overflowed) return error.OutOfPool;
     return block;
 }
-fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
+pub fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
     const base = try std.Uri.parse(base_url);
     const block = try UrlBlock.create(try poolBound(input.len, base_url.len));
     errdefer block.release();
@@ -1132,7 +1132,7 @@ fn parseUrlRelative(input: []const u8, base_url: []const u8) !*UrlBlock {
 // check below makes that bound explicit so every write in the body is
 // provably in range; it is redundant with PoolWriter.putNormalizedPath but
 // keeps this function safe for any future caller.
-fn removeDotSegmentsInto(out: []u8, input: []const u8) error{OutOfPool}!usize {
+pub fn removeDotSegmentsInto(out: []u8, input: []const u8) error{OutOfPool}!usize {
     if (input.len >= out.len) return error.OutOfPool;
     var n: usize = 0;
     var rest = input;
@@ -1394,4 +1394,139 @@ pub fn setup(ctx: *c.Context) void {
     _ = c.definePropertyValueStr(ctx, url_ctor, "parse", parse_fn, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     const can_parse_fn = c.newCFunction(ctx, &urlCanParseStatic, "canParse", 2);
     _ = c.definePropertyValueStr(ctx, url_ctor, "canParse", can_parse_fn, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+}
+
+test "defaultPortForScheme and isSpecialScheme" {
+    try std.testing.expectEqual(@as(?u16, 80), defaultPortForScheme("http"));
+    try std.testing.expectEqual(@as(?u16, 443), defaultPortForScheme("https"));
+    try std.testing.expectEqual(@as(?u16, 80), defaultPortForScheme("ws"));
+    try std.testing.expectEqual(@as(?u16, 443), defaultPortForScheme("wss"));
+    try std.testing.expectEqual(@as(?u16, 21), defaultPortForScheme("ftp"));
+    try std.testing.expect(defaultPortForScheme("custom") == null);
+
+    try std.testing.expect(isSpecialScheme("http"));
+    try std.testing.expect(isSpecialScheme("https"));
+    try std.testing.expect(isSpecialScheme("file"));
+    try std.testing.expect(!isSpecialScheme("custom"));
+}
+
+test "URLSearchParamsData parse, get, set, delete, sort, and serialize" {
+    var sp = URLSearchParamsData.init();
+    defer sp.deinit();
+
+    sp.parseFromString("b=2&a=1&b=3&flag");
+    try std.testing.expectEqual(@as(usize, 4), sp.entries.items.len);
+    try std.testing.expectEqualStrings("2", sp.getFirst("b").?);
+    try std.testing.expectEqualStrings("", sp.getFirst("flag").?);
+    try std.testing.expect(sp.getFirst("missing") == null);
+    try std.testing.expect(sp.hasEntry("b", null));
+    try std.testing.expect(sp.hasEntry("b", "3"));
+    try std.testing.expect(!sp.hasEntry("b", "99"));
+
+    const b_vals = sp.getAllValues("b");
+    try std.testing.expectEqual(@as(usize, 2), b_vals.len);
+    try std.testing.expectEqualStrings("2", b_vals[0]);
+    try std.testing.expectEqualStrings("3", b_vals[1]);
+
+    // setEntry keeps one entry and swaps out duplicates; appends if absent
+    sp.setEntry("b", "only");
+    try std.testing.expectEqual(@as(usize, 1), sp.getAllValues("b").len);
+    try std.testing.expectEqualStrings("only", sp.getFirst("b").?);
+    sp.setEntry("c", "new");
+    try std.testing.expectEqualStrings("new", sp.getFirst("c").?);
+
+    // deleteEntry specific value vs all
+    sp.appendPair("a", "2");
+    sp.deleteEntry("a", "999");
+    try std.testing.expectEqual(@as(usize, 2), sp.getAllValues("a").len);
+    sp.deleteEntry("a", "1");
+    try std.testing.expectEqual(@as(usize, 1), sp.getAllValues("a").len);
+    sp.deleteEntry("flag", null);
+    try std.testing.expect(!sp.hasEntry("flag", null));
+
+    sp.sortPairs();
+    try std.testing.expectEqualStrings("a=2&b=only&c=new", sp.serialize());
+}
+
+test "parseUrlAbsolute and parseUrlRelative resolve schemes, ports, userinfo, and dot segments" {
+    {
+        const b = try parseUrlAbsolute("https://user:pass@example.com:443/a/b/../c%20d?k=1&m=2#sec");
+        defer b.release();
+        var proto_buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings("https:", b.url.protocolStr(&proto_buf));
+        try std.testing.expectEqualStrings("user", b.url.username);
+        try std.testing.expectEqualStrings("pass", b.url.password);
+        try std.testing.expectEqualStrings("example.com", b.url.host);
+        try std.testing.expectEqualStrings("example.com", b.url.host_str);
+        try std.testing.expectEqualStrings("", b.url.port_str);
+        try std.testing.expectEqualStrings("https://example.com", b.url.origin);
+        try std.testing.expectEqualStrings("/a/c d", b.url.path);
+        try std.testing.expectEqualStrings("?k=1&m=2", b.url.search);
+        try std.testing.expectEqualStrings("#sec", b.url.hash);
+        try std.testing.expectEqualStrings("https://user:pass@example.com/a/c d?k=1&m=2#sec", b.url.href);
+        try std.testing.expectEqualStrings("2", b.sp.getFirst("m").?);
+    }
+
+    {
+        const b = try parseUrlAbsolute("custom://host:9000");
+        defer b.release();
+        try std.testing.expectEqualStrings("null", b.url.origin);
+        try std.testing.expectEqualStrings("9000", b.url.port_str);
+        try std.testing.expectEqualStrings("/", b.url.path);
+    }
+
+    {
+        const b = try parseUrlAbsolute("file:///tmp/x");
+        defer b.release();
+        try std.testing.expectEqualStrings("null", b.url.origin);
+    }
+
+    // Relative resolution variants
+    {
+        const b1 = try parseUrlRelative("//other.org:8080/x?a=1#h", "https://base.org/dir/file");
+        defer b1.release();
+        try std.testing.expectEqualStrings("https://base.org//other.org:8080/x?a=1#h", b1.url.href);
+
+        const b2 = try parseUrlRelative("/abs/../p?q=1#f", "https://base.org/dir/file");
+        defer b2.release();
+        try std.testing.expectEqualStrings("https://base.org/p?q=1#f", b2.url.href);
+
+        const b3 = try parseUrlRelative("sub/../leaf?k=v#h", "https://base.org/dir/file");
+        defer b3.release();
+        try std.testing.expectEqualStrings("https://base.org/dir/leaf?k=v#h", b3.url.href);
+
+        const b4 = try parseUrlRelative("?just=query", "https://base.org/dir/file?old=1");
+        defer b4.release();
+        try std.testing.expectEqualStrings("https://base.org/dir/file?just=query", b4.url.href);
+
+        const b5 = try parseUrlRelative("#hash", "https://base.org/dir/file?x=1");
+        defer b5.release();
+        try std.testing.expectEqualStrings("https://base.org/dir/file?x=1#hash", b5.url.href);
+
+        const b6 = try parseUrlRelative("", "https://base.org/dir/file?x=1");
+        defer b6.release();
+        try std.testing.expectEqualStrings("https://base.org/dir/file?x=1", b6.url.href);
+
+        const b7 = try parseUrlRelative("http://override.test/", "https://base.org/");
+        defer b7.release();
+        try std.testing.expectEqualStrings("http://override.test/", b7.url.href);
+    }
+}
+
+test "removeDotSegmentsInto handles dot segments and OutOfPool" {
+    var small: [3]u8 = undefined;
+    try std.testing.expectError(error.OutOfPool, removeDotSegmentsInto(&small, "/abc"));
+
+    var out: [64]u8 = undefined;
+    var n = try removeDotSegmentsInto(&out, "");
+    try std.testing.expectEqualStrings("/", out[0..n]);
+
+    n = try removeDotSegmentsInto(&out, "/a/b/c/./../../g/..");
+    try std.testing.expectEqualStrings("/a/b/", out[0..n]);
+
+    n = try removeDotSegmentsInto(&out, "/a/b/c/../g");
+    try std.testing.expectEqualStrings("/a/b/g", out[0..n]);
+
+    n = try removeDotSegmentsInto(&out, ".././../..");
+    try std.testing.expectEqualStrings("/", out[0..n]);
 }
