@@ -66,7 +66,8 @@ const WsFlags = packed struct(u8) {
     rx_binary: bool = false,
     partial_binary: bool = false,
     conn_live: bool = false,
-    _pad: u3 = 0,
+    peer_close: bool = false,
+    _pad: u2 = 0,
 };
 comptime {
     std.debug.assert(@sizeOf(MainFlags) == 1);
@@ -601,8 +602,10 @@ fn sharedWorkerMain() void {
 fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) void {
     if (rx_event[s] != EV_CLOSE) {
         rx_event[s] = EV_CLOSE;
-        rx_code[s] = 1006;
-        rx_reason_len[s] = 0;
+        if (!wflags[s].peer_close) {
+            rx_code[s] = 1006;
+            rx_reason_len[s] = 0;
+        }
     }
     cleanupConn(s, conn, r);
     if (w_reqs[s]) |*rr| rr.deinit();
@@ -790,8 +793,11 @@ fn initiateClose(s: usize, cn: *http.Client.Connection, code: u16, reason: []con
 }
 
 fn recordClose(s: usize, payload: []const u8) void {
+    wflags[s].peer_close = true;
     if (payload.len >= 2) {
         rx_code[s] = (@as(u16, payload[0]) << 8) | @as(u16, payload[1]);
+    } else {
+        rx_code[s] = 1005;
     }
     const rl: usize = if (payload.len > 2) @min(payload.len - 2, CLOSE_REASON_MAX) else 0;
     if (rl > 0) @memcpy(rx_reason[s][0..rl], payload[2..][0..rl]);

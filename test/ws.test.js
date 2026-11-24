@@ -167,6 +167,25 @@ async function waitUntil(pred, timeoutMs = 2000) {
   await bigSrv.close();
 }
 
+// Regression 5 (client-initiated close preserves peer-echoed 1000 instead of 1006)
+{
+  let closeCode = -1;
+  const closeSrv = http.serve({
+    port: 0,
+    websocket: {},
+  }, () => new Response("ok"));
+  const closeWs = new WebSocket("ws://127.0.0.1:" + closeSrv.port + "/");
+  closeWs.onopen = () => {
+    closeWs.close(1000, "done");
+  };
+  closeWs.onclose = (ev) => {
+    closeCode = ev.code;
+  };
+  await waitUntil(() => closeCode !== -1, 2000);
+  check("WebSocket client close(1000) receives code 1000", closeCode === 1000);
+  await closeSrv.close();
+}
+
 // Unclosed / failed WebSocket does not assert on runtime shutdown in ReleaseSafe/Debug
 new WebSocket("ws://127.0.0.1:1/");
 
