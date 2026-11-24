@@ -55,7 +55,8 @@ const ConnFlags = packed struct(u16) {
     body_from_heap: bool = false,
     // Which column the staged request body lives in (req_spill vs read_bufs).
     req_body_spill: bool = false,
-    _pad: u2 = 0,
+    ws_frame_fin: bool = false,
+    _pad: u1 = 0,
 };
 comptime {
     assert(@sizeOf(ConnFlags) == 2);
@@ -65,6 +66,7 @@ comptime {
     assert(@sizeOf(ParsedRequest) <= 64);
     assert(@alignOf(ParsedRequest) <= 8);
     assert(@sizeOf(ConnState) == 1);
+    assert(ws.WS_MSG_SIZE <= std.math.maxInt(u16));
 }
 const assert = std.debug.assert;
 
@@ -95,7 +97,10 @@ var buf_lens: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
 // (headers_end + content_length). Keep-alive re-arms use it to preserve
 // pipelined bytes instead of discarding them.
 var req_consumed: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
-var ws_partial_len: [MAX_CONN]usize = [_]usize{0} ** MAX_CONN;
+var ws_partial_len: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
+var ws_frame_rem: [MAX_CONN]u16 = [_]u16{0} ** MAX_CONN;
+var ws_frame_mask: [MAX_CONN][4]u8 = undefined;
+var ws_frame_mask_off: [MAX_CONN]u2 = [_]u2{0} ** MAX_CONN;
 // DOD §3: 512B bool column → 64B bitset (8×u64). Set only on fragment start,
 // read only on fragment completion — never scanned linearly with buf_lens.
 var ws_partial_binary_bits: [MAX_CONN / 64]u64 = [_]u64{0} ** (MAX_CONN / 64);
@@ -2328,6 +2333,8 @@ fn wsSendPong(id: usize, payload: []const u8) void {
 
 // DOD-FIX 4: ws_partial is now a static per-slot byte array (no heap pointer).
 fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
+    assert(id < MAX_CONN);
+    assert(ws_partial_len[id] <= ws.WS_MSG_SIZE);
     if (ws.isData(hdr.opcode)) {
         // A new data frame while a fragmented message is open is a protocol
         // error. "Open" is a bit, not `ws_partial_len != 0`: RFC 6455
@@ -2352,7 +2359,7 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         }
         wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
         @memcpy(ws_partial[id][0..payload.len], payload);
-        ws_partial_len[id] = payload.len;
+        ws_partial_len[id] = @intCast(payload.len);
         wsSetFragmentOpen(id, true);
         return true;
     }
@@ -2360,14 +2367,14 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
         wsSendClose(id, 1002); // continuation with nothing to continue
         return false;
     }
-    if (ws_partial_len[id] + payload.len > ws.WS_MSG_SIZE) {
+    if (@as(usize, ws_partial_len[id]) + payload.len > ws.WS_MSG_SIZE) {
         wsSendClose(id, 1009);
         ws_partial_len[id] = 0;
         wsSetFragmentOpen(id, false);
         return false;
     }
     @memcpy(ws_partial[id][ws_partial_len[id]..][0..payload.len], payload);
-    ws_partial_len[id] += payload.len;
+    ws_partial_len[id] += @intCast(payload.len);
     if (hdr.fin) {
         const msg = ws_partial[id][0..ws_partial_len[id]];
         // Validate the ASSEMBLED message: a multi-byte code point may be split
@@ -2386,8 +2393,39 @@ fn wsHandleData(id: usize, hdr: ws.FrameHdr, payload: []const u8) bool {
 }
 
 fn wsConsume(id: usize, l: *xev.Loop) void {
+    assert(id < MAX_CONN);
+    assert(buf_lens[id] <= READ_BUF_SIZE);
     var leftover = read_bufs[id][0..buf_lens[id]];
     while (leftover.len > 0) {
+        const prev_len = leftover.len;
+        if (ws_frame_rem[id] > 0) {
+            const take: usize = @min(leftover.len, ws_frame_rem[id]);
+            assert(take > 0);
+            assert(@as(usize, ws_partial_len[id]) + take <= ws.WS_MSG_SIZE);
+            const dst = ws_partial[id][ws_partial_len[id]..][0..take];
+            @memcpy(dst, leftover[0..take]);
+            ws.unmaskWithOffset(dst, ws_frame_mask[id], ws_frame_mask_off[id]);
+            ws_partial_len[id] += @intCast(take);
+            ws_frame_mask_off[id] = @truncate(@as(usize, ws_frame_mask_off[id]) + take);
+            ws_frame_rem[id] -= @intCast(take);
+            leftover = leftover[take..];
+            if (ws_frame_rem[id] == 0) {
+                if (cflags[id].ws_frame_fin) {
+                    const msg = ws_partial[id][0..ws_partial_len[id]];
+                    if (!wsPartialBinary(id) and !ws.validUtf8(msg)) {
+                        ws_partial_len[id] = 0;
+                        wsSetFragmentOpen(id, false);
+                        wsSendClose(id, 1007);
+                        return;
+                    }
+                    wsNotifyMessage(id, msg, wsPartialBinary(id));
+                    ws_partial_len[id] = 0;
+                    wsSetFragmentOpen(id, false);
+                }
+            }
+            assert(leftover.len < prev_len);
+            continue;
+        }
         const hdr = ws.parseHeader(leftover) orelse break;
         // RFC 6455 §5.1: every client->server frame MUST be masked. Accepting
         // unmasked frames lets a cache/proxy treat the stream as HTTP, and it
@@ -2411,7 +2449,36 @@ fn wsConsume(id: usize, l: *xev.Loop) void {
             return;
         }
         const total = @as(usize, hdr.header_len) + hdr.payload_len;
-        if (leftover.len < total) break;
+        if (leftover.len < total) {
+            if (total <= READ_BUF_SIZE) break;
+            if (ws.isData(hdr.opcode)) {
+                if (wsFragmentOpen(id)) {
+                    wsSendClose(id, 1002);
+                    return;
+                }
+                wsSetPartialBinary(id, hdr.opcode == ws.OP_BINARY);
+                ws_partial_len[id] = 0;
+                wsSetFragmentOpen(id, true);
+            } else {
+                if (!wsFragmentOpen(id)) {
+                    wsSendClose(id, 1002);
+                    return;
+                }
+                if (@as(usize, ws_partial_len[id]) + hdr.payload_len > ws.WS_MSG_SIZE) {
+                    ws_partial_len[id] = 0;
+                    wsSetFragmentOpen(id, false);
+                    wsSendClose(id, 1009);
+                    return;
+                }
+            }
+            leftover = leftover[hdr.header_len..];
+            ws_frame_rem[id] = @intCast(hdr.payload_len);
+            ws_frame_mask[id] = hdr.mask;
+            ws_frame_mask_off[id] = 0;
+            cflags[id].ws_frame_fin = hdr.fin;
+            assert(leftover.len < prev_len);
+            continue;
+        }
         const payload = leftover[hdr.header_len..total];
         ws.unmask(payload, hdr.mask);
         switch (hdr.opcode) {
@@ -2426,8 +2493,10 @@ fn wsConsume(id: usize, l: *xev.Loop) void {
             },
         }
         leftover = leftover[total..];
+        assert(leftover.len < prev_len);
     }
     buf_lens[id] = leftover.len;
+    assert(buf_lens[id] <= READ_BUF_SIZE);
     if (leftover.len > 0) {
         @memmove(read_bufs[id][0..leftover.len], leftover);
     }
@@ -2451,6 +2520,8 @@ fn wsShutdown(id: usize) void {
     }
     cflags[id].ws_open = false;
     ws_partial_len[id] = 0;
+    ws_frame_rem[id] = 0;
+    cflags[id].ws_frame_fin = false;
     wsSetPartialBinary(id, false);
     wsSetFragmentOpen(id, false);
     cflags[id].ws_close_after_write = false;
@@ -2488,7 +2559,9 @@ fn tryUpgrade(id: usize, l: *xev.Loop, headers_end: usize, pr: *const ParsedRequ
     cflags[id].ws_writing = true;
     cflags[id].ws_close_after_write = false;
     cflags[id].ws_pending_open = true;
+    cflags[id].ws_frame_fin = false;
     ws_partial_len[id] = 0;
+    ws_frame_rem[id] = 0;
     wsSetPartialBinary(id, false);
     wsSetFragmentOpen(id, false);
     states[id] = .writing;
@@ -2711,6 +2784,7 @@ fn setupSlot(l: *xev.Loop, tcp: xev.TCP) bool {
     cflags[id] = .{ .keep_alive = !closing_server, .ws_read_armed = true, .tls = tls_active };
     http2_mod.resetSlot(id);
     ws_partial_len[id] = 0;
+    ws_frame_rem[id] = 0;
     wsSetPartialBinary(id, false);
     wsSetFragmentOpen(id, false);
     if (tls_on and tls_active) tls_mod.slotInit(&tls_ctxs[id], &tls_iobufs[id]);
@@ -2829,6 +2903,7 @@ fn processPlaintext(id: usize, l: *xev.Loop) void {
                 closeConn(id);
                 return;
             }
+            assert(used <= buf_lens[id]);
             const rem = buf_lens[id] - used;
             if (rem == 0) {
                 buf_lens[id] = 0;
@@ -3491,11 +3566,11 @@ pub fn init(loop: *xev.Loop, addr: std.Io.net.IpAddress, reuse_port: bool) !void
     }
     listener_tcp.accept(loop, &accept_comp, void, null, acceptCb);
     if (!watchdog_started) { // NEW
-        watchdog_timer = xev.Timer.init() catch unreachable;
+        watchdog_timer = try xev.Timer.init();
         watchdog_timer.run(loop, &watchdog_comp, WATCHDOG_INTERVAL_MS, void, null, watchdogCb);
         watchdog_started = true;
     }
-    shutdown_timer = xev.Timer.init() catch unreachable;
+    shutdown_timer = try xev.Timer.init();
     initialized = true;
     server_running.store(true, .release);
     const scheme: []const u8 = if (tls_active) "https" else "http";
@@ -3604,11 +3679,11 @@ test "ws fragment-open bit is independent of partial length" {
     // Zero-length first fragment: len stays 0, but the message IS open.
     wsSetFragmentOpen(id, true);
     try std.testing.expect(wsFragmentOpen(id));
-    try std.testing.expectEqual(@as(usize, 0), ws_partial_len[id]);
+    try std.testing.expectEqual(@as(u16, 0), ws_partial_len[id]);
 
     wsSetFragmentOpen(id, false);
     try std.testing.expect(!wsFragmentOpen(id));
-    try std.testing.expectEqual(@as(usize, 0), ws_partial_len[id]);
+    try std.testing.expectEqual(@as(u16, 0), ws_partial_len[id]);
 
     // Bits are per-slot, not global.
     wsSetFragmentOpen(403, true);

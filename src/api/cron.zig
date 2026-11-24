@@ -20,21 +20,26 @@ pub const CronSchedule = union(enum) {
 };
 
 pub const CronJob = struct {
+    sched: CronSchedule,
+    handler: c.Value,
+    timer_slot: ?usize = null,
     name_buf: [MAX_NAME_LEN]u8 = undefined,
     name_len: u8 = 0,
-    handler: c.Value,
-    sched: CronSchedule,
-    timer_slot: ?usize = null,
 
     pub fn nameSlice(self: *const CronJob) []const u8 {
         return self.name_buf[0..self.name_len];
     }
 };
+comptime {
+    std.debug.assert(MAX_NAME_LEN <= std.math.maxInt(u8));
+    std.debug.assert(@sizeOf(CronJob) <= 200);
+}
 
 pub var cron_jobs: [MAX_CRON]CronJob = undefined;
 pub var cron_count: usize = 0;
 
 pub fn parseSingleField(field: []const u8, min_val: u8, max_val: u8) ?u64 {
+    std.debug.assert(min_val <= max_val);
     if (field.len == 0 or max_val >= 64) return null;
     var mask: u64 = 0;
     var parts = std.mem.splitScalar(u8, field, ',');

@@ -127,6 +127,46 @@ async function waitUntil(pred, timeoutMs = 2000) {
   await echoSrv.close();
 }
 
+// Regression 4 (> 4096 B single frames streamed across read buffers up to WS_MSG_SIZE)
+{
+  const bigBin = new Uint8Array(4096);
+  for (let i = 0; i < bigBin.length; i++) bigBin[i] = (i * 7 + 3) & 255;
+  const bigText = "B".repeat(16000);
+  let gotBin = null;
+  let gotText = null;
+  const bigSrv = http.serve({
+    port: 0,
+    websocket: {
+      message(sock, msg) {
+        if (typeof msg === "string") {
+          sock.send(msg);
+        } else {
+          sock.sendBinary(msg);
+        }
+      },
+    },
+  }, () => new Response("ok"));
+  const bigWs = new WebSocket("ws://127.0.0.1:" + bigSrv.port + "/");
+  bigWs.binaryType = "arraybuffer";
+  bigWs.onopen = () => {
+    bigWs.sendBinary(bigBin);
+    bigWs.send(bigText);
+  };
+  bigWs.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      gotText = e.data;
+    } else {
+      gotBin = new Uint8Array(e.data);
+    }
+  };
+  await waitUntil(() => gotBin !== null && gotText !== null, 3000);
+  const binOk = gotBin !== null && gotBin.length === bigBin.length && gotBin.every((b, i) => b === bigBin[i]);
+  check("WebSocket 4096 B binary frame echoes intact", binOk);
+  check("WebSocket 16000 B text frame echoes intact", gotText === bigText);
+  bigWs.close();
+  await bigSrv.close();
+}
+
 // Unclosed / failed WebSocket does not assert on runtime shutdown in ReleaseSafe/Debug
 new WebSocket("ws://127.0.0.1:1/");
 

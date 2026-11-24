@@ -64,7 +64,7 @@ ci: fmt build fixtures
 	sh test/run.sh
 	zig build fuzz -Doptimize=ReleaseSafe $(ZIGFLAGS) -- smoke
 
-# Deterministic parser fuzzers (TigerBeetle-style). Always ReleaseSafe so
+# Deterministic parser fuzzers . Always ReleaseSafe so
 # OOB/overflow checks fire; the seed fully determines the run.
 fuzz:
 	zig build fuzz -Doptimize=ReleaseSafe $(ZIGFLAGS) -- smoke
@@ -77,7 +77,7 @@ fuzz-one:
 fuzz-canary:
 	! zig build fuzz -Doptimize=ReleaseSafe $(ZIGFLAGS) -- canary 1
 
-# Coverage via kcov (TigerBeetle-style): DWARF machine-code line coverage,
+# Coverage via kcov : DWARF machine-code line coverage,
 # no compiler flags. Requires `kcov` (brew install kcov / apt install kcov).
 KCOV ?= kcov
 
