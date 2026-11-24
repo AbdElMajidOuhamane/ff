@@ -64,11 +64,15 @@ launch command grants it with a `--allow-*` flag.
 | `--deny-read=<paths>` | Explicitly deny file paths even when covered by `--allow-read`; scope `=<paths>` is required (e.g. `--deny-read=/etc/passwd`) |
 | `--deny-write=<paths>` | Explicitly deny file paths even when covered by `--allow-write`; scope `=<paths>` is required (e.g. `--deny-write=./secrets`) |
 | `--deny-net=<hosts>` | Explicitly block hosts/ports even when `--allow-net` is active; scope `=<hosts>` is required (e.g. `--deny-net=169.254.169.254`) |
+| `--deny-private-net` | Deny loopback, RFC1918, CGNAT, link-local/cloud-metadata (`169.254.169.254`), and private IPv6 after DNS across `fetch`, `WebSocket`, `tcp.connect`, outbound `udp`, and Postgres (bare flag only) |
+| `--simple-sandbox` | Enable Linux OS sandbox (`PR_SET_NO_NEW_PRIVS` + Landlock LSM v1 + seccomp-bpf blocking `io_uring_setup`/`io_uring_register`/`execve`/`ptrace`/`mount`/`bpf`/module syscalls while keeping `io_uring_enter` allowed); fails closed on non-Linux OSes |
 | `--env-file[=]<path>` | Load `.env` variables into `process.env` (max 2 MB, missing/unreadable files ignored, OS env wins, still gated by `--allow-env`) |
 | `--max-heap[=]<size>` | Set max JavaScript main heap size (`64MB` default, range `8MB`–`4GB`; overrides `FF_MAX_HEAP`) |
 | `--worker-heap[=]<size>` | Set per-worker JS heap size (`min(32MB, max-heap)` default, range `1MB`–`max-heap`) |
 | `--max-stack[=]<size>` | Set max JS execution stack size (`1MB` default, range `128KB`–`native/2`; requires native stack >= 256 KB) |
-| `--cpu-budget[=]<ms>` | Set consecutive JS execution budget in ms before interrupt (`0` disabled by default, range `0`–`3600000`; overrides `FF_CPU_BUDGET`). Enforced on `ff <file.js>`, `ff -e`, HTTP handlers, timers, microtasks, streams, and worker eval/`onmessage` (not top-level eval in `ff start`, `ff test`, `ff repl`, `.ffbc`, or `--standalone`) |
+| `--cpu-budget[=]<ms>` | Set consecutive JS execution budget in ms before interrupt (`0` disabled by default, range `0`–`3600000`; overrides `FF_CPU_BUDGET`). Enforced on `ff <file.js>`, `ff -e`, `.ffbc` / `--standalone`, HTTP handlers, timers, microtasks, streams, and worker eval/`onmessage` (not top-level eval in `ff start`, `ff test`, or `ff repl`) |
+| `--wall-timeout[=]<ms>` | Terminate the entire process if wall-clock uptime exceeds ms (`0` disabled by default, range `0`–`3600000`; overrides `FF_WALL_TIMEOUT`; exits `124`) |
+| `--max-log-bytes[=]<size>` | Cap total bytes written by `console.*` (`0` = unlimited, max `100MB`; prints suppression notice once exceeded) |
 
 `--deny-*` exists only for `read`, `write`, and `net` (there are no `--deny-env`, `--deny-run`, or `--deny-ffi` flags, and bare `--deny-read`/`--deny-write`/`--deny-net` without `=<scope>` fail at startup). Byte sizes accept integer values with optional case-insensitive `K`/`KB`, `M`/`MB`, or `G`/`GB` suffixes (or raw bytes); runtime limit flags and `--env-file` accept both `--flag=val` and `--flag val` forms.
 
@@ -391,6 +395,7 @@ Runtime limit environment variables are read once at process start (CLI flags ov
 
 - `FF_MAX_HEAP`: JS main heap size (`8MB`–`4GB`, default `64MB`; overridden by `--max-heap`)
 - `FF_CPU_BUDGET`: consecutive JS CPU budget in ms (`0`–`3600000`, default `0`; overridden by `--cpu-budget`)
+- `FF_WALL_TIMEOUT`: process wall-clock timeout in ms (`0`–`3600000`, default `0`; overridden by `--wall-timeout`)
 
 Outbound `fetch` / `WebSocket` requests in every command honor the standard
 proxy environment variables. They are read once at process start:

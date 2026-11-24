@@ -124,6 +124,7 @@ onmessage = (e) => {
 - ANSI colour codes survive redirection into files; strip them at the
   collector if your format requires it.
 - Each `console.*` call writes directly to stderr before returning (only lines `> 4096` bytes flush across chunks, so an abrupt kill mid-call would only truncate an oversized line).
+- Output is uncapped by default; pass `--max-log-bytes=<size>` (`0`–`100MB`) to cap total bytes written by `console.*` (emits `[console] log limit exceeded; further output suppressed` once reached).
 - There is no log-level filtering: every call prints. Gate noisy output
   yourself (`if (debug) console.debug(...)`).
 

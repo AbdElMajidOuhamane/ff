@@ -106,10 +106,14 @@ Native APIs are **deny-by-default**. The only initial policy input is `--allow-*
 | `--deny-read=<paths>` | explicitly deny file paths even when covered by `--allow-read` (`=<paths>` required) | paths |
 | `--deny-write=<paths>` | explicitly deny file paths even when covered by `--allow-write` (`=<paths>` required) | paths |
 | `--deny-net=<hosts>` | explicitly block hosts/ports even when `--allow-net` is active (`=<hosts>` required) | `host`, `host:port`, `*.domain` |
+| `--deny-private-net` | deny loopback, RFC1918, CGNAT, link-local/cloud-metadata (`169.254.169.254`), and private IPv6 after DNS (`fetch`, `WebSocket`, `tcp.connect`, outbound `udp`, Postgres `sql`) | bare flag only |
+| `--simple-sandbox` | Linux OS sandbox (`PR_SET_NO_NEW_PRIVS` + Landlock LSM v1 + seccomp-bpf blocking `io_uring_setup`/`io_uring_register`/`execve`/`ptrace`/`mount`/`bpf`/module syscalls while keeping `io_uring_enter` allowed); fails closed on non-Linux OSes | bare flag only |
 | `--max-heap` | set max main JS heap (default `64MB`, range `8MB`–`4GB`; overrides `FF_MAX_HEAP`) | bytes / suffix |
 | `--worker-heap` | set per-worker JS heap (default `min(32MB, max-heap)`, range `1MB`–`max-heap`) | bytes / suffix |
 | `--max-stack` | set max JS stack size (default `1MB`, range `128KB`–`native/2`) | bytes / suffix |
 | `--cpu-budget` | interrupt runaway JS if synchronous loop runs beyond ms budget (default `0` = off, max `3600000`; overrides `FF_CPU_BUDGET`) | integer ms |
+| `--wall-timeout` | process wall-clock timeout in ms (default `0` = off, max `3600000`; overrides `FF_WALL_TIMEOUT`; exits `124` on expiry) | integer ms |
+| `--max-log-bytes` | cap total `console.*` output bytes (`0` = unlimited, max `100MB`; prints suppression notice once exceeded) | bytes / suffix |
 | `--env-file` | load `KEY=VALUE` `.env` file into `process.env` (max 2 MB, OS env wins, still `--allow-env` gated) | path |
 
 ```sh
@@ -132,8 +136,10 @@ ff test --allow-all
   Permitting the shell permits any command string.
 - Workers read the same atomic policy; `globalThis.permissions` exposes the six
   enabled categories as live booleans plus `permissions.revoke()` (scopes are not exposed).
-- `--allow-run` and `--allow-ffi` are trust-equivalent to full access. These
-  are in-process checks, not an OS sandbox.
+- `--allow-run` and `--allow-ffi` are trust-equivalent to full access. Permission
+  flags alone are in-process checks; pass `--simple-sandbox` on Linux for
+  kernel-level Landlock LSM + seccomp-bpf confinement (and `--deny-private-net`
+  for post-DNS SSRF blocking).
 
 Full model: [Permissions](docs/concepts/permissions.md).
 
@@ -146,7 +152,7 @@ built for cases where:
 
 - **Cold start matters** — CLI tools, edge functions, short-lived jobs
 - **Memory is constrained** — containers with strict limits
-- **The whole codebase should fit in your head** — ~39k lines of Zig across 82 files
+- **The whole codebase should fit in your head** — ~41k lines of Zig across 85 files
 
 It's *not* aimed at:
 
@@ -429,9 +435,10 @@ ff --version             Print runtime version
 ff help | -h | --help    Print help summary
 ```
 
-Every command parses `--allow-*`, `--deny-*`, `--max-heap`, `--worker-heap`,
-`--max-stack`, `--cpu-budget`, and `--env-file` flags before dispatch (`ff --watch`
-forwards flags that appear *after* `--watch` to the child), for example:
+Every command parses `--allow-*`, `--deny-*`, `--deny-private-net`, `--simple-sandbox`,
+`--max-heap`, `--worker-heap`, `--max-stack`, `--cpu-budget`, `--wall-timeout`,
+`--max-log-bytes`, and `--env-file` flags before dispatch (`ff --watch` forwards
+flags that appear *after* `--watch` to the child), for example:
 
 ```sh
 ff --watch app.js --allow-net=api.example.com:443
@@ -449,6 +456,7 @@ Environment variables:
 - `FF_CA_FILE` — CA file for the runtime's own TLS client (fetch/WebSocket)
 - `FF_MAX_HEAP` — default main JS heap limit (overridden by `--max-heap`)
 - `FF_CPU_BUDGET` — default synchronous JS CPU budget in ms (overridden by `--cpu-budget`)
+- `FF_WALL_TIMEOUT` — default process wall-clock timeout in ms (overridden by `--wall-timeout`)
 - `NO_COLOR` — disables ANSI colors in CLI messages when present
 - `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (or lowercase) — HTTP proxy for outbound `fetch` / `WebSocket`; `ws://` follows `HTTP_PROXY`, `wss://` follows `HTTPS_PROXY`
 - `NO_PROXY` (or `no_proxy`) — comma-separated hosts that bypass the proxy (`*` bypasses all)
@@ -473,9 +481,8 @@ Database:
 
 **Permissions**
 
-- Deny-by-default; CLI `--allow-*` grants access and `--deny-read` / `--deny-write` / `--deny-net` override matching grants
-- In-process checks, not an OS sandbox. A symlink race can escape a path
-  scope; `--allow-run` and `--allow-ffi` are trust-equivalent to full access
+- Deny-by-default; CLI `--allow-*` grants access and `--deny-read` / `--deny-write` / `--deny-net` override matching grants (`--deny-private-net` adds post-DNS SSRF blocking across `fetch`, `WebSocket`, `tcp.connect`, outbound `udp`, and Postgres)
+- Permission flags alone are in-process checks (a symlink race can escape a path scope; `--allow-run` and `--allow-ffi` are trust-equivalent to full access). On Linux, `--simple-sandbox` adds kernel-level Landlock LSM filesystem restriction + seccomp-bpf syscall filtering while keeping `io_uring_enter` allowed; it fails closed on non-Linux OSes
 - Initial scopes are parsed at launch and shared atomically with workers; permissions cannot be escalated at runtime, only dropped/narrowed one-way via `permissions.revoke()`
 - Module loading is a carve-out; imported code runs with the process's grants
 
@@ -521,6 +528,7 @@ Database:
 
 - Prints **every argument** of each call, joined with spaces
 - Writes to **stderr**, not stdout
+- Output is uncapped by default; `--max-log-bytes=<size>` (`0`–`100MB`) caps total bytes written and emits a suppression notice once exceeded
 
 **Workers**
 
@@ -565,7 +573,7 @@ Database:
 - `process.chdir` needs `--allow-read` on the target; denial throws
   `PermissionDenied`
 - Exit codes clamp to 0–255 (no mod-256 wrap)
-- CPU interrupt watchdog is disabled by default; pass `--cpu-budget=<ms>` (or `FF_CPU_BUDGET`, `0`–`3600000` ms) to interrupt runaway JS loops with `InternalError: interrupted`
+- CPU interrupt watchdog is disabled by default; pass `--cpu-budget=<ms>` (or `FF_CPU_BUDGET`, `0`–`3600000` ms) to interrupt runaway JS loops with `InternalError: interrupted`, and `--wall-timeout=<ms>` (or `FF_WALL_TIMEOUT`, `0`–`3600000` ms) to terminate hung processes with exit code `124`
 
 **Packages**
 

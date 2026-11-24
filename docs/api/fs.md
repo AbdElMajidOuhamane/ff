@@ -149,14 +149,9 @@ Inside an `async` function that synchronous throw becomes a rejected promise.
 The flag and scope rules are identical to the sync calls.
 
 The second argument of `readFileAsync` is a mode: `"buffer"` / `"binary"`
-returns bytes; anything else returns a string.
-
-> **Known issue:** **any** submitted `fs.*Async` call that reaches the worker
-> pool (both successes and async I/O rejections like `FileNotFound`) leaves the
-> internal async watcher armed so the process never exits on its own. Only
-> synchronous pre-submit throws (`PermissionDenied`, invalid arguments,
-> `writeFileAsync` > 10 MiB) exit normally. This is invisible inside servers; in
-> short scripts use sync calls or `process.exit()`.
+returns bytes; anything else returns a string. Once all async FS jobs settle, the
+idle internal async watcher is excluded by the event loop so short scripts exit
+cleanly (`0` on completion, `1` on unhandled rejection).
 
 ## Full example
 

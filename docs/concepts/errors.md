@@ -53,7 +53,7 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 | Postgres unsupported `sslmode` | **throws** `sslmode must be 'disable' or 'verify-full'` (options object), `invalid database URL` (DSN), or `UnsupportedSslMode` (global tag) |
 | `fs.readFile` / `mkdir` / `rm` / `readdir` | **does not throw on I/O errors** — returns `undefined`; **throws `PermissionDenied`** when the path is outside the matching `--allow-read` / `--allow-write` scope |
 | `fs.writeFile` / `fs.writeFileAsync` | sync `fs.writeFile` **returns `undefined` without throwing in JS** on I/O errors or data `> 10 MiB` (nothing written); `fs.writeFileAsync` `> 10 MiB` **throws `TypeError` synchronously** before creating a Promise; permission denial **throws `PermissionDenied`** |
-| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — but permission denial/bad args/`writeFileAsync` `> 10 MiB` throw synchronously, and **any** submitted job (success or I/O rejection) hangs the process on exit (Known issue; see [fs](/docs/api/fs)) |
+| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — permission denial/bad args/`writeFileAsync` `> 10 MiB` throw synchronously; settled jobs exit the event loop cleanly |
 | `process.chdir()` | **throws `PermissionDenied`** when the target is outside `--allow-read`; a missing or unreachable path is still a silent no-op |
 | `process.env` | **never throws** — names outside `--allow-env` are absent (`undefined`) |
 | `fetch` / `WebSocket` / `http.serve` (+ `tls` paths) / `tcp.connect` / `udp.*` / `Response.file` / `Database.open` / `child_process` (`execSync` reports `child_process.execSync`) / `process.kill` / `SQL` | **throw `PermissionDenied`** before I/O without the matching flag; a redirect-hop denial rejects `fetch` with a string instead |
@@ -90,20 +90,22 @@ try {
 }
 ```
 
-## Unhandled promise rejections are silent
+## Unhandled promise rejections
 
-In script context a rejected Promise with no handler prints **nothing** and
-the process exits **0**:
+Unhandled rejected Promises (including top-level `await` rejections in `.js`,
+`.ffbc`, and `--standalone` binaries) are tracked via QuickJS's
+`JS_SetHostPromiseRejectionTracker`, printed to **stderr**, and cause the
+process to exit **1** once the event loop drains:
 
 ```js
-Promise.reject(new Error("rej"));   // no output, exit 0
+Promise.reject(new Error("rej"));   // Uncaught (in promise): Error: rej -> exit 1
 async function f() { throw new Error("x"); }
-f();                               // no output, exit 0
+f();                                // Uncaught (in promise): Error: x -> exit 1
 ```
 
-Always attach a `.catch`, or `await` inside a `try`. In an HTTP handler the
-runtime does catch it — a rejected handler Promise becomes a **500**
-response.
+Attaching a `.catch()` handler on the same turn (or `await`ing inside a
+`try`/`catch`) marks the rejection as handled and exits **0**. In an HTTP
+handler, a rejected handler Promise becomes a **500** response.
 
 ## `fetch` rejects with strings
 
@@ -158,7 +160,9 @@ as normal JavaScript exceptions (uncaught → `500`).
 |---|---|
 | normal end of script | `0` |
 | uncaught error | `1` |
+| unhandled promise rejection | `1` |
 | uncaught permission denial | `1` |
+| `--wall-timeout` exceeded | `124` |
 | `SIGINT` / `SIGTERM` (armed, no custom handler or server) | `130` / `143` |
 | `process.exit(300)` | `255` (clamped) |
 | `process.exit(-5)` | `0` (clamped) |
@@ -218,9 +222,6 @@ Strings you'll see in practice — useful for assertions in tests:
 - `e.message` is `undefined` for ordinary `fetch` rejections and redirect
   permission denials — check `typeof e`. Initial permission errors are real
   `Error` objects.
-- **Any** submitted `fs.*Async` call that reaches the worker pool (success or
-  I/O rejection; synchronous pre-submit throws exit normally) hangs the
-  process on exit — Known issue, see [fs](/docs/api/fs).
 - Sync `fs` **I/O** failures are silent; don't write `try/catch` around them
   expecting an exception. Permission denials do throw.
 - `process.env` never throws; a disallowed variable is just `undefined`.

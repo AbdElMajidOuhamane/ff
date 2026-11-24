@@ -157,7 +157,7 @@ console.log(isInvalid); // false
 
 - **Passwords ≤ 72 bytes:** Per bcrypt design, `crypto.bcrypt.hash` rejects passwords exceeding 72 bytes (`Error: bcrypt: password exceeds 72 bytes`). `crypto.bcrypt.verify` resolves to `false` on passwords `> 72` bytes or malformed/`> 128`-byte hashes (missing or non-string arguments throw `TypeError` synchronously on both methods before returning a Promise).
 - **Bounded worker queue:** Backed by a dedicated thread pool (2–4 threads with
-  256 KiB stacks) and a fixed 16-slot ring queue. If all 16 slots are busy, calls
+  1 MB stacks) and a fixed 16-slot ring queue. If all 16 slots are busy, calls
   reject immediately with `Error: crypto.bcrypt: queue full` rather than growing
   unbounded memory.
 - **Off-event-loop execution:** Key derivation and crypt rounds execute strictly on

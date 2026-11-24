@@ -24,9 +24,10 @@ designing are:
 | Run scopes | Basename or absolute path; `exec` / `execSync` also need `/bin/sh` |
 | FFI | Bare `--allow-ffi` only; gates every `ffi` entry point except startup snapshot `ffi.allowed`; trust-equivalent to full access |
 | Module loading | `import` and `new Worker(path)` do not need `read`; loaded code runs with the process policy |
-| Isolation | In-process policy, not an OS sandbox; a symlink swapped between check and syscall can escape a path scope |
+| Isolation | Permission flags alone are an in-process policy layer (a symlink swapped between check and syscall can escape a path scope); on Linux, `--simple-sandbox` adds kernel-level Landlock LSM v1 + seccomp-bpf confinement (`io_uring_setup`/`io_uring_register`/`execve`/`ptrace`/`mount`/`bpf`/module syscalls blocked while `io_uring_enter` stays allowed), failing closed on non-Linux OSes |
 | Granularity | Process-global (dynamically updatable via `permissions.revoke`); no per-request or per-user scopes |
 | Deny flags | `--deny-read=<paths>`, `--deny-write=<paths>`, `--deny-net=<hosts>` override matching `--allow-*` / `--allow-all` grants (scope required; no `--deny-env` / `--deny-run` / `--deny-ffi`) |
+| SSRF guard | `--deny-private-net` enforces post-DNS blocking of loopback, RFC1918, CGNAT, link-local/cloud-metadata (`169.254.169.254`), and private IPv6 across `fetch`, `WebSocket`, `tcp.connect`, outbound `udp`, and Postgres `sql` |
 
 `run` and `ffi` execute arbitrary code with the process's authority. Use
 permissions to reduce mistakes in code you mostly trust, not as the only
@@ -40,6 +41,8 @@ boundary for hostile code.
 | `--worker-heap` | `min(32MB, max-heap)` | `1MB`–`max-heap` |
 | `--max-stack` | `1MB` | `128KB`–`native/2` (requires native stack >= 256 KB) |
 | `--cpu-budget` (`FF_CPU_BUDGET`) | `0` (disabled) | `0`–`3600000` ms |
+| `--wall-timeout` (`FF_WALL_TIMEOUT`) | `0` (disabled) | `0`–`3600000` ms (exits `124` on expiry) |
+| `--max-log-bytes` | `0` (unlimited) | `0`–`100MB` (prints suppression notice once exceeded) |
 
 ## HTTP server
 
@@ -149,6 +152,7 @@ queueMicrotask(fn);
 |------|------|-------------|
 | Arguments printed | All per call | Every argument prints, joined with spaces |
 | Destination | stderr | `console.log > out.txt` captures nothing |
+| Output cap | Unlimited by default | `--max-log-bytes=<size>` (`0`–`100MB`) caps total bytes written across `console.*` and emits a suppression notice once reached |
 
 ## Modules and language
 
@@ -192,9 +196,9 @@ queueMicrotask(fn);
 | `process.chdir` | Needs `read` on the target | Outside the scope it throws `PermissionDenied`; an allowed missing path is still a silent no-op |
 | Signals (`process.on` / `once` / `off`) | `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` (max 8 listeners per signal) | Unsupported signal names or > 8 listeners throw `TypeError` |
 | `process.kill(pid, sig?)` | Needs `--allow-run=kill` when `pid !== process.pid` | Self-signaling `process.pid` is ungated |
-| stdout/stdin streams | Missing | No `process.stdout.write` or stdin reads |
+| `stdout` / `stdin` | Minimal helpers only | `process.stdout.write` and `process.stdin.read` / `readSync` are supported; no Node EventEmitter streams |
 | `hrtime` | Missing | Use `performance.now()` |
-| Runaway JS watchdog | None | An infinite loop hangs the process |
+| Runaway JS / hang watchdogs | Opt-in (`--cpu-budget` / `--wall-timeout`) | Disabled (`0`) by default; `--cpu-budget=<ms>` interrupts runaway JS loops (`InternalError: interrupted`) and `--wall-timeout=<ms>` exits `124` |
 
 ## child_process
 

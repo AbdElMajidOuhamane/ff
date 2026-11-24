@@ -21,12 +21,12 @@ There is no single "4-thread pool" doing everything. Each subsystem owns its thr
 |---|---|---|
 | Event-loop pool (`libxev`) | 4 | general loop work |
 | `fs.*Async` | own 4-thread pool + 16 job slots | a 17th concurrent job throws `OutOfMemory` immediately |
-| `crypto.bcrypt` | own 2–4 thread pool (`min(4, max(2, cpu - 1))`, 256 KiB stacks) + 16 job slots | a 17th concurrent job rejects immediately (`crypto.bcrypt: queue full`) |
+| `crypto.bcrypt` | own 2–4 thread pool (`min(4, max(2, cpu - 1))`, 1 MB stacks) + 16 job slots | a 17th concurrent job rejects immediately (`crypto.bcrypt: queue full`) |
 | `ffi` | own 4-thread pool + 32 job slots | `nonblocking: true` native calls (33rd throws `OutOfMemory`; sync calls run on JS thread) |
 | `fetch` | 16 dedicated threads (1 MB stack each) | one thread per slot — a 16-way fan-out truly runs in parallel |
 | `std.Io.Threaded` (`fetch` / client TLS) | up to 32 (1 MB stack each) | DNS/connect/TLS backing I/O for outbound HTTP clients |
 | WebSocket client | 1 worker thread (1 MB stack, lazy) | drives all 64 client `WebSocket` sockets (`ws://` / `wss://`) |
-| `--cpu-budget` / `--watch` | 1 each (64 KB stack) | interrupt monitor (20 ms poll when `--cpu-budget > 0`) and parent watchdog |
+| `--cpu-budget` / `--wall-timeout` / `--watch` | 1 each (1 MB stack) | interrupt/timeout monitor (20 ms poll when `--cpu-budget > 0` or `--wall-timeout > 0`) and parent watchdog |
 | Postgres / server TLS | none | event-driven on the loop thread; no helper threads |
 | `Worker` | up to 8 OS threads (`>= max(8 MB, 2 * --max-stack)`) | one JS runtime + `--worker-heap` (`min(32 MB, max-heap)` default), running an independent `libxev` loop; 4 MB per message |
 

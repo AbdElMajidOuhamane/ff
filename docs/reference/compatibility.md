@@ -94,7 +94,7 @@ These are the ones that bite during a port:
 |---|---|
 | Native permissions | **Deny-by-default**; Node/Bun run with full access — pass `--allow-*` |
 | `console.*` | Writes to **stderr**; all arguments printed; `warn` is yellow, `error` red — non-standard colours |
-| Unhandled rejections / jobs | Bare unhandled promise rejections are silent (exit `0`); uncaught errors in queued microtasks or timer callbacks print to stderr and exit `1` |
+| Unhandled rejections / jobs | Unhandled Promise rejections (including top-level `await` in `.js`/`.ffbc`/`--standalone`) and uncaught errors in queued microtasks or timer callbacks print to stderr (`Uncaught (in promise): ...`) and exit `1` |
 | Sync `fs` failures | Return `undefined` on ordinary **I/O** failure (and on sync `writeFile` > 10 MiB, which currently writes nothing without throwing in JS; `fs.writeFileAsync` > 10 MiB throws `TypeError` synchronously); permission denial **throws** `PermissionDenied` |
 | `process.env` | Filtered snapshot — only `--allow-env` names are present |
 | `process.chdir` | Needs `read` on the target; outside the scope it throws `PermissionDenied` |

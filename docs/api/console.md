@@ -91,6 +91,14 @@ console.log(JSON.stringify({ ok: true }, null, 2));  // use this instead
 - `console.log.length` is `2` and `console.time.length` is `1` — the arity
   QuickJS reports. Don't rely on it.
 
+## Log output cap (`--max-log-bytes`)
+
+```sh
+ff app.js --max-log-bytes=1MB
+```
+
+Caps total bytes written across all `console.*` calls (`0` = unlimited, up to `100MB`). Once exceeded, `console` prints `[console] log limit exceeded; further output suppressed` once and drops subsequent `console.*` output.
+
 ## Gotchas
 
 - **stderr, not stdout.** `console.log > file` captures nothing.

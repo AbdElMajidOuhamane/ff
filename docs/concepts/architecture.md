@@ -48,12 +48,12 @@ codebase makes the rest of the documentation predictable.
 
 | Directory | Contents | Read when |
 |---|---|---|
-| `src/engine/` | QuickJS runtime init, C shims, `--cpu-budget` monitor | Startup limits or JS interrupt watchdog |
+| `src/engine/` | QuickJS runtime init, C shims, `--cpu-budget` / `--wall-timeout` monitor | Startup limits or interrupt/timeout watchdog |
 | `src/util/` | CLI UI helpers, `--max-heap`/`--max-stack` limits, `--env-file` | Flag parsing, limits, or `.env` loading |
 | `src/api/` | Every JS global (`cron`, `stdio`, `fs`, `process`, `ffi`, …) | Looking up a global's behaviour |
 | `src/crypto/` | Dedicated `crypto.bcrypt` worker pool (`bcrypt_pool.zig`) | Password hashing pool and job slots |
 | `src/net/` | HTTP server, HTTP/2, fetch, TCP, UDP, Postgres, TLS, WebSocket | Networking limits or protocol details |
-| `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` / `--deny-*` parsing, `permissions.revoke`, scope checks |
+| `src/security/` | Permission policy + Linux sandbox (`permissions.zig`, `deny.zig`, `sandbox.zig`) | `--allow-*` / `--deny-*` / `--deny-private-net`, `permissions.revoke`, or `--simple-sandbox` (Landlock + seccomp-bpf) |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
 | `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData`, `ReadableStream` | Fetch/stream API semantics |
 | `src/worker/` | Workers + structured clone | Worker limits |
@@ -68,13 +68,13 @@ codebase makes the rest of the documentation predictable.
 | JS thread | 1 | All JavaScript, all Promise settlements |
 | Event-loop pool (`libxev`) | 4 | General loop work |
 | `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job throws `OutOfMemory` immediately |
-| `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
+| `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`, 1 MB stack) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
 | `ffi` pool | 4 + 32 job slots | `nonblocking: true` native calls (33rd throws `OutOfMemory`; sync calls run on JS thread) |
 | `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound HTTP connections |
 | `std.Io.Threaded` pool | up to 32 (1 MB stack each) | Backing I/O for `fetch` / client TLS DNS, connect, and reads |
 | WebSocket client worker | 1 (1 MB stack, lazy) | Drives all 64 client `WebSocket` connections (`ws://` / `wss://`) |
-| `--cpu-budget` monitor | 1 (64 KB stack, 20 ms poll) | Interrupts runaway JS when `--cpu-budget > 0` |
-| `--watch` parent watchdog | 1 (64 KB stack, 500 ms poll) | Exits watched children if supervisor dies |
+| `--cpu-budget` / `--wall-timeout` monitor | 1 (1 MB stack, 20 ms poll) | Interrupts runaway JS loops (`--cpu-budget`) and enforces process wall-clock exit `124` (`--wall-timeout`) |
+| `--watch` parent watchdog | 1 (1 MB stack, 500 ms poll) | Exits watched children if supervisor dies |
 | Postgres / server TLS | none | Event-driven on the loop thread |
 | `Worker` | up to 8 | Your CPU-bound JS, each with its own runtime |
 

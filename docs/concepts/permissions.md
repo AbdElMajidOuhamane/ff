@@ -37,6 +37,8 @@ Every command that starts a JS runtime accepts the flags: `ff <file>`,
 | `--deny-read=<paths>` | explicitly deny file paths even when covered by `--allow-read` (`=<paths>` required) | paths |
 | `--deny-write=<paths>` | explicitly deny file paths even when covered by `--allow-write` (`=<paths>` required) | paths |
 | `--deny-net=<hosts>` | explicitly block hosts/ports even when `--allow-net` is active (`=<hosts>` required) | `host`, `host:port`, `*.domain` |
+| `--deny-private-net` | deny loopback, RFC1918, CGNAT, link-local/cloud-metadata (`169.254.169.254`), and private IPv6 after DNS resolution across `fetch`, `WebSocket`, `tcp.connect`, outbound `udp`, and Postgres `sql` | none — bare only |
+| `--simple-sandbox` | enable Linux OS sandbox (`PR_SET_NO_NEW_PRIVS` + Landlock LSM v1 + seccomp-bpf keeping `io_uring_enter` allowed); fails closed on non-Linux OSes | none — bare only |
 
 Rules:
 
@@ -106,7 +108,7 @@ Rules:
   it does not throw.
 - The runtime still reads its own CLI/runtime configuration (`FF_ECHO`,
   `FF_CERT`, `FF_KEY`, `FF_CA_FILE`, `FF_MAX_HEAP`, `FF_CPU_BUDGET`,
-  `FF_WATCH_PARENT`, `NO_COLOR`, and proxy env vars) outside `--allow-env`.
+  `FF_WALL_TIMEOUT`, `FF_WATCH_PARENT`, `NO_COLOR`, and proxy env vars) outside `--allow-env`.
   That does not expose those keys in JavaScript `process.env`.
 
 ## Run scopes
@@ -240,18 +242,26 @@ runtime APIs. They are not gated by these flags.
 
 ## Security model
 
-Permissions are an **in-process policy layer, not an OS sandbox**.
+Permission flags alone are an **in-process policy layer, not an OS sandbox**.
 
 - A path is canonicalized and then passed to a normal filesystem syscall. A
   symlink swapped between the check and the syscall can escape the scope.
 - `run` and `ffi` are trust-equivalent to full access; native code and child
-  processes are not confined.
+  processes are not confined unless OS sandboxing is enabled.
 - Module loading is a carve-out. Importing untrusted code gives that code the
   permissions of the process.
 - Scopes are process-global. There is no per-request or per-user narrowing.
 
-Use permissions to catch mistakes and to run code you mostly trust with less
-authority. Do not use them as the only boundary for hostile code.
+For OS-level isolation on Linux and SSRF hardening:
+
+- **`--simple-sandbox`** enables kernel-level confinement (`PR_SET_NO_NEW_PRIVS` +
+  Landlock LSM ABI v1 matching your `--allow-read`/`--allow-write` scopes +
+  seccomp-bpf blocking `io_uring_setup`, `io_uring_register`, `execve`,
+  `execveat`, `ptrace`, `mount`, `bpf`, and module syscalls while keeping
+  `io_uring_enter` fast); it fails closed on non-Linux OSes.
+- **`--deny-private-net`** performs post-DNS IP checks to block loopback,
+  RFC1918, CGNAT, link-local/cloud-metadata (`169.254.169.254`), and private
+  IPv6 addresses even when DNS resolves an external hostname to an internal IP.
 
 ## Migration
 
