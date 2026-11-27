@@ -237,10 +237,11 @@ const wShare = await childShare.wait();
 check("child reusePort exit 0", wShare.code === 0);
 
 // Without reusePort (default), duplicate bind to the same port must fail
-const sBase = http.serve({ port: rpPort }, () => new Response("base"));
+const sBase = http.serve({ port: 0 }, () => new Response("base"));
+const basePort = sBase.port;
 const childNoShare = child_process.spawn(ffBin, [
   "-e",
-  `http.serve({ port: ${rpPort} }, () => new Response("dup"));`,
+  `http.serve({ port: ${basePort} }, () => new Response("dup"));`,
   "--allow-all",
 ]);
 const resNoShare = await childNoShare.wait();
