@@ -4,9 +4,7 @@ zig-out
 zig-pkg
 .DS_Store
 vendor/quickjs/
-bench/*
-!bench/httpbench/
-bench/httpbench/results/
+bench/
 examples
 vendor/bearssl 
 tests

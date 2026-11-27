@@ -1090,9 +1090,18 @@ fn tlsPump(id: usize, l: *xev.Loop) void {
 fn noopCancelCb(
     _: ?*anyopaque,
     _: *xev.Loop,
-    _: *xev.Completion,
+    comp: *xev.Completion,
     _: xev.Result,
 ) xev.CallbackAction {
+    // Work around libxev epoll backend: stop_completion() removes dup_fd
+    // from epoll (CTL_DEL) without closing it, leaking the dup'd socket fd.
+    if (xev.backend == .epoll) {
+        const target = comp.op.cancel.c;
+        if (target.flags.dup and target.flags.dup_fd > 0) {
+            _ = std.c.close(target.flags.dup_fd);
+            target.flags.dup_fd = 0;
+        }
+    }
     return .disarm;
 }
 
@@ -3496,6 +3505,11 @@ pub fn closeServer() void {
             l.add(&accept_cancel_comp);
         }
         if (!listener_closed) {
+            // On Linux, shutdown(SHUT_RDWR) immediately transitions a listening
+            // socket out of TCP_LISTEN and unhashes it from SO_REUSEPORT groups
+            // even if a child process inherited a dup'd fd from libxev's epoll
+            // backend (which calls dup() without FD_CLOEXEC).
+            _ = std.c.shutdown(listener_tcp.fd, std.posix.SHUT.RDWR);
             listener_tcp.close(l, &listener_close_comp, void, null, listenerCloseCb);
         }
     } else {
