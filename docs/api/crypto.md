@@ -42,16 +42,16 @@ http.serve({ port: 3000 }, (url) => Response.json({ requestId: crypto.randomUUID
 
 | | |
 |---|---|
-| Signature | `(TypedArray) → TypedArray` |
+| Signature | `(Uint8Array) → Uint8Array` |
+| Length bounds | `1` to `65536` elements (`0` or `> 65536` throws `TypeError: getRandomValues: max 65536 bytes`) |
 | Returns | The **same array**, filled with random bytes |
 
 ```js
 const bytes = new Uint8Array(16);
 crypto.getRandomValues(bytes);          // returns `bytes` itself
-crypto.getRandomValues(new Uint32Array(4));
 ```
 
-Non-typed arguments throw:
+> **Caution:** Non-`Uint8Array` TypedArrays (e.g. `Uint32Array`) and non-empty plain arrays (`[0, 0]`) do **not** throw, but each element only receives **one random byte (`0..255`)** rather than filling its element width. Empty arrays (`[]`, `new Uint8Array(0)`) throw `TypeError: getRandomValues: max 65536 bytes`, and primitives/strings throw:
 
 ```js
 crypto.getRandomValues("nope");
@@ -99,10 +99,12 @@ async function sha256Hex(chunks) {
 
 | Method | Signature | Description |
 |---|---|---|
-| `subtle.importKey(format, keyData, algorithm, extractable, keyUsages)` | `("raw", ArrayBuffer \| TypedArray, "HMAC" \| { name: "HMAC", hash? }, boolean, string[]) → Promise<CryptoKey>` | Imports raw bytes as an HMAC `CryptoKey` (`algorithm` can be `"HMAC"` or `{ name: "HMAC", hash?: string }`; `hash` defaults to `"SHA-256"` if omitted; usages must be non-empty and contain `"sign"` and/or `"verify"`) |
-| `subtle.sign(algorithm, key, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` | Computes the HMAC tag; requires `"sign"` in `key.usages` |
-| `subtle.verify(algorithm, key, signature, data)` | `("HMAC" \| { name: "HMAC" }, CryptoKey, ArrayBuffer \| TypedArray, ArrayBuffer \| TypedArray) → Promise<boolean>` | Verifies `signature` against `data` in constant time; requires `"verify"` in `key.usages` |
+| `subtle.importKey(format, keyData, algorithm, extractable, keyUsages)` | `("raw", ArrayBuffer \| TypedArray, "HMAC" \| { name: "HMAC", hash? }, boolean, string[]) → Promise<CryptoKey>` | Imports raw bytes as an HMAC `CryptoKey` (empty `keyData` throws `TypeError: subtle.importKey: keyData must not be empty`; `hash` defaults to `"SHA-256"`; usages must contain `"sign"` and/or `"verify"`) |
+| `subtle.sign(algorithm, key, data)` | `("HMAC" \| { name: "HMAC", hash? }, CryptoKey, ArrayBuffer \| TypedArray) → Promise<ArrayBuffer>` | Computes the HMAC tag; requires `"sign"` in `key.usages` (matching `hash` if passed as object) |
+| `subtle.verify(algorithm, key, signature, data)` | `("HMAC" \| { name: "HMAC", hash? }, CryptoKey, ArrayBuffer \| TypedArray, ArrayBuffer \| TypedArray) → Promise<boolean>` | Verifies `signature` against `data` in constant time; requires `"verify"` in `key.usages` |
 | `subtle.exportKey(format, key)` | `("raw", CryptoKey) → Promise<ArrayBuffer>` | Exports the raw key bytes; requires `key.extractable === true` |
+
+All validation errors across `subtle` (`digest`, `importKey`, `sign`, `verify`, `exportKey`) throw `TypeError` synchronously before returning a Promise. Returned `CryptoKey` objects expose `{ type: "secret", extractable, algorithm: { name: "HMAC", hash: { name }, length }, usages }`.
 
 ```js
 const enc = new TextEncoder();
@@ -132,7 +134,7 @@ or stutter HTTP traffic, WebSocket connections, or timer callbacks.
 
 | Method | Signature | Description |
 |---|---|---|
-| `crypto.bcrypt.hash(password, options?)` | `(string, { cost?: number }?) → Promise<string>` | Hashes password into standard modular crypt `$2b$` format. `cost` defaults to `12` (range `4`–`14`). |
+| `crypto.bcrypt.hash(password, options?)` | `(string, ({ cost?: number } \| number)?) → Promise<string>` | Hashes password into standard modular crypt `$2b$` format. `cost` defaults to `12` (range `4`–`14`; floats truncate to integer). |
 | `crypto.bcrypt.verify(password, hash)` | `(string, string) → Promise<boolean>` | Verifies password against a `$2b$`, `$2a$`, or `$2y$` modular crypt hash using Zig's std bcrypt verifier (the KDF dominates timing). |
 
 ```js
@@ -153,10 +155,9 @@ console.log(isInvalid); // false
 
 ### Safety & Constraints
 
-- **Passwords ≤ 72 bytes:** Per bcrypt design, passwords exceeding 72 bytes are
-  rejected (`Error: bcrypt: password exceeds 72 bytes`).
+- **Passwords ≤ 72 bytes:** Per bcrypt design, `crypto.bcrypt.hash` rejects passwords exceeding 72 bytes (`Error: bcrypt: password exceeds 72 bytes`). `crypto.bcrypt.verify` resolves to `false` on passwords `> 72` bytes or malformed/`> 128`-byte hashes (missing or non-string arguments throw `TypeError` synchronously on both methods before returning a Promise).
 - **Bounded worker queue:** Backed by a dedicated thread pool (2–4 threads with
-  256 KiB stacks) and a fixed 16-slot ring queue. If all 16 slots are busy, calls
+  1 MB stacks) and a fixed 16-slot ring queue. If all 16 slots are busy, calls
   reject immediately with `Error: crypto.bcrypt: queue full` rather than growing
   unbounded memory.
 - **Off-event-loop execution:** Key derivation and crypt rounds execute strictly on
@@ -210,8 +211,7 @@ atob("!!!");
 
 - `crypto.subtle` methods compute synchronously and resolve on the microtask
   queue — awaiting them does not free the loop for I/O.
-- `getRandomValues` is `Uint8Array`-only-ish: any TypedArray works, plain
-  arrays/strings throw.
+- `getRandomValues` requires `1..65536` elements (empty arrays throw `TypeError: getRandomValues: max 65536 bytes`) and is best used with `Uint8Array`: non-`Uint8Array` TypedArrays (e.g. `Uint32Array`) and non-empty plain arrays do not throw, but each element only gets a single byte (`0..255`). Primitives and strings throw `TypeError`.
 - `btoa` / `atob` don't throw on non-Latin-1 — both sides go through
   UTF-8, so Unicode round-trips (unlike browsers).
 - `crypto.subtle` keys only support `"raw"` HMAC — for TLS server certificates,

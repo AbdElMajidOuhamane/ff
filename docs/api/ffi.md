@@ -36,10 +36,10 @@ Every `ffi` entry point except `ffi.allowed` requires the flag:
 | `ffi.read` / `ffi.write` / `ffi.copyBytes` / `ffi.writeBytes` | `PermissionDenied: ffi.read requires --allow-ffi` (or the matching name) |
 | `ffi.struct` / `ffi.union` / `ffi.isNull` | `PermissionDenied: ffi.struct requires --allow-ffi` (or the matching name) |
 
-`ffi.allowed` reports whether the flag is set:
+`ffi.allowed` is a startup snapshot boolean reflecting `--allow-ffi` at launch (to check live permission status after `permissions.revoke({ name: "ffi" })`, read `permissions.ffi`):
 
 ```js
-console.log(ffi.allowed); // false by default, true with --allow-ffi
+console.log(ffi.allowed); // false by default, true with --allow-ffi at launch
 ```
 
 Denial uses the same error shape as the other native APIs, minus the scope
@@ -81,19 +81,23 @@ Full model: [Permissions](/docs/concepts/permissions).
 ## Quick look
 
 ```js
-const lib = ffi.dlopen("libz.1.dylib", {
+// zlib for crc32, libc ("libSystem.B.dylib" on macOS / "libc.so.6" on Linux) for div
+const zlib = ffi.dlopen("libz.1.dylib", {
   crc32: { parameters: ["usize", "buffer", "u32"], result: "usize" },
-  div:   { parameters: ["i32", "i32"], result: { struct: [["quot", "i32"], ["rem", "i32"]] } },
+});
+const libc = ffi.dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+  div: { parameters: ["i32", "i32"], result: { struct: [["quot", "i32"], ["rem", "i32"]] } },
 });
 
-lib.symbols.crc32(0n, new TextEncoder().encode("123456789"), 9); // 3421780262n
+zlib.symbols.crc32(0n, new TextEncoder().encode("123456789"), 9); // 3421780262n
 
-const t = lib.symbols.div(7, 2);   // Uint8Array — the struct's bytes
+const t = libc.symbols.div(7, 2);   // Uint8Array — the struct's bytes
 const v = ffi.view(t);
-v.getInt32(0);                     // 3  (quot)
-v.getInt32(4);                     // 1  (rem)
+v.getInt32(0);                      // 3  (quot)
+v.getInt32(4);                      // 1  (rem)
 
-lib.close();
+zlib.close();
+libc.close();
 ```
 
 ```sh
@@ -119,7 +123,7 @@ Returns a library object:
 | Property | What it does |
 |---|---|
 | `lib.symbols.name(...args)` | Call the C function (returns a `Promise` if `nonblocking: true`) |
-| `lib.close()` | `dlclose`; further calls throw. Idempotent |
+| `lib.close()` | Marks the library closed immediately so further calls throw, and calls `dlclose` once any in-flight `nonblocking` calls finish. Idempotent |
 
 A closed library throws `TypeError: ffi: library is closed`. If the
 library object is garbage-collected, the handle is closed for you.
@@ -128,16 +132,16 @@ library object is garbage-collected, the handle is closed for you.
 
 | Type | JS in | JS out | Notes |
 |---|---|---|---|
-| `i8 u8 i16 u16 i32 u32` | `number` | `number` | Silent truncation to the C width |
+| `i8 u8 i16 u16 i32 u32` | `number` \| `bigint` | `number` | Silent truncation to the C width |
 | `i64 u64 isize usize` | `BigInt` (or `number`) | `BigInt` | |
 | `f32 f64` | `number` | `number` | |
 | `void` | — | `undefined` | Results only |
-| `pointer` | `FfiPtr`, `bigint`, `null` | `FfiPtr` \| `null` | |
-| `buffer` | `TypedArray`, `ArrayBuffer`, `null` | `FfiPtr` \| `null` | Passes the data pointer (view-adjusted); a result is a pointer, not a copy |
-| `cstring` | `string`, `null` | `string` \| `null` | In: NUL-terminated copy, valid for the call. Out: cloned JS string |
-| `function` | `FfiCallback` `.pointer` | — | JS→C callback — see [Callbacks](#callbacks) |
-| struct | `Uint8Array` (≥ `size` bytes) | `Uint8Array` (`size` bytes) | Byte image in C layout — see [Structs](#structs) |
-| union | `Uint8Array` (≥ `size` bytes) | `Uint8Array` (`size` bytes) | Byte image, all members at offset 0 — see [Unions](#unions) |
+| `pointer` | `FfiPtr`, `bigint`, `null`, `undefined` | `FfiPtr` \| `null` | `null`/`undefined` coerce to `NULL` |
+| `buffer` | `TypedArray`, `ArrayBuffer`, `null`, `undefined` (sync calls also accept `FfiPtr` / `bigint`) | `FfiPtr` \| `null` | Passes the data pointer (view-adjusted); a result is a pointer, not a copy |
+| `cstring` | `string`, `null`, `undefined` | `string` \| `null` | In: NUL-terminated copy, valid for the call. Out: cloned JS string |
+| `function` | `FfiCallback` `.pointer`, `FfiPtr`, `bigint`, `null`, `undefined` | `FfiPtr` \| `null` | JS→C callback or function pointer — see [Callbacks](#callbacks) |
+| struct | `TypedArray`, `ArrayBuffer` (≥ `size` bytes) | `Uint8Array` (`size` bytes) | Byte image in C layout — see [Structs](#structs) |
+| union | `TypedArray`, `ArrayBuffer` (≥ `size` bytes) | `Uint8Array` (`size` bytes) | Byte image, all members at offset 0 — see [Unions](#unions) |
 
 Unknown type names throw at `dlopen`. `void` as a parameter throws.
 
@@ -147,12 +151,12 @@ Unknown type names throw at `dlopen`. `void` as a parameter throws.
 
 ```js
 const p = ffi.ptr(typedArray);     // pointer to buffer data
-const q = ffi.ptr(p, 16);          // p + 16 bytes
+const q = ffi.ptr(p, 16);          // p + 16 bytes (offset applies only when 1st arg is an FfiPtr)
 const r = ffi.ptr(0x1000n);        // raw address
 
-p.addr;        // 140234n (BigInt)
+p.addr;        // 140234n (BigInt; null for 0-address FfiPtr)
 p.toString();  // "FfiPtr(0x224b0)"
-ffi.isNull(p); // true for null/undefined and for 0-address pointers
+ffi.isNull(p); // true for null, undefined, and 0n (note: returns false for ffi.ptr(0n))
 ffi.cstring(p);        // read a C string → JS string | null
 ffi.cstring(typedArray); // same, from a buffer
 ```
@@ -171,23 +175,22 @@ ffi.copyBytes(p, 16);                 // → ArrayBuffer copy
 ffi.writeBytes(p, typedArray);        // typedArray → native bytes
 ```
 
-`ffi.view(p)` returns the same pointer object with DataView-style
-getters (Deno-compatible names):
+`ffi.view(p, off?)` returns a **new** `FfiPtr` wrapping the same address (plus optional byte offset `off` when `p` is already an `FfiPtr`; ignored for `TypedArray`/`ArrayBuffer`/`BigInt`), and every `FfiPtr` exposes these DataView-style getters directly (`off` defaults to `0` when omitted):
 
 ```js
 const v = ffi.view(p);
-v.getInt8(off);  v.getUint8(off);
-v.getInt16(off); v.getUint16(off);
-v.getInt32(off); v.getUint32(off);
-v.getBigInt64(off); v.getBigUint64(off);
-v.getFloat32(off); v.getFloat64(off);
-v.getPointer(off);                    // → FfiPtr | null
+v.getInt8(off?);  v.getUint8(off?);
+v.getInt16(off?); v.getUint16(off?);
+v.getInt32(off?); v.getUint32(off?);
+v.getBigInt64(off?); v.getBigUint64(off?);
+v.getFloat32(off?); v.getFloat64(off?);
+v.getPointer(off?);                   // → FfiPtr | null
 v.getCString(off?);                   // → string | null
 v.getArrayBuffer(byteLength, off?);   // → ArrayBuffer copy
 v.copyInto(destination, off?);        // native → TypedArray
 ```
 
-Readable/writable types are the scalars plus `pointer`; `cstring` strings
+Readable/writable types are the scalars plus `pointer` and `function`; `cstring` strings
 are read with `ffi.cstring`/`getCString`, buffers with
 `ffi.copyBytes`/`copyInto`. No bounds checking — C's rules.
 
@@ -298,7 +301,7 @@ const lib = ffi.dlopen("libprobe.dylib", {
 });
 
 // union as a struct field
-const Tagged = ffi.union([["tag", "i32"], ["val", { union: [["i", "i32"], ["f", "f32"]] }]]);
+const Tagged = ffi.struct([["tag", "i32"], ["val", { union: [["i", "i32"], ["f", "f32"]] }]]);
 ```
 
 Reading a union member: write/read at offset 0 with the member's type:
@@ -368,14 +371,15 @@ event loop stays free:
 ```js
 const lib = ffi.dlopen("libz.1.dylib", {
   compress: {
-    parameters: ["buffer", "usize", "buffer", "usize"],
+    parameters: ["buffer", "buffer", "buffer", "usize"],
     result: "i32",
     nonblocking: true,
   },
 });
 
 const out = new Uint8Array(1024);
-const p = lib.symbols.compress(out, 1024n, input, input.length);
+const destLen = new BigUint64Array([1024n]); // uLongf *destLen output length
+const p = lib.symbols.compress(out, destLen, input, input.length);
 // p is a Promise — the loop keeps running
 const rc = await p;
 ```
@@ -386,7 +390,7 @@ Semantics:
 - `cstring` arguments are copied; `pointer` is passed by value (caller
   keeps the memory alive).
 - The result is wrapped at settle time (same as a sync call).
-- Up to 32 concurrent calls (job pool).
+- Backed by a 4-thread pool holding up to 32 concurrent calls; submitting a 33rd throws `InternalError` (`OutOfMemory`) synchronously.
 
 Combine with callbacks — a JS callback invoked from C during a
 nonblocking call runs on the JS thread via the bridge, and a throw

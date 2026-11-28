@@ -29,18 +29,24 @@ fn throwTypeError(ctx: ?*c.Context, msg: []const u8) void {
     _ = c.throwTypeError(ctx, "http.serve: %s", @as([*c]const u8, @ptrCast(msg.ptr)));
 }
 
-fn extractIntFromVal(ctx: ?*c.Context, val: c.Value, default: u16) u16 {
+/// Extract a TCP port. Returns null when the value is present but not an
+/// integer in 0..65535, so the caller can throw instead of binding a
+/// silently wrapped port: `@intCast(i32 -> u16)` traps in ReleaseSafe and
+/// is undefined behavior in ReleaseFast, so `port: 70000` used to do
+/// different wrong things per optimize mode.
+fn extractPortFromVal(ctx: ?*c.Context, val: c.Value, default: u16) ?u16 {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return default;
     var out: i32 = 0;
-    if (c.toInt32(ctx, &out, val) == -1) return default;
+    if (c.toInt32(ctx, &out, val) == -1) return null;
+    if (out < 0 or out > std.math.maxInt(u16)) return null;
     return @intCast(out);
 }
 
 /// Returns false with a pending JS exception when the bind is not allowed.
-fn allowListen(ctx: ?*c.Context, port: u16) bool {
-    if (perm.global().checkNet("0.0.0.0", port) == .allowed) return true;
-    var detail_buf: [32]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "0.0.0.0:{d}", .{port}) catch "0.0.0.0";
+fn allowListen(ctx: ?*c.Context, host: []const u8, port: u16) bool {
+    if (perm.global().checkNet(host, port) == .allowed) return true;
+    var detail_buf: [64]u8 = undefined;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s}:{d}", .{ host, port }) catch "0.0.0.0";
     _ = deny.throw(ctx, "http.serve", .net, detail);
     return false;
 }
@@ -151,13 +157,30 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
 
     const opts_val = argv[0];
     var port: u16 = 3000;
+    var hostname_buf: [128]u8 = undefined;
+    var hostname: []const u8 = "0.0.0.0";
     var reuse_port: bool = false;
 
     if (c.isObject(opts_val) != 0) {
         const port_val = c.getPropertyStr(ctx, opts_val, "port");
-        port = extractIntFromVal(ctx, port_val, 3000);
+        port = extractPortFromVal(ctx, port_val, 3000) orelse {
+            c.freeValue(ctx, port_val);
+            throwTypeError(ctx, "port must be an integer in 0..65535");
+            return c.JS_EXCEPTION;
+        };
         c.freeValue(ctx, port_val);
-        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+
+        const host_val = c.getPropertyStr(ctx, opts_val, "hostname");
+        defer c.freeValue(ctx, host_val);
+        if (c.isString(host_val) != 0) {
+            var hlen: usize = 0;
+            if (c.toCStringLen(ctx, &hlen, host_val)) |cstr| {
+                defer c.freeCString(ctx, cstr);
+                const copy_len = @min(hlen, hostname_buf.len);
+                @memcpy(hostname_buf[0..copy_len], cstr[0..copy_len]);
+                hostname = hostname_buf[0..copy_len];
+            }
+        }
 
         const rp_val = c.getPropertyStr(ctx, opts_val, "reusePort");
         defer c.freeValue(ctx, rp_val);
@@ -186,20 +209,74 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
             }
         }
     } else if (c.isNumber(opts_val) != 0) {
-        port = extractIntFromVal(ctx, opts_val, 3000);
-        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
-    } else {
-        if (!allowListen(ctx, port)) return c.JS_EXCEPTION;
+        port = extractPortFromVal(ctx, opts_val, 3000) orelse {
+            throwTypeError(ctx, "port must be an integer in 0..65535");
+            return c.JS_EXCEPTION;
+        };
     }
+
+    const parsed_addr = if (std.Io.net.IpAddress.parseIp4(hostname, port)) |a4|
+        a4
+    else |_| if (std.Io.net.IpAddress.parseIp6(hostname, port)) |a6|
+        a6
+    else |_| {
+        throwTypeError(ctx, "invalid hostname (IP literals only, e.g. '127.0.0.1' or '0.0.0.0')");
+        return c.JS_EXCEPTION;
+    };
+
+    var canon_buf: [64]u8 = undefined;
+    const canon_host = switch (parsed_addr) {
+        .ip4 => |a| std.fmt.bufPrint(&canon_buf, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch "0.0.0.0",
+        .ip6 => |a| blk: {
+            const s = std.fmt.bufPrint(&canon_buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+                @as(u16, a.bytes[0]) << 8 | a.bytes[1],
+                @as(u16, a.bytes[2]) << 8 | a.bytes[3],
+                @as(u16, a.bytes[4]) << 8 | a.bytes[5],
+                @as(u16, a.bytes[6]) << 8 | a.bytes[7],
+                @as(u16, a.bytes[8]) << 8 | a.bytes[9],
+                @as(u16, a.bytes[10]) << 8 | a.bytes[11],
+                @as(u16, a.bytes[12]) << 8 | a.bytes[13],
+                @as(u16, a.bytes[14]) << 8 | a.bytes[15],
+            }) catch "::";
+            break :blk s;
+        },
+    };
+    if (!allowListen(ctx, hostname, port) and !allowListen(ctx, canon_host, port)) return c.JS_EXCEPTION;
 
     const handler_val = argv[1];
     if (c.isFunction(ctx, handler_val) == 0) {
-        throwTypeError(ctx, "handler must be a function");
-        return c.JS_EXCEPTION;
+        if (c.isObject(handler_val) != 0) {
+            // routes table passed as second argument
+            http_native.handler_fn = c.dupValue(ctx, handler_val);
+            http_native.handler_ctx = ctx;
+            http_native.handler_arity = 5;
+        } else {
+            throwTypeError(ctx, "handler must be a function or routes object");
+            return c.JS_EXCEPTION;
+        }
+    } else {
+        http_native.handler_fn = c.dupValue(ctx, handler_val);
+        http_native.handler_ctx = ctx;
+        const len_val = c.getPropertyStr(ctx, handler_val, "length");
+        defer c.freeValue(ctx, len_val);
+        var arity: i32 = 4;
+        if (c.toInt32(ctx, &arity, len_val) == 0 and arity >= 0 and arity <= 4) {
+            // Only use reduced arity when the function doesn't reference `arguments` or `...rest`
+            const str_val = c.toString(ctx, handler_val);
+            defer c.freeValue(ctx, str_val);
+            var slen: usize = 0;
+            if (c.toCStringLen(ctx, &slen, str_val)) |cstr| {
+                defer c.freeCString(ctx, cstr);
+                const src = cstr[0..slen];
+                if (std.mem.indexOf(u8, src, "arguments") != null or std.mem.indexOf(u8, src, "...") != null) {
+                    arity = 4;
+                }
+            }
+            http_native.handler_arity = @intCast(arity);
+        } else {
+            http_native.handler_arity = 4;
+        }
     }
-
-    http_native.handler_fn = c.dupValue(ctx, handler_val);
-    http_native.handler_ctx = ctx;
 
     // TLS must be fully configured before the listener starts accepting.
     if (!loadTlsFromOptions(ctx, opts_val)) {
@@ -211,7 +288,7 @@ fn serveCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         return c.JS_EXCEPTION;
     };
 
-    http_native.init(&loop_ptr.loop, port, reuse_port) catch |err| {
+    http_native.init(&loop_ptr.loop, parsed_addr, reuse_port) catch |err| {
         cli.errorMsg("cannot start server on port {d}: {s}", .{ port, @errorName(err) });
         throwTypeError(ctx, "failed to start server (is the port in use?)");
         return c.JS_EXCEPTION;

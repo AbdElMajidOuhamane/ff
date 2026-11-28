@@ -9,3 +9,15 @@ pub fn isWorkerThread() bool {
 pub fn setWorkerThread(v: bool) void {
     is_worker = v;
 }
+
+test "worker thread marker toggles thread-local flag cleanly" {
+    const prev = isWorkerThread();
+    defer setWorkerThread(prev);
+
+    setWorkerThread(false);
+    try std.testing.expect(!isWorkerThread());
+    setWorkerThread(true);
+    try std.testing.expect(isWorkerThread());
+    setWorkerThread(false);
+    try std.testing.expect(!isWorkerThread());
+}

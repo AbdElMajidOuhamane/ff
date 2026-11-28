@@ -7,8 +7,9 @@ order: 3
 # Errors and exit codes
 
 There are no custom error classes in Fairyfly. You get QuickJS's built-ins
-— `Error`, `TypeError`, `SyntaxError`, `RangeError` — plus a handful of
-APIs that reject with plain strings.
+— `Error`, `TypeError`, `SyntaxError`, `RangeError`, `ReferenceError`,
+`InternalError` (used by `--cpu-budget` interrupts and internal failures),
+`DOMException` — plus a handful of APIs that reject with plain strings.
 
 Permission failures are ordinary `Error` objects with extra properties:
 `name` is `PermissionDenied` and `code` is `PERMISSION_DENIED`. There is no
@@ -43,19 +44,19 @@ Note the doubled `Error: Error:` prefix, the `at <eval>` frame carrying
 
 | API | Behaviour |
 |---|---|
-| `setTimeout(fn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` |
+| `setTimeout(nonFn)`, `queueMicrotask(nonFn)` | **throws** `TypeError` — caught by `try`/`catch` (`setTimeout(fn)` with an omitted delay defaults `ms` to `0`) |
 | `Database.open()` without a path | **throws** `Database.open requires a file path` |
 | `new Request()` without a URL | **throws** `Request requires a URL string as first argument` |
 | `new Worker()` without a path | **throws** `Worker requires a module path` |
-| `sql` template with no pool | **throws** `no database pool` |
+| `sql.unsafe` / `sql.begin` / `sql.connect` with no pool | **throws** `no database pool` (`sql` template tag throws `@errorName(err)`, e.g. `PoolFailed` or `BadDsn`) |
 | Postgres `tx` after `commit()` | **throws** `transaction is closed` |
-| Postgres unsupported `sslmode` | **throws** `sslmode must be 'disable' or 'verify-full'` |
+| Postgres unsupported `sslmode` | **throws** `sslmode must be 'disable' or 'verify-full'` (options object), `invalid database URL` (DSN), or `UnsupportedSslMode` (global tag) |
 | `fs.readFile` / `mkdir` / `rm` / `readdir` | **does not throw on I/O errors** — returns `undefined`; **throws `PermissionDenied`** when the path is outside the matching `--allow-read` / `--allow-write` scope |
-| `fs.writeFile` | **does not throw on ordinary I/O errors** — returns `undefined`; **throws** if data exceeds 10 MiB limit; **throws `PermissionDenied`** when path is outside `--allow-write` |
-| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — but a permission denial throws synchronously before the promise exists, and a *successful* call hangs the process afterwards (Known issue; see [fs](/docs/api/fs)) |
+| `fs.writeFile` / `fs.writeFileAsync` | sync `fs.writeFile` **returns `undefined` without throwing in JS** on I/O errors or data `> 10 MiB` (nothing written); `fs.writeFileAsync` `> 10 MiB` **throws `TypeError` synchronously** before creating a Promise; permission denial **throws `PermissionDenied`** |
+| `fs.readFileAsync()` etc. | **rejects** with the error name, e.g. `FileNotFound` — permission denial/bad args/`writeFileAsync` `> 10 MiB` throw synchronously; settled jobs exit the event loop cleanly |
 | `process.chdir()` | **throws `PermissionDenied`** when the target is outside `--allow-read`; a missing or unreachable path is still a silent no-op |
 | `process.env` | **never throws** — names outside `--allow-env` are absent (`undefined`) |
-| `fetch` / `WebSocket` / `http.serve` / `Database.open` / `child_process` / `SQL` | **throw `PermissionDenied`** before I/O without the matching flag; a redirect-hop denial rejects `fetch` with a string instead |
+| `fetch` / `WebSocket` / `http.serve` (+ `tls` paths) / `tcp.connect` / `udp.*` / `Response.file` / `Database.open` / `child_process` (`execSync` reports `child_process.execSync`) / `process.kill` / `SQL` | **throw `PermissionDenied`** before I/O without the matching flag; a redirect-hop denial rejects `fetch` with a string instead |
 | `ffi.dlopen` / `ffi.callback` / all other `ffi` entry points | **throw `PermissionDenied`** without `--allow-ffi` |
 
 > **Sync `fs` swallows I/O errors today.** A missing file, a bad directory, an
@@ -89,20 +90,22 @@ try {
 }
 ```
 
-## Unhandled promise rejections are silent
+## Unhandled promise rejections
 
-In script context a rejected Promise with no handler prints **nothing** and
-the process exits **0**:
+Unhandled rejected Promises (including top-level `await` rejections in `.js`,
+`.ffbc`, and `--standalone` binaries) are tracked via QuickJS's
+`JS_SetHostPromiseRejectionTracker`, printed to **stderr**, and cause the
+process to exit **1** once the event loop drains:
 
 ```js
-Promise.reject(new Error("rej"));   // no output, exit 0
+Promise.reject(new Error("rej"));   // Uncaught (in promise): Error: rej -> exit 1
 async function f() { throw new Error("x"); }
-f();                               // no output, exit 0
+f();                                // Uncaught (in promise): Error: x -> exit 1
 ```
 
-Always attach a `.catch`, or `await` inside a `try`. In an HTTP handler the
-runtime does catch it — a rejected handler Promise becomes a **500**
-response.
+Attaching a `.catch()` handler on the same turn (or `await`ing inside a
+`try`/`catch`) marks the rejection as handled and exits **0**. In an HTTP
+handler, a rejected handler Promise becomes a **500** response.
 
 ## `fetch` rejects with strings
 
@@ -140,7 +143,10 @@ Permission denial is different:
 | Handler throws or its Promise rejects | `500 Internal Server Error` |
 | Handler never settles | `504 Gateway Timeout` after 30 s |
 | Response body over 10 MB | `500` |
-| Request headers over 4 KB (HTTP/1.1) | `431 Request Header Fields Too Large` |
+| HTTP/2 `ReadableStream` response body | `501 Not Implemented` |
+| Request head / URL over 4096 bytes (HTTP/1.1) or `:path` over 512 bytes (HTTP/2) | `431 Request Header Fields Too Large` (HTTP/1.1) or `400 Bad Request` (HTTP/2) before routing (route-level `414` is unreachable) |
+| HTTP/1.1 malformed framing | `400 Bad Request` |
+| Request headers over 4 KB (HTTP/1.1) or 64 KB (HTTP/2) | `431 Request Header Fields Too Large` |
 | Request body over 1 MB (HTTP/1.1) | `413 Payload Too Large` (HTTP/2 caps at 10 MB/stream, 16 MB/session) |
 | Request body spill exceeds 64 MB global budget (HTTP/1.1) | `503 Service Unavailable` |
 
@@ -154,7 +160,10 @@ as normal JavaScript exceptions (uncaught → `500`).
 |---|---|
 | normal end of script | `0` |
 | uncaught error | `1` |
+| unhandled promise rejection | `1` |
 | uncaught permission denial | `1` |
+| `--wall-timeout` exceeded | `124` |
+| `SIGINT` / `SIGTERM` (armed, no custom handler or server) | `130` / `143` |
 | `process.exit(300)` | `255` (clamped) |
 | `process.exit(-5)` | `0` (clamped) |
 | event-loop failure | `1` |
@@ -172,36 +181,36 @@ Strings you'll see in practice — useful for assertions in tests:
 | Message | Thrown by |
 |---|---|
 | `setTimeout requires a function as first argument` | timers |
-| `too many timers (max 128)` | timers |
+| `too many timers (max 128)` | timers (`setTimeout`, `setInterval`, `AbortSignal.timeout`); `ff.cron` throws `failed to schedule cron timer (timer table full)` when the shared 128-slot table is full |
 | `setTimeout accepts at most 8 callback arguments` | timers |
 | `queueMicrotask requires a function argument` | microtasks |
-| `WebSocket constructor requires a URL` | `new WebSocket` |
-| `WebSocket: send buffer full` | `ws.send` / `ws.sendBinary` |
+| `WebSocket: WebSocket constructor requires a URL` | `new WebSocket` |
+| `WebSocket: send buffer full` | client `WebSocket` (`ws.send` / `ws.sendBinary`) |
 | `subtle.importKey: algorithm must be 'HMAC' or { name: 'HMAC', hash: 'SHA-...' }` | `crypto.subtle.importKey` |
 | `too many workers (max 8)` | `new Worker` |
 | `Worker requires a module path` | `new Worker` |
-| `value could not be cloned` | `postMessage` / `structuredClone` with a function/WeakMap/… |
+| `value could not be cloned` | `postMessage` / `structuredClone` with a function/WeakMap/native object/… |
 | `Database.open requires a file path` | SQLite |
 | `exec requires a SQL string` / `exec: invalid database` | SQLite |
 | `transaction requires a function argument` | SQLite |
-| `no database pool` | Postgres |
+| `no database pool` | `sql.unsafe` / `sql.begin` / `sql.connect` (tag `` sql`...` `` throws `@errorName(err)`) |
 | `sql must be used as a template tag` | Postgres |
 | `template arity mismatch` | Postgres |
 | `transaction is closed` | Postgres |
 | `sslmode must be 'disable' or 'verify-full'` | Postgres |
 | `SQL: TLS setup failed (...)` | Postgres TLS |
-| `fs.writeFile: data exceeds the 10 MiB limit (nothing written)` | `fs.writeFile` |
+| `fs.writeFileAsync: data exceeds the 10 MiB limit` | `fs.writeFileAsync` (throws `TypeError` synchronously; sync `fs.writeFile` currently returns `undefined` without throwing in JS) |
 | `Request requires a URL string as first argument` | `new Request` |
 | `Response.redirect requires a URL` | `Response.redirect` |
 | `Invalid URL` | `fetch`, `URL` |
 | `fetch requires a URL string or Request as first argument` | `fetch` |
 | `FileNotFound` | `fs.*Async` rejection |
 | `ffi.dlopen: FFI not compiled in (build with -Dffi=true)` | `ffi` |
-| `failed to start server (is the port in use?)` | `http.serve` |
+| `http.serve: failed to start server (is the port in use?)` | `http.serve` |
 | `fs.readFile requires --allow-read for '<path>'` | `fs` — `Error` named `PermissionDenied`, code `PERMISSION_DENIED` |
 | `process.chdir requires --allow-read for '<path>'` | `process.chdir` — `PermissionDenied` |
 | `fetch requires --allow-net for '<host>:<port>'` | `fetch` — `PermissionDenied` |
-| `http.serve requires --allow-net for '0.0.0.0:<port>'` | `http.serve` — `PermissionDenied` |
+| `http.serve requires --allow-net for '<hostname>:<port>'` | `http.serve` (default `0.0.0.0:<port>`) — `PermissionDenied` |
 | `Database.open requires --allow-read for '<path>'` | SQLite — `PermissionDenied` |
 | `child_process requires --allow-run for '<program>'` | `child_process` — `PermissionDenied` |
 | `process.kill requires --allow-run for 'kill'` | `process.kill` (external PID) — `PermissionDenied` |
@@ -213,7 +222,6 @@ Strings you'll see in practice — useful for assertions in tests:
 - `e.message` is `undefined` for ordinary `fetch` rejections and redirect
   permission denials — check `typeof e`. Initial permission errors are real
   `Error` objects.
-- A successful `fs.*Async` call hangs the process afterwards (it prints, then never exits) — Known issue, see [fs](/docs/api/fs).
 - Sync `fs` **I/O** failures are silent; don't write `try/catch` around them
   expecting an exception. Permission denials do throw.
 - `process.env` never throws; a disallowed variable is just `undefined`.

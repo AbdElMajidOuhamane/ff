@@ -1,6 +1,6 @@
 ---
 title: Concurrency
-description: One JS thread, a shared I/O pool, and up to 8 Workers — which primitive to reach for.
+description: One JS thread, dedicated I/O pools, and up to 8 Workers — which primitive to reach for.
 order: 2
 ---
 
@@ -12,20 +12,23 @@ of a server that "gets stuck".
 | Layer | Runs on | Use for | Limit |
 |---|---|---|---|
 | **JS event loop** | one thread | everything you write | see [Event loop](/docs/concepts/event-loop) |
-| **Background I/O** | internal threads | `fetch`, Postgres, TLS, `fs.*Async`, `crypto.bcrypt`, `ffi` calls | per-subsystem pools below — not one shared pool |
-| **Workers** | up to 8 OS threads | CPU-bound JS | **8** workers, 32 MB heap each, 4 MB per message |
+| **Background I/O** | internal threads | `fetch`, Postgres, server TLS, `fs.*Async`, `crypto.bcrypt`, `ffi` (`nonblocking`) | per-subsystem pools below — not one shared pool |
+| **Workers** | up to 8 OS threads | CPU-bound JS | **8** workers, `min(32 MB, max-heap)` default heap (`--worker-heap`), 4 MB per message |
 
 There is no single "4-thread pool" doing everything. Each subsystem owns its threads:
 
 | Subsystem | Threads | Cap / notes |
 |---|---|---|
 | Event-loop pool (`libxev`) | 4 | general loop work |
-| `fs.*Async` | own 4-thread pool + 16 job slots | a 17th concurrent job waits |
-| `crypto.bcrypt` | own 2–4 thread pool (`min(4, max(2, cpu - 1))`) + 16 job slots | a 17th concurrent job rejects immediately (`bcrypt queue full`) |
-| `ffi` | own 4-thread pool | each native call parks a pool thread while it runs |
+| `fs.*Async` | own 4-thread pool + 16 job slots | a 17th concurrent job throws `OutOfMemory` immediately |
+| `crypto.bcrypt` | own 2–4 thread pool (`min(4, max(2, cpu - 1))`, 1 MB stacks) + 16 job slots | a 17th concurrent job rejects immediately (`crypto.bcrypt: queue full`) |
+| `ffi` | own 4-thread pool + 32 job slots | `nonblocking: true` native calls (33rd throws `OutOfMemory`; sync calls run on JS thread) |
 | `fetch` | 16 dedicated threads (1 MB stack each) | one thread per slot — a 16-way fan-out truly runs in parallel |
-| Postgres / TLS | none | event-driven on the loop thread; no helper threads |
-| `Worker` | 8 OS threads (8 MB stack each) | one JS runtime + 32 MB heap each, running an independent `libxev` loop; wakes parent on message/timer/error; 4 MB per message |
+| `std.Io.Threaded` (`fetch` / client TLS) | up to 32 (1 MB stack each) | DNS/connect/TLS backing I/O for outbound HTTP clients |
+| WebSocket client | 1 worker thread (1 MB stack, lazy) | drives all 64 client `WebSocket` sockets (`ws://` / `wss://`) |
+| `--cpu-budget` / `--wall-timeout` / `--watch` | 1 each (1 MB stack) | interrupt/timeout monitor (20 ms poll when `--cpu-budget > 0` or `--wall-timeout > 0`) and parent watchdog |
+| Postgres / server TLS | none | event-driven on the loop thread; no helper threads |
+| `Worker` | up to 8 OS threads (`>= max(8 MB, 2 * --max-stack)`) | one JS runtime + `--worker-heap` (`min(32 MB, max-heap)` default), running an independent `libxev` loop; 4 MB per message |
 
 JavaScript itself never runs in parallel with other JavaScript. Two JS
 sections execute one after the other, always.
@@ -35,7 +38,7 @@ sections execute one after the other, always.
 | You need to… | Do this | Not this |
 |---|---|---|
 | Call other APIs | `await fetch(...)` | blocking the loop |
-| Query Postgres / SQLite | `await sql\`…\`` / `db.row()` | spinning up a thread |
+| Query Postgres / SQLite | `` await sql`…` `` / `db.row()` | spinning up a thread |
 | Read/write files in a server | `await fs.readFileAsync(...)` | `fs.readFile(...)` |
 | Hash, compress, parse a huge payload | `new Worker(...)` | a tight loop in the handler |
 | Run 5 requests at once | `Promise.all([...])` | sequential `await`s |
@@ -92,7 +95,7 @@ w.postMessage({ password: "hunter2" });
 
 Workers have their **own** JS runtime and event loop. They share no state
 and talk only by messages (structured clone). The worker scope has
-`console`, timers, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`), `postMessage`, `workerData`, and
+`console`, numeric timers, `queueMicrotask`, `structuredClone`, `crypto` (`randomUUID`, `getRandomValues`, `subtle`; `crypto.bcrypt` throws), `btoa`, `atob`, `postMessage`, `workerData`, and
 `performance` — no `fs`, no `fetch`, no `http.serve`, no `crypto.bcrypt`.
 
 ## Limits worth memorising
@@ -101,11 +104,15 @@ and talk only by messages (structured clone). The worker scope has
 |---|---|
 | Concurrent `fetch` | 16 slots, one thread each |
 | Concurrent HTTP connections | 512 |
-| Loop / fs / ffi pools | 4 threads each (separate pools) |
-| Concurrent `fs.*Async` jobs | 16 |
+| Loop / `fs` / `ffi` pools | 4 threads each (separate pools) |
+| Concurrent `fs.*Async` jobs | 16 (17th throws `OutOfMemory`) |
+| Concurrent `ffi` `nonblocking` jobs | 32 (33rd throws `OutOfMemory`) |
+| Concurrent `crypto.bcrypt` jobs | 16 (17th rejects `"crypto.bcrypt: queue full"`) |
 | Workers | 8 |
 | Worker message | 4 MB |
-| Live timers | 128 |
+| Live timers | 128 (`ff.cron` max 32 jobs) |
+| TCP / UDP / WS client sockets | 128 / 64 / 64 |
+| `child_process` (`spawn` / `exec`) | 8 concurrent children |
 
 ## Gotchas
 

@@ -38,7 +38,7 @@ ff script.js --allow-read=. --allow-write=./out
 - Symlinks are resolved before matching. The target must be inside a scope; a
   symlink inside an allowed directory that points outside is denied. Writes
   through a dangling symlink are denied.
-- `..` traversal, NUL bytes, and paths at or beyond 4096 bytes are denied.
+- `..` traversal outside the scope is denied with `PermissionDenied`. NUL bytes and paths at or beyond `PATH_MAX` (`4096` bytes on Linux, `1024` bytes on macOS) are rejected before permission checking with a synchronous string throw (`"path contains a NUL byte"` / `"path too long"`).
 - Bare `--allow-read` / `--allow-write` grant every path.
 - There are no globs or per-extension rules.
 
@@ -71,7 +71,7 @@ Creates the file when missing, overwrites when present. Parent directories must 
 
 `writeFile` and `writeFileAsync` take string data (UTF-8 text); non-string values such as `Uint8Array` or `ArrayBuffer` are coerced via `String()` rather than written as raw bytes.
 
-Writes are capped at **10 MB**. Passing data larger than 10 MB throws an error immediately (`fs.writeFile: data exceeds the 10 MiB limit (nothing written)`) instead of silently truncating the file.
+Writes are capped at **10 MiB** (`10 * 1024 * 1024` bytes). Passing data larger than 10 MiB writes nothing and currently returns `undefined` from synchronous `fs.writeFile` without throwing in JS (same `undefined` return as sync I/O errors), while `fs.writeFileAsync` throws `TypeError: fs.writeFileAsync: data exceeds the 10 MiB limit` synchronously before creating a Promise.
 
 ## Check existence
 
@@ -100,7 +100,7 @@ fs.rm("out.txt");
 fs.rm("a", true);
 ```
 
-The second argument is `recursive`. Pass `true` to delete a directory tree, omit it for a single file. Needs `--allow-write` on the target path.
+The second argument is `recursive`. Pass `true` to delete a directory tree, omit it for a single file or empty directory. Needs `--allow-write` on the target path.
 
 ## List a directory
 
@@ -125,7 +125,7 @@ await fs.rmAsync("out.txt");
 const names = await fs.readdirAsync(".");
 ```
 
-Failures **reject** instead of being swallowed (including `writeFileAsync` with data > 10 MB):
+Failures **reject** instead of being swallowed (permission denial throws `PermissionDenied`, NUL bytes / over-long paths throw a plain string, and invalid args or `fs.writeFileAsync` with data > 10 MiB throw `TypeError` — all **synchronously** before creating a Promise):
 
 ```js
 try {
@@ -135,7 +135,7 @@ try {
 }
 ```
 
-Permission denial is thrown **synchronously**, before the Promise is created:
+Permission denial (as well as `writeFileAsync` > 10 MiB or bad args) is thrown **synchronously**, before the Promise is created:
 
 ```js
 try {
@@ -149,12 +149,9 @@ Inside an `async` function that synchronous throw becomes a rejected promise.
 The flag and scope rules are identical to the sync calls.
 
 The second argument of `readFileAsync` is a mode: `"buffer"` / `"binary"`
-returns bytes; anything else returns a string.
-
-> **Known issue:** after a *successful* `fs.*Async` call the process may
-> never exit — the promise settles and prints, then the loop waits on the
-> fs pending counter forever. Failures exit normally. This is invisible
-> inside servers; in short scripts prefer sync calls or `process.exit()`.
+returns bytes; anything else returns a string. Once all async FS jobs settle, the
+idle internal async watcher is excluded by the event loop so short scripts exit
+cleanly (`0` on completion, `1` on unhandled rejection).
 
 ## Full example
 
@@ -173,10 +170,10 @@ ff example.js --allow-read=. --allow-write=.
 
 ## Limits you will hit
 
-- Max path 4096 bytes.
-- Max read 10MB per call.
-- Max write 10MB per call — throws/rejects immediately above 10MB instead of truncating.
-- Sync **I/O** failures return `undefined` — no exception is raised, so a
-  `try/catch` around a missing file catches nothing. Permission denial and write overflow are exceptions and do throw.
+- Max path is OS-dependent (`4096` bytes on Linux, `1024` bytes on macOS `PATH_MAX`).
+- Max read 10 MiB per call.
+- Max write 10 MiB per call — `fs.writeFileAsync` throws `TypeError` synchronously above 10 MiB; sync `fs.writeFile` currently writes nothing and returns `undefined` without throwing in JS.
+- Max **16 concurrent** `fs.*Async` calls in flight (backed by a 4-thread pool); submitting a 17th throws `OutOfMemory` synchronously.
+- Sync **I/O** failures (and > 10 MiB sync `writeFile`) return `undefined` — no exception is raised in JS, so a `try/catch` catches nothing. Permission denial throws `PermissionDenied` synchronously.
 - Scope roots are fixed at launch; `process.chdir()` does not move them.
 - No file watching — poll with timers instead.

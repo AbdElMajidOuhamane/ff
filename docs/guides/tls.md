@@ -17,7 +17,7 @@ still files:
 
 | Item | Needs |
 |---|---|
-| Listener | `--allow-net=0.0.0.0:<port>` |
+| Listener | `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`) |
 | `tls.cert` / `tls.key` **paths** | `--allow-read` on each file |
 | `tls.cert` / `tls.key` **inline PEM** | No file grant |
 | `ff start --cert/--key`, `FF_CERT` / `FF_KEY` | No runtime `--allow-read` — the CLI reads them before the engine starts |
@@ -81,7 +81,7 @@ What happens:
 
 - `tls.cert` and `tls.key` accept a file path **or** inline PEM text. A string starting with `-----BEGIN ` is treated as PEM content; anything else is a path.
 - Path inputs are permission-checked before reading. Grant `--allow-read` for each path (and any symlink target).
-- Cert files are capped at 512KB, key files at 256KB. Larger files fail to load.
+- `http.serve({ tls })` caps both cert and key file reads at 512 KB (and BearSSL decoded DER caps are 32 KB cert chain / max 4 certs and 8 KB private key). Larger files fail to load.
 - A bad cert or key throws a `TypeError` and the server never starts half-configured — you see the error, never a silent plain-HTTP fallback. A denied path throws `PermissionDenied` instead.
 
 Inline PEM needs no file grant:
@@ -101,7 +101,7 @@ Here the reads happen in JS, so `--allow-read` is still required for the
 
 ## Enable TLS from the CLI
 
-If your entrypoint is `ff.json`, skip the `tls` object and pass paths at startup:
+`ff start` also accepts certificate paths at startup via `--cert`/`--key` or `FF_CERT`/`FF_KEY`:
 
 ```sh
 ff start --cert cert.pem --key key.pem --allow-net=0.0.0.0:8443
@@ -114,13 +114,15 @@ FF_CERT=cert.pem FF_KEY=key.pem \
 ff start --allow-net=0.0.0.0:8443
 ```
 
+> **Known issue:** When your entrypoint calls `http.serve({ port }, handler)` without an `opts.tls` object, `http.serve` currently disables TLS on the listener (overriding `--cert` / `--key` / `FF_CERT` / `FF_KEY` loaded at startup). Pass `tls: { cert, key }` in `http.serve(...)` until that bug is resolved.
+
 Rules:
 
 - `--cert` and `--key` must be given together. One without the other prints an error and exits.
-- When both CLI flags and the JS `tls` object are set, the JS object wins at listener start.
+- `ff start` caps cert files at 512 KB and key files at 256 KB.
 - The CLI reads `--cert` / `--key` / `FF_CERT` / `FF_KEY` itself, so those paths do **not** need `--allow-read`. A `tls` object inside the app is a runtime read and does.
-- A binary built with `-Dbearssl=false` has no TLS: starting with cert/key prints `built without TLS` and exits.
-- The app's listener still needs its port scope: `--allow-net=0.0.0.0:<port>` after `start`.
+- A binary built with `-Dbearssl=false` has no TLS: `ff start --cert ... --key ...` prints `error: this build has no TLS support` (`hint: rebuild without -Dbearssl=false`) and exits, while JS `http.serve({ tls })` throws `TypeError: http.serve: built without TLS (rebuild without -Dbearssl=false)`.
+- The app's listener still needs its port scope: `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`) after `start`.
 
 ## WebSocket over TLS
 
@@ -172,7 +174,7 @@ port plus `--ca` for the self-signed certificate. Binary frames arrive as
 
 Browsers and `fetch` reject self-signed certs by default. Three cases:
 
-**1. Same process serves and fetches.** Starting with `--cert cert.pem` (or `FF_CERT`) auto-trusts that cert for the process's own `fetch` and `WebSocket` clients — no extra CA flag:
+**1. Same process serves and fetches.** Starting with `--cert cert.pem` / `FF_CERT` or passing file paths in `http.serve({ tls: { cert: "cert.pem", key: "key.pem" } })` auto-trusts that cert file for the process's own `fetch` and `WebSocket` clients (inline PEM strings do **not** auto-trust):
 
 ```js
 http.serve(
@@ -249,10 +251,10 @@ Only `sslmode=verify-full` and `sslmode=disable` are supported. Full details: [P
 - IP-literal TLS hosts (`https://127.0.0.1:...` / `wss://127.0.0.1:...`) fail closed: `std.crypto.tls.Client` matches DNS SANs, not IP SANs. Always dial TLS servers using a DNS hostname (e.g. `localhost`).
 - Custom CA bundles loaded via `--ca` or `FF_CA_FILE` are retained across client root bundle rescans and safe to configure before or after server initialization.
 - One listener is TLS-or-plain per `tls` block. No client-certificate auth.
-- Cert ≤ 512KB, key ≤ 256KB.
+- `http.serve({ tls })` caps cert and key file reads at 512 KB each (`ff start` caps cert at 512 KB, key at 256 KB; BearSSL decoded DER caps are 32 KB cert chain / 4 certs and 8 KB private key).
 - RSA or EC keys; RSA is the well-trodden path.
 - Outbound `fetch` stays HTTP/1.1 even against HTTPS hosts.
-- Server bind is always `0.0.0.0`; the net scope must name `0.0.0.0:<port>`.
+- Server bind defaults to `0.0.0.0` (configurable via `options.hostname`, IPv4/IPv6 literals only); `--allow-net` checks `<hostname>:<port>`.
 - `tls.cert` / `tls.key` paths need `--allow-read`; inline PEM and CLI
   `--cert` / `FF_CERT` do not.
 

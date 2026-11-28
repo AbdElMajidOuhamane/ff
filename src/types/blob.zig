@@ -381,9 +381,36 @@ pub fn setup(ctx: ?*c.Context) void {
         const fn_val = c.newCFunction(ctx, m.func, m.name, m.len);
         _ = c.definePropertyValueStr(ctx, proto, m.name, fn_val, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
     }
-    c.setClassProto(ctx, blob_class_id, proto);
     const global = c.getGlobalObject(ctx);
     defer c.freeValue(ctx, global);
     const ctor = c.newCFunction2(ctx, &blobConstructor, "Blob", 2, c.JS_CFUNC_constructor, 0);
+    _ = c.setConstructor(ctx, ctor, proto);
+    c.setClassProto(ctx, blob_class_id, proto);
     _ = c.definePropertyValueStr(ctx, global, "Blob", ctor, c.PROP_WRITABLE | c.PROP_CONFIGURABLE);
+}
+
+test "BlobData stores bytes and normalizes MIME types" {
+    var b = BlobData.init();
+    defer b.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), b.size());
+    try std.testing.expectEqualStrings("", b.bytes());
+    try std.testing.expectEqualStrings("", b.mimeType());
+
+    b.setBytes("hello world");
+    try std.testing.expectEqual(@as(usize, 11), b.size());
+    try std.testing.expectEqualStrings("hello world", b.bytes());
+
+    b.setBytes("");
+    try std.testing.expectEqual(@as(usize, 0), b.size());
+    try std.testing.expectEqualStrings("", b.bytes());
+
+    b.setTypeNormalized("  Text/HTML ; charset=UTF-8 ");
+    try std.testing.expectEqualStrings("text/html", b.mimeType());
+
+    b.setTypeNormalized("   ;charset=utf-8");
+    try std.testing.expectEqualStrings("", b.mimeType());
+
+    b.setTypeNormalized("Application/JSON");
+    try std.testing.expectEqualStrings("application/json", b.mimeType());
 }

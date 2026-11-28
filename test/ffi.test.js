@@ -52,8 +52,21 @@ function openFixture(symbols) {
   return null;
 }
 
+function isFfiCompiledIn() {
+  try {
+    ffi.dlopen("__ff_ffi_probe_nonexistent__", {});
+  } catch (e) {
+    if (String(e && e.message ? e.message : e).includes("FFI not compiled in")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 if (typeof globalThis.ffi === "undefined" || !ffi.allowed) {
   console.log("ffi.test.js: skipped (needs --allow-ffi)");
+} else if (!isFfiCompiledIn()) {
+  console.log("ffi.test.js: skipped (built with -Dffi=false)");
 } else {
   // ══ 1. Library, symbols, lifecycle ══
   const S = {

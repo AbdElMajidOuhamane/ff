@@ -75,3 +75,35 @@ pub const CountingAllocator = struct {
         self.base.rawFree(memory, a, ra);
     }
 };
+
+test "CountingAllocator tracks alloc, resize, remap, free, and reset" {
+    var ca: CountingAllocator = .{ .base = std.testing.allocator };
+    const alloc = ca.allocator();
+
+    var buf = try alloc.alloc(u8, 64);
+    try std.testing.expectEqual(@as(usize, 1), ca.alloc_count);
+    try std.testing.expectEqual(@as(usize, 64), ca.bytes_allocated);
+    try std.testing.expect(!ca.balanced());
+
+    // Shrink in-place if supported, else realloc path.
+    if (alloc.resize(buf, 32)) {
+        buf = buf[0..32];
+        try std.testing.expectEqual(@as(usize, 32), ca.bytes_freed);
+        if (alloc.resize(buf, 48)) {
+            buf = buf[0..48];
+            try std.testing.expectEqual(@as(usize, 80), ca.bytes_allocated);
+        }
+    }
+
+    // Exercise remap through realloc.
+    buf = try alloc.realloc(buf, 256);
+    alloc.free(buf);
+    try std.testing.expect(ca.balanced());
+
+    ca.reset();
+    try std.testing.expectEqual(@as(usize, 0), ca.alloc_count);
+    try std.testing.expectEqual(@as(usize, 0), ca.free_count);
+    try std.testing.expectEqual(@as(usize, 0), ca.bytes_allocated);
+    try std.testing.expectEqual(@as(usize, 0), ca.bytes_freed);
+    try std.testing.expect(ca.balanced());
+}

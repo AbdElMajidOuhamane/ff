@@ -30,8 +30,10 @@ ff info.js hello --allow-env=HOME
 
 | Member | Type | Description |
 |--------|------|-------------|
-| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and any `--allow-*` flags (`["/path/to/ff", "main.js", …]`) |
-| `process.env` | `object` | Filtered environment snapshot — only names granted by `--allow-env` appear |
+| `process.argv` | `string[]` | Full argv **including** the runtime, script name, and any `--allow-*` / `--deny-*` flags (`["/path/to/ff", "main.js", …]`) |
+| `process.env` | `object` | Filtered environment snapshot (OS env + optional `--env-file`) — only names granted by `--allow-env` appear |
+| `process.stdout` | `{ write, isTTY }` | Synchronous unbuffered writer to fd 1 (`write(str \| Uint8Array) -> boolean`, `isTTY: boolean`) |
+| `process.stdin` | `{ read, readSync, isTTY }` | 64 KiB reader on fd 0 (`read() -> Promise<Uint8Array \| null>`, `readSync() -> Uint8Array \| null`, `isTTY: boolean`) |
 | `process.cwd()` | `() => string` | Current working directory |
 | `process.chdir(path)` | `(path) => void` | Change directory — throws `PermissionDenied` when the target is outside `--allow-read`; a missing/unreachable path is a silent no-op |
 | `process.exit(code?)` | `(code?) => never` | Exit now; code clamped to 0–255, default 0. Also stops the event loop |
@@ -41,8 +43,8 @@ ff info.js hello --allow-env=HOME
 | `process.on(signal, fn)` | `(string, (sig) => void) => process` | Register a signal listener (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`; max 8 per signal) |
 | `process.once(signal, fn)` | `(string, (sig) => void) => process` | Register a one-shot signal listener |
 | `process.off(signal, fn)` / `process.removeListener(signal, fn)` | `(string, Function) => process` | Remove a registered signal listener |
-| `process.kill(pid, signal?)` | `(number, string?) => boolean` | Send a signal (default `"SIGTERM"`). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
-| `process.memoryUsage()` | `() => { rss: number }` | Resident Set Size in bytes |
+| `process.kill(pid, signal?)` | `(number, (string \| number)?) => boolean` | Send a signal (default `"SIGTERM"`; accepts the 5 named signals or any numeric signal). Signaling `process.pid` is ungated; other PIDs require `--allow-run=kill` |
+| `process.memoryUsage()` | `() => { rss: number }` | Peak Resident Set Size (`ru_maxrss`) in bytes |
 | `process.stats()` | `() => object` | Internal allocator, spill, and pool counters |
 
 ## Permissions
@@ -51,13 +53,13 @@ Only three members are gated:
 
 | Member | Flag | Notes |
 |--------|------|-------|
-| `process.env` | `--allow-env=NAME,…` | Built once at startup; disallowed keys are absent |
+| `process.env` | `--allow-env=NAME,…` | Built once at startup (from OS env + optional `--env-file`); disallowed keys are absent |
 | `process.chdir(path)` | `--allow-read=<target>` | The target must be inside a read scope |
 | `process.kill(pid, sig?)` | `--allow-run=kill` | Only checked when `pid !== process.pid`; self-signaling is always allowed |
 
-Everything else — `argv`, `cwd`, `exit`, `pid`, `platform`, `arch`,
-`on`, `once`, `off`, `removeListener`, `memoryUsage`, `stats` — is always
-available. `process.exit()` works even when every category is denied.
+Everything else — `argv`, `stdout`, `stdin`, `cwd`, `exit`, `pid`, `platform`,
+`arch`, `on`, `once`, `off`, `removeListener`, `memoryUsage`, `stats` — is
+always available. `process.exit()` works even when every category is denied.
 
 ## Arguments: `argv`
 
@@ -114,15 +116,10 @@ http.serve({ port }, () => new Response("ok"));
 ```sh
 PORT=4242 API_TOKEN=secret ff config.js \
   --allow-env=PORT,API_TOKEN \
-  --allow-net=0.0.0.0:3000
+  --allow-net=0.0.0.0:4242
 ```
 
-> **Note:** `process.env` is a startup snapshot, not a live view, and there is
-> no `.env` loader. Export variables (or prefix the command, as above) before
-> starting `ff`. Only granted names are copied into the object; bare
-> `--allow-env` grants all of them. The `FF_*` variables (`FF_ECHO`, `FF_CERT`,
-> `FF_KEY`, `FF_CA_FILE`) are read by the runtime itself, but the application
-> sees them only if `--allow-env` includes them.
+> **Note:** `process.env` is a startup snapshot, not a live view. By default no `.env` file is auto-loaded, though `--env-file <path>` (max 2 MiB; `#` comments and blank lines skipped; OS env wins; still gated by `--allow-env`) loads pairs into `process.env`. Only granted names are copied into the object; bare `--allow-env` grants all of them. Runtime config vars (`FF_ECHO`, `FF_CERT`, `FF_KEY`, `FF_CA_FILE`, `FF_MAX_HEAP`, `FF_CPU_BUDGET`) are read by the runtime itself, and JS only sees them if `--allow-env` includes them.
 
 ## Working directory: `cwd` / `chdir`
 
@@ -186,11 +183,30 @@ process.once("SIGTERM", async (sig) => {
 - When `http.serve` is running and no user listener is registered for `SIGINT` / `SIGTERM`, the runtime automatically triggers `server.close()` on those signals.
 - `process.kill(pid, signal?)` sends a signal (`"SIGTERM"` when omitted). Signaling `process.pid` needs no permission flag; signaling another process requires `--allow-run=kill` (or bare `--allow-run`).
 
+## Standard I/O: `stdout` / `stdin`
+
+`process.stdout` and `process.stdin` are plain objects (ungated — no permissions needed):
+
+```js
+process.stdout.write("hello\n");                    // boolean
+process.stdout.write(new Uint8Array([104, 105, 10]));
+
+if (!process.stdin.isTTY) {
+  const chunk = await process.stdin.read();         // Uint8Array (up to 64 KiB) or null on EOF
+  if (chunk) console.log("bytes:", chunk.length);
+}
+const syncChunk = process.stdin.readSync();         // synchronous read (up to 64 KiB) or null
+```
+
+- `process.stdout.write(str | Uint8Array) -> boolean` writes synchronously and unbuffered directly to fd 1 (`STDOUT_FILENO`).
+- `process.stdin.read() -> Promise<Uint8Array | null>` reads up to 64 KiB asynchronously and keeps the event loop alive while pending (calling a second `read()` before the first settles throws `TypeError: concurrent stdin.read already in progress` synchronously). `readSync()` performs a synchronous blocking 64 KiB read.
+- Both expose `.isTTY` (`boolean`). Note that neither is a Node EventEmitter/Stream (no `.on()`, `.pipe()`, `.end()`), and there is no `process.stderr` object (`console.*` writes to stderr).
+
 ## Memory and allocator introspection
 
 ### `process.memoryUsage()`
 
-Returns an object with the current process Resident Set Size (`rss`) in bytes:
+Returns an object with the peak process Resident Set Size (`ru_maxrss`) in bytes:
 
 ```js
 const { rss } = process.memoryUsage();
@@ -255,17 +271,18 @@ should read `PORT`.
 | `spawn` / `exec` / `execFile` | Provided on the separate [child_process](/docs/api/child-process) global |
 | `nextTick` | `queueMicrotask(fn)` |
 | `uptime()` / `cpuUsage()` | `performance.now()` for elapsed time |
-| `stdin` / `stdout` streams | `console.log` writes **stderr**; no readable stdin |
+| Node `stdin` / `stdout` / `stderr` EventEmitter streams | Use `process.stdout.write` and `process.stdin.read` / `readSync` (`console.*` writes **stderr**) |
 
-(`process.memoryUsage()` does exist — its `rss` is a peak counter from `getrusage`, see the [API page](/docs/api/process).)
+(`process.memoryUsage()` does exist — its `rss` is a peak counter from `getrusage`, see above.)
 
 Need Postgres? Use the built-in [`SQL` client](/docs/api/postgres) — no driver to install.
 
 ## Troubleshooting
 
-**`process.env.X` is undefined** — either the variable wasn't exported in the
-launching shell, or `--allow-env` does not include it. Check both:
-`X=1 ff app.js --allow-env=X`. No `.env` file is read.
+**`process.env.X` is undefined** — either the variable wasn't exported (and
+not in `--env-file`), or `--allow-env` does not include it. Check both:
+`X=1 ff app.js --allow-env=X` (or `--env-file=.env --allow-env=X`). Note that
+`.env` files are only read when explicitly passed via `--env-file`.
 
 **`chdir` threw `PermissionDenied`** — the target is outside every `read`
 scope. Add `--allow-read=<target>` (or a parent directory). This is different

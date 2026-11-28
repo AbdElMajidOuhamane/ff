@@ -35,6 +35,7 @@ comptime {
     // Stack transient: assert exact stride so future field adds are deliberate.
     std.debug.assert(@sizeOf(FrameHdr) <= 32);
     std.debug.assert(@alignOf(FrameHdr) == 8);
+    std.debug.assert(WS_MSG_SIZE <= std.math.maxInt(u16));
 }
 pub fn isControl(op: u8) bool {
     return op >= 0x8;
@@ -148,6 +149,17 @@ pub fn unmask(buf: []u8, mask: [4]u8) void {
         buf[i] ^= mask[i & 3];
     }
 }
+// Unmask a slice starting at byte `offset` within an active WebSocket frame payload.
+pub fn unmaskWithOffset(data: []u8, mask: [4]u8, offset: u2) void {
+    const off: usize = offset;
+    const rot = [4]u8{
+        mask[off],
+        mask[(off + 1) & 3],
+        mask[(off + 2) & 3],
+        mask[(off + 3) & 3],
+    };
+    unmask(data, rot);
+}
 // Server -> client frames are unmasked. Returns header length.
 pub fn buildHeader(out: []u8, opcode: u8, fin: bool, payload_len: usize) u8 {
     out[0] = (if (fin) @as(u8, 0x80) else 0) | (opcode & 0x0f);
@@ -256,4 +268,21 @@ test "unmask vector equals scalar" {
         unmaskScalar(b[0..s], mask);
         try std.testing.expectEqualSlices(u8, a[0..s], b[0..s]);
     }
+}
+test "unmaskWithOffset across arbitrary chunks matches single-pass unmaskScalar" {
+    const mask = [4]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var single: [185]u8 = undefined;
+    var chunked: [185]u8 = undefined;
+    for (0..single.len) |i| {
+        single[i] = @intCast((i * 19 + 7) & 0xff);
+        chunked[i] = single[i];
+    }
+    unmaskScalar(&single, mask);
+    const chunks = [_]usize{ 3, 17, 64, 1, 100 };
+    var off: usize = 0;
+    for (chunks) |clen| {
+        unmaskWithOffset(chunked[off..][0..clen], mask, @intCast(off & 3));
+        off += clen;
+    }
+    try std.testing.expectEqualSlices(u8, &single, &chunked);
 }

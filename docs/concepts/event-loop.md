@@ -69,12 +69,15 @@ The process exits when none of these are true:
 | Pending work | Where it comes from |
 |---|---|
 | A **referenced** timer armed | `setTimeout` / `setInterval` |
+| A registered `ff.cron` job | [`ff.cron`](/docs/api/cron) (uses the timer table; no unref/cancel) |
 | An `http.serve` listener running | any active server |
 | A `fetch` in flight | outbound HTTP |
 | A WebSocket client connection in flight | `new WebSocket(...)` |
+| Pending `tcp` or `udp` socket I/O | [`tcp`](/docs/api/tcp), [`udp`](/docs/api/udp) |
+| A pending `process.stdin.read()` call | [`process.stdin`](/docs/api/process) |
 | A Postgres query in flight | `sql` / `SQL` |
 | An FFI job in flight | `ffi` non-blocking calls |
-| An async `fs` job in flight | `fs.readFileAsync()` etc. — and Known issue: a *completed* job still pins the process, which then never exits (see [fs](/docs/api/fs)) |
+| An async `fs` job in flight | `fs.readFileAsync()` etc. — once all jobs settle, idle internal async watchers are ignored so scripts exit cleanly |
 | A `crypto.bcrypt` job in flight | `crypto.bcrypt.hash()` / `crypto.bcrypt.verify()` |
 | A live `Worker` | until `terminate()` |
 | A live `child_process` | until the child exits and its pipes close |
@@ -127,12 +130,13 @@ Details and more examples: [Errors and exit codes](/docs/concepts/errors).
 ## Gotchas
 
 - There is **no `process.nextTick`** — use `queueMicrotask`.
-- Sync `fs` calls block this thread. In a server, prefer
-  [`fs.*Async`](/docs/api/fs) so a slow disk never stalls connections —
-  but note the Known issue above: a successful `*Async` call still pins
-  the process afterwards.
-- An infinite JS loop hangs the process — there is no watchdog that can
-  interrupt running JavaScript. See [Limitations](/docs/reference/limitations).
+- Sync `fs` calls block this thread. In a server or script, prefer
+  [`fs.*Async`](/docs/api/fs) so slow disk I/O stays off the event-loop thread.
+- By default an infinite JS loop or hung timer hangs the process; pass
+  `--cpu-budget=<ms>` (or `FF_CPU_BUDGET`, `0`–`3600000` ms) to interrupt
+  runaway JS with `InternalError: interrupted`, or `--wall-timeout=<ms>` (or
+  `FF_WALL_TIMEOUT`, `0`–`3600000` ms) to exit `124` on wall-clock timeout. See
+  [Limitations](/docs/reference/limitations).
 - `console` writes to **stderr**, so `ff app.js > out.txt` captures nothing.
 - The loop wakes at most every 100 µs while idle; don't expect sub-100 µs
   timer precision.

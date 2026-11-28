@@ -15,7 +15,7 @@ as the [TLS guide](/docs/guides/tls#permissions):
 
 | Item | Needs |
 |---|---|
-| Listener | `--allow-net=0.0.0.0:<port>` |
+| Listener | `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`) |
 | `tls.cert` / `tls.key` paths | `--allow-read` on each file |
 | Inline PEM | No file grant |
 | `--allow-env` | Only if the app reads `PORT` / cert paths from `process.env` |
@@ -51,7 +51,7 @@ http.serve(
     port: 8443,
     tls: { cert: "./cert.pem", key: "./key.pem" },
   },
-  (url, method, body) => Response.json({ proto: "either — handler can't tell" }),
+  (url, method, body, headers) => Response.json({ proto: "either — handler can't tell" }),
 );
 ```
 
@@ -96,17 +96,17 @@ curl -k --http2 -s -o /dev/null -w "%{http_version}\n" https://127.0.0.1:8443/
 
 ## What changes with HTTP/2 (and what doesn't)
 
-Unchanged — write handlers exactly like the HTTP Server guide:
+Unchanged — write handlers (or declarative routes objects) just like the HTTP Server guide:
 
-- Handler signature `(url, method, body)` → `Response | { status, body } | Promise<…>`.
-- `Response.json` / `redirect` / statics, `Headers`, status codes — all identical.
-- Limits still apply: 512 connections, 10 MB response body (64 KB stage buffer spills to the heap), 30s watchdog, 10 MB per-stream / 16 MB per-session request body caps, max 512-byte `:path` and 16-byte `:method`, strict pseudo-header validation.
+- Handler signature `(url, method, body, headers)` → `Response | { status, body } | Promise<…>` (or `(url, method, body, headers, params)` in a routes table).
+- `Response.json` / `redirect` / `file` / statics, `Headers`, status codes — all identical.
+- Limits: 512 connections, `MAX_STREAMS = 100` concurrent streams per connection (a 101st is refused with `RST_STREAM(REFUSED_STREAM)`), 64 KiB request headers (`431`; header OOM → `503`), response headers capped at 128 total Nv slots including `:status` and `content-length` (so ≤126 user pairs; name > 64 B or value > 4096 B pairs are dropped), 10 MB per-stream request body (`413`) / 16 MB per-session (connection reset, no `413`), 10 MB response body (`500`), 16 MiB staged response output per connection (connection reset on overflow), 30s watchdog, max 512-byte `:path` and 16-byte `:method`, strict pseudo-header validation.
 - WebSocket upgrades ride the HTTP/1.1 connections on the same port; `h2` connections serve normal requests.
 - Permissions are unchanged: the port grant covers HTTP/2 and HTTP/1.1, and TLS file reads are still `read` scopes.
 
 What you get from the protocol (handled by nghttp2, not your code):
 
-- Multiplexed streams — many in-flight requests per connection.
+- Multiplexed streams — many streams can be open per connection, but the runtime runs one handler at a time per connection: completed streams wait in a pending queue and are chained as each handler settles.
 - Header compression (HPACK) — smaller repeated headers.
 - Server framing (Content-Length / Transfer-Encoding) computed for you, as with HTTP/1.1.
 
@@ -114,6 +114,7 @@ What you don't get:
 
 - No server push API — there is no push handle on the socket.
 - No trailers API — set all headers up front in the `Response`.
+- No `ReadableStream` streaming responses — returning a stream body over HTTP/2 immediately responds with `501` status (chunked streaming is HTTP/1.1 only).
 - No `fetch` upgrade — the **client is HTTP/1.1 only**. Outbound `fetch("https://h2-only.example")` fails; call HTTP/1.1-capable endpoints.
 
 ## Practical example: dual-protocol JSON API
@@ -129,7 +130,7 @@ http.serve(
     port,
     tls: { cert: process.env.TLS_CERT ?? "./cert.pem", key: process.env.TLS_KEY ?? "./key.pem" },
   },
-  (url, method, body) => {
+  (url, method, body, headers) => {
     const path = new URL(url, "http://localhost").pathname;
     if (path === "/health") return Response.json({ ok: true });
     if (path === "/echo" && method === "POST") {
@@ -157,13 +158,13 @@ fallbacks to `./cert.pem` / `./key.pem` are used. The read scopes must cover
 whichever paths are actually used. If the app reads `PORT`, add `PORT` to the
 env grant.
 
-Behind a platform load balancer that terminates TLS, skip `tls` entirely and serve plain HTTP — the balancer speaks HTTP/2 to the internet for you. The listener still needs `--allow-net=0.0.0.0:<port>`.
+Behind a platform load balancer that terminates TLS, skip `tls` entirely and serve plain HTTP — the balancer speaks HTTP/2 to the internet for you. The listener still needs `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`).
 
 ## Troubleshooting
 
 **`http.serve` throws `PermissionDenied`** — check the message: a net denial
-names `0.0.0.0:<port>`; a TLS denial names `tls.cert` or `tls.key` and the
-path. Add the listener port to `--allow-net` and each path to `--allow-read`.
+names `<hostname>:<port>` (default `0.0.0.0:<port>`); a TLS denial names `tls.cert` or `tls.key` and the
+path. Add the listener host/port to `--allow-net` and each path to `--allow-read`.
 
 **`tls.cert` is denied even though the file exists** — the path is outside
 `--allow-read`, or a symlink target is. Add the canonical target (or its
@@ -172,7 +173,7 @@ content in memory first.
 
 **`curl` reports version 1.1** — the client didn't offer `h2`, or TLS isn't on. Confirm the `tls` block is present and retest with `curl --http2`.
 
-**Handshake failure** — cert/key unreadable, over size caps (cert ≤ 512KB, key ≤ 256KB), or not a matching pair. Permission denial is separate and reports `PermissionDenied`; a malformed pair throws `TypeError` after the files are read. Start plain-HTTP first to isolate app bugs, then add TLS.
+**Handshake failure** — cert/key unreadable, over size caps (`http.serve({ tls })` caps cert and key file reads at 512 KB each; `ff start --key` caps key at 256 KB; BearSSL decoded DER caps are 32 KB cert chain / 4 certs and 8 KB key), or not a matching pair. Permission denial is separate and reports `PermissionDenied`; a malformed pair throws `TypeError` after the files are read. Start plain-HTTP first to isolate app bugs, then add TLS.
 
 **Outbound fetch to an h2-only host fails** — expected: no HTTP/2 client. Proxy through an HTTP/1.1 endpoint or pick a host that still negotiates 1.1.
 

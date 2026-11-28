@@ -123,12 +123,17 @@ fn fuzzRequest(rand: std.Random, buf: *[8192]u8) !void {
 
     const input = buf[0..pos];
     const end = http.findHeaderEnd(input, 0) orelse return; // incomplete: nothing to check
-    const pr = http.parseRequest(input, end);
-    const region = input[0..end];
+    // Mirror processPlaintext: it passes headers_end = terminator offset + 4,
+    // and the parser asserts headers_end >= 4. Passing the bare terminator
+    // offset made this target disagree with production and panic on an input
+    // that starts with the empty-line terminator.
+    const headers_end = end + 4;
+    const pr = http.parseRequest(input, headers_end);
+    const region = input[0..headers_end];
     try checkSlice(region, pr.method);
     try checkSlice(region, pr.url);
     if (pr.method_tag != http.classifyMethod(pr.method)) return error.MethodTagMismatch;
-    if (!std.meta.eql(pr, http.parseRequest(input, end))) return error.NotDeterministic;
+    if (!std.meta.eql(pr, http.parseRequest(input, headers_end))) return error.NotDeterministic;
 }
 
 fn fuzzMethod(rand: std.Random, buf: *[8192]u8) !void {

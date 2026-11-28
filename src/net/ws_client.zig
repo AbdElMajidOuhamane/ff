@@ -6,6 +6,7 @@ const tls_tunnel = @import("./tls_tunnel.zig");
 const ws = @import("./ws_native.zig");
 const builtin = @import("builtin");
 const microtasks = @import("../event/microtasks.zig"); // CHANGED
+const perm = @import("../security/permissions.zig");
 const http = std.http;
 extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 fn getRandomBytes(buf: []u8) void {
@@ -50,23 +51,29 @@ var states: [MAX_WS]std.atomic.Value(u8) = [_]std.atomic.Value(u8){.{ .raw = JOB
 // http_native ConnFlags). `want_connect`/`tx_pending` stay separate plain
 // columns: they are cross-thread hints written by main while the worker
 // reads/writes sibling flags — sharing a byte would tear on RMW.
-// Packing is safe here because for any slot, at most one thread writes
-// wflags at a time: main writes pre-publish (submit) or on CLAIMED slots
-// (completeEvent/releaseSlot, which the worker skips as non-BUSY), the
-// worker writes only on BUSY slots it owns. `tls_active` is written once
-// pre-publish, then read-only.
+// Main-thread-only flags (never read or written by the worker thread).
+const MainFlags = packed struct(u8) {
+    ws_open: bool = false,
+    ws_closing: bool = false,
+    _pad: u6 = 0,
+};
+// Worker-owned flags after submit() publishes JOB_BUSY. Main writes only
+// pre-publish in submit() (before JOB_BUSY .release) and reads rx_binary
+// only while CLAIMED (after JOB_DONE .acquire, when worker skips the slot).
 const WsFlags = packed struct(u8) {
     tls_active: bool = false,
-    ws_open: bool = false,
     ws_sent_close: bool = false,
     rx_binary: bool = false,
     partial_binary: bool = false,
     conn_live: bool = false,
+    peer_close: bool = false,
     _pad: u2 = 0,
 };
 comptime {
+    std.debug.assert(@sizeOf(MainFlags) == 1);
     std.debug.assert(@sizeOf(WsFlags) == 1);
 }
+var main_flags: [MAX_WS]MainFlags = [_]MainFlags{.{}} ** MAX_WS;
 var wflags: [MAX_WS]WsFlags = [_]WsFlags{.{}} ** MAX_WS;
 var sock_fds: [MAX_WS]std.posix.fd_t = [_]std.posix.fd_t{-1} ** MAX_WS;
 var hosts: [MAX_WS][:0]const u8 = [_][:0]const u8{""} ** MAX_WS;
@@ -153,7 +160,6 @@ fn acquireSlot() ?usize {
     if (free_count == 0) return null;
     free_count -= 1;
     const s: usize = free_list[free_count];
-    states[s].store(JOB_BUSY, .release);
     return s;
 }
 
@@ -166,7 +172,7 @@ fn releaseSlot(s: usize) void {
     hosts[s] = "";
     paths[s] = "";
     want_connect[s] = false;
-    wflags[s].ws_open = false;
+    main_flags[s] = .{};
     rx_event[s] = EV_NONE;
     rx_err_len[s] = 0;
     tx_lock[s].lockUncancelable(lockIo());
@@ -242,12 +248,11 @@ pub fn submit(
     @memcpy(path_bufs[s][0..path.len], path);
     paths[s] = path_bufs[s][0..path.len];
     ports[s] = port;
-    wflags[s].tls_active = tls_flag;
+    main_flags[s] = .{};
+    wflags[s] = .{ .tls_active = tls_flag };
     var key16: [16]u8 = undefined;
     getRandomBytes(&key16);
     _ = std.base64.standard.Encoder.encode(keys[s][0..24], &key16);
-    wflags[s].ws_open = false;
-    wflags[s].ws_sent_close = false;
     rd_len[s] = 0;
     partial_len[s] = 0;
     tx_pending[s] = .{ .raw = false };
@@ -268,6 +273,7 @@ pub fn submit(
         return error.SpawnFailed;
     };
     want_connect[s] = true;
+    states[s].store(JOB_BUSY, .release);
     wakeWorker();
     ensureArmed();
     return .{ .slot = @intCast(s), .gen = gens[s] };
@@ -345,7 +351,7 @@ fn appendFrameLocked(s: usize, opcode: u8, payload: []const u8) bool {
 pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) bool {
     if (!isValid(h)) return false;
     const s: usize = h.slot;
-    if (!wflags[s].ws_open) return false;
+    if (!main_flags[s].ws_open) return false;
     if (bytes.len > WS_MSG_SIZE) return false;
     const io = lockIo();
     tx_lock[s].lockUncancelable(io);
@@ -359,7 +365,8 @@ pub fn sendBytes(h: Handle, bytes: []const u8, binary: bool) bool {
 pub fn closeWs(h: Handle, code: u16, reason: []const u8) void {
     if (!isValid(h)) return;
     const s: usize = h.slot;
-    if (wflags[s].ws_sent_close) return;
+    if (main_flags[s].ws_closing) return;
+    main_flags[s].ws_closing = true;
     const io = lockIo();
     tx_lock[s].lockUncancelable(io);
     defer tx_lock[s].unlock(io);
@@ -388,6 +395,10 @@ fn connectSlot(s: usize) void {
     var conn: ?*http.Client.Connection = null;
     var req: ?http.Client.Request = null;
     defer if (req) |*r| r.deinit();
+    if (perm.global().checkHostNotPrivate(hosts[s], ports[s]) == .denied) {
+        failClose(s, null, "PermissionDenied: private network", &req);
+        return;
+    }
     if (wflags[s].tls_active) {
         var uri_buf: [768]u8 = undefined;
         const uri_str = std.fmt.bufPrint(&uri_buf, "wss://{s}:{d}{s}", .{ hosts[s], ports[s], paths[s] }) catch {
@@ -527,25 +538,32 @@ fn sharedWorkerMain() void {
         var nfds: usize = 1;
         var slots: [MAX_WS]u16 = undefined;
         var nslots: usize = 0;
-        var tls_ready_any = false;
+        // Readiness of already-decrypted TLS bytes, computed once per sweep.
+        // Re-probing each TLS slot in the post-poll loop issued one extra
+        // poll(2) per slot (64 sockets = 64 wasted syscalls/wake); raw socket
+        // readiness is already covered by pfd[].
+        var tls_ready_mask: u64 = 0;
         for (0..MAX_WS) |s| {
             if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
             if (w_conns[s]) |cn| {
-                if (wflags[s].tls_active and tlsReadReady(s, cn)) tls_ready_any = true;
+                if (wflags[s].tls_active and cn.reader().bufferedLen() > 0) {
+                    tls_ready_mask |= @as(u64, 1) << @intCast(s);
+                }
                 pfd[nfds] = .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 };
                 slots[nslots] = @intCast(s);
                 nfds += 1;
                 nslots += 1;
             }
         }
+        comptime std.debug.assert(MAX_WS == 64); // readiness mask is a u64
         // No live sockets: block in poll until the next submit/send/close.
-        const rc = std.posix.poll(pfd[0..nfds], if (nfds == 1) -1 else (if (tls_ready_any) 0 else 50)) catch 0;
+        const rc = std.posix.poll(pfd[0..nfds], if (nfds == 1) -1 else (if (tls_ready_mask != 0) 0 else 50)) catch 0;
         _ = rc;
         for (0..nslots) |k| {
             const s: usize = slots[k];
             if (!wflags[s].conn_live or states[s].load(.acquire) != JOB_BUSY) continue;
             const cn = w_conns[s] orelse continue;
-            const readable = (wflags[s].tls_active and tlsReadReady(s, cn)) or pfd[1 + k].revents != 0;
+            const readable = ((tls_ready_mask >> @intCast(s)) & 1 == 1) or pfd[1 + k].revents != 0;
             if (readable) {
                 if (rd_len[s] >= RDBUF) {
                     closeExit(s, cn, &w_reqs[s]);
@@ -584,8 +602,10 @@ fn sharedWorkerMain() void {
 fn closeExit(s: usize, conn: *http.Client.Connection, r: *?http.Client.Request) void {
     if (rx_event[s] != EV_CLOSE) {
         rx_event[s] = EV_CLOSE;
-        rx_code[s] = 1006;
-        rx_reason_len[s] = 0;
+        if (!wflags[s].peer_close) {
+            rx_code[s] = 1006;
+            rx_reason_len[s] = 0;
+        }
     }
     cleanupConn(s, conn, r);
     if (w_reqs[s]) |*rr| rr.deinit();
@@ -665,20 +685,6 @@ fn findHeaderValueCI(haystack: []const u8, name: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[colon + 1 ..], " \t");
     }
     return null;
-}
-
-fn sockReadable(s: usize, timeout_ms: i32) bool {
-    if (sock_fds[s] < 0) return false;
-    var pfd = [_]std.posix.pollfd{
-        .{ .fd = sock_fds[s], .events = std.posix.POLL.IN, .revents = 0 },
-    };
-    const rc = std.posix.poll(&pfd, timeout_ms) catch return false;
-    return rc != 0 and pfd[0].revents != 0;
-}
-
-fn tlsReadReady(s: usize, cn: *http.Client.Connection) bool {
-    if (cn.reader().bufferedLen() > 0) return true;
-    return sockReadable(s, 0);
 }
 
 fn readWs(s: usize, cn: *http.Client.Connection, buf: []u8) !usize {
@@ -787,8 +793,11 @@ fn initiateClose(s: usize, cn: *http.Client.Connection, code: u16, reason: []con
 }
 
 fn recordClose(s: usize, payload: []const u8) void {
+    wflags[s].peer_close = true;
     if (payload.len >= 2) {
         rx_code[s] = (@as(u16, payload[0]) << 8) | @as(u16, payload[1]);
+    } else {
+        rx_code[s] = 1005;
     }
     const rl: usize = if (payload.len > 2) @min(payload.len - 2, CLOSE_REASON_MAX) else 0;
     if (rl > 0) @memcpy(rx_reason[s][0..rl], payload[2..][0..rl]);
@@ -796,6 +805,9 @@ fn recordClose(s: usize, payload: []const u8) void {
 }
 
 fn emitMessage(s: usize, msg: []const u8, binary: bool) void {
+    // Callers must reject oversized messages (close 1009); a silent @min here
+    // delivered a truncated message to JS indistinguishable from a full one.
+    std.debug.assert(msg.len <= WS_MSG_SIZE);
     const n = @min(msg.len, WS_MSG_SIZE);
     @memcpy(rx_msg[s][0..n], msg[0..n]);
     rx_len[s] = n;
@@ -828,15 +840,45 @@ fn handleData(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: 
         @memcpy(partial[s][partial_len[s]..][0..payload.len], payload);
         partial_len[s] += payload.len;
         if (!hdr.fin) return true;
-        emitMessage(s, partial[s][0..partial_len[s]], wflags[s].partial_binary);
+        const msg = partial[s][0..partial_len[s]];
+        // RFC 6455 §5.6: validate the assembled text message once, not each
+        // fragment, and fail with 1007 instead of handing JS broken UTF-8.
+        if (!wflags[s].partial_binary and !ws.validUtf8(msg)) {
+            partial_len[s] = 0;
+            _ = initiateClose(s, cn, 1007, "");
+            return false;
+        }
+        emitMessage(s, msg, wflags[s].partial_binary);
         partial_len[s] = 0;
         return true;
+    }
+    // Single-frame message. emitMessage copies into a WS_MSG_SIZE buffer, so
+    // an oversized frame used to be truncated to 16 KiB and delivered as if
+    // complete (rd_buf holds up to 64 KiB). Fail closed instead.
+    if (payload.len > WS_MSG_SIZE) {
+        _ = initiateClose(s, cn, 1009, "");
+        return false;
+    }
+    if (op == ws.OP_TEXT and !ws.validUtf8(payload)) {
+        _ = initiateClose(s, cn, 1007, "");
+        return false;
     }
     emitMessage(s, payload, op == ws.OP_BINARY);
     return true;
 }
 
 fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload: []const u8) bool {
+    // The predicates in ws_native existed but were only wired into the server
+    // path, so reserved opcodes reached JS as text and oversized/fragmented
+    // PINGs were echoed (an amplification primitive). Enforce them here.
+    if (!ws.isValidOpcode(hdr.opcode)) {
+        _ = initiateClose(s, cn, 1002, "");
+        return false;
+    }
+    if (!ws.controlFrameOk(hdr)) {
+        _ = initiateClose(s, cn, 1002, "");
+        return false;
+    }
     if (ws.isControl(hdr.opcode)) {
         switch (hdr.opcode) {
             ws.OP_PING => return sendFrame(s, cn, ws.OP_PONG, payload),
@@ -856,6 +898,8 @@ fn handleFrame(s: usize, cn: *http.Client.Connection, hdr: ws.FrameHdr, payload:
 }
 
 fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
+    std.debug.assert(rd_len[s] <= RDBUF);
+    std.debug.assert(partial_len[s] <= WS_MSG_SIZE);
     var off: usize = 0;
     const buf = rd_buf[s][0..rd_len[s]];
     while (off < buf.len) {
@@ -878,6 +922,7 @@ fn consumeFrames(s: usize, cn: *http.Client.Connection) bool {
 }
 
 fn serviceTx(s: usize, cn: *http.Client.Connection) bool {
+    std.debug.assert(tx_len[s] <= TX_BUF_SIZE);
     if (!tx_pending[s].load(.acquire)) return true;
     var to_write: usize = 0;
     var had_close = false;
@@ -928,6 +973,11 @@ pub fn ensureArmed() void {
     if (g_loop) |l| arm(l);
 }
 
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0 and doneMask() == 0) return 1;
+    return 0;
+}
+
 pub fn setLoop(l: *xev.Loop) void {
     g_loop = l;
 }
@@ -939,7 +989,10 @@ fn asyncCb( // CHANGED: drains events and pumps microtasks
 ) xev.CallbackAction {
     _ = ud;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);
@@ -970,10 +1023,6 @@ fn claimSlot(s: usize) bool {
 
 pub fn drainCompleted(ctx: ?*c.Context) void {
     var mask = doneMask();
-    // F7-B: one wake per batch so the worker promptly resumes polling slots
-    // the dispatch just flipped back to BUSY (replaces the old per-message
-    // spin handshake).
-    if (mask != 0) wakeWorker();
     while (mask != 0) {
         const s: usize = @ctz(mask);
         mask &= mask - 1;
@@ -1062,6 +1111,15 @@ fn makeErrorEvent(ctx: ?*c.Context, s: usize) c.Value {
     return obj;
 }
 
+fn markBusy(s: usize) void {
+    // Release the slot back to the worker BEFORE writing the wake byte so
+    // the worker is guaranteed to observe JOB_BUSY for both RX polling
+    // (including buffered rd_buf frames) and any TX/close queued during
+    // onopen/onmessage.
+    states[s].store(JOB_BUSY, .release);
+    wakeWorker();
+}
+
 fn completeEvent(ctx: ?*c.Context, s: usize) void {
     const ev = rx_event[s];
 
@@ -1079,20 +1137,20 @@ fn completeEvent(ctx: ?*c.Context, s: usize) void {
     }
 
     const sv = socks[s] orelse {
-        states[s].store(JOB_BUSY, .release);
+        markBusy(s);
         return;
     };
     switch (ev) {
         EV_OPEN => {
-            wflags[s].ws_open = true;
+            main_flags[s].ws_open = true;
             setReadyState(ctx, sv, 1);
             dispatchEvent(ctx, sv, "onopen", makeOpenEvent(ctx));
-            states[s].store(JOB_BUSY, .release);
+            markBusy(s);
         },
         EV_MESSAGE => {
             dispatchEvent(ctx, sv, "onmessage", makeMessageEvent(ctx, s));
-            states[s].store(JOB_BUSY, .release);
+            markBusy(s);
         },
-        else => states[s].store(JOB_BUSY, .release),
+        else => markBusy(s),
     }
 }

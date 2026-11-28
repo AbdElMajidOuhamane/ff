@@ -6,7 +6,7 @@ order: 8
 
 # Testing
 
-Fairyfly has no external test framework. Put files ending in `.test.js` inside `test/` and run them with `ff test` (one process, all files) or `test/run.sh` (one process per file).
+Put files ending in `.test.js` inside `test/` and run them either with `ff test` (single process; fails on uncaught exceptions) or `test/run.sh` (spawns one fresh `ff` process per file and uses Fairyfly's `check`/`done` pattern).
 
 ## Permissions
 
@@ -19,9 +19,7 @@ ff test server-smoke --allow-net=0.0.0.0:3901,127.0.0.1:3901
 ff test --allow-all
 ```
 
-- Permission flags are parsed by `ff` itself, not by the test filter. They may
-  appear before or after the filter, and they are skipped when choosing which
-  files to run.
+- Place permission and limit flags **after `test`** (before or after the filter). When using value flags alongside `ff test`, prefer `=` syntax (e.g. `ff test --max-heap=128MB url`) so the value is not mistaken for the filename filter.
 - A flag applies to **every** test file in that `ff test` run. There is no
   per-file grant.
 - The runner reads `test/*.test.js` as program files, so no `--allow-read` is
@@ -75,6 +73,13 @@ done("smoke");
 Run it:
 
 ```sh
+ff test/smoke.test.js
+# [smoke] pass:3 fail:0
+```
+
+For `ff test` directly (single-process runner without `done()` / `process.exit()`), throw an `Error` on failure instead of calling `done()` — otherwise `done()` calls `process.exit()` after the first file:
+
+```sh
 ff test smoke
 # OK   test/smoke.test.js
 #
@@ -83,20 +88,22 @@ ff test smoke
 
 This test touches no native API, so it needs no permission flags.
 
-## The `check` / `done` pattern
+## The `check` / `done` pattern (`test/run.sh`)
 
-`test/lib.mjs` is tiny on purpose — read it once, then copy the pattern:
+`test/lib.mjs` is designed for `test/run.sh` (which runs one fresh `ff` process per file) — read it once, then copy the pattern:
 
 | Helper | Signature | What it does |
 |--------|-----------|--------------|
 | `check` | `check(name, cond)` | Counts a pass when `cond` is truthy, else prints `FAIL: <name>` |
 | `done` | `done(name)` | Prints `[<name>] pass:<n> fail:<m>`, then `process.exit(failed > 0 ? 1 : 0)` |
 
-Three rules:
+Three rules for `test/run.sh` suites:
 
 1. Every test file imports from `./lib.mjs` — relative import **with** the `.mjs` extension.
 2. Every test file ends with `done("<name>")`. Without it the process may idle instead of exiting.
 3. `done()` calls `process.exit()`, which also stops the event loop. Server-fixture tests (which keep a listener alive) terminate cleanly because of this.
+
+> **Important:** Because `done()` calls `process.exit()`, running `ff test` on files that call `done()` exits the entire `ff test` process immediately after the first matching file (skipping remaining files and `ff test`'s `OK` / `N passed, M failed` summary). Use `test/run.sh` for suites using `done()`, or throw on assertion failure for single-process `ff test` runs.
 
 Real example from the repo (`test/url.test.js`):
 
@@ -112,33 +119,32 @@ done("url");
 ```
 
 ```sh
-ff test url
-# OK   test/url.test.js
-#
-# 1 passed, 0 failed
+ff test/url.test.js
+# [url] pass:21 fail:0
 ```
 
 ## Running tests: `ff test`
 
 ```sh
-ff test          # every test/*.test.js in one process
+ff test          # every test/*.test.js in one process (for throw-on-failure tests)
 ff test url      # substring filter — only files with "url" in the name
 ff test formdata # only formdata.test.js
 ```
 
 Behavior:
 
-- Opens `test/` — a missing directory prints `No test/ directory found.` and exits. Run from the project root.
+- Opens `test/` — a missing directory fails with `error: no test/ directory found` (exit `1`). Run from the project root.
+- If a filter matches no files, prints `error: no tests match '<filter>'` and exits `1`.
 - Runs only files ending in `.test.js`. Anything else is ignored (e.g. `test/url.test.ffbc` never runs under `ff test`).
-- Each file is evaluated as a module, then microtasks and the event loop are pumped — top-level `await` works.
-- Prints `OK   test/<name>` or `FAIL test/<name>` per file, then a `{passed} passed, {failed} failed` summary.
+- Each file is evaluated as a module, then microtasks and the event loop are pumped — top-level `await` works. A file fails only when evaluation or async microtasks/loop throw an uncaught error (and stops the whole runner if the file calls `process.exit()`).
+- Prints `OK   test/<name>` or `FAIL test/<name>` per file (prefixed with `✓` / `✗` on a TTY), then a `{passed} passed, {failed} failed` summary. `ff test` does **not** scan stdout/stderr for `FAIL` lines.
 - Exit code is `1` when any file fails.
-- Files larger than 10MB are not loaded (`FAIL … (read error)`).
+- Files larger than 10MB or unreadable fail with `FAIL test/<name>`.
 - Permission flags in the command line apply to all files in the run; `--allow-all` makes every test file unrestricted.
 
 ## Running tests: `test/run.sh`
 
-Same job, one process per file:
+Takes no CLI arguments or filters — runs every `test/*.test.js` in its own fresh process with `--allow-all` and a per-suite timeout (`FF_TEST_TIMEOUT`, default `60`s):
 
 ```sh
 ./test/run.sh
@@ -196,10 +202,8 @@ done("server-smoke");
 ```
 
 ```sh
-ff test server-smoke --allow-net=0.0.0.0:3901,127.0.0.1:3901
-# OK   test/server-smoke.test.js
-#
-# 1 passed, 0 failed
+ff test/server-smoke.test.js --allow-net=0.0.0.0:3901,127.0.0.1:3901
+# [server-smoke] pass:1 fail:0
 ```
 
 Both grants are required: the listener binds `0.0.0.0:3901`, and the client
@@ -239,7 +243,7 @@ done("notes");
 ```
 
 ```sh
-ff test notes --allow-net=0.0.0.0:3902,127.0.0.1:3902
+ff test/notes.test.js --allow-net=0.0.0.0:3902,127.0.0.1:3902
 ```
 
 ## Testing denials
@@ -262,7 +266,7 @@ const out = child_process.execSync(
   `${BIN} -e 'try { fs.readFile("nope.txt"); } catch (e) { console.log(e.code); }'`,
   { maxBuffer: 1024 * 1024 },
 );
-check("read denied", out.stdout.includes("PERMISSION_DENIED"));
+check("read denied", out.stderr.includes("PERMISSION_DENIED"));
 ```
 
 Note that `execSync` itself needs `--allow-run=/bin/sh` in the parent. The
@@ -281,13 +285,13 @@ is missing a real grant. Add the specific scope rather than widening the
 whole run. For server fixtures, remember the listener and client checks use
 different addresses.
 
-**`No test/ directory found.`** — run from the project root, not from inside `test/`.
+**`error: no test/ directory found`** — run from the project root, not from inside `test/`.
 
-**Hanging test run** — you forgot `done(name)`, or a `setInterval` / listener keeps the loop alive with no exit path. End every file with `done()`.
+**Hanging test run** — you forgot `done(name)` under `test/run.sh`, or a `setInterval` / listener keeps the loop alive with no exit path.
 
-**`FAIL test/x.test.js (read error)`** — the file exceeds the 10MB per-file cap or is unreadable.
+**`FAIL test/x.test.js`** — the file threw an uncaught error, failed `check()`/`FAIL` under `run.sh`, exceeds the 10MB per-file cap, or is unreadable.
 
-**Passes under `ff test`, fails under `run.sh`** — something printed `FAIL` without failing `check()`. Search the output for stray `FAIL` text.
+**Passes under `ff test`, fails under `run.sh`** — something printed `FAIL` without failing `check()`, or an earlier file called `done()`/`process.exit()` before later files ran under `ff test`. Search the output for stray `FAIL` text, and run `done()` suites via `./test/run.sh`.
 
 **Denial test passes unexpectedly under `run.sh`** — the parent has
 `--allow-all`. Spawn a child `ff` with explicit flags and assert its

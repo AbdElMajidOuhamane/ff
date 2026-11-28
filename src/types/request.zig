@@ -73,7 +73,7 @@ pub const Method = enum(u8) {
             .HEAD => "HEAD",
             .OPTIONS => "OPTIONS",
             .PATCH => "PATCH",
-            .other => unreachable,
+            .other => "",
         };
     }
 };
@@ -102,7 +102,7 @@ pub const CacheMode = enum(u8) {
             .no_cache => "no-cache",
             .force_cache => "force-cache",
             .only_if_cached => "only-if-cached",
-            .other => unreachable,
+            .other => "",
         };
     }
 };
@@ -122,7 +122,7 @@ pub const CredMode = enum(u8) {
             .same_origin => "same-origin",
             .include => "include",
             .omit => "omit",
-            .other => unreachable,
+            .other => "",
         };
     }
 };
@@ -145,7 +145,7 @@ pub const Mode = enum(u8) {
             .same_origin => "same-origin",
             .no_cors => "no-cors",
             .cors => "cors",
-            .other => unreachable,
+            .other => "",
         };
     }
 };
@@ -165,7 +165,7 @@ pub const RedirectMode = enum(u8) {
             .follow => "follow",
             .err => "error",
             .manual => "manual",
-            .other => unreachable,
+            .other => "",
         };
     }
 };
@@ -208,11 +208,12 @@ pub const RequestData = struct {
         std.debug.assert(@alignOf(RequestData) >= 8);
     }
 
-    pub fn init() RequestData {
+    pub fn init() error{OutOfMemory}!RequestData {
         // Gap-5 fix: headers live in a heap refcounted HeadersData like
         // ResponseData (see response.zig), so createEmbeddedHeaders' retain
-        // and deinit's release always pair on a real heap object.
-        const h = headers_mod.acquire() orelse @panic("OOM HeadersData");
+        // and deinit's release always pair on a real heap object. OOM is
+        // returned so the constructor can throw instead of aborting.
+        const h = headers_mod.acquire() orelse return error.OutOfMemory;
         return .{
             .pool = std.ArrayList(u8).empty,
             .headers = h,
@@ -280,15 +281,15 @@ pub const RequestData = struct {
         }
         return self._redirect.string();
     }
-    fn store(self: *RequestData, s: []const u8, dst: *PoolSlice) void {
+    fn store(self: *RequestData, s: []const u8, dst: *PoolSlice) error{OutOfMemory}!void {
         if (s.len == 0) return;
         const off = self.pool.items.len;
-        self.pool.appendSlice(gpa, s) catch return;
+        try self.pool.appendSlice(gpa, s);
         dst.* = .{ .off = @intCast(off), .len = @intCast(s.len) };
     }
-    fn ensureCold(self: *RequestData) ?*RequestDataCold {
+    fn ensureCold(self: *RequestData) error{OutOfMemory}!*RequestDataCold {
         if (self.cold) |cd| return cd;
-        const cd = gpa.create(RequestDataCold) catch return null;
+        const cd = gpa.create(RequestDataCold) catch return error.OutOfMemory;
         cd.* = .{
             ._method_other = .{},
             ._cache_other = .{},
@@ -305,64 +306,72 @@ pub const RequestData = struct {
     // pushed the caller's stack buffer (≤512B) — or a second free of the
     // >512B heap buffer — onto smp_allocator's free list, poisoning it on
     // every `new Request()`. Matches ResponseData's borrowed contract.
-    pub fn setUrl(self: *RequestData, s: []const u8) void {
-        self.store(s, &self._url);
+    pub fn setUrl(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
+        try self.store(s, &self._url);
     }
-    pub fn setBody(self: *RequestData, s: []const u8) void {
+    pub fn setBody(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         if (s.len == 0) {
             self.has_body = false;
             self._body = .{};
             return;
         }
         // Reserve the body and JS_ParseJSON's NUL before retaining either.
-        self.pool.ensureUnusedCapacity(gpa, s.len + 1) catch return;
+        try self.pool.ensureUnusedCapacity(gpa, s.len + 1);
         const off = self.pool.items.len;
         self.pool.appendSliceAssumeCapacity(s);
         self.pool.appendAssumeCapacity(0);
         self._body = .{ .off = @intCast(off), .len = @intCast(s.len) };
         self.has_body = true;
     }
-    pub fn setIntegrity(self: *RequestData, s: []const u8) void {
-        self.store(s, &self._integrity);
+    pub fn setIntegrity(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
+        try self.store(s, &self._integrity);
     }
-    pub fn setMethod(self: *RequestData, s: []const u8) void {
+    pub fn setMethod(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         const m = Method.fromSlice(s);
         self._method = m;
         if (m == .other) {
-            if (self.ensureCold()) |cd| self.store(s, &cd._method_other);
+            const cd = try self.ensureCold();
+            try self.store(s, &cd._method_other);
         }
     }
-    pub fn setCache(self: *RequestData, s: []const u8) void {
+    pub fn setCache(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         const v = CacheMode.fromSlice(s);
         self._cache = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(s, &cd._cache_other);
+            const cd = try self.ensureCold();
+            try self.store(s, &cd._cache_other);
         }
     }
-    pub fn setCredentials(self: *RequestData, s: []const u8) void {
+    pub fn setCredentials(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         const v = CredMode.fromSlice(s);
         self._credentials = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(s, &cd._credentials_other);
+            const cd = try self.ensureCold();
+            try self.store(s, &cd._credentials_other);
         }
     }
-    pub fn setMode(self: *RequestData, s: []const u8) void {
+    pub fn setMode(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         const v = Mode.fromSlice(s);
         self._mode = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(s, &cd._mode_other);
+            const cd = try self.ensureCold();
+            try self.store(s, &cd._mode_other);
         }
     }
-    pub fn setRedirect(self: *RequestData, s: []const u8) void {
+    pub fn setRedirect(self: *RequestData, s: []const u8) error{OutOfMemory}!void {
         const v = RedirectMode.fromSlice(s);
         self._redirect = v;
         if (v == .other) {
-            if (self.ensureCold()) |cd| self.store(s, &cd._redirect_other);
+            const cd = try self.ensureCold();
+            try self.store(s, &cd._redirect_other);
         }
     }
-    pub fn cloneFrom(self: *RequestData, src: *const RequestData) void {
-        self.pool.ensureTotalCapacity(gpa, self.pool.items.len + src.pool.items.len) catch {};
-        self.pool.appendSlice(gpa, src.pool.items) catch {};
+    pub fn cloneFrom(self: *RequestData, src: *const RequestData) !void {
+        // Offsets in src point into src.pool; clone into an empty pool so they
+        // stay valid. (init() is empty today, but this keeps the contract.)
+        self.pool.clearRetainingCapacity();
+        try self.pool.ensureTotalCapacity(gpa, src.pool.items.len);
+        try self.pool.appendSlice(gpa, src.pool.items);
         self._url = src._url;
         self._body = src._body;
         self._integrity = src._integrity;
@@ -375,7 +384,8 @@ pub const RequestData = struct {
         self.body_used = false;
         self.keepalive = src.keepalive;
         if (src.cold) |sc| {
-            if (self.ensureCold()) |dc| {
+            {
+                const dc = try self.ensureCold();
                 dc._method_other = sc._method_other;
                 dc._cache_other = sc._cache_other;
                 dc._credentials_other = sc._credentials_other;
@@ -386,12 +396,12 @@ pub const RequestData = struct {
         self.headers.reserve(src.headers.len(), src.headers.names.items.len, src.headers.values.items.len);
         for (0..src.headers.len()) |i| {
             const p = src.headers.getPair(i);
-            self.headers.appendEntry(p.name, p.value);
+            try self.headers.appendEntry(p.name, p.value);
         }
     }
 };
 
-fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) void {
+fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.HeadersData) !void {
     if (c.isUndefined(init_val) != 0 or c.isNull(init_val) != 0) return;
     if (c.isObject(init_val) == 0) return;
     if (c.getOpaque2(ctx, init_val, headers_mod.headers_class_id)) |ptr| {
@@ -399,7 +409,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         target.reserve(src.len(), src.names.items.len, src.values.items.len);
         for (0..src.len()) |i| {
             const p = src.getPair(i);
-            target.appendEntry(p.name, p.value);
+            try target.appendEntry(p.name, p.value);
         }
         return;
     }
@@ -408,9 +418,13 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
         defer c.freeValue(ctx, len_val);
         var len: c_int = 0;
         _ = c.toInt32(ctx, &len, len_val);
-        if (len > 0) target.reserveEntries(@intCast(len));
+        // Negative c_int for length > 2^31: clamp before @intCast (UB in
+        // ReleaseFast), and bound the property walk like every other input.
+        const count: c_uint = @intCast(@max(len, 0));
+        if (count > headers_mod.MAX_HEADERS_INIT) return error.HeadersTooLarge;
+        if (count > 0) target.reserveEntries(count);
         var i: c_uint = 0;
-        while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+        while (i < count) : (i += 1) {
             const item = c.getPropertyUint32(ctx, init_val, i);
             defer c.freeValue(ctx, item);
             if (c.isObject(item) == 0) continue;
@@ -426,7 +440,7 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
                 defer nn.deinit();
                 if (v) |vv| {
                     defer vv.deinit();
-                    target.appendEntry(nn.slice, vv.slice);
+                    try target.appendEntry(nn.slice, vv.slice);
                 }
             }
         }
@@ -451,18 +465,18 @@ fn parseHeadersInit(ctx: ?*c.Context, init_val: c.Value, target: *headers_mod.He
                 defer nn.deinit();
                 if (v) |vv| {
                     defer vv.deinit();
-                    target.appendEntry(nn.slice, vv.slice);
+                    try target.appendEntry(nn.slice, vv.slice);
                 }
             }
         }
     }
 }
 
-fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers_mod.HeadersData) void {
+fn parseHeadersInitFromObj(ctx: ?*c.Context, init_obj: c.Value, target: *headers_mod.HeadersData) !void {
     const headers_val = c.getPropertyStr(ctx, init_obj, "headers");
     defer c.freeValue(ctx, headers_val);
     if (c.isUndefined(headers_val) == 0 and c.isNull(headers_val) == 0) {
-        parseHeadersInit(ctx, headers_val, target);
+        try parseHeadersInit(ctx, headers_val, target);
     }
 }
 
@@ -626,9 +640,8 @@ fn requestClone(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Va
     _ = argc;
     _ = argv;
     const data = extractRequestData(ctx, this_val) orelse return c.JS_EXCEPTION;
-    const new_data = gpa.create(RequestData) catch return c.throwOutOfMemory(ctx);
-    new_data.* = RequestData.init();
-    new_data.cloneFrom(data);
+    const new_data = createInitialized(ctx) orelse return c.JS_EXCEPTION;
+    new_data.cloneFrom(data) catch |err| return failRequest(ctx, new_data, err);
     const obj = c.newObjectClass(ctx, @intCast(request_class_id));
     c.setOpaque(obj, new_data);
     setRequestProps(ctx, obj, new_data);
@@ -667,14 +680,40 @@ fn requestFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
+/// RequestData is not pooled, so the shell must be destroyed on every failed
+/// init. `init()` can only fail before anything is allocated.
+fn createInitialized(ctx: ?*c.Context) ?*RequestData {
+    const data = gpa.create(RequestData) catch {
+        _ = c.throwOutOfMemory(ctx);
+        return null;
+    };
+    data.* = RequestData.init() catch {
+        gpa.destroy(data);
+        _ = c.throwOutOfMemory(ctx);
+        return null;
+    };
+    return data;
+}
+
+/// Tear down a half-built request and turn `err` into the matching JS throw.
+fn failRequest(ctx: ?*c.Context, data: *RequestData, err: anyerror) c.Value {
+    data.deinit();
+    gpa.destroy(data);
+    return switch (err) {
+        error.OutOfMemory => c.throwOutOfMemory(ctx),
+        error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        error.HeadersTooLarge => c.throwTypeError(ctx, "too many headers (max 2048)"),
+        else => c.throwInternalError(ctx, "request construction failed"),
+    };
+}
+
 fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     if (argc < 1) {
         _ = c.throwTypeError(ctx, "Request requires a URL string as first argument");
         return c.JS_EXCEPTION;
     }
-    const data = gpa.create(RequestData) catch return c.throwOutOfMemory(ctx);
-    data.* = RequestData.init();
+    const data = createInitialized(ctx) orelse return c.JS_EXCEPTION;
 
     var url_buf: [512]u8 = undefined;
     var scratch: [128]u8 = undefined;
@@ -683,7 +722,8 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
     if (c.isString(arg0) != 0) {
         if (extractStringAuto(ctx, arg0, &url_buf)) |u| {
             defer u.deinit();
-            data.setUrl(u.slice);
+            data.setUrl(u.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
     } else if (c.isObject(arg0) != 0) {
         const src = extractRequestData(ctx, arg0);
@@ -691,14 +731,16 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
             // Fresh headers from init() are empty: clone straight into them.
             // Releasing here would destroy the live container and leave
             // cloneFrom writing through a dangling pointer.
-            data.cloneFrom(src_data);
+            data.cloneFrom(src_data) catch |err|
+                return failRequest(ctx, data, err);
         } else {
             const url_val = c.getPropertyStr(ctx, arg0, "url");
             defer c.freeValue(ctx, url_val);
             if (c.isString(url_val) != 0) {
                 if (extractStringAuto(ctx, url_val, &url_buf)) |u| {
                     defer u.deinit();
-                    data.setUrl(u.slice);
+                    data.setUrl(u.slice) catch |err|
+                        return failRequest(ctx, data, err);
                 }
             }
         }
@@ -716,47 +758,55 @@ fn requestConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
         if (c.isString(method_val) != 0) {
             if (extractStringAuto(ctx, method_val, &scratch)) |m| {
                 defer m.deinit();
-                data.setMethod(m.slice);
+                data.setMethod(m.slice) catch |err|
+                    return failRequest(ctx, data, err);
             }
         }
-        parseHeadersInitFromObj(ctx, init_val, data.headers);
+        parseHeadersInitFromObj(ctx, init_val, data.headers) catch |err|
+            return failRequest(ctx, data, err);
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {
             if (extractStringAuto(ctx, body_val, &url_buf)) |b| {
                 defer b.deinit();
-                data.setBody(b.slice);
+                data.setBody(b.slice) catch |err|
+                    return failRequest(ctx, data, err);
             }
         }
         const cache_val = c.getPropertyStr(ctx, init_val, "cache");
         defer c.freeValue(ctx, cache_val);
         if (extractStringAuto(ctx, cache_val, &scratch)) |c_val| {
             defer c_val.deinit();
-            data.setCache(c_val.slice);
+            data.setCache(c_val.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
         const cred_val = c.getPropertyStr(ctx, init_val, "credentials");
         defer c.freeValue(ctx, cred_val);
         if (extractStringAuto(ctx, cred_val, &scratch)) |c_val| {
             defer c_val.deinit();
-            data.setCredentials(c_val.slice);
+            data.setCredentials(c_val.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
         const mode_val = c.getPropertyStr(ctx, init_val, "mode");
         defer c.freeValue(ctx, mode_val);
         if (extractStringAuto(ctx, mode_val, &scratch)) |m_val| {
             defer m_val.deinit();
-            data.setMode(m_val.slice);
+            data.setMode(m_val.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
         const redir_val = c.getPropertyStr(ctx, init_val, "redirect");
         defer c.freeValue(ctx, redir_val);
         if (extractStringAuto(ctx, redir_val, &scratch)) |r_val| {
             defer r_val.deinit();
-            data.setRedirect(r_val.slice);
+            data.setRedirect(r_val.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
         const integ_val = c.getPropertyStr(ctx, init_val, "integrity");
         defer c.freeValue(ctx, integ_val);
         if (extractStringAuto(ctx, integ_val, &scratch)) |i_val| {
             defer i_val.deinit();
-            data.setIntegrity(i_val.slice);
+            data.setIntegrity(i_val.slice) catch |err|
+                return failRequest(ctx, data, err);
         }
         const keep_val = c.getPropertyStr(ctx, init_val, "keepalive");
         defer c.freeValue(ctx, keep_val);
@@ -824,15 +874,15 @@ pub fn setup(ctx: ?*c.Context) void {
 
 // ── Regression test: JS_ParseJSON requires buf[len] == '\0' ──
 test "setBody keeps request bodies NUL-terminated for JS_ParseJSON" {
-    var d = RequestData.init();
+    var d = try RequestData.init();
     defer d.deinit();
-    d.setBody("{\"a\":1}");
+    try d.setBody("{\"a\":1}");
     const b = d.body().?;
     try std.testing.expectEqualStrings("{\"a\":1}", b);
     const end = @as(usize, d._body.off) + @as(usize, d._body.len);
     try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
     // Position-stable: constructor-order append (setCache etc.) lands after it.
-    d.setCache("no-store");
+    try d.setCache("no-store");
     try std.testing.expectEqual(@as(u8, 0), d.pool.items[end]);
     try std.testing.expectEqualStrings("{\"a\":1}", d.body().?);
 }

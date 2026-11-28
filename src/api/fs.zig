@@ -320,10 +320,20 @@ pub fn ensureArmed() void {
     async_h.wait(l, &async_comp, void, null, asyncCb);
 }
 
+/// Included in loop.zig's `unrefArmed()` so a lingering armed async handle
+/// after all async FS jobs settle does not keep `loop.active -| unrefArmed() > 0`.
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0) return 1;
+    return 0;
+}
+
 fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!void) xev.CallbackAction {
     _ = ud;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);
@@ -797,4 +807,25 @@ pub fn setup(ctx: *c.Context) void {
     _ = c.definePropertyValueStr(ctx, fs_obj, "readdirAsync", readdirAsync_fn, c.PROP_C_W_E);
 
     _ = c.definePropertyValueStr(ctx, global, "fs", fs_obj, c.PROP_C_W_E);
+}
+
+test "unrefAsyncCount reports 1 only when armed and idle" {
+    const prev_armed = async_armed;
+    const prev_pending = pending.load(.acquire);
+    defer {
+        async_armed = prev_armed;
+        pending.store(prev_pending, .release);
+    }
+
+    async_armed = false;
+    pending.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 0), unrefAsyncCount());
+
+    async_armed = true;
+    pending.store(1, .release);
+    try std.testing.expectEqual(@as(usize, 0), unrefAsyncCount());
+
+    async_armed = true;
+    pending.store(0, .release);
+    try std.testing.expectEqual(@as(usize, 1), unrefAsyncCount());
 }

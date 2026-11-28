@@ -27,10 +27,14 @@ Add the app's other flags as needed.
 
 | Variable | Used by | Effect |
 |----------|---------|--------|
-| `FF_ECHO` | `ff <file>`, `ff start` | Presence enables canned `200 {"message":"ok"}` for every request — any value, **including empty** |
-| `FF_CERT` | `ff start` | Fallback for `--cert`: PEM certificate path |
+| `FF_ECHO` | any command running `http.serve` | Presence enables canned `200 {"message":"ok"}` for every request — any value, **including empty** |
+| `FF_CERT` | `ff start` (and outbound TLS fallback) | Fallback for `--cert`: PEM certificate path; also trusted by outbound TLS if `--ca` and `FF_CA_FILE` are unset |
 | `FF_KEY` | `ff start` | Fallback for `--key`: PEM private key path |
 | `FF_CA_FILE` | runtime `fetch` / `WebSocket` client | Extra CA bundle trusted for outbound HTTPS/WSS |
+| `FF_MAX_HEAP` | runtime startup | JS main heap size (`8MB`–`4GB`, default `64MB`; overridden by `--max-heap`) |
+| `FF_CPU_BUDGET` | runtime startup | Consecutive JS CPU interrupt budget in ms (`0`–`3600000`, default `0`; overridden by `--cpu-budget`) |
+| `FF_WATCH_PARENT` | child spawned by `ff --watch` | Internal supervisor PID so the child exits if `--watch` dies |
+| `NO_COLOR` | CLI output | Presence (any value) disables ANSI colors in CLI diagnostics |
 
 ### `FF_ECHO` — smoke mode
 
@@ -78,16 +82,37 @@ FF_CA_FILE=./ca.pem ff client.js --allow-net=api.example.com:443
 FF_CA_FILE=./ca.pem ff start --allow-net=0.0.0.0:3000
 ```
 
+### `FF_MAX_HEAP` — main heap limit
+
+Sets the QuickJS main heap limit at startup (`8MB`–`4GB`, default `64MB`, integer sizes with optional `K`/`KB`, `M`/`MB`, `G`/`GB` suffixes):
+
+```sh
+FF_MAX_HEAP=256MB ff server.js --allow-net=0.0.0.0:3000
+```
+
+An explicit `--max-heap` flag on the command line overrides `FF_MAX_HEAP`.
+
+### `FF_CPU_BUDGET` — JS CPU interrupt watchdog
+
+Interrupts consecutive synchronous JS execution after `N` milliseconds (`0`–`3600000`, default `0` = disabled) on `ff <file.js>`, `ff -e`, HTTP handlers, timers, microtasks, streams, and worker eval/`onmessage` (top-level eval in `ff start`, `ff test`, `ff repl`, `.ffbc`, and `--standalone` is not guarded):
+
+```sh
+FF_CPU_BUDGET=1000 ff worker-heavy.js
+```
+
+An explicit `--cpu-budget` flag overrides `FF_CPU_BUDGET`. Requires no `--allow-env` grant.
+
 `FF_CA_FILE` only changes trust. It does **not** grant network access:
 outbound `fetch` / `WebSocket` calls still need `--allow-net` for their
 host and port.
 
-Unlike `--ca` (which `ff start` rejects), `FF_CA_FILE` works everywhere, including `ff start`. When TLS is started with `--cert`/`FF_CERT`, that cert path is additionally trusted by the runtime's own outbound clients — handy for self-signed dev loops.
+Unlike `--ca` (which `ff start` silently ignores; `--ca` works on `ff <file>`, `ff -e`, and `ff --watch <file>`), `FF_CA_FILE` works everywhere, including `ff start`. If neither `--ca` nor `FF_CA_FILE` is set, outbound TLS falls back to trusting `FF_CERT` when present — handy for self-signed dev loops.
 
 ## Reading env in code
 
-`process.env` is a plain object snapshot of the environment, filtered by
-`--allow-env`. Only granted names appear; everything else is `undefined`:
+`process.env` is a plain object snapshot of the environment at startup,
+filtered by `--allow-env`. Only granted names appear; everything else is
+`undefined`:
 
 ```js
 // config.js
@@ -101,15 +126,27 @@ http.serve({ port }, () => new Response("ok"));
 ```sh
 PORT=4242 API_TOKEN=secret ff config.js \
   --allow-env=PORT,API_TOKEN \
-  --allow-net=0.0.0.0:3000
+  --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 # ok
 ```
 
-> **Note:** `process.env` reflects the environment at startup. There is no
-> `.env` file loader — export variables in your shell (or prefix the command,
-> as above) before starting `ff`. Bare `--allow-env` grants every name;
-> `--allow-env=PORT,API_TOKEN` grants just those two.
+> **Note:** Bare `--allow-env` grants every name; `--allow-env=PORT,API_TOKEN`
+> grants just those two. `process.env` is populated once at startup — see below
+> for loading `.env` files explicitly with `--env-file`.
+
+### Loading a `.env` file (`--env-file`)
+
+No `.env` file is read automatically, but you can pass `--env-file <path>` (or `--env-file=<path>`) on the CLI:
+
+```sh
+ff config.js --env-file=.env.production --allow-env=PORT,API_TOKEN --allow-net=0.0.0.0:4242
+```
+
+- **Syntax**: `KEY=VALUE` per line; blank lines and `#` comments are skipped; surrounding spaces/tabs/`\r` are trimmed and matching `'...'` or `"..."` quotes around `VALUE` are stripped.
+- **Size & missing files**: capped at 2 MB; if the file is missing or unreadable, startup continues silently without failing.
+- **Precedence**: OS environment variables always take precedence over values in `--env-file`.
+- **Permissions & scope**: entries from `--env-file` are still filtered by `--allow-env` and only populate JavaScript `process.env` (they do not alter OS env vars read by `FF_*` runtime flags or the global `sql` pool).
 
 ### Runtime config vs application env
 
@@ -125,7 +162,8 @@ FF_ECHO=1 ff app.js --allow-env=FF_ECHO
 ```
 
 Without the grant, `process.env.FF_ECHO` is `undefined` even though echo mode
-is active. The same applies to `FF_CERT`, `FF_KEY`, and `FF_CA_FILE`.
+is active. The same applies to `FF_CERT`, `FF_KEY`, `FF_CA_FILE`, `FF_MAX_HEAP`,
+`FF_CPU_BUDGET`, `FF_WATCH_PARENT`, and `NO_COLOR`.
 
 ### Database environment variables
 
@@ -171,15 +209,13 @@ FF_CA_FILE=/etc/ssl/upstream-ca.pem ff start \
 
 **Port env var does nothing** — the runtime does not read `PORT` or `FF_PORT`; set the port in `http.serve({ port })`. Your app may read `PORT` itself, but only with `--allow-env=PORT`.
 
-**`process.env.X` is undefined** — either the variable was not exported, or
-`--allow-env` does not include it. Check both: `X=1 ff app.js --allow-env=X`.
-No `.env` file is read.
+**`process.env.X` is undefined** — either the variable was not exported (or not in `--env-file`), or `--allow-env` does not include it. Check both: `X=1 ff app.js --allow-env=X`. Note that `.env` files are only read when explicitly passed via `--env-file <path>`.
 
 **`FF_ECHO` works but `process.env.FF_ECHO` is undefined** — expected.
 `FF_*` variables are runtime config; JS sees them only with a matching
 `--allow-env` grant.
 
-**`--ca` rejected by `ff start`** — expected. Use `FF_CA_FILE` with `ff start`; `--ca` works only with `ff <file>` and `ff -e`.
+**`--ca` ignored by `ff start`** — expected. Use `FF_CA_FILE` with `ff start`; `--ca` works with `ff <file>`, `ff -e`, and `ff --watch <file>`.
 
 **`FF_CA_FILE` set but fetch still denied** — trust and permission are
 separate. Add `--allow-net=<host>:<port>` for the request.

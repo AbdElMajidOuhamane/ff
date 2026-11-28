@@ -19,9 +19,9 @@ ff server.js 2> server.log    # logs to file, terminal stays clean
 ff server.js 2> >(tee server.log)   # both
 ```
 
-There is no `process.stdout.write` and no other API that touches fd 1 —
-**every log line lands on stderr**. For a shipper that insists on stdout,
-merge at the shell:
+Every `console.*` call lands on **stderr**, leaving fd 1 clean for explicit
+program output via `process.stdout.write(...)`. For a shipper that insists on
+stdout, merge at the shell:
 
 ```sh
 ff server.js 2>&1 | collector
@@ -123,9 +123,8 @@ onmessage = (e) => {
 - `console.log({ a: 1 })` prints `[object Object]` — use `JSON.stringify`.
 - ANSI colour codes survive redirection into files; strip them at the
   collector if your format requires it.
-- Nothing flushes aggressively — if the process is killed, the last line
-  in a pipe may be lost. For crash-only diagnostics, prefer writing to a
-  file with `fs.writeFile`.
+- Each `console.*` call writes directly to stderr before returning (only lines `> 4096` bytes flush across chunks, so an abrupt kill mid-call would only truncate an oversized line).
+- Output is uncapped by default; pass `--max-log-bytes=<size>` (`0`–`100MB`) to cap total bytes written by `console.*` (emits `[console] log limit exceeded; further output suppressed` once reached).
 - There is no log-level filtering: every call prints. Gate noisy output
   yourself (`if (debug) console.debug(...)`).
 

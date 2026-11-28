@@ -41,8 +41,9 @@ pub const ERR_OK: u8 = 0;
 pub const ERR_MISMATCH: u8 = 1;
 pub const ERR_INTERNAL: u8 = 2;
 
-// 256 KiB worker stack is plenty for bcrypt frames (~4-8 KiB max)
-const WORKER_STACK_SIZE: usize = 256 * 1024;
+// 1 MiB virtual stack reserve: ARM64 Linux glibc rejects <=256 KiB stacks with EINVAL
+// (PTHREAD_STACK_MIN + SVE AT_MINSIGSTKSZ + guard page); untouched pages cost 0 RSS.
+const WORKER_STACK_SIZE: usize = 1024 * 1024;
 
 pub var pending: std.atomic.Value(u64) = .{ .raw = 0 };
 
@@ -163,11 +164,19 @@ pub fn ensureArmed() void {
     if (g_loop) |l| arm(l);
 }
 
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0) return 1;
+    return 0;
+}
+
 fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!void) xev.CallbackAction {
     _ = ud;
     _ = l;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);

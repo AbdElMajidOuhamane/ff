@@ -370,6 +370,9 @@ const SymbolDesc = struct {
 const Lib = struct {
     handle: ?*anyopaque,
     closed: bool = false,
+    /// Nonblocking calls currently executing this library's code. `close()`
+    /// must not dlclose while > 0, or the worker executes unmapped pages.
+    inflight: u32 = 0,
     symbols: std.ArrayList(*SymbolDesc),
 };
 
@@ -441,6 +444,9 @@ fn makePtr(ctx: ?*c.Context, addr: usize) c.Value {
 // ── Library class ──
 
 fn freeLib(lib: *Lib) void {
+    // Every in-flight job holds a JS reference to the library object, so the
+    // finalizer cannot run while `inflight > 0`.
+    std.debug.assert(lib.inflight == 0);
     for (lib.symbols.items) |sym| {
         for (sym.params) |p| {
             if (p.spec) |s| freeStructDesc(s);
@@ -473,8 +479,13 @@ fn closeCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.V
     };
     if (!lib.closed) {
         lib.closed = true;
-        if (lib.handle) |h| _ = dlclose(h);
-        lib.handle = null;
+        // Unload now only when no worker is inside the library; otherwise the
+        // last settleJob() does it. (Sync calls hold func_data[0], so their
+        // library object is pinned for the duration of the call.)
+        if (lib.inflight == 0) {
+            if (lib.handle) |h| _ = dlclose(h);
+            lib.handle = null;
+        }
     }
     return c.JS_UNDEFINED;
 }
@@ -501,7 +512,7 @@ fn symCall(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value, 
         _ = c.throwTypeError(ctx, "ffi: '%s' expects %d arguments, got %d", sym.name_z.ptr, need, argc);
         return c.JS_EXCEPTION;
     }
-    if (sym.nonblocking) return symCallAsync(ctx, sym, argc, argv);
+    if (sym.nonblocking) return symCallAsync(ctx, lib, func_data[0], sym, argc, argv);
 
     var store: [MAX_ARGS]u128 align(16) = undefined;
     var avals: [MAX_ARGS]*anyopaque = undefined;
@@ -589,7 +600,7 @@ fn symCall(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value, 
     return wrapResult(ctx, sym, &rstore);
 }
 
-fn symCallAsync(ctx: ?*c.Context, sym: *SymbolDesc, argc: c_int, argv: [*c]c.Value) c.Value {
+fn symCallAsync(ctx: ?*c.Context, lib: *Lib, lib_obj: c.Value, sym: *SymbolDesc, argc: c_int, argv: [*c]c.Value) c.Value {
     const need: c_int = @intCast(sym.params.len);
     if (argc < need) {
         _ = c.throwTypeError(ctx, "ffi: '%s' expects %d arguments, got %d", sym.name_z.ptr, need, argc);
@@ -619,6 +630,13 @@ fn symCallAsync(ctx: ?*c.Context, sym: *SymbolDesc, argc: c_int, argv: [*c]c.Val
     job.reject = c.dupValue(ctx, cap[1]);
     c.freeValue(ctx, cap[0]);
     c.freeValue(ctx, cap[1]);
+    // Pin the library for the whole call: a JS `lib.close()` (or GC) must not
+    // unmap the code the worker is about to run.
+    std.debug.assert(lib.inflight < std.math.maxInt(u32));
+    lib.inflight += 1;
+    job.lib = lib;
+    job.lib_obj = c.dupValue(ctx, lib_obj);
+    std.debug.assert(c.isException(job.lib_obj) == 0);
     _ = pending.fetchAdd(1, .acq_rel);
     ensureArmed();
     poolRef().schedule(.from(&job.task));
@@ -741,6 +759,9 @@ const MAX_JOBS: usize = 32;
 const CallJob = struct {
     task: xev.ThreadPool.Task = .{ .callback = jobRun },
     sym: *SymbolDesc = undefined,
+    /// Library pin for the duration of a nonblocking call (see Lib.inflight).
+    lib: ?*Lib = null,
+    lib_obj: c.Value = c.JS_UNDEFINED,
     resolve: c.Value = c.JS_UNDEFINED,
     reject: c.Value = c.JS_UNDEFINED,
     store: [MAX_ARGS]u128 align(16) = undefined,
@@ -808,10 +829,18 @@ pub fn ensureArmed() void {
     async_h.wait(l, &async_comp, void, null, asyncCb);
 }
 
+pub inline fn unrefAsyncCount() usize {
+    if (async_armed and pending.load(.acquire) == 0 and bridge_pending.load(.acquire) == 0) return 1;
+    return 0;
+}
+
 fn asyncCb(ud: ?*void, l: *xev.Loop, comp: *xev.Completion, r: AsyncT.WaitError!void) xev.CallbackAction {
     _ = ud;
     _ = comp;
-    _ = r catch return .disarm;
+    _ = r catch {
+        async_armed = false;
+        return .disarm;
+    };
     if (g_ctx) |ctx| {
         drainCompleted(ctx);
         microtasks.pumpMicrotasks(ctx);
@@ -848,6 +877,8 @@ fn acquireJob() ?*CallJob {
         if (job_state[i].cmpxchgStrong(ST_FREE, ST_CLAIMED, .acq_rel, .acquire) != null) continue;
         const j = &jobs[i];
         j.task = .{ .callback = jobRun };
+        j.lib = null;
+        j.lib_obj = c.JS_UNDEFINED;
         j.resolve = c.JS_UNDEFINED;
         j.reject = c.JS_UNDEFINED;
         j.owned = .{null} ** MAX_ARGS;
@@ -1036,6 +1067,21 @@ fn settleJob(ctx: ?*c.Context, job: *CallJob) void {
         const dd = cbd orelse continue;
         _ = dd.bridge_job.cmpxchgStrong(@intFromPtr(job), 0, .acq_rel, .acquire);
     }
+    if (job.lib) |lib| {
+        std.debug.assert(lib.inflight > 0);
+        lib.inflight -= 1;
+        // Last user of a closed library performs the deferred unload. Do it
+        // BEFORE releasing lib_obj: that free may run the finalizer.
+        if (lib.closed and lib.inflight == 0) {
+            if (lib.handle) |h| _ = dlclose(h);
+            lib.handle = null;
+        }
+        job.lib = null;
+        if (c.isUndefined(job.lib_obj) == 0) {
+            c.freeValue(ctx, job.lib_obj);
+            job.lib_obj = c.JS_UNDEFINED;
+        }
+    }
     // A3 FIX: `job.used = false` moved to drainJobs next to the state
     // release (settleJob is only called from there); pending decrement stays.
     _ = pending.fetchSub(1, .release);
@@ -1081,10 +1127,24 @@ var bridge_free: [BRIDGE_CAP]*BridgeCall = undefined;
 var bridge_free_n: std.atomic.Value(usize) = .{ .raw = 0 };
 var bridge_spill: std.atomic.Value(u64) = .{ .raw = 0 };
 
+// The bridge freelist is pushed from arbitrary foreign threads. A bare
+// load/store pair loses slots (two pushers read the same head), silently
+// decaying the pool to the 2-allocation spill path, so guard it.
+var bridge_free_mu: std.atomic.Mutex = .unlocked;
+
+fn bridgeFreeLock() void {
+    while (!bridge_free_mu.tryLock()) std.atomic.spinLoopHint();
+}
+fn bridgeFreeUnlock() void {
+    bridge_free_mu.unlock();
+}
+
 fn acquireBridge() ?*BridgeCall {
-    const n = bridge_free_n.load(.acquire);
+    bridgeFreeLock();
+    defer bridgeFreeUnlock();
+    const n = bridge_free_n.load(.monotonic);
     if (n == 0) return null;
-    if (bridge_free_n.cmpxchgStrong(n, n - 1, .acq_rel, .acquire) != null) return null;
+    bridge_free_n.store(n - 1, .monotonic);
     return bridge_free[n - 1];
 }
 
@@ -1093,10 +1153,13 @@ fn releaseBridge(bc: *BridgeCall) void {
         gpa.free(b);
         bc.argbuf_spill = null;
     }
-    const n = bridge_free_n.load(.acquire);
-    if (n >= BRIDGE_CAP) return; // unreachable: pool never overflows
+    bridgeFreeLock();
+    defer bridgeFreeUnlock();
+    const n = bridge_free_n.load(.monotonic);
+    std.debug.assert(n < BRIDGE_CAP); // one release per acquire
+    if (n >= BRIDGE_CAP) return;
     bridge_free[n] = bc;
-    bridge_free_n.store(n + 1, .release);
+    bridge_free_n.store(n + 1, .monotonic);
 }
 
 /// Arg storage currently backing a BridgeCall (inline or spill).
@@ -1759,6 +1822,8 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     const symbols_obj = c.newObject(ctx);
     if (c.isException(symbols_obj) != 0) {
         c.freePropertyEnum(ctx, tab, n);
+        c.setOpaque(lib_obj, null);
+        c.freeValue(ctx, lib_obj);
         freeLib(lib);
         return symbols_obj;
     }
@@ -1768,6 +1833,9 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     while (k < n) : (k += 1) {
         const name_c = atomStrOf(ctx, tab[k].atom) orelse {
             c.freePropertyEnum(ctx, tab, n);
+            c.setOpaque(lib_obj, null);
+            c.freeValue(ctx, lib_obj);
+            c.freeValue(ctx, symbols_obj);
             freeLib(lib);
             return c.JS_EXCEPTION;
         };
@@ -1779,12 +1847,18 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
 
         const sym = parseSymbol(ctx, lib, name, desc, handle) catch {
             c.freePropertyEnum(ctx, tab, n);
+            c.setOpaque(lib_obj, null);
+            c.freeValue(ctx, lib_obj);
+            c.freeValue(ctx, symbols_obj);
             freeLib(lib);
             return c.JS_EXCEPTION;
         };
         if (sym) |s| {
             lib.symbols.append(gpa, s) catch {
                 c.freePropertyEnum(ctx, tab, n);
+                c.setOpaque(lib_obj, null);
+                c.freeValue(ctx, lib_obj);
+                c.freeValue(ctx, symbols_obj);
                 freeLib(lib);
                 return c.throwOutOfMemory(ctx);
             };
@@ -1792,6 +1866,9 @@ fn dlopenCallback(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
             const fn_obj = c.newCFunctionData(ctx, symCall, @intCast(s.params.len), @intCast(idx), 1, &data_arr);
             if (c.isException(fn_obj) != 0) {
                 c.freePropertyEnum(ctx, tab, n);
+                c.setOpaque(lib_obj, null);
+                c.freeValue(ctx, lib_obj);
+                c.freeValue(ctx, symbols_obj);
                 freeLib(lib);
                 return fn_obj;
             }

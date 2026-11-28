@@ -176,108 +176,120 @@ fn envIfAllowed(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(v);
 }
 
-fn loadConfig() !pg.Config {
+pub fn initConfigWithAlloc(alloc: std.mem.Allocator) !pg.Config {
     var cfg = pg.Config{};
-    cfg.host = try gpa.dupe(u8, cfg.host);
-    errdefer gpa.free(cfg.host);
-    cfg.user = try gpa.dupe(u8, cfg.user);
-    errdefer gpa.free(cfg.user);
-    cfg.password = try gpa.dupe(u8, cfg.password);
-    errdefer gpa.free(cfg.password);
-    cfg.database = try gpa.dupe(u8, cfg.database);
-    errdefer gpa.free(cfg.database);
-    cfg.sslrootcert = try gpa.dupe(u8, cfg.sslrootcert);
-    errdefer gpa.free(cfg.sslrootcert);
+    cfg.host = try alloc.dupe(u8, cfg.host);
+    errdefer alloc.free(cfg.host);
+    cfg.user = try alloc.dupe(u8, cfg.user);
+    errdefer alloc.free(cfg.user);
+    cfg.password = try alloc.dupe(u8, cfg.password);
+    errdefer alloc.free(cfg.password);
+    cfg.database = try alloc.dupe(u8, cfg.database);
+    errdefer alloc.free(cfg.database);
+    cfg.sslrootcert = try alloc.dupe(u8, cfg.sslrootcert);
+    errdefer alloc.free(cfg.sslrootcert);
+    return cfg;
+}
+
+pub fn freeConfigWithAlloc(alloc: std.mem.Allocator, cfg: pg.Config) void {
+    alloc.free(cfg.host);
+    alloc.free(cfg.user);
+    alloc.free(cfg.password);
+    alloc.free(cfg.database);
+    alloc.free(cfg.sslrootcert);
+}
+
+fn replaceConfigField(alloc: std.mem.Allocator, dst: *[]const u8, src: []const u8) !void {
+    const duped = try alloc.dupe(u8, src);
+    alloc.free(dst.*);
+    dst.* = duped;
+}
+
+fn loadConfig() !pg.Config {
+    var cfg = try initConfigWithAlloc(gpa);
+    errdefer freeConfigWithAlloc(gpa, cfg);
     if (envIfAllowed("PG_TEST_DSN")) |url| {
-        try parseDsn(url, &cfg);
+        try parseDsnWithAlloc(gpa, url, &cfg);
         return cfg;
     }
     if (envIfAllowed("DATABASE_URL")) |url| {
-        try parseDsn(url, &cfg);
+        try parseDsnWithAlloc(gpa, url, &cfg);
         return cfg;
     }
     if (envIfAllowed("PGHOST")) |v| {
-        gpa.free(cfg.host);
-        cfg.host = try gpa.dupe(u8, v);
+        try replaceConfigField(gpa, &cfg.host, v);
     }
     if (envIfAllowed("PGPORT")) |v| {
         cfg.port = std.fmt.parseInt(u16, v, 10) catch 5432;
     }
     if (envIfAllowed("PGUSER")) |v| {
-        gpa.free(cfg.user);
-        cfg.user = try gpa.dupe(u8, v);
+        try replaceConfigField(gpa, &cfg.user, v);
     }
     if (envIfAllowed("PGPASSWORD")) |v| {
-        gpa.free(cfg.password);
-        cfg.password = try gpa.dupe(u8, v);
+        try replaceConfigField(gpa, &cfg.password, v);
     }
     if (envIfAllowed("PGDATABASE")) |v| {
-        gpa.free(cfg.database);
-        cfg.database = try gpa.dupe(u8, v);
+        try replaceConfigField(gpa, &cfg.database, v);
     }
     if (envIfAllowed("PGSSLMODE")) |v| {
         cfg.sslmode = parseSslMode(v) orelse return error.UnsupportedSslMode;
     }
     if (envIfAllowed("PGSSLROOTCERT")) |v| {
-        gpa.free(cfg.sslrootcert);
-        cfg.sslrootcert = try gpa.dupe(u8, v);
+        try replaceConfigField(gpa, &cfg.sslrootcert, v);
     }
     return cfg;
 }
 
 fn parseDsn(url: []const u8, cfg: *pg.Config) !void {
+    return parseDsnWithAlloc(gpa, url, cfg);
+}
+
+pub fn parseDsnWithAlloc(alloc: std.mem.Allocator, url: []const u8, cfg: *pg.Config) !void {
     const scheme = std.mem.indexOf(u8, url, "://") orelse return error.BadDsn;
     var rest = url[scheme + 3 ..];
     if (std.mem.indexOfScalar(u8, rest, '@')) |at| {
         const auth = rest[0..at];
         rest = rest[at + 1 ..];
         if (std.mem.indexOfScalar(u8, auth, ':')) |colon| {
-            gpa.free(cfg.user);
-            cfg.user = try gpa.dupe(u8, auth[0..colon]);
-            gpa.free(cfg.password);
-            cfg.password = try gpa.dupe(u8, auth[colon + 1 ..]);
+            try replaceConfigField(alloc, &cfg.user, auth[0..colon]);
+            try replaceConfigField(alloc, &cfg.password, auth[colon + 1 ..]);
         } else {
-            gpa.free(cfg.user);
-            cfg.user = try gpa.dupe(u8, auth);
+            try replaceConfigField(alloc, &cfg.user, auth);
         }
     }
     var hostport = rest;
     if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
         var db = rest[slash + 1 ..];
         if (std.mem.indexOfScalar(u8, db, '?')) |q| {
-            try parseDsnQuery(db[q + 1 ..], cfg);
+            try parseDsnQueryWithAlloc(alloc, db[q + 1 ..], cfg);
             db = db[0..q];
         }
         if (db.len > 0) {
-            gpa.free(cfg.database);
-            cfg.database = try gpa.dupe(u8, db);
+            try replaceConfigField(alloc, &cfg.database, db);
         }
         hostport = rest[0..slash];
     } else if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
-        try parseDsnQuery(rest[q + 1 ..], cfg);
+        try parseDsnQueryWithAlloc(alloc, rest[q + 1 ..], cfg);
         hostport = rest[0..q];
     }
     if (std.mem.startsWith(u8, hostport, "[")) {
         const end = std.mem.indexOfScalar(u8, hostport, ']') orelse return error.BadDsn;
-        gpa.free(cfg.host);
-        cfg.host = try gpa.dupe(u8, hostport[1..end]);
+        try replaceConfigField(alloc, &cfg.host, hostport[1..end]);
         if (end + 1 < hostport.len and hostport[end + 1] == ':') {
             cfg.port = try std.fmt.parseInt(u16, hostport[end + 2 ..], 10);
         }
     } else if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |colon| {
-        gpa.free(cfg.host);
-        cfg.host = try gpa.dupe(u8, hostport[0..colon]);
+        try replaceConfigField(alloc, &cfg.host, hostport[0..colon]);
         cfg.port = try std.fmt.parseInt(u16, hostport[colon + 1 ..], 10);
     } else if (hostport.len > 0) {
-        gpa.free(cfg.host);
-        cfg.host = try gpa.dupe(u8, hostport);
+        try replaceConfigField(alloc, &cfg.host, hostport);
     }
 }
 
 /// Query-string options. Only the two modes we can honour are accepted;
 /// `require` / `prefer` / `verify-ca` are refused rather than silently
 /// upgraded or downgraded.
-fn parseDsnQuery(query: []const u8, cfg: *pg.Config) !void {
+fn parseDsnQueryWithAlloc(alloc: std.mem.Allocator, query: []const u8, cfg: *pg.Config) !void {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (pair.len == 0) continue;
@@ -287,13 +299,12 @@ fn parseDsnQuery(query: []const u8, cfg: *pg.Config) !void {
         if (std.ascii.eqlIgnoreCase(key, "sslmode")) {
             cfg.sslmode = parseSslMode(val) orelse return error.UnsupportedSslMode;
         } else if (std.ascii.eqlIgnoreCase(key, "sslrootcert")) {
-            gpa.free(cfg.sslrootcert);
-            cfg.sslrootcert = try gpa.dupe(u8, val);
+            try replaceConfigField(alloc, &cfg.sslrootcert, val);
         }
     }
 }
 
-fn parseSslMode(v: []const u8) ?pg.SslMode {
+pub fn parseSslMode(v: []const u8) ?pg.SslMode {
     if (std.ascii.eqlIgnoreCase(v, "disable")) return .disable;
     if (std.ascii.eqlIgnoreCase(v, "verify-full") or
         std.ascii.eqlIgnoreCase(v, "verify_full")) return .verify_full;
@@ -595,7 +606,11 @@ fn arrayLength(ctx: ?*c.Context, v: c.Value) !usize {
     return @intCast(n);
 }
 
-fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool) !void {
+fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool, depth: u8) !void {
+    // Nested arrays are walked recursively. Cap the depth: a JS-supplied
+    // [[[[...]]]] used to recurse until the stack overflowed. Same bound as
+    // appendArrayElem's encoder, so what can be classified can be encoded.
+    if (depth > 8) return error.EncodeFailed;
     if (c.isNull(v) != 0 or c.isUndefined(v) != 0) return;
     if (c.isArray(ctx, v) != 0) {
         const n = try arrayLength(ctx, v);
@@ -604,7 +619,7 @@ fn classifyValue(ctx: ?*c.Context, v: c.Value, kind: *ArrKind, decided: *bool) !
             const el = c.getPropertyUint32(ctx, v, @intCast(i));
             if (c.isException(el) != 0) return error.EncodeFailed;
             defer c.freeValue(ctx, el);
-            try classifyValue(ctx, el, kind, decided);
+            try classifyValue(ctx, el, kind, decided, depth + 1);
             if (decided.* and kind.* == .text) return;
         }
         return;
@@ -774,7 +789,7 @@ fn encodeArrayParam(ctx: ?*c.Context, alloc: std.mem.Allocator, arr: c.Value) !E
             const el = c.getPropertyUint32(ctx, arr, @intCast(i));
             if (c.isException(el) != 0) return error.EncodeFailed;
             defer c.freeValue(ctx, el);
-            try classifyValue(ctx, el, &kind, &decided);
+            try classifyValue(ctx, el, &kind, &decided, 0);
             if (decided and kind == .text) break;
         }
     }
@@ -1208,9 +1223,49 @@ fn sqlCtor(ctx: ?*c.Context, new_target: c.Value, argc: c_int, argv: [*c]c.Value
 }
 
 fn freeLooseConfig(cfg: pg.Config) void {
-    gpa.free(cfg.host);
-    gpa.free(cfg.user);
-    gpa.free(cfg.password);
-    gpa.free(cfg.database);
-    gpa.free(cfg.sslrootcert);
+    freeConfigWithAlloc(gpa, cfg);
+}
+
+test "parseSslMode and parseDsnWithAlloc handle full DSNs, IPv6, queries, and invalid inputs" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?pg.SslMode, .disable), parseSslMode("DISABLE"));
+    try std.testing.expectEqual(@as(?pg.SslMode, .verify_full), parseSslMode("verify-full"));
+    try std.testing.expectEqual(@as(?pg.SslMode, .verify_full), parseSslMode("VERIFY_FULL"));
+    try std.testing.expect(parseSslMode("require") == null);
+    try std.testing.expect(parseSslMode("prefer") == null);
+    try std.testing.expect(parseSslMode("verify-ca") == null);
+
+    {
+        var cfg = try initConfigWithAlloc(alloc);
+        defer freeConfigWithAlloc(alloc, cfg);
+        try parseDsnWithAlloc(alloc, "postgres://alice:s3cr3t@db.internal:5433/appdb?sslmode=verify-full&sslrootcert=/etc/ca.pem", &cfg);
+        try std.testing.expectEqualStrings("alice", cfg.user);
+        try std.testing.expectEqualStrings("s3cr3t", cfg.password);
+        try std.testing.expectEqualStrings("db.internal", cfg.host);
+        try std.testing.expectEqual(@as(u16, 5433), cfg.port);
+        try std.testing.expectEqualStrings("appdb", cfg.database);
+        try std.testing.expectEqual(pg.SslMode.verify_full, cfg.sslmode);
+        try std.testing.expectEqualStrings("/etc/ca.pem", cfg.sslrootcert);
+    }
+
+    {
+        var cfg = try initConfigWithAlloc(alloc);
+        defer freeConfigWithAlloc(alloc, cfg);
+        try parseDsnWithAlloc(alloc, "postgresql://bob@[::1]:5435?sslmode=disable", &cfg);
+        try std.testing.expectEqualStrings("bob", cfg.user);
+        try std.testing.expectEqualStrings("", cfg.password);
+        try std.testing.expectEqualStrings("::1", cfg.host);
+        try std.testing.expectEqual(@as(u16, 5435), cfg.port);
+        try std.testing.expectEqual(pg.SslMode.disable, cfg.sslmode);
+    }
+
+    {
+        var cfg = try initConfigWithAlloc(alloc);
+        defer freeConfigWithAlloc(alloc, cfg);
+        try std.testing.expectError(error.BadDsn, parseDsnWithAlloc(alloc, "not-a-url", &cfg));
+        try std.testing.expectError(error.BadDsn, parseDsnWithAlloc(alloc, "postgres://[::1/db", &cfg));
+        try std.testing.expectError(error.UnsupportedSslMode, parseDsnWithAlloc(alloc, "postgres://host/db?sslmode=require", &cfg));
+        try std.testing.expectError(error.InvalidCharacter, parseDsnWithAlloc(alloc, "postgres://host:badport/db", &cfg));
+    }
 }

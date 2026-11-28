@@ -52,7 +52,7 @@ const w2 = new Worker("./worker.js", { data: { id: 1 } });
 
 | Argument | Description |
 |----------|-------------|
-| `path` | Worker module path, relative to the current script. Missing file throws `Worker module not found` |
+| `path` | Worker script path resolved relative to `process.cwd()` (auto-probes `<path>.js` if omitted). Missing file throws `Worker module not found` |
 | `options.data` | Initial payload, structured-cloned once, visible in the worker as `globalThis.workerData` |
 
 > **Caution:** The option key is `data`, not `workerData`. `new Worker("./w.js", { workerData: … })` silently passes nothing — the worker must read `globalThis.workerData`, but the parent sends `{ data: … }`.
@@ -108,9 +108,9 @@ w.postMessage("go");
 
 Rules:
 
-- Workers live until `terminate()`. There is no idle-exit — the process stays alive while any worker is unterminated.
+- Workers stay open until `terminate()`. Even if a top-level startup throw exits the worker thread early, the parent still holds the worker slot open until `w.terminate()` is called.
 - The process exits once all workers are terminated (and the main loop drains).
-- Worker-side uncaught errors, timer errors, and microtask errors wake the parent immediately and surface via the parent's `onerror` (printing `[worker] unhandled error: …` or `[worker] timer error: …` diagnostics).
+- Worker-side uncaught top-level throws, `onmessage` errors, timer errors, and microtask errors wake the parent immediately and surface via the parent's `onerror` (printing `[worker] unhandled error: …` or `[worker] timer error: …` diagnostics). Only top-level throws exit the worker thread; `onmessage`/timer/microtask errors leave the worker running.
 - `postMessage` after `terminate()` throws — guard or null out the handle.
 
 ## Practical example: non-blocking hash endpoint
@@ -155,7 +155,7 @@ onmessage = (e) => {
 ```
 
 ```sh
-ff server.js
+ff server.js --allow-net=0.0.0.0:3000
 curl -X POST http://127.0.0.1:3000/hash \
   -H "content-type: application/json" -d '{"password":"hunter2"}'
 # {"hex":"...","rounds":50000}
@@ -168,14 +168,16 @@ The handler returns a `Promise`, so the connection parks while the worker crunch
 | Area | Limit / rule |
 |------|--------------|
 | Max workers | 8 — the 9th throws `too many workers (max 8)` |
-| Worker scope | `console` + timers + `structuredClone` + `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`) + `performance` + `self` + `postMessage`/`onmessage`/`workerData` — no `http.serve` or `crypto.bcrypt` in workers, keep servers on the main thread |
+| Worker heap | `min(32 MB, max-heap)` default, configurable via `--worker-heap` (`1 MB`–`max-heap`) |
+| Worker stack / CPU budget | JS stack inherits `--max-stack` (`1 MB` default, `128 KB`–`native/2`); OS thread stack auto-scales `>= max(8 MB, 2 * JS stack)`; inherits `--cpu-budget=<ms>` |
+| Worker scope | `console` + numeric timers (`setTimeout`/`setInterval`/`clear*`) + `queueMicrotask` + `structuredClone` + `crypto` (`randomUUID`, `getRandomValues`, `subtle`, `btoa`, `atob`; no `crypto.bcrypt`) + `performance` + `self` + `postMessage`/`onmessage`/`workerData` — no `http.serve`, `fetch`, `fs`, `TextEncoder`, `URL`, `Blob`, `process`, `ffi`, `tcp`, `udp`, `ff`, etc. |
 | Nested workers | Not supported — spawning from inside a worker fails |
 | Shutdown | Only via `terminate()`; process exits once all workers terminate |
-| Module size | Worker file capped at 10MB on load |
+| Module size | Worker script capped at 10 MiB on load |
 
 ## Troubleshooting
 
-**`Worker module not found`** — the path is relative to the spawning script, and needs the extension (`"./hasher.js"`, not `"./hasher"`).
+**`Worker module not found`** — the path resolves relative to `process.cwd()` (not the spawning script). Extensionless paths automatically probe `<path>.js` (`"./hasher"` probes `"./hasher.js"`).
 
 **`workerData` is undefined** — parent used the wrong key. Send `{ data: … }`, read `globalThis.workerData`.
 

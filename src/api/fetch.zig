@@ -393,7 +393,7 @@ fn collectHeadersFromJS(
     ctx: ?*c.Context,
     val: c.Value,
     target: *headers_mod.HeadersData,
-) void {
+) !void {
     if (c.isUndefined(val) != 0 or c.isNull(val) != 0) return;
     if (c.isObject(val) == 0) return;
     if (c.getOpaque2(ctx, val, headers_mod.headers_class_id)) |ptr| {
@@ -402,7 +402,7 @@ fn collectHeadersFromJS(
         target.reserve(src.len(), src.names.items.len, src.values.items.len);
         for (0..src.len()) |i| {
             const p = src.getPair(i);
-            target.appendEntry(p.name, p.value);
+            try target.appendEntry(p.name, p.value);
         }
         return;
     }
@@ -426,7 +426,7 @@ fn collectHeadersFromJS(
                 defer nn.deinit();
                 if (v) |vv| {
                     defer vv.deinit();
-                    target.appendEntry(nn.slice, vv.slice);
+                    try target.appendEntry(nn.slice, vv.slice);
                 }
             }
         }
@@ -534,7 +534,13 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         in_flight_headers.reserve(rd.headers.len(), rd.headers.names.items.len, rd.headers.values.items.len);
         for (0..rd.headers.len()) |i| {
             const pair = rd.headers.getPair(i);
-            in_flight_headers.appendEntry(pair.name, pair.value);
+            in_flight_headers.appendEntry(pair.name, pair.value) catch |err| {
+                in_flight_headers.deinit();
+                return switch (err) {
+                    error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+                    else => c.throwOutOfMemory(ctx),
+                };
+            };
         }
     }
 
@@ -564,7 +570,13 @@ fn fetchCallback(ctx: ?*c.Context, _: c.Value, argc: c_int, argv: [*c]c.Value) c
         }
         const headers_val = c.getPropertyStr(ctx, init_val, "headers");
         defer c.freeValue(ctx, headers_val);
-        collectHeadersFromJS(ctx, headers_val, &in_flight_headers);
+        collectHeadersFromJS(ctx, headers_val, &in_flight_headers) catch |err| {
+            in_flight_headers.deinit();
+            return switch (err) {
+                error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+                else => c.throwOutOfMemory(ctx),
+            };
+        };
         const body_val = c.getPropertyStr(ctx, init_val, "body");
         defer c.freeValue(ctx, body_val);
         if (c.isUndefined(body_val) == 0 and c.isNull(body_val) == 0) {

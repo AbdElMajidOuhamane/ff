@@ -34,6 +34,11 @@ const child_process_api = @import("../api/child_process.zig");
 const bcrypt_pool = @import("../crypto/bcrypt_pool.zig");
 
 const gpa = std.heap.smp_allocator;
+const limits = @import("../util/limits.zig");
+const interrupt = @import("interrupt.zig");
+const rstream = @import("../types/readable_stream.zig");
+const cron_api = @import("../api/cron.zig");
+const tcp_api = @import("../net/tcp_api.zig");
 var boot_arena: std.heap.ArenaAllocator = undefined;
 var boot_inited: bool = false;
 
@@ -46,6 +51,7 @@ pub fn deinitNetwork() void {
     ws_client.deinit();
     worker_mod.deinit();
     sql_api.deinit();
+    interrupt.stopMonitor();
 }
 
 var g_runtime: ?*Runtime = null;
@@ -187,10 +193,19 @@ pub const Runtime = struct {
     timer_manager: TimerManager,
 
     pub fn init(args: std.process.Args) !*Runtime {
+        limits.initFromArgs(args) catch {};
+        const lim = limits.get();
+
         const rt = qjs.newRuntime() orelse return error.InitFailed;
-        qjs.setMaxStackSize(rt, 1024 * 1024);
-        qjs.setMemoryLimit(rt, 64 * 1024 * 1024);
+        // Invariant (quickjs-ng PR #1700): thread native stack reservation is at
+        // least 2 * stack_bytes, ensuring QuickJS triggers RangeError before native
+        // stack exhaustion (SIGSEGV/SIGBUS).
+        qjs.setMaxStackSize(rt, lim.stack_bytes);
+        qjs.setMemoryLimit(rt, lim.heap_bytes);
+        interrupt.registerRuntime(rt, 0, lim.cpu_budget_ms);
+        interrupt.setWallTimeout(lim.wall_timeout_ms);
         qjs.setModuleLoaderFunc(rt, moduleNormalize, moduleLoader, null);
+        qjs.setHostPromiseRejectionTracker(rt, microtasks.hostPromiseRejectionTracker, null);
 
         const ctx = qjs.newContext(rt) orelse return error.InitFailed;
 
@@ -203,6 +218,9 @@ pub const Runtime = struct {
         fetch_api.setup(ctx);
         header.setup(ctx);
         blob.setup(ctx);
+        rstream.setup(ctx);
+        cron_api.setup(ctx);
+        tcp_api.setup(ctx);
         formdata.setup(ctx);
         request.setup(ctx);
         response.setup(ctx);
@@ -495,6 +513,7 @@ pub const Runtime = struct {
         fetch_api.deinitClient();
         process_api.deinit(self.ctx);
         self.timer_manager.cancelAll();
+        microtasks.clearUnhandledRejections(self.ctx);
         const rt = qjs.getRuntime(self.ctx);
         qjs.freeContext(self.ctx);
         qjs.freeRuntime(rt);
@@ -579,10 +598,42 @@ pub const Runtime = struct {
         if (is_module) {
             const ps = qjs.promiseState(self.ctx, result);
             if (ps == 2) { // JS_PROMISE_REJECTED
+                microtasks.discardRejection(self.ctx, result);
                 const pr = qjs.promiseResult(self.ctx, result);
                 reportAndFail(self, qjs.dupValue(self.ctx, pr));
                 return false;
             }
+        }
+
+        microtasks.pumpMicrotasks(self.ctx);
+        return true;
+    }
+
+    pub fn evalBytecode(self: *Runtime, bc: []const u8) bool {
+        interrupt.enterJs(0, interrupt.monotonicNowMs());
+        defer interrupt.leaveJs(0);
+
+        const obj = qjs.readObject(self.ctx, bc.ptr, bc.len, qjs.READ_OBJ_BYTECODE);
+        if (qjs.isException(obj) != 0) {
+            qjs.freeValue(self.ctx, obj);
+            reportAndFail(self, qjs.getException(self.ctx));
+            return false;
+        }
+
+        // JS_EvalFunction takes ownership of `obj`.
+        const result = qjs.evalFunction(self.ctx, obj);
+        defer qjs.freeValue(self.ctx, result);
+
+        if (qjs.isException(result) != 0) {
+            reportAndFail(self, qjs.getException(self.ctx));
+            return false;
+        }
+
+        if (qjs.promiseState(self.ctx, result) == 2) { // JS_PROMISE_REJECTED
+            microtasks.discardRejection(self.ctx, result);
+            const pr = qjs.promiseResult(self.ctx, result);
+            reportAndFail(self, qjs.dupValue(self.ctx, pr));
+            return false;
         }
 
         microtasks.pumpMicrotasks(self.ctx);

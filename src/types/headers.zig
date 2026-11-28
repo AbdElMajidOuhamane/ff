@@ -32,6 +32,11 @@ const ExtractedStr = struct {
     }
 };
 
+/// Upper bound on headers accepted from one JS init value. Without it a
+/// sparse array (`new Array(2**31)`) reserves ~90 GB and then walks 2^31
+/// properties: two unbounded quantities driven by JS input.
+pub const MAX_HEADERS_INIT: c_uint = 2048;
+
 fn extractStringAuto(ctx: ?*c.Context, val: c.Value, stack_buf: []u8) ?ExtractedStr {
     const cstr = c.toCString(ctx, val) orelse return null;
     defer c.freeCString(ctx, cstr);
@@ -103,7 +108,7 @@ fn validHeaderValue(value: []const u8) bool {
     return true;
 }
 
-fn validHeaderPair(name: []const u8, value: []const u8) bool {
+pub fn validHeaderPair(name: []const u8, value: []const u8) bool {
     return validHeaderName(name) and validHeaderValue(value);
 }
 
@@ -201,6 +206,17 @@ comptime {
 const HDR_POOL_MAX: usize = 32;
 var hdr_pool: [HDR_POOL_MAX]*HeadersData = undefined;
 var hdr_pool_n: usize = 0;
+// async_fetch releases fetch-owned header containers from 16 worker threads
+// (ResponseData.releaseData -> HeadersData.release), so the index is shared.
+// Guard the index only; a shell at refcount 0 has no other owner.
+var hdr_pool_mutex: std.atomic.Mutex = .unlocked;
+
+inline fn hdrPoolLock() void {
+    while (!hdr_pool_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+inline fn hdrPoolUnlock() void {
+    hdr_pool_mutex.unlock();
+}
 
 pub var stat_pool_hit: std.atomic.Value(usize) = .{ .raw = 0 };
 pub var stat_pool_miss: std.atomic.Value(usize) = .{ .raw = 0 };
@@ -212,15 +228,18 @@ const HDR_RETAIN_SLICES: usize = 64;
 /// Pooled HeadersData shell, freshly cleared (refcount = 1).
 /// Null only on OOM — callers use `orelse` like the old gpa.create path.
 pub fn acquire() ?*HeadersData {
+    hdrPoolLock();
     if (hdr_pool_n > 0) {
         hdr_pool_n -= 1;
         if (builtin.is_test or builtin.mode == .Debug) {
             _ = stat_pool_hit.fetchAdd(1, .monotonic);
         }
         const h = hdr_pool[hdr_pool_n];
+        hdrPoolUnlock();
         h.refcount.store(1, .release);
         return h;
     }
+    hdrPoolUnlock();
     if (builtin.is_test or builtin.mode == .Debug) {
         _ = stat_pool_miss.fetchAdd(1, .monotonic);
     }
@@ -230,24 +249,28 @@ pub fn acquire() ?*HeadersData {
 }
 
 fn releaseToPool(h: *HeadersData) void {
+    // Refcount 0 means no other owner: shrink or clear outside the index lock.
+    if (h.entries.capacity > HDR_RETAIN_ENTRIES or
+        h.names.capacity > HDR_RETAIN_BYTES or
+        h.values.capacity > HDR_RETAIN_BYTES or
+        h.merge_buf.capacity > HDR_RETAIN_BYTES or
+        h.view_buf.capacity > HDR_RETAIN_SLICES)
+    {
+        h.deinit();
+        h.* = HeadersData.init();
+    } else {
+        h.clear();
+    }
+    hdrPoolLock();
     if (hdr_pool_n < HDR_POOL_MAX) {
-        if (h.entries.capacity > HDR_RETAIN_ENTRIES or
-            h.names.capacity > HDR_RETAIN_BYTES or
-            h.values.capacity > HDR_RETAIN_BYTES or
-            h.merge_buf.capacity > HDR_RETAIN_BYTES or
-            h.view_buf.capacity > HDR_RETAIN_SLICES)
-        {
-            h.deinit();
-            h.* = HeadersData.init();
-        } else {
-            h.clear();
-        }
         hdr_pool[hdr_pool_n] = h;
         hdr_pool_n += 1;
-    } else {
-        h.deinit();
-        gpa.destroy(h);
+        hdrPoolUnlock();
+        return;
     }
+    hdrPoolUnlock();
+    h.deinit();
+    gpa.destroy(h);
 }
 
 // Hot data: `entries` (16B stride, scanned by every get/has/forEach).
@@ -329,7 +352,7 @@ pub const HeadersData = struct {
         self.reserve(n_entries, n_entries * 16, n_entries * 32);
     }
     // Single-reserve batch append — preferred over appendEntry in a loop.
-    pub fn appendBatch(self: *HeadersData, pairs: []const Pair) void {
+    pub fn appendBatch(self: *HeadersData, pairs: []const Pair) !void {
         var nb: usize = 0;
         var vb: usize = 0;
         for (pairs) |p| {
@@ -337,7 +360,7 @@ pub const HeadersData = struct {
             vb += p.value.len;
         }
         self.reserve(pairs.len, nb, vb);
-        for (pairs) |p| self.appendEntry(p.name, p.value);
+        for (pairs) |p| try self.appendEntry(p.name, p.value);
     }
     fn nameOf(self: *const HeadersData, e: Entry) []const u8 {
         return self.names.items[e.name_off .. e.name_off + e.name_len];
@@ -359,8 +382,11 @@ pub const HeadersData = struct {
         if (i != last) self.entries.items[i] = self.entries.items[last];
         self.entries.items.len -= 1;
     }
-    pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
-        self.tryAppendEntry(name, value) catch return;
+    /// Append one header. Errors are the caller's: a rejected pair must become a
+    /// JS TypeError and an allocation failure a JS RangeError, never a silent
+    /// drop — a request leaving without an auth header is worse than a throw.
+    pub fn appendEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
+        try self.tryAppendEntry(name, value);
     }
     pub fn tryAppendEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
         // Ingest gate: a rejected pair never reaches the pools, so every
@@ -381,11 +407,11 @@ pub const HeadersData = struct {
             .val_len = @intCast(value.len),
         });
     }
-    pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) void {
+    pub fn setEntry(self: *HeadersData, name: []const u8, value: []const u8) !void {
         // The replace branch writes `values` directly (no appendEntry), so the
         // gate must be repeated here or `headers.set("x", "a\r\nb")` would
         // bypass validation entirely.
-        if (!validHeaderPair(name, value)) return;
+        if (!validHeaderPair(name, value)) return error.InvalidHeader;
         var lower_buf: [128]u8 = undefined;
         const q = lowerQuery(name, &lower_buf);
         var first: ?usize = null;
@@ -395,7 +421,7 @@ pub const HeadersData = struct {
                 if (first == null) {
                     first = i;
                     const vbase = self.values.items.len;
-                    self.values.appendSlice(gpa, value) catch return;
+                    try self.values.appendSlice(gpa, value);
                     self.entries.items[i].val_off = @intCast(vbase);
                     self.entries.items[i].val_len = @intCast(value.len);
                     i += 1;
@@ -406,7 +432,7 @@ pub const HeadersData = struct {
                 i += 1;
             }
         }
-        if (first == null) self.appendEntry(name, value);
+        if (first == null) try self.appendEntry(name, value);
     }
     pub fn deleteEntry(self: *HeadersData, name: []const u8, value: ?[]const u8) void {
         var lower_buf: [128]u8 = undefined;
@@ -515,10 +541,10 @@ pub const HeadersData = struct {
         }
         return try result.toOwnedSlice(gpa);
     }
-    pub fn fromPairs(self: *HeadersData, pairs: []const Pair) void {
-        self.appendBatch(pairs);
+    pub fn fromPairs(self: *HeadersData, pairs: []const Pair) !void {
+        try self.appendBatch(pairs);
     }
-    pub fn fromRawHeaderString(self: *HeadersData, raw: []const u8) void {
+    pub fn fromRawHeaderString(self: *HeadersData, raw: []const u8) !void {
         self.reserve(8, raw.len / 2, raw.len / 2);
         var lines = std.mem.splitSequence(u8, raw, "\r\n");
         while (lines.next()) |line| {
@@ -526,7 +552,7 @@ pub const HeadersData = struct {
             if (std.mem.indexOf(u8, line, ":")) |colon| {
                 const name = std.mem.trim(u8, line[0..colon], " \t");
                 const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-                if (name.len > 0) self.appendEntry(name, value);
+                if (name.len > 0) try self.appendEntry(name, value);
             }
         }
     }
@@ -573,6 +599,15 @@ pub fn headersHas(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     return if (data.hasEntry(name.slice, null)) c.JS_TRUE else c.JS_FALSE;
 }
 
+fn throwHeaderError(ctx: ?*c.Context, err: anyerror) c.Value {
+    return switch (err) {
+        error.InvalidHeader => c.throwTypeError(ctx, "invalid header name or value"),
+        error.HeadersTooLarge => c.throwTypeError(ctx, "too many headers (max 2048)"),
+        error.OutOfMemory => c.throwOutOfMemory(ctx),
+        else => c.throwInternalError(ctx, "header update failed"),
+    };
+}
+
 pub fn headersSet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = argc;
     const data = extractHeadersData(ctx, this_val) orelse return c.JS_UNDEFINED;
@@ -582,7 +617,7 @@ pub fn headersSet(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.
     defer name.deinit();
     const value = extractStringAuto(ctx, argv[1], &value_buf) orelse return c.JS_UNDEFINED;
     defer value.deinit();
-    data.setEntry(name.slice, value.slice);
+    data.setEntry(name.slice, value.slice) catch |err| return throwHeaderError(ctx, err);
     return c.JS_UNDEFINED;
 }
 
@@ -595,7 +630,7 @@ pub fn headersAppend(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c
     defer name.deinit();
     const value = extractStringAuto(ctx, argv[1], &value_buf) orelse return c.JS_UNDEFINED;
     defer value.deinit();
-    data.appendEntry(name.slice, value.slice);
+    data.appendEntry(name.slice, value.slice) catch |err| return throwHeaderError(ctx, err);
     return c.JS_UNDEFINED;
 }
 
@@ -689,6 +724,12 @@ fn headersFinalizer(rt: ?*c.Runtime, val: c.Value) callconv(.c) void {
     }
 }
 
+/// Unwind a half-built Headers object and throw the matching JS error.
+fn failHeaders(ctx: ?*c.Context, data: *HeadersData, err: anyerror) c.Value {
+    data.release();
+    return throwHeaderError(ctx, err);
+}
+
 fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*c]c.Value) callconv(.c) c.Value {
     _ = this_val;
     // C1 FIX: pooled shell instead of gpa.create per `new Headers()`.
@@ -702,7 +743,8 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 data.reserve(src.len(), src.names.items.len, src.values.items.len);
                 for (0..src.len()) |i| {
                     const p = src.getPair(i);
-                    data.appendEntry(p.name, p.value);
+                    data.appendEntry(p.name, p.value) catch |err|
+                        return failHeaders(ctx, data, err);
                 }
             } else if (c.isArray(ctx, init_val) != 0) {
                 // DOD-FIX: append directly — old code stored n.slice/v.slice
@@ -711,9 +753,14 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                 defer c.freeValue(ctx, len_val);
                 var len: c_int = 0;
                 _ = c.toInt32(ctx, &len, len_val);
-                if (len > 0) data.reserveEntries(@intCast(len));
+                // JS_ToInt32 returns a negative c_int for length > 2^31;
+                // @intCast of a negative value is UB in ReleaseFast (trap in
+                // ReleaseSafe). Clamp, then bound the work as well.
+                const count: c_uint = @intCast(@max(len, 0));
+                if (count > MAX_HEADERS_INIT) return failHeaders(ctx, data, error.HeadersTooLarge);
+                if (count > 0) data.reserveEntries(count);
                 var i: c_uint = 0;
-                while (i < @as(c_uint, @intCast(len))) : (i += 1) {
+                while (i < count) : (i += 1) {
                     const item = c.getPropertyUint32(ctx, init_val, i);
                     defer c.freeValue(ctx, item);
                     if (c.isObject(item) == 0) continue;
@@ -727,7 +774,8 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                     defer name_z.deinit();
                     const val_z = extractStringAuto(ctx, val_val, &vbuf) orelse continue;
                     defer val_z.deinit();
-                    data.appendEntry(name_z.slice, val_z.slice);
+                    data.appendEntry(name_z.slice, val_z.slice) catch |err|
+                        return failHeaders(ctx, data, err);
                 }
             } else {
                 var p: [*c]c.PropertyEnum = null;
@@ -748,7 +796,8 @@ fn headersConstructor(ctx: ?*c.Context, this_val: c.Value, argc: c_int, argv: [*
                         defer name_z.deinit();
                         const val_z = extractStringAuto(ctx, val_val, &vbuf) orelse continue;
                         defer val_z.deinit();
-                        data.appendEntry(name_z.slice, val_z.slice);
+                        data.appendEntry(name_z.slice, val_z.slice) catch |err|
+                            return failHeaders(ctx, data, err);
                     }
                 }
             }
@@ -812,8 +861,8 @@ test "HeadersData pool reuses capacity and tracks hit/miss" {
     try std.testing.expect(stat_pool_miss.load(.monotonic) > misses_before or stat_pool_hit.load(.monotonic) > hits_before);
 
     // Append some headers to ensure capacity is allocated
-    h1.appendEntry("x-test-1", "value1");
-    h1.appendEntry("x-test-2", "value2");
+    try h1.appendEntry("x-test-1", "value1");
+    try h1.appendEntry("x-test-2", "value2");
     try std.testing.expect(h1.entries.capacity >= 2);
     const cap_entries = h1.entries.capacity;
     const cap_names = h1.names.capacity;
@@ -836,12 +885,12 @@ test "cookie and set-cookie behaviors per RFC 9113" {
     var h = HeadersData.init();
     defer h.deinit();
 
-    h.appendEntry("cookie", "a=1");
-    h.appendEntry("cookie", "b=2");
-    h.appendEntry("x-multi", "val1");
-    h.appendEntry("x-multi", "val2");
-    h.appendEntry("set-cookie", "a=1");
-    h.appendEntry("set-cookie", "b=2");
+    try h.appendEntry("cookie", "a=1");
+    try h.appendEntry("cookie", "b=2");
+    try h.appendEntry("x-multi", "val1");
+    try h.appendEntry("x-multi", "val2");
+    try h.appendEntry("set-cookie", "a=1");
+    try h.appendEntry("set-cookie", "b=2");
 
     try std.testing.expectEqualStrings("a=1; b=2", h.getFirst("cookie").?);
     try std.testing.expectEqualStrings("val1, val2", h.getFirst("x-multi").?);
@@ -855,7 +904,7 @@ test "pathological oversized headers shrink instead of permanently pinning memor
         const h = acquire() orelse return error.OutOfMemory;
         var i: usize = 0;
         while (i < 70) : (i += 1) {
-            h.appendEntry("x-header", "value");
+            try h.appendEntry("x-header", "value");
         }
         try std.testing.expect(h.entries.capacity > HDR_RETAIN_ENTRIES);
         h.release();
@@ -870,7 +919,7 @@ test "pathological oversized headers shrink instead of permanently pinning memor
         const h = acquire() orelse return error.OutOfMemory;
         var i: usize = 0;
         while (i < 70) : (i += 1) {
-            h.appendEntry("x-multi", "val");
+            try h.appendEntry("x-multi", "val");
         }
         _ = h.getAllValues("x-multi");
         try std.testing.expect(h.view_buf.capacity > HDR_RETAIN_SLICES);
@@ -888,7 +937,7 @@ test "pathological oversized headers shrink instead of permanently pinning memor
         @memset(&long_val, 'a');
         var i: usize = 0;
         while (i < 5) : (i += 1) {
-            h.appendEntry("x-join", &long_val);
+            try h.appendEntry("x-join", &long_val);
         }
         _ = h.getFirst("x-join");
         try std.testing.expect(h.merge_buf.capacity > HDR_RETAIN_BYTES);

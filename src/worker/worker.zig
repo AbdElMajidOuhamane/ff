@@ -10,9 +10,10 @@ const crypto_api = @import("../api/crypto.zig");
 const thread_marker = @import("thread_marker.zig");
 
 const gpa = std.heap.smp_allocator;
+const limits = @import("../util/limits.zig");
+const interrupt = @import("../engine/interrupt.zig");
 
 pub const MAX_WORKERS = 8;
-const WORKER_STACK = 8 * 1024 * 1024;
 const POLL_QUANTUM_MS: i32 = 5;
 
 // ── Parent-side state (main thread only — worker threads never touch this) ──
@@ -38,6 +39,7 @@ var slots: [MAX_WORKERS]Slot = [_]Slot{.{}} ** MAX_WORKERS;
 threadlocal var tls_port: ?port_mod.MessagePort = null;
 threadlocal var tls_tm: ?*timers_mod.TimerManager = null;
 threadlocal var tls_perf_origin: i96 = 0;
+threadlocal var tls_slot: usize = 0;
 
 pub const isWorkerThread = thread_marker.isWorkerThread;
 
@@ -127,35 +129,53 @@ fn jsConstructor(ctx: ?*qjs.Context, this_val: qjs.Value, argc: c_int, argv: [*c
         }
         qjs.freeValue(ctx, d);
     }
-    errdefer if (initial) |b| gpa.free(b);
 
+    // Every failure below is an explicit cleanup: this function returns
+    // qjs.Value (not an error union), so `errdefer` cannot fire. Leaking the
+    // serialized payload (up to MAX_FRAME) or a pipe pair on a constructible
+    // failure is a bug a JS try/catch loop can repeat without bound.
     const slot = allocSlot() orelse {
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwTypeError(ctx, "too many workers (max 8)");
         return qjs.JS_EXCEPTION;
     };
+    std.debug.assert(slot < MAX_WORKERS);
 
     const abs = resolveWorkerPath(path) catch {
         freeSlot(slot);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwTypeError(ctx, "Worker module not found");
         return qjs.JS_EXCEPTION;
     };
-    errdefer gpa.free(abs);
 
     var ch = port_mod.MessagePort.create() catch {
         freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwInternalError(ctx, "Worker pipe creation failed");
         return qjs.JS_EXCEPTION;
     };
-    errdefer ch.closeAll();
+    std.debug.assert(ch.parent.send_fd >= 0);
+    std.debug.assert(ch.child.send_fd >= 0);
 
     const wdata = gpa.create(WorkerData) catch {
+        ch.closeAll();
+        freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwOutOfMemory(ctx);
         return qjs.JS_EXCEPTION;
     };
     wdata.* = .{ .slot = slot, .module_path = abs, .initial_payload = initial, .channel = ch.child };
 
-    slots[slot].thread = std.Thread.spawn(.{ .stack_size = WORKER_STACK }, workerMain, .{wdata}) catch {
+    slots[slot].thread = std.Thread.spawn(.{ .stack_size = limits.get().worker_stack_bytes }, workerMain, .{wdata}) catch {
+        // workerMain never ran, so it will not free (wdata, abs, initial,
+        // ch.*): undo the ownership transfer here.
         gpa.destroy(wdata);
+        ch.closeAll();
+        freeSlot(slot);
+        gpa.free(abs);
+        if (initial) |b| gpa.free(b);
         _ = qjs.throwInternalError(ctx, "Worker thread spawn failed");
         return qjs.JS_EXCEPTION;
     };
@@ -401,11 +421,15 @@ fn workerMain(data: *WorkerData) void {
     defer thread_marker.setWorkerThread(false);
     tls_port = data.channel;
     defer tls_port = null;
+    tls_slot = @as(usize, data.slot) + 1;
+    defer tls_slot = 0;
 
     const rt = qjs.newRuntime() orelse return;
     defer qjs.freeRuntime(rt);
-    qjs.setMaxStackSize(rt, 1024 * 1024);
-    qjs.setMemoryLimit(rt, 32 * 1024 * 1024);
+    const lim = limits.get();
+    qjs.setMaxStackSize(rt, lim.stack_bytes);
+    qjs.setMemoryLimit(rt, lim.worker_heap_bytes);
+    interrupt.registerRuntime(rt, @as(usize, data.slot) + 1, lim.cpu_budget_ms);
 
     const ctx = qjs.newContext(rt) orelse return;
     defer qjs.freeContext(ctx);
@@ -434,7 +458,9 @@ fn workerMain(data: *WorkerData) void {
     };
     defer gpa.free(src_z);
 
+    interrupt.enterJs(@as(usize, data.slot) + 1, interrupt.monotonicNowMs());
     const res = qjs.eval(ctx, src_z.ptr, src.len, data.module_path.ptr, qjs.EVAL_TYPE_GLOBAL);
+    interrupt.leaveJs(@as(usize, data.slot) + 1);
     if (qjs.isException(res) != 0) {
         const exc = qjs.getException(ctx);
         defer qjs.freeValue(ctx, exc);
@@ -675,7 +701,9 @@ fn deliverToWorker(ctx: *qjs.Context, fr: port_mod.Frame) void {
     defer qjs.freeValue(ctx, handler);
     if (qjs.isFunction(ctx, handler) == 0) return;
     var args = [_]qjs.Value{event};
+    interrupt.enterJs(tls_slot, interrupt.monotonicNowMs());
     const ret = qjs.call(ctx, handler, global, 1, &args[0]);
+    interrupt.leaveJs(tls_slot);
     if (qjs.isException(ret) != 0) {
         const exc = qjs.getException(ctx);
         defer qjs.freeValue(ctx, exc);

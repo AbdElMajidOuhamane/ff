@@ -31,8 +31,8 @@ ff tool.js --allow-run=git
 ff addon.js --allow-ffi
 ```
 
-- Flags are CLI-only. There is no `ff.json` field or environment variable that
-  grants access.
+- Initial policy flags (`--allow-*` and `--deny-*`) are CLI-only. There is no `ff.json` field or environment variable that
+  grants access; permissions can only be revoked one-way at runtime via `permissions.revoke()`.
 - Scopes are comma-split and repeatable: `--allow-read=src,views`.
 - A bare flag grants the whole category: `--allow-net` means any host and port.
 - Missing access throws `PermissionDenied` (`code: "PERMISSION_DENIED"`) before
@@ -59,7 +59,7 @@ ff hello.js
 # hello from fairyfly
 ```
 
-> **Note:** There is no bundled `examples/` directory — always create the file first (or scaffold with `ff init -y demo`).
+> **Note:** If you installed the prebuilt binary without cloning the repo, create the file first (or scaffold with `ff init -y demo`).
 
 ## Run inline code
 
@@ -96,15 +96,15 @@ curl http://127.0.0.1:3000/nope
 # not found
 ```
 
-The listener always binds `0.0.0.0`, so the scope must name `0.0.0.0:3000`;
-`--allow-net=127.0.0.1:3000` does not match.
+The listener binds `0.0.0.0` by default (unless `{ hostname }` is passed), so the scope must name `0.0.0.0:3000`;
+`--allow-net=127.0.0.1:3000` does not match unless `hostname: "127.0.0.1"` is configured.
 
 `http.serve` accepts two call shapes: `http.serve(3000, handler)` and
 `http.serve({ port: 3000 }, handler)`. The one-argument
 `http.serve(handler)` form is not supported — it throws
-`TypeError: http.serve requires (options, handler)`.
+`TypeError: http.serve: http.serve requires (options, handler)`.
 
-The handler receives `(url, method, body)` strings and returns a `Response` (or a `{ status, body }` object, as above). Full contract: [HTTP Server guide](/docs/guides/http-server).
+The handler receives `(url, method, body, headers)` (`url`, `method`, `body` strings and a `Headers` instance) and returns a `Response` (or a `{ status, body }` object, as above). You can also pass a routes object as the second argument; route handlers receive `(url, method, body, headers, params)`. Full contract: [HTTP Server guide](/docs/guides/http-server).
 
 ## SQLite
 
@@ -154,7 +154,7 @@ console.warn("warned", "here");
 console.error("errored", 42);
 ```
 
-Methods: `log`, `info`, `debug`, `warn`, `error`, `slops`, `redbal`, `detail`. All return `undefined`.
+Methods: `log`, `info`, `debug`, `warn`, `error`, `slops`, `redbal`, `detail`, `time`, `timeLog`, `timeEnd`. All return `undefined`.
 
 ## Microtasks
 

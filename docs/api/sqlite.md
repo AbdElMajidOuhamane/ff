@@ -109,7 +109,7 @@ console.log(all.length); // 0 when empty — never null
 | `row` | `row(sql, params?)` | First matching row as an object, or `null` |
 | `rows` | `rows(sql, params?)` | Array of row objects (empty array when none) |
 
-Row objects map column names to values. `params` is an array bound to `?` placeholders in order — always prefer placeholders over string interpolation (no escaping bugs, no injection). Each `Database` handle maintains a 64-entry prepared-statement cache (with pre-interned column property atoms and automatic eviction on `SQLITE_SCHEMA`). Parameter binding maps 32-bit signed integers to `INTEGER`, other JS numbers (`double`) to `REAL`, strings to `TEXT`, `ArrayBuffer`/`Uint8Array` to `BLOB`, booleans to `0`/`1`, and `null`/`undefined`/`BigInt` to `NULL`.
+Row objects map column names to values. `params` is an array bound to `?` placeholders in order — always prefer placeholders over string interpolation (no escaping bugs, no injection). Each `Database` handle maintains a 64-entry prepared-statement cache (with pre-interned column property atoms and automatic eviction on `SQLITE_SCHEMA`). Parameter binding maps 32-bit signed integers to `INTEGER`, other JS numbers (`double`) to `REAL`, strings to `TEXT`, `ArrayBuffer`/`Uint8Array` to `BLOB`, booleans to `0`/`1`, and `null`/`undefined`/`BigInt` or other non-buffer objects (plain objects, arrays, other TypedArrays) to `NULL`.
 
 ## Writing: `exec` / `execNoArgs`
 
@@ -167,7 +167,7 @@ db.transaction(() => {
 });
 ```
 
-Semantics: `BEGIN`, then your function runs (called with the db as `this`, no arguments). Throw inside → `ROLLBACK` and the error propagates. Return cleanly → `COMMIT`. The return value of `transaction()` is whatever your function returned:
+Semantics: `BEGIN`, then your function runs strictly synchronously (called with the db as `this`, no arguments — do not pass an `async` function, as it commits immediately when the Promise is returned before any `await` runs). Throw inside → `ROLLBACK` and the error propagates. Return cleanly → `COMMIT`. The return value of `transaction()` is whatever your function returned:
 
 ```js
 const id = db.transaction(() => {
@@ -194,7 +194,7 @@ try {
 
 ```js
 db.busyTimeout(10000); // wait up to 10s on locked tables (default 5000)
-db.close();            // release the handle — queries after this throw
+db.close();            // release the handle — queries and a second close() throw (`TypeError: close: invalid database`), while changes()/lastInsertRowId() return 0
 ```
 
 Raise the timeout when workers or concurrent writers contend; lower it to fail fast on deadlock-prone flows.
@@ -256,7 +256,7 @@ not writable. A common fix is `--allow-read=notes.db --allow-write=.`.
 
 **`id` comes back as source text in JSON** — you passed `db.lastInsertRowId` instead of calling `db.lastInsertRowId()`. Add the parens.
 
-**Queries after `close()` throw** — by design. Open one handle per process (or per worker) and close only at shutdown.
+**Queries after `close()` throw** — by design. Calling `db.close()` twice also throws (`TypeError: close: invalid database`), while `db.changes()` and `db.lastInsertRowId()` return `0` once closed. Open one handle per process (or per worker) and close only at shutdown.
 
 **`transaction requires a function argument`** — you passed a non-function (e.g. the *result* of calling it). Pass the closure: `db.transaction(() => { … })`.
 

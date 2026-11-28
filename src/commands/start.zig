@@ -5,6 +5,7 @@ const microtasks = @import("../event/microtasks.zig");
 const tls_server = @import("../net/tls_server.zig");
 const http_native = @import("../net/http_native.zig");
 const tls = @import("../net/tls.zig");
+const sandbox = @import("../security/sandbox.zig");
 
 fn envSlice(name: [:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name.ptr) orelse return null;
@@ -92,6 +93,7 @@ pub fn run(io: std.Io, init: std.process.Init) !void {
         runtime.event_loop.deinit();
         runtime.deinit();
     }
+    sandbox.applyIfRequested();
     cli.step("starting {s}", .{main_name});
     if (!runtime.evalModule(source, main_name_z)) microtasks.had_error = true;
     runtime.event_loop.runWithMicrotasks(runtime.ctx);

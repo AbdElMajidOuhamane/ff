@@ -311,6 +311,7 @@ pub const getTypedArrayBuffer = qjs_c.JS_GetTypedArrayBuffer;
 pub const newPromiseCapability = qjs_c.JS_NewPromiseCapability;
 pub const promiseState = qjs_c.JS_PromiseState;
 pub const promiseResult = qjs_c.JS_PromiseResult;
+pub const setHostPromiseRejectionTracker = qjs_c.JS_SetHostPromiseRejectionTracker;
 
 // ─── Exceptions ─────────────────────────────────────────────────
 pub const throw = qjs_c.JS_Throw;

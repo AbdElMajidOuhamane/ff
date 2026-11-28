@@ -6,7 +6,12 @@ const qjs = @import("engine/quickjs_shim.zig");
 const tls = @import("net/tls.zig");
 const ffcfg = @import("ffcfg");
 const permissions = @import("security/permissions.zig");
+const sandbox = @import("security/sandbox.zig");
 const child_process_api = @import("api/child_process.zig");
+const process_api = @import("api/process.zig");
+const stdio = @import("api/stdio.zig");
+const limits = @import("util/limits.zig");
+const interrupt = @import("engine/interrupt.zig");
 const loop_mod = @import("event/loop.zig");
 const microtasks = @import("event/microtasks.zig");
 const init_cmd = @import("commands/init.zig");
@@ -79,6 +84,73 @@ fn parsePermissions(init: std.process.Init) void {
         );
     };
 }
+fn parseLimits(init: std.process.Init) void {
+    limits.initFromArgs(init.minimal.args) catch |err| {
+        switch (err) {
+            error.InvalidHeapSize => cli.failWithHint("invalid --max-heap value", .{}, "heap limit must be between 8MB and 4GB (e.g. --max-heap=64MB)", .{}),
+            error.InvalidStackSize => cli.failWithHint("invalid --max-stack value", .{}, "stack limit must be at least 128KB (e.g. --max-stack=1MB)", .{}),
+            error.InvalidWorkerHeapSize => cli.failWithHint("invalid --worker-heap value", .{}, "worker heap limit must be between 1MB and main heap size", .{}),
+            error.InvalidCpuBudget => cli.failWithHint("invalid --cpu-budget value", .{}, "cpu budget must be between 0 and 3600000 ms", .{}),
+            error.InvalidWallTimeout => cli.failWithHint("invalid --wall-timeout value", .{}, "wall timeout must be between 0 and 3600000 ms", .{}),
+            error.InvalidMaxLogBytes => cli.failWithHint("invalid --max-log-bytes value", .{}, "log cap must be 0..100MB (e.g. --max-log-bytes=64KB)", .{}),
+            error.MissingEnvFilePath => cli.failWithHint("--env-file requires a path", .{}, "usage: ff --env-file <path>", .{}),
+            error.MissingStackSizeValue => cli.failWithHint("--max-stack requires a value", .{}, "usage: ff --max-stack <size> (e.g. --max-stack=1MB)", .{}),
+            error.InvalidByteSize => cli.failWithHint("invalid byte size format", .{}, "use suffixes KB, MB, or GB (e.g. 64MB)", .{}),
+            error.NativeStackTooSmall => {
+                const lim = limits.get();
+                cli.failWithHint(
+                    "native stack is too small",
+                    .{},
+                    "detected native stack is {d} KB; fairyfly requires at least 256 KB",
+                    .{lim.native_stack_bytes / 1024},
+                );
+            },
+            error.StackSizeExceedsNative => {
+                const lim = limits.get();
+                cli.failWithHint(
+                    "--max-stack exceeds safe limit for native stack",
+                    .{},
+                    "detected native stack is {d} MB; safe limit is at most {d} MB (native/2)",
+                    .{
+                        lim.native_stack_bytes / (1024 * 1024),
+                        lim.stack_max_bytes / (1024 * 1024),
+                    },
+                );
+            },
+        }
+    };
+}
+
+fn isRuntimeFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--env-file") or
+        std.mem.startsWith(u8, arg, "--env-file=") or
+        std.mem.eql(u8, arg, "--max-heap") or
+        std.mem.startsWith(u8, arg, "--max-heap=") or
+        std.mem.eql(u8, arg, "--max-stack") or
+        std.mem.startsWith(u8, arg, "--max-stack=") or
+        std.mem.eql(u8, arg, "--worker-heap") or
+        std.mem.startsWith(u8, arg, "--worker-heap=") or
+        std.mem.eql(u8, arg, "--cpu-budget") or
+        std.mem.startsWith(u8, arg, "--cpu-budget=") or
+        std.mem.eql(u8, arg, "--wall-timeout") or
+        std.mem.startsWith(u8, arg, "--wall-timeout=") or
+        std.mem.eql(u8, arg, "--max-log-bytes") or
+        std.mem.startsWith(u8, arg, "--max-log-bytes=") or
+        std.mem.eql(u8, arg, "--simple-sandbox");
+}
+
+fn skipRuntimeFlag(arg: []const u8, it: *std.process.Args.Iterator) void {
+    if (std.mem.eql(u8, arg, "--env-file") or
+        std.mem.eql(u8, arg, "--max-heap") or
+        std.mem.eql(u8, arg, "--max-stack") or
+        std.mem.eql(u8, arg, "--worker-heap") or
+        std.mem.eql(u8, arg, "--cpu-budget") or
+        std.mem.eql(u8, arg, "--wall-timeout") or
+        std.mem.eql(u8, arg, "--max-log-bytes"))
+    {
+        _ = it.next();
+    }
+}
 
 // POSIX forces SIGINT/SIGQUIT to ignore for background jobs, so `kill -INT`
 // on a backgrounded ff was a no-op. Restore the default action when a
@@ -105,7 +177,7 @@ fn resetIgnoredInterrupt() void {
 fn maybeStartParentWatchdog() void {
     const env = std.c.getenv("FF_WATCH_PARENT") orelse return;
     const parent = std.fmt.parseInt(std.posix.pid_t, std.mem.span(env), 10) catch return;
-    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parentWatchdog, .{parent}) catch return;
+    const t = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, parentWatchdog, .{parent}) catch return;
     t.detach();
 }
 
@@ -127,21 +199,84 @@ fn runAndExit(runtime: *engine.Runtime) void {
 
 fn run(init: std.process.Init) !void {
     child_process_api.setIo(init.io);
+    process_api.setIo(init.io);
 
     if (builtin.os.tag != .windows) {
         resetIgnoredInterrupt();
         maybeStartParentWatchdog();
     }
     parsePermissions(init);
+    parseLimits(init);
     var args_iter = init.minimal.args.iterate();
     const exe = args_iter.next() orelse {
         cli.printUsage();
         return;
     };
-    const first_arg = args_iter.next() orelse {
-        cli.printUsage();
-        return;
-    };
+
+    // Check if running as a standalone binary with embedded bytecode
+    var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.process.executablePath(init.io, &self_exe_buf)) |n| {
+        const self_path = self_exe_buf[0..n];
+        if (std.Io.Dir.cwd().openFile(init.io, self_path, .{ .mode = .read_only })) |file| {
+            defer file.close(init.io);
+            if (file.stat(init.io)) |st| {
+                const trailer_magic = "FFSTANDA";
+                const trailer_len = trailer_magic.len + 8 + 8; // 24 bytes
+                if (st.size >= trailer_len) {
+                    var trailer_buf: [24]u8 = undefined;
+                    const read_bytes = file.readPositionalAll(init.io, &trailer_buf, st.size - trailer_len) catch 0;
+                    if (read_bytes == trailer_len and std.mem.eql(u8, trailer_buf[0..trailer_magic.len], trailer_magic)) {
+                        const bc_size = std.mem.readInt(u64, trailer_buf[trailer_magic.len..][0..8], .little);
+                        const expected_hash = std.mem.readInt(u64, trailer_buf[trailer_magic.len + 8 ..][0..8], .little);
+                        if (bc_size > 0 and bc_size <= st.size - trailer_len) {
+                            const self_bin_len = st.size - trailer_len - bc_size;
+                            const host_bin = std.heap.page_allocator.alloc(u8, self_bin_len) catch null;
+                            if (host_bin) |hb| {
+                                defer std.heap.page_allocator.free(hb);
+                                const h_read = file.readPositionalAll(init.io, hb, 0) catch 0;
+                                if (h_read == self_bin_len) {
+                                    const actual_hash = std.hash.Wyhash.hash(0, hb);
+                                    if (actual_hash != expected_hash) {
+                                        cli.fail("standalone bytecode was compiled with a different build of fairyfly", .{});
+                                    }
+                                }
+                            }
+                            const bc_slice = std.heap.page_allocator.alloc(u8, bc_size) catch null;
+                            if (bc_slice) |bc| {
+                                defer std.heap.page_allocator.free(bc);
+                                const bc_read = file.readPositionalAll(init.io, bc, st.size - trailer_len - bc_size) catch 0;
+                                if (bc_read == bc_size) {
+                                    const runtime = try engine.Runtime.init(init.minimal.args);
+                                    defer shutdownRuntime(runtime);
+                                    sandbox.applyIfRequested();
+                                    if (!runtime.evalBytecode(bc)) microtasks.had_error = true;
+                                    runAndExit(runtime);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    var first_arg: [:0]const u8 = undefined;
+    while (true) {
+        first_arg = args_iter.next() orelse {
+            cli.printUsage();
+            return;
+        };
+        if (isRuntimeFlag(first_arg)) {
+            skipRuntimeFlag(first_arg, &args_iter);
+        } else if (permissions.isPermissionFlag(first_arg)) {
+            // already processed in parsePermissions
+        } else if (std.mem.eql(u8, first_arg, "--ca")) {
+            _ = args_iter.next();
+        } else {
+            break;
+        }
+    }
     const cmd = parseCommand(first_arg);
     switch (cmd) {
         .init => {
@@ -220,7 +355,10 @@ fn run(init: std.process.Init) !void {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
+            sandbox.applyIfRequested();
+            interrupt.enterJs(0, interrupt.monotonicNowMs());
             if (!runtime.eval(code, "<eval>")) microtasks.had_error = true;
+            interrupt.leaveJs(0);
             runAndExit(runtime);
         },
         .file => {
@@ -233,6 +371,7 @@ fn run(init: std.process.Init) !void {
             parseCaFlag(init);
             const runtime = try engine.Runtime.init(init.minimal.args);
             defer shutdownRuntime(runtime);
+            sandbox.applyIfRequested();
             const allocator = std.heap.page_allocator;
             const buf = std.Io.Dir.cwd().readFileAllocOptions(
                 init.io,
@@ -248,32 +387,13 @@ fn run(init: std.process.Init) !void {
             const size = buf.len;
 
             if (std.mem.endsWith(u8, first_arg, ".ffbc")) {
-                const obj = qjs.readObject(runtime.ctx, buf.ptr, size, qjs.READ_OBJ_BYTECODE);
-                defer qjs.freeValue(runtime.ctx, obj);
-                if (qjs.isException(obj) != 0) {
-                    const exc = qjs.getException(runtime.ctx);
-                    defer qjs.freeValue(runtime.ctx, exc);
-                    if (qjs.toCString(runtime.ctx, exc)) |m| {
-                        defer qjs.freeCString(runtime.ctx, m);
-                        std.debug.print("Error: {s}\n", .{m});
-                    }
-                    std.process.exit(1);
-                }
-                const result = qjs.evalFunction(runtime.ctx, obj);
-                defer qjs.freeValue(runtime.ctx, result);
-                if (qjs.isException(result) != 0) {
-                    const exc = qjs.getException(runtime.ctx);
-                    defer qjs.freeValue(runtime.ctx, exc);
-                    if (qjs.toCString(runtime.ctx, exc)) |m| {
-                        defer qjs.freeCString(runtime.ctx, m);
-                        std.debug.print("Error: {s}\n", .{m});
-                    }
-                    std.process.exit(1);
-                }
+                if (!runtime.evalBytecode(buf[0..size])) microtasks.had_error = true;
                 runAndExit(runtime);
             } else {
                 const source: [:0]const u8 = buf;
+                interrupt.enterJs(0, interrupt.monotonicNowMs());
                 if (!runtime.evalModule(source, first_arg)) microtasks.had_error = true;
+                interrupt.leaveJs(0);
                 runAndExit(runtime);
             }
         },

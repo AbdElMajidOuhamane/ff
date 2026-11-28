@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdio = @import("../api/stdio.zig");
 
 // Shared presentation for ff's own CLI messages.
 //
@@ -138,6 +139,7 @@ pub fn printUsage() void {
     std.debug.print("  ff <file.js> [--allow-read[=paths]] [--allow-write[=paths]]\n", .{});
     std.debug.print("              [--allow-net[=hosts]] [--allow-env[=names]]\n", .{});
     std.debug.print("              [--allow-run[=programs]] [--allow-ffi] [--allow-all]\n", .{});
+    std.debug.print("              [--max-heap=<size>] [--max-stack=<size>] [--cpu-budget=<ms>]\n", .{});
     std.debug.print("  ff -e <code> [same permission flags]\n", .{});
     std.debug.print("  ff --watch <file|start> [--ca <path>] [permission flags]\n", .{});
     std.debug.print("  ff <command> [options]\n", .{});
@@ -164,6 +166,26 @@ pub fn printUsage() void {
     helpItem("--allow-run[=P]", "Execute program P (exec* needs /bin/sh)");
     helpItem("--allow-ffi", "Allow ffi.dlopen (native libraries)");
     helpItem("--allow-all", "Grant every permission, including FFI");
+    helpItem("--deny-read[=p]", "Deny reads under p even if allowed");
+    helpItem("--deny-write[=p]", "Deny writes under p even if allowed");
+    helpItem("--deny-net[=h:p]", "Deny network access to host:port");
+    helpItem("--deny-private-net", "Deny loopback/RFC1918/metadata IPs after DNS");
+    helpItem("--simple-sandbox", "Enable Linux Landlock + seccomp sandbox");
+    std.debug.print("\n", .{});
+    heading("Runtime limits:");
+    helpItem("--max-heap[=]size", "Main JS heap (64MB default, 8MB-4GB)");
+    helpItem("--worker-heap[=]size", "Per-worker heap (min(32MB, max-heap))");
+    helpItem("--max-stack[=]size", "JS stack (1MB default, max native/2)");
+    helpItem("--cpu-budget[=]ms", "JS interrupt budget (0 = disabled)");
+    helpItem("--wall-timeout[=]ms", "Process wall-clock timeout (0 = disabled)");
+    helpItem("--max-log-bytes[=]sz", "Max console output bytes (0 = unlimited)");
+    helpItem("--env-file <path>", "Load environment variables from a file");
+    std.debug.print("\n", .{});
+    heading("Environment:");
+    helpItem("FF_MAX_HEAP", "Main JS heap size (overridden by --max-heap)");
+    helpItem("FF_CPU_BUDGET", "JS interrupt budget ms (overridden by flag)");
+    helpItem("FF_WALL_TIMEOUT", "Wall-clock timeout ms (overridden by flag)");
+    std.debug.print("\n", .{});
     helpItem("--version", "Print runtime version");
     helpItem("-h, --help", "Show this help");
 }

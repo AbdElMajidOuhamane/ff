@@ -19,11 +19,20 @@ const gpa = std.heap.smp_allocator;
 threadlocal var recv_scratch: []u8 = &.{};
 
 fn scratchFor(len: usize) ![]u8 {
-    if (recv_scratch.len < len) {
-        if (recv_scratch.len != 0) gpa.free(recv_scratch);
-        recv_scratch = try gpa.alloc(u8, len);
-    }
-    return recv_scratch[0..len];
+    std.debug.assert(len <= MAX_FRAME);
+    if (recv_scratch.len >= len) return recv_scratch[0..len];
+
+    // Detach before allocating: if the allocation fails, the thread-local must
+    // not still hold the freed slice (the next frame would free it again).
+    const old = recv_scratch;
+    recv_scratch = &.{};
+    const fresh = gpa.alloc(u8, len) catch |err| {
+        recv_scratch = old;
+        return err;
+    };
+    if (old.len != 0) gpa.free(old);
+    recv_scratch = fresh;
+    return fresh[0..len];
 }
 
 /// Free the per-thread buffer when a worker thread exits.

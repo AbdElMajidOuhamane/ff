@@ -6,20 +6,21 @@ order: 1
 
 # HTTP Server
 
-`http.serve` starts an HTTP server bound to `0.0.0.0`. Your handler is called per request as `(url, method, body, headers)` and returns a `Response`.
+`http.serve` starts an HTTP server (bound to `0.0.0.0` by default, or `options.hostname`). You can pass either a request handler function `(url, method, body, headers) => Response` or a declarative routes table `{ "GET /path/:id": handler }`.
 
 ## Permissions
 
 Servers are deny-by-default. Every `http.serve` needs `--allow-net` on the
-bind address:
+bind address (`<hostname>:<port>`, defaulting to `0.0.0.0:<port>`):
 
 ```sh
 ff server.js --allow-net=0.0.0.0:3000
 ```
 
-- The server always binds `0.0.0.0`, and the permission check is always
-  `0.0.0.0:<port>` — even when clients connect over loopback. Granting
-  `127.0.0.1:3000` or `localhost:3000` will not start the listener.
+- By default the server binds `0.0.0.0`, so `--allow-net=0.0.0.0:<port>` is
+  checked even when clients connect over loopback. If you pass
+  `{ hostname: "127.0.0.1" }`, grant `--allow-net=127.0.0.1:<port>` instead.
+  (`hostname` accepts IPv4/IPv6 literals only — `"localhost"` throws `TypeError`.)
 - A scope without a port (`--allow-net=0.0.0.0`) covers every port.
 - The same grant covers HTTP, WebSocket upgrades, and TLS on that port.
 - `tls.cert` / `tls.key` file paths need `--allow-read`; inline PEM does not.
@@ -103,19 +104,19 @@ ff server.js --allow-net=0.0.0.0:4242
 curl http://127.0.0.1:4242/
 ```
 
-> **Note:** The server always binds to `0.0.0.0`. There is no host option, no `--port` flag, and no `FF_PORT` environment variable — the port comes only from your JS. The permission scope must name that bind address.
+> **Note:** By default the server binds `0.0.0.0`; pass `{ hostname: "127.0.0.1" }` (any IPv4 or IPv6 literal) to bind a specific address. There is no `--port` flag and no `FF_PORT` environment variable — the port comes only from your JS, and the `--allow-net` scope must match `<hostname>:<port>`.
 
 > **Note:** `http.serve(handler)` (one argument) is **not** supported by the
-> current runtime; it throws `TypeError: http.serve requires (options, handler)`.
+> current runtime; it throws `TypeError: http.serve: http.serve requires (options, handler)`.
 > Use `http.serve(3000, handler)` or `http.serve({}, handler)` instead.
 
 ## Inspecting the incoming request
 
-The handler receives `(url, method, body, headers)`:
+The handler receives `(url, method, body, headers)` (or `(url, method, body, headers, params)` when using a routes table):
 - `url`: request path + query string (string)
-- `method`: uppercase HTTP method (e.g. `"GET"`, string)
+- `method`: HTTP method string exactly as sent by the client (`curl -X post` yields `"post"` — normalize with `.toUpperCase()` if needed)
 - `body`: request text (string, empty when none)
-- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2)
+- `headers`: web-standard `Headers` instance (populated for both HTTP/1.1 and HTTP/2). On HTTP/1.1 it is parsed only when the handler declares four or more parameters: a handler whose `fn.length < 4` receives `undefined` and the runtime only validates the headers (`arguments` or a rest parameter forces full parsing). On HTTP/2 regular headers are always parsed and passed when present
 
 ### Working with request headers
 
@@ -123,7 +124,7 @@ The `headers` parameter provides standard `Headers` methods:
 - `headers.get(name)`: returns the header value (case-insensitive), or `null` if absent. Multi-value headers are comma-joined (`"a, b"`), except `Cookie` which joins with `"; "` per RFC 9113 §8.2.3, and `Set-Cookie` which returns the first value (use `getAll` to retrieve all).
 - `headers.has(name)`: returns `true` if present, `false` otherwise.
 - `headers.getAll(name)`: returns an array of all values for the header name.
-- Total request header size is capped at 4 KB for HTTP/1.1 (`READ_BUF_SIZE`) and 64 KiB for HTTP/2. Requests exceeding the limit receive `431 Request Header Fields Too Large`.
+- The HTTP/1.1 request **head** (request line plus header block) must fit the 4 KB read buffer; HTTP/2 caps header name+value bytes at 64 KiB (pseudo-headers excluded). Exceeding either limit returns `431 Request Header Fields Too Large`.
 
 ```js
 // server.js
@@ -149,6 +150,7 @@ curl -X POST "http://127.0.0.1:3000/greet?name=ada" -d "hi"
 # URL: /greet?name=ada
 # Path: /greet
 # Query: ada
+# User-Agent: curl/...
 # Body: hi
 ```
 
@@ -182,15 +184,33 @@ Three return shapes are accepted:
 
 | Return value | What happens |
 |--------------|--------------|
-| `Response` | Status, headers, and body sent as-is |
-| `{ status, body }` with string or ArrayBuffer body | Sent with that status code |
+| `Response` | Status, headers, and body sent as-is (including `ReadableStream` bodies on HTTP/1.1) |
+| `{ status, body }` with `string`, `ArrayBuffer`, or `ReadableStream` body | Sent with that status code (any `headers` key on plain objects is ignored — use `new Response`) |
 | `Promise` of either shape above | Connection waits until it settles |
 
-> **Caution:** Anything else — including a bare string — produces an empty `200` response. `return "hello"` does **not** send `"hello"`. Always wrap it: `return new Response("hello")`.
+> **Caution:** Anything else — including a bare string or bare `ReadableStream` — produces an empty `200` response (or `501` for bare `ReadableStream` over HTTP/2). `return "hello"` does **not** send `"hello"`. Always wrap it: `return new Response("hello")`.
 
 ## Routing requests
 
-Match `url` (and `method`) to serve more than one endpoint:
+Use a declarative routes table as the second argument to `http.serve`, or match paths manually inside a single handler function:
+
+```js
+// Declarative routes table
+http.serve(
+  { port: 3000 },
+  {
+    "GET /": () => new Response("Home"),
+    "GET /users/:id": (url, method, body, headers, params) =>
+      Response.json({ id: params.id, name: "Ada" }),
+    "/health": () => Response.json({ ok: true }), // any method
+    "*": () => new Response("Not found", { status: 404 }),
+  },
+);
+```
+
+Route keys (`< 512` B) support `"METHOD /path"`, `"/path"` (any method), and `"*"` (wildcard fallback), with up to 16 `:param` segments passed as the 5th arg `params` to `(url, method, body, headers, params)`. Query strings are stripped before matching. Oversized URLs never reach routing — the request head is bounded first (`431` on HTTP/1.1, `400` on HTTP/2). Method mismatches get `405`, and unmatched routes get `404` (both protocols).
+
+Or match `url` (and `method`) manually:
 
 ```js
 // server.js
@@ -214,7 +234,26 @@ curl http://127.0.0.1:3000/users/42  # {"id":42,"name":"Ada"}
 curl -i http://127.0.0.1:3000/nope   # 404 Not found
 ```
 
-For larger route trees, put the matching in a small router function or reach for an `ff imprint` routing package.
+## Streaming responses (HTTP/1.1)
+
+Return `new Response(stream)` (or `{ status, body: stream }`) with a [`ReadableStream`](/docs/api/streams) to stream chunks over HTTP/1.1 `Transfer-Encoding: chunked`:
+
+```js
+http.serve({ port: 3000 }, () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue("chunk 1\n");
+      setTimeout(() => {
+        controller.enqueue("chunk 2\n");
+        controller.close();
+      }, 100);
+    },
+  });
+  return new Response(stream);
+});
+```
+
+Chunks larger than `16352` bytes (the 16 KB write buffer minus chunk framing) are emitted one slice per write, copied into the write buffer. The JS buffer is retained until its last slice drains, so mutating a `Uint8Array` before then affects the not-yet-written slices. Over HTTP/2, `ReadableStream` responses return `501` status only.
 
 ## Practical example: JSON REST API
 
@@ -275,7 +314,7 @@ file needs both grants and the parent directory needs `write`.
 
 ## Smoke-testing with FF_ECHO
 
-Set `FF_ECHO` to any value and every request returns canned `200 {"message":"ok"}` without running your handler. Use it to verify the port mapping and deployment before debugging app logic:
+Set `FF_ECHO` to any value and every HTTP/1.1 request returns canned `200 {"message":"ok"}` without running your handler (HTTP/2 requests still run the handler). Use it to verify the port mapping and deployment before debugging app logic:
 
 ```sh
 FF_ECHO=1 ff server.js --allow-net=0.0.0.0:3000
@@ -290,23 +329,24 @@ needs the listener grant.
 
 | Area | Limit | When hit |
 |------|-------|----------|
-| Concurrent connections | 512 | The 513th waits for a free slot |
-| Request headers (HTTP/1.1) | 4 KB | Beyond → `431 Request Header Fields Too Large` |
+| Concurrent connections | 512 | 513th connection is accepted and immediately closed (does not wait) |
+| Request head (HTTP/1.1) | 4 KB (request line + header block) | Beyond → `431 Request Header Fields Too Large` |
 | Request headers (HTTP/2) | 64 KiB | Beyond → `431 Request Header Fields Too Large` |
 | Request body (HTTP/1.1) | 1 MB hard cap (4 KB static buffer spills to heap; 64 MB global spill budget) | Beyond 1 MB → `413 Payload Too Large`; global budget exhausted → `503 Service Unavailable` (HTTP/2 allows 10 MB/stream, 16 MB/session) |
-| Response body | 10 MB hard cap | 64 KB stage buffer spills to the heap; beyond 10 MB → `500` |
-| Read deadline | 30s | Connections with incomplete headers/body after 30s are terminated |
+| Response body | 10 MB hard cap (buffered) | 64 KB HTTP/1.1 stage buffer spills to the heap (64 MB process-wide spill budget, up to 256 KB retained per slot); beyond 10 MB → `500`; spill budget exhausted → `503` for `Response`/`ArrayBuffer` bodies, `500` for plain `{status, body}` objects (`ReadableStream` is chunked on HTTP/1.1, `501` on HTTP/2) |
+| Read/idle deadline | 30s without progress | A connection that receives no bytes for 30s while waiting for request headers/body is closed; the deadline restarts on every read, so a trickling client is never expired. The same 30s budget is the keep-alive idle timeout. Sockets stalled during a response write are not timed out. |
 | Hung handler | 30s | Connection fails with `504` |
 | Framing strictness | Duplicate/ambiguous Content-Length, Transfer-Encoding, obs-fold, or BWS | Connection terminated with `400 Bad Request` |
-| Response status | 100..999 | Clamped/validated to 100..999 |
-| Bind address | Always `0.0.0.0` | No host option exists; the net scope must be `0.0.0.0:<port>` |
+| Response status | 100..999 | Out-of-range falls back to default (`200`, or `302` for `Response.redirect`) |
+| Bind address | Default `0.0.0.0` (`options.hostname`) | IPv4/IPv6 literals only; `--allow-net` checks `<hostname>:<port>` |
 | Plain protocol | HTTP/1.1 | HTTP/2 needs TLS (see the TLS guide) |
 
 ## Troubleshooting
 
-**`http.serve` throws `PermissionDenied`** — the listener's port is outside
-every `--allow-net` scope. Add `--allow-net=0.0.0.0:<port>`. `127.0.0.1` and
-`localhost` will not match the bind address.
+**`http.serve` throws `PermissionDenied`** — the listener's host/port is outside
+every `--allow-net` scope. Grant `--allow-net=<hostname>:<port>` (default
+`0.0.0.0:<port>`; `127.0.0.1` only matches when `{ hostname: "127.0.0.1" }`
+is set, and `"localhost"` is not accepted).
 
 **TLS fails with `PermissionDenied` on `tls.cert` / `tls.key`** — the path is
 outside `--allow-read`. Add the file (and any symlink target) to the scope, or

@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: Layers from QuickJS down to libxev, where each subsystem lives, and how the hot path stays allocation-free.
+description: Layers from QuickJS down to libxev, where each subsystem lives, and how the fast path (0-arity handlers, small requests and responses) stays allocation-free.
 order: 4
 ---
 
@@ -21,15 +21,22 @@ codebase makes the rest of the documentation predictable.
 └──────────────────┬───────────────────────────────┘
                    │ C ABI (src/c.zig → quickjs_shim.zig)
 ┌──────────────────▼───────────────────────────────┐
-│ Zig API layer                                    │
-│   api/     console, fs, process, crypto, url,    │
-│            fetch, websocket, sqlite, sql, ffi    │
+│ Zig runtime & API layer                          │
+│   engine/  engine, quickjs_shim, interrupt       │
+│   util/    cli, limits, env_file                 │
+│   api/     console, fs, process, stdio, crypto,  │
+│            url, text_encoding, fetch, websocket, │
+│            websocket_client, udp, cron,          │
+│            child_process, sqlite, sql, ffi,      │
+│            permissions                           │
 │   net/     http_native (512-slot server),        │
-│            http2_server, pg_client, async_fetch  │
+│            http2_server, pg_client, async_fetch, │
+│            tcp_api, udp_native, ws_*, tls*, proxy│
 │   event/   loop, timers, microtasks              │
 │   types/   Headers, Request, Response, Blob,     │
-│            FormData, PoolSlice                   │
-│   worker/  worker, message_port, serialize       │
+│            FormData, ReadableStream, PoolSlice   │
+│   worker/  worker, message_port, serialize,      │
+│            thread_marker                         │
 │   commands/ init, imprint, sever, start, test,   │
 │            repl, compile, fmt, upgrade, watch    │
 └──────────────────┬───────────────────────────────┘
@@ -43,12 +50,14 @@ codebase makes the rest of the documentation predictable.
 
 | Directory | Contents | Read when |
 |---|---|---|
-| `src/api/` | Every JS global | Looking up a global's behaviour |
+| `src/engine/` | QuickJS runtime init, C shims, `--cpu-budget` / `--wall-timeout` monitor | Startup limits or interrupt/timeout watchdog |
+| `src/util/` | CLI UI helpers, `--max-heap`/`--max-stack` limits, `--env-file` | Flag parsing, limits, or `.env` loading |
+| `src/api/` | Every JS global (`cron`, `stdio`, `fs`, `process`, `ffi`, …) | Looking up a global's behaviour |
 | `src/crypto/` | Dedicated `crypto.bcrypt` worker pool (`bcrypt_pool.zig`) | Password hashing pool and job slots |
-| `src/net/` | HTTP server, HTTP/2, fetch, Postgres, TLS, WebSocket | Networking limits or protocol details |
-| `src/security/` | Permission policy (`permissions.zig`, `deny.zig`) | `--allow-*` flag parsing and scope checks |
+| `src/net/` | HTTP server, HTTP/2, fetch, TCP, UDP, Postgres, TLS, WebSocket | Networking limits or protocol details |
+| `src/security/` | Permission policy + Linux sandbox (`permissions.zig`, `deny.zig`, `sandbox.zig`) | `--allow-*` / `--deny-*` / `--deny-private-net`, `permissions.revoke`, or `--simple-sandbox` (Landlock + seccomp-bpf) |
 | `src/event/` | Loop, timers, microtasks | Ordering or liveness questions |
-| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData` | Fetch API semantics |
+| `src/types/` | `Headers`, `Request`, `Response`, `Blob`, `FormData`, `ReadableStream` | Fetch/stream API semantics |
 | `src/worker/` | Workers + structured clone | Worker limits |
 | `src/commands/` | CLI subcommands | CLI flags |
 | `src/modules/` | ESM resolver | Import resolution rules |
@@ -60,11 +69,15 @@ codebase makes the rest of the documentation predictable.
 |---|---|---|
 | JS thread | 1 | All JavaScript, all Promise settlements |
 | Event-loop pool (`libxev`) | 4 | General loop work |
-| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job waits |
-| `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
-| `ffi` pool | 4 | Each native call parks a pool thread |
-| `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound connections |
-| Postgres / TLS | none | Event-driven on the loop thread |
+| `fs.*Async` pool | 4 + 16 job slots | File I/O; a 17th concurrent job throws `OutOfMemory` immediately |
+| `crypto.bcrypt` pool | 2–4 (`min(4, max(2, cpu - 1))`, 1 MB stack) + 16 job slots | Off-loop password hashing; a 17th concurrent job rejects immediately |
+| `ffi` pool | 4 + 32 job slots | `nonblocking: true` native calls (33rd throws `OutOfMemory`; sync calls run on JS thread) |
+| `fetch` workers | 16 (1 MB stack each) | One thread per slot; outbound HTTP connections |
+| `std.Io.Threaded` pool | up to 32 (1 MB stack each) | Backing I/O for `fetch` / client TLS DNS, connect, and reads |
+| WebSocket client worker | 1 (1 MB stack, lazy) | Drives all 64 client `WebSocket` connections (`ws://` / `wss://`) |
+| `--cpu-budget` / `--wall-timeout` monitor | 1 (1 MB stack, 20 ms poll) | Interrupts runaway JS loops (`--cpu-budget`) and enforces process wall-clock exit `124` (`--wall-timeout`) |
+| `--watch` parent watchdog | 1 (1 MB stack, 500 ms poll) | Exits watched children if supervisor dies |
+| Postgres / server TLS | none | Event-driven on the loop thread |
 | `Worker` | up to 8 | Your CPU-bound JS, each with its own runtime |
 
 There is no single shared pool — loop, `fs`, and `ffi` each own a
@@ -86,6 +99,13 @@ the full inventory.
 - **Worker messages** — one small allocation plus a `memcpy` per message.
 - **Postgres arenas** — per-job arena with a 32 KB retain cap plus a job
   freelist, so a warm query path allocates nothing.
+
+"Allocation-free" above means the fast path: a 0-arity handler (`() => ...`)
+with a request head <= 4 KB and a response <= 64 KB makes no Zig heap call.
+Everything outside it uses the documented pooled/gpa paths: `headers`
+parsing for handlers with arity >= 4 allocates a pooled `HeadersData`,
+request bodies above 4 KB spill to the heap, response bodies above 64 KB
+spill to the heap, and every HTTP/2 connection allocates a `Session`.
 
 ## Build options
 

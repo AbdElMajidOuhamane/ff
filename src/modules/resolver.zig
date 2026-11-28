@@ -55,6 +55,8 @@ fn resolveRelative(allocator: Allocator, importer_dir: []const u8, specifier: []
     }
     var result = std.ArrayList(u8).empty;
     defer result.deinit(allocator);
+    const is_abs = std.mem.startsWith(u8, importer_dir, "/");
+    if (is_abs) try result.append(allocator, '/');
     for (parts.items, 0..) |p, i| {
         if (i > 0) try result.append(allocator, '/');
         try result.appendSlice(allocator, p);

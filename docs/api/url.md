@@ -50,7 +50,7 @@ new URL("//cdn.x.dev/a.js", "https://x.dev").href; // "https://cdn.x.dev/a.js"
 | `hash` | yes | Includes leading `#` |
 | `username` | yes | Before `@` |
 | `password` | yes | After `@` |
-| `searchParams` | no | Read view of the query — reflects URL edits, but edits to it never flow back (see below) |
+| `searchParams` | yes (own property) | Read view of the query — reflects URL edits, but edits to it never flow back (see below) |
 
 Setting a component updates the whole URL:
 
@@ -93,7 +93,7 @@ if (!u) return new Response("bad url", { status: 400 });
 
 ## `URLSearchParams`
 
-Reached through `url.searchParams` or constructed directly:
+Reached through `url.searchParams` or constructed directly from a query string (non-string arguments such as objects/arrays/other `URLSearchParams` yield empty instances, and a leading `?` is **not** stripped — `new URLSearchParams("?a=1")` keeps key `"?a"`):
 
 ```js
 const sp = new URLSearchParams("a=1&b=2");
@@ -103,7 +103,7 @@ sp.get("a");          // "1"   (first match)
 sp.getAll("a");       // ["1", "10"]
 sp.has("b");          // true
 sp.delete("b");
-sp.toString();        // "a=1&a=10&c=3"   (insertion order, NOT percent-encoded)
+sp.toString();        // "a=1&c=3&a=10"  (delete swap-removes last entry into deleted slot; NOT percent-encoded)
 sp.size();            // 3      ← a METHOD, not a property
 ```
 
@@ -113,11 +113,11 @@ sp.size();            // 3      ← a METHOD, not a property
 |---|---|---|
 | `get(name)` | `(string) → string \| null` | First value, verbatim (no percent-decoding) |
 | `getAll(name)` | `(string) → string[]` | All values |
-| `has(name)` | `(string) → boolean` | |
-| `set(name, value)` | `(string, string)` | Replaces all matches |
+| `has(name, value?)` | `(string, string?) → boolean` | Optional `value` restricts match to entries matching both name and value |
+| `set(name, value)` | `(string, string)` | Replaces all matches (duplicate removal swap-removes later entries) |
 | `append(name, value)` | `(string, string)` | |
-| `delete(name)` | `(string) → void` | |
-| `sort()` | `() → void` | Key order |
+| `delete(name, value?)` | `(string, string?) → void` | Swap-removes all entries for `name`, or only entries matching `(name, value)` when `value` is given |
+| `sort()` | `() → void` | Key order (call when deterministic order is needed after `delete`/`set`) |
 | `toString()` | `() → string` | `a=1&b=2` — verbatim, never percent-encoded |
 | `size()` | `() → number` | **Call it** — it's a function |
 | `entries()` / `keys()` / `values()` | `() → string[][]` / `string[]` / `string[]` | Return **arrays**, not iterators |
@@ -153,8 +153,8 @@ const res = await fetch("https://api.example.com/search?" + qs);
 // wire query: q=caf%C3%A9%20%26%20tea&page=2 — intact
 ```
 
-Two things that look right but aren't: `fetch(urlObject)` throws
-`Invalid URL` — always pass a string (`fetch(u.href)`) — and
+Two things that look right but aren't: `fetch(urlObject)` rejects with
+`"Invalid URL"` — always pass a string (`fetch(u.href)`) — and
 `u.searchParams.set(...)` followed by `fetch(u.href)` sends the *old*
 query, because param edits never reach the URL.
 
@@ -172,16 +172,24 @@ http.serve({ port: 3000 }, (raw, method) => {
 
 - `searchParams.size` and `Headers.size` are **functions** — call them
   (`sp.size()`), they are not numeric properties.
+- `new URLSearchParams(init)` accepts strings only (objects, pair arrays, and
+  other `URLSearchParams` produce an empty instance) and preserves a leading
+  `?` (e.g. `"?a=1"` creates key `"?a"`).
+- `delete()` and duplicate-removing `set()` swap-remove entries, so
+  insertion order is not preserved across edits — call `sp.sort()` if
+  deterministic ordering matters.
 - Query values are never percent-encoded on output — but the URL parser
   *decodes* `%XX` on input. Encode with `encodeURIComponent` and keep
   encoded strings out of `new URL` / `.search`.
-- `fetch()` takes a URL *string*, not a `URL` object (`fetch(u)` throws
-  `Invalid URL` — use `fetch(u.href)`).
+- `fetch()` takes a URL *string*, not a `URL` object (`fetch(u)` rejects with
+  `"Invalid URL"` — use `fetch(u.href)`).
 - `for...of` doesn't work on `URLSearchParams` (or `Headers`) — loop over
   `.entries()` instead.
 - `URL.parse` returns `null`; the **constructor throws**. Pick per context.
-- Input longer than the internal buffer falls back to heap allocation —
-  there is no documented length cap, but absurd URLs are waste.
+- Construction (`new URL()` / `URL.parse()`) allocates dynamically, **but**
+  property setters (`u.href =`, `u.pathname =`, `u.search =`, etc.) recompose
+  into a fixed **8192-byte** stack buffer and silently no-op past 8192 bytes.
+  Setting `u.search = ...` also strips any existing `#hash`.
 - `origin` is read-only; use `href = …` to change the host.
 - No `URL.canParse` in very old environments — it exists here.
 

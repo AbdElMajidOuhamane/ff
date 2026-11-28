@@ -26,7 +26,7 @@ const data = await res.json();
 | | |
 |---|---|
 | Signature | `new Response(body?, init?)` |
-| `body` | `string` \| `ArrayBuffer` \| `Uint8Array` (or `null`/omitted) |
+| `body` | `string` \| `ArrayBuffer` \| `Uint8Array` \| [`ReadableStream`](/docs/api/streams) (or `null`/omitted) |
 | `init` | `{ status?, statusText?, headers? }` (status must be `100`–`999`, default `200`) |
 
 ```js
@@ -44,18 +44,18 @@ new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "applicatio
 | Property | Type | Description |
 |---|---|---|
 | `status` | `number` | HTTP status |
-| `statusText` | `string` | Reason phrase |
+| `statusText` | `string` | Reason phrase. Fetched responses derive it from `status`; a constructed response keeps the default `"OK"` unless `init.statusText` is given |
 | `ok` | `boolean` | `200 ≤ status ≤ 299` |
 | `headers` | `Headers` | Live header collection |
+| `body` | `ReadableStream \| null` | Stream passed to `new Response(stream)`, `null` for empty bodies, or a closed single-chunk `ReadableStream` for buffered responses |
 | `url` | `string` | Final URL (after redirects) — for `fetch` results |
 | `redirected` | `boolean` | Whether `fetch` followed a redirect |
-| `type` | `string` | `"default"` |
-| `bodyUsed` | `boolean` | Always `false` — never flips, even after reading (see Gotchas) |
+| `type` | `string` | `"basic"` (or `"error"` from `Response.error()`) |
+| `bodyUsed` | `boolean` | Flips to `true` after the first body reader (`text()`, `json()`, `arrayBuffer()`, `bytes()`, `blob()`, `formData()`); it never blocks a later read |
 
 ### Body readers
 
-Readers do **not** consume — call any reader any number of times, in any
-order:
+For buffered responses (including `fetch()` and `Response.file()`), readers do **not** consume — call any reader any number of times, in any order:
 
 | Method | Returns |
 |---|---|
@@ -65,7 +65,9 @@ order:
 | `bytes()` | `Promise<ArrayBuffer>` — same bytes as `arrayBuffer()`, despite the name; **not** a `Uint8Array` |
 | `blob()` | `Promise<Blob>` — a `Blob` instance (`size`, `type`, `slice()`, `text()`, `arrayBuffer()`, `bytes()`) |
 | `formData()` | `Promise<FormData>` |
-| `clone()` | `Response` — Known issue: the copy comes back **corrupted**, so don't use it; just re-read the original |
+| `clone()` | `Response` — copies headers and buffered body; the original stays readable. A `ReadableStream` body is not carried over (the clone's `body` is an empty, already-closed stream) |
+
+> **Streaming body note:** When `new Response(stream)` is constructed directly with a [`ReadableStream`](/docs/api/streams), `res.text()` only pops chunks already queued synchronously (it does not invoke `pull()` or await async chunks). `arrayBuffer()`, `bytes()`, `blob()`, `formData()`, and `clone()` read only buffered bytes (`""`/empty) without consuming the stream, while `json()` rejects with `Unexpected end of JSON input`. Use `res.body.getReader()` (or stream via `http.serve`) instead.
 
 ```js
 const res = await fetch(url);
@@ -74,11 +76,11 @@ console.log(await res.text());   // "hello" — re-readable
 console.log((await res.bytes()).byteLength); // 5 — ArrayBuffer, not Uint8Array
 ```
 
-`clone()` corrupts instead of teeing — observed verbatim:
+`clone()` copies the buffered body; the source stays intact (it does not tee a stream):
 
 ```js
 const res = new Response("OKABCDEFGH");
-console.log(await res.clone().text()); // "OKOKABCDEF" — corrupted
+console.log(await res.clone().text()); // "OKABCDEFGH"
 console.log(await res.text());         // "OKABCDEFGH" — original intact
 ```
 
@@ -87,6 +89,7 @@ console.log(await res.text());         // "OKABCDEFGH" — original intact
 ```js
 Response.json({ ok: true });                      // application/json body
 Response.json({ ok: true }, { status: 201 });
+Response.file("./public/index.html");             // reads file, requires --allow-read
 Response.redirect("/login");                      // 302 status only — no Location header
 Response.redirect("/login", 307);
 Response.error();                                 // status 0 — a network-failure marker
@@ -94,7 +97,8 @@ Response.error();                                 // status 0 — a network-fail
 
 | Static | Signature | Notes |
 |---|---|---|
-| `Response.json(value, init?)` | `(any, { status?, headers? }) → Response` | Sets `content-type: application/json` |
+| `Response.json(value, init?)` | `(any, { status?, statusText?, headers? }) → Response` | Sets `content-type: application/json` |
+| `Response.file(path)` | `(string) → Response` | Synchronously reads file (`--allow-read`, 50 MB read cap; `http.serve` enforces 10 MB wire cap), guesses `Content-Type` by extension |
 | `Response.redirect(url, status?)` | `(string, number?) → Response` | Throws `Response.redirect requires a URL` if missing. Known issue: no `Location` header is emitted, so no client follows it — send `Location` yourself (see [fetch Gotchas](/docs/api/fetch#gotchas)) |
 | `Response.error()` | `() → Response` | `status: 0`, `type: "error"` |
 
@@ -137,7 +141,7 @@ new Request(otherRequest);                 // clone
 |---|---|---|
 | `url` | `string` | Target URL |
 | `method` | `string` | As given — case preserved (`"post"` stays `"post"`, not uppercased) |
-| `headers` | `headers` | `Headers` instance |
+| `headers` | `Headers` | `Headers` instance |
 | `bodyUsed` | `boolean` | Always `false` — bodies can be re-read freely (see Gotchas) |
 | `cache`, `credentials`, `mode`, `redirect`, `integrity` | `string` | Standard init fields, stored as given |
 | `keepalive` | `boolean` | |
@@ -146,7 +150,7 @@ new Request(otherRequest);                 // clone
 ### Methods
 
 `text()`, `json()`, `arrayBuffer()`, `blob()`, `formData()`, `bytes()`,
-`clone()` — same contract as `Response`. Plus:
+`clone()` — same re-readable contract as `Response` (note `Request` has no `.body` getter). Plus:
 
 ```js
 req.toString();   // the URL
@@ -158,29 +162,29 @@ req.toJSON();     // { url, method }
 ```js
 const h = new Headers({ accept: "application/json" });
 h.append("accept", "text/plain");
-h.get("Accept");         // "application/json, text/plain"  (merged)
+h.get("Accept");         // "application/json, text/plain"  (joined)
 h.getAll("accept");      // ["application/json", "text/plain"]
 h.has("accept");         // true
 h.set("x-trace", "1");
 h.delete("x-trace");
-h.size();                // number of header names          ← METHOD
-h.toString();            // "accept: application/json, text/plain\n…"
+h.size();                // total number of header entries (including duplicates) ← METHOD
+h.toString();            // "accept: application/json\r\naccept: text/plain"
 ```
 
 | Method | Signature | Notes |
 |---|---|---|
-| `get(name)` | `(string) → string \| null` | Values joined with `, ` |
+| `get(name)` | `(string) → string \| null` | Multi-values joined with `, ` (except `cookie` → `; `, and `set-cookie` → first value only) |
 | `getAll(name)` | `(string) → string[]` | **Non-standard** (removed from the spec) |
 | `has(name)` | `(string) → boolean` | |
-| `set(name, value)` | `(string, string)` | Replaces |
+| `set(name, value)` | `(string, string)` | Replaces existing entries for `name` (uses swap-remove) |
 | `append(name, value)` | `(string, string)` | |
-| `delete(name)` | `(string) → void` | |
-| `size()` | `() → number` | **A method**, not a property |
-| `entries()` / `keys()` / `values()` | `() → string[][]` / `string[]` / `string[]` | Return **arrays**, not iterators |
+| `delete(name, value?)` | `(string, string?) → void` | Deletes all entries for `name`, or only the first entry matching `(name, value)` if `value` is given |
+| `size()` | `() → number` | **A method**, not a property; counts raw entries including duplicates |
+| `entries()` / `keys()` / `values()` | `() → string[][]` / `string[]` / `string[]` | Return **arrays**, not iterators (`keys()` deduplicates names; `entries()`/`values()` return all raw entries) |
 | `forEach(fn)` | `((value, key, parent) => void)` | |
-| `toString()` | `() → string` | `name: value` lines |
+| `toString()` | `() → string` | Raw `name: value` entries joined with `\r\n` (duplicates not merged) |
 
-Names are case-insensitive; iteration order is insertion order.
+Names are case-insensitive. Invalid RFC 7230 header names or values containing CR/LF/NUL/CTLs throw a `TypeError` (allocation failure throws instead of dropping); a header is never silently discarded. `delete()` and duplicate-collapsing `set()` use swap-remove internally, so order is not preserved after deletions.
 
 ### Iterating
 
@@ -193,13 +197,16 @@ res.headers.forEach((v, k) => console.log(k, v));
 
 ## Gotchas
 
-- **`bodyUsed` never flips** — it stays `false` before, during, and after
-  every read. Don't branch on it; bodies are simply re-readable.
+- **`bodyUsed` never prevents a second read** — on `Response` it flips to
+  `true` once a body reader has run, while on `Request` it stays `false`. In
+  neither case does it block subsequent reads, so don't use it to guard against
+  re-reading.
 - **Status code range (100–999)** — `status` is bounded to valid 3-digit HTTP status codes. Out-of-range numbers (negative, `< 100`, or `> 999`) fall back to default (`200`, or `302` for `Response.redirect`).
-- **`headers.size` is a function** — `h.size` is `undefined`;
-  `h.size()` is the number. Same for `URLSearchParams.size`.
-- `clone()` corrupts the copy (`"OKABCDEFGH"` → `"OKOKABCDEF"`) — re-read
-  the original instead of cloning.
+- **Stream body borrow** — In HTTP/1.1 chunked streaming, oversized binary chunks (>16 KB) are emitted one slice per write, copied into the write buffer, and the `Uint8Array` / `ArrayBuffer` backing buffer is retained until the last slice drains. If the producer mutates the buffer in-place while streaming, not-yet-written slices reflect the mutation.
+- **HTTP/2 stream responses** — Returning a `ReadableStream` body over HTTP/2 returns `501 Not Implemented`.
+- **`headers.size` is a method** — `h.size` evaluates to a function, not a
+  number; call `h.size()` for the count. Same for `URLSearchParams.size`.
+- `clone()` snapshots headers and buffered body; the source stays readable. A `ReadableStream` body is not carried over — the clone's `body` is an empty, already-closed stream.
 - `new Response(body)` copies the bytes; mutating the original afterwards
   does not change the response.
 - `Response.redirect(url)` without a URL **throws** — and with one it still sends no `Location` header, so clients never follow it.

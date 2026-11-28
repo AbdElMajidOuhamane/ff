@@ -32,7 +32,14 @@ fn timersAlive() bool {
 // legitimately lead active by one.
 inline fn unrefArmed() usize {
     const tm_unref = if (timer_mgr) |tm| tm.unrefScheduledCount() else 0;
-    return tm_unref + process_api.unrefSignalCount() + worker_mod.unrefAsyncCount();
+    return tm_unref +
+        process_api.unrefSignalCount() +
+        worker_mod.unrefAsyncCount() +
+        fs_mod.unrefAsyncCount() +
+        ffi_api.unrefAsyncCount() +
+        bcrypt_pool.unrefAsyncCount() +
+        ws_client.unrefAsyncCount() +
+        async_fetch.unrefAsyncCount();
 }
 
 pub const EventLoop = struct {
@@ -53,7 +60,10 @@ pub const EventLoop = struct {
             std.process.exit(1);
         }
         g_thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
-        self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch unreachable };
+        self.* = .{ .loop = xev.Loop.init(.{ .thread_pool = &g_thread_pool }) catch |err| {
+            std.debug.print("ff: event loop init failed: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        } };
     }
     pub fn initHeap(allocator: std.mem.Allocator) !*EventLoop {
         const ptr = try allocator.create(EventLoop);
@@ -103,6 +113,7 @@ pub const EventLoop = struct {
         if (bcrypt_pool.pending.load(.acquire) > 0) return true;
         if (worker_mod.liveCount() > 0) return true;
         if (child_process.liveCount() > 0) return true;
+        if (@import("../api/stdio.zig").isStdinPending()) return true;
         // Queue entries only count as blocking when nothing is unref'd:
         // with an unref'd timer pending, an entry in submissions may be that
         // timer's own submission, and waiting on it is precisely the bug.
@@ -212,5 +223,6 @@ pub const EventLoop = struct {
                 idle_delay_ns = IDLE_MIN_NS;
             }
         }
+        microtasks.flushUnhandledRejections(ctx);
     }
 };

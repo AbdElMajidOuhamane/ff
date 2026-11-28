@@ -8,39 +8,43 @@ order: 7
 
 A deploy is: get the binary — prebuilt with `curl -fsSL …/install.sh | sh`
 (see [Installation](/docs/getting-started/installation)), pull
-`ghcr.io/abdelmjidouhamane/ff:latest`, or build from source (below) — get your
+`ghcr.io/abdelmajidouhamane/ff:latest`, or build from source (below) — get your
 code on the box, start it with `ff start` (or `ff server.js`), and verify with
 `FF_ECHO` before opening traffic.
 
 ## Permissions
 
 Production runs deny-by-default just like local runs. `ff start` does **not**
-read permissions from `ff.json` or from environment variables — pass the
-`--allow-*` flags on the command line, after `start`:
+read permissions from `ff.json` or from environment variables — pass `--allow-*`,
+`--deny-*`, `--env-file`, and production limit flags (`--max-heap`, `--max-stack`,
+`--worker-heap`, `--cpu-budget`) on the command line:
 
 ```sh
-ff start --allow-net=0.0.0.0:3000
+ff start --allow-net=0.0.0.0:3000 --max-heap=128MB --cpu-budget=2000
 ```
 
 Minimum for a normal web service:
 
 | Need | Flag |
 |---|---|
-| The listener | `--allow-net=0.0.0.0:<port>` |
+| The listener | `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`) |
 | `process.env.PORT` / other app vars | `--allow-env=PORT,...` |
-| Reading files / TLS paths in JS | `--allow-read=<path>` |
+| Reading files / `Response.file` / TLS paths in JS | `--allow-read=<path>` |
 | Writing files / SQLite | `--allow-write=<path>` |
 | Subprocesses | `--allow-run=<program>` |
 | FFI | `--allow-ffi` |
 
-- The listener always binds `0.0.0.0`; the scope must name
-  `0.0.0.0:<port>`, not the platform's public hostname or `127.0.0.1`.
-- The policy is fixed at launch. There is no signal or API to add a scope
-  while the process runs.
+- The listener binds `0.0.0.0` by default unless `{ hostname }` is set in
+  `http.serve`; match `--allow-net` to that `<hostname>:<port>` (not the
+  platform's public hostname or `127.0.0.1` unless you explicitly bound `127.0.0.1`).
+- Initial grants come only from CLI flags (nothing can add scopes at runtime),
+  though applications can drop/narrow privileges after initialization via
+  `permissions.revoke()`, and `--deny-read=` / `--deny-write=` / `--deny-net=`
+  block specific paths or hosts even inside broader allows.
 - `--allow-all` exists for fully trusted apps but gives up every boundary; do
   not use it as a deploy default.
-- `FF_ECHO` is runtime configuration, not app env: it needs no
-  `--allow-env`, and it does not bypass the listener's `--allow-net`.
+- `FF_ECHO`, `FF_MAX_HEAP`, and `FF_CPU_BUDGET` are runtime configuration, not
+  app env: they need no `--allow-env`, and `FF_ECHO` does not bypass `--allow-net`.
 
 A missing grant usually fails at startup with `PermissionDenied` and a
 non-zero exit; check the process logs before debugging the platform.
@@ -86,7 +90,7 @@ There is no `make build-native` target.
 
 On Linux the I/O backend is io_uring by default; build with
 `zig build -Dio_uring=false` for an epoll binary that runs anywhere. See the
-README's "I/O backend on Linux" for the kernel and seccomp requirements.
+README's "Building from source" section for the kernel and seccomp requirements.
 
 ## Run with `ff start`
 
@@ -95,14 +99,18 @@ README's "I/O backend on Linux" for the kernel and seccomp requirements.
 ```sh
 ff init -y my-app
 cd my-app
+cat > main.js <<'EOF'
+http.serve({ port: 3000 }, () => new Response("ok"));
+EOF
 ff start --allow-net=0.0.0.0:3000
 ```
 
 ```sh
 curl http://127.0.0.1:3000/
+# ok
 ```
 
-The listen port comes from `http.serve({ port })` in your code (default `3000`, binds `0.0.0.0`). Match whatever your platform expects:
+The listen host and port come from `http.serve({ hostname, port })` in your code (defaults: `hostname` `"0.0.0.0"`, `port` `3000`). Match whatever your platform expects:
 
 ```js
 // server.js — port from the environment, default 3000
@@ -127,6 +135,7 @@ curl http://127.0.0.1:8080/
 FROM alpine:3 AS build
 # ... build steps produce /ff ...
 FROM alpine:3
+RUN apk add --no-cache ca-certificates
 COPY --from=build /ff /usr/local/bin/ff
 COPY ff.json server.js ./
 EXPOSE 3000
@@ -135,7 +144,7 @@ CMD ["ff", "start", "--allow-net=0.0.0.0:3000"]
 
 ```sh
 docker build -t fairyfly .
-docker run -p 3000:3000 fairyfly
+docker run --security-opt seccomp=unconfined -p 3000:3000 fairyfly
 curl http://127.0.0.1:3000/
 ```
 
@@ -143,7 +152,7 @@ curl http://127.0.0.1:3000/
 `--allow-*` flags in `CMD` (or the platform's start command). If the app reads
 `PORT`, add `--allow-env=PORT` and make the net scope match.
 
-The `-p` mapping must match the port in `http.serve({ port })` — the container binds `0.0.0.0` already, so only the mapping can be wrong.
+The `-p` mapping must match the port in `http.serve({ port })` — the container binds `0.0.0.0` by default unless `hostname` is set, so match `-p` and `--allow-net` to the bound address and port.
 
 > **io_uring images need a permissive seccomp profile.** The published image
 > is built with io_uring; Docker's default profile blocks it and the process
@@ -169,21 +178,23 @@ grant is still required.
 
 ## TLS in production
 
-Terminate TLS in Fairyfly with a real certificate (see the TLS guide for the full walkthrough):
+Terminate TLS in Fairyfly with a real certificate (see the [TLS guide](/docs/guides/tls) for details and current caveats):
 
-```sh
-ff start \
-  --cert /etc/ssl/cert.pem \
-  --key /etc/ssl/key.pem \
-  --allow-net=0.0.0.0:3000
-# or via env:
-FF_CERT=/etc/ssl/cert.pem FF_KEY=/etc/ssl/key.pem \
-ff start --allow-net=0.0.0.0:3000
+```js
+// server.js — pass tls: { cert, key } directly to http.serve
+http.serve(
+  { port: 3000, tls: { cert: "/etc/ssl/cert.pem", key: "/etc/ssl/key.pem" } },
+  () => new Response("ok"),
+);
 ```
 
-Both must be given together; on success the same port serves HTTPS and WSS alongside plain HTTP/WS. The CLI reads `--cert` / `--key` / `FF_CERT` / `FF_KEY` before the runtime starts, so those paths need no `--allow-read` — but a `tls` object inside your app is a runtime read and does.
+```sh
+ff start --allow-net=0.0.0.0:3000 --allow-read=/etc/ssl/cert.pem,/etc/ssl/key.pem
+```
 
-Behind a platform load balancer that terminates TLS for you, skip these and serve plain HTTP. The listener still needs `--allow-net=0.0.0.0:<port>`.
+> **Known issue:** `ff start` also accepts `--cert` / `--key` (and `FF_CERT` / `FF_KEY`) before JS runs without needing `--allow-read`, **but** calling `http.serve({ port }, handler)` without a `tls` option currently disables TLS on the listener (overriding CLI TLS). Pass `{ tls: { cert, key } }` in `http.serve` until that interaction is fixed. When TLS is active, the listener serves HTTPS/WSS/HTTP/2 **only** (replacing plain HTTP/WS on that port).
+
+Behind a platform load balancer that terminates TLS for you, skip TLS in Fairyfly and serve plain HTTP. The listener still needs `--allow-net=<hostname>:<port>`.
 
 ## Practical example: health-checked service
 
@@ -211,18 +222,20 @@ Point your platform's health check at `/health` and assert on `ok: true`.
 
 ## Troubleshooting
 
-**`PermissionDenied` at startup** — the listener port is outside every
-`--allow-net` scope. Add `--allow-net=0.0.0.0:<port>` to the `ff start`
-command (or Docker `CMD`). `127.0.0.1` and the platform hostname will not
-match the bind address.
+**`PermissionDenied` at startup** — the listener port/host is outside every
+`--allow-net` scope. Add `--allow-net=<hostname>:<port>` (default `0.0.0.0:<port>`)
+to the `ff start` command (or Docker `CMD`). `127.0.0.1` and the platform hostname
+will not match the default `0.0.0.0` bind address unless `{ hostname }` is passed in `http.serve`.
 
 **`process.env.PORT` is undefined in production** — add
 `--allow-env=PORT`. The variable is filtered out of `process.env`, while the
 platform may still have exported it. `ff.json` and env vars cannot grant this.
 
-**TLS files denied in production** — CLI `--cert` / `--key` are read before
-the runtime and need no `--allow-read`. A `tls: { cert, key }` object in the
-app is a runtime read: add both paths, or switch to the CLI form.
+**TLS files denied or CLI `--cert` / `--key` inactive** — CLI `--cert` / `--key`
+are read before the runtime and need no `--allow-read`, **but** calling
+`http.serve({ port }, handler)` without an `opts.tls` object currently disables
+TLS on the listener (known issue). Pass `{ tls: { cert, key } }` in `http.serve`
+along with `--allow-read` for both paths.
 
 **Connection refused after deploy** — port mismatch: compare `http.serve({ port })`, `PORT`, the `--allow-net` port, and the Docker `-p` / platform port. Nothing overrides the code port.
 

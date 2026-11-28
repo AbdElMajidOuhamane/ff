@@ -297,13 +297,16 @@ Address objects always have this shape:
 | `connect: address required` / `connect: port required` | `connect` without both fields |
 | `sendto: address required` / `sendto: port required` | `sendto` destination validation |
 | `send: socket is not connected` / `recv: socket is not connected` | connected-only methods |
-| `send: MessageTooLong` | data > 65507 bytes |
-| `recvfrom: NotABuffer` | buffer isn't `Uint8Array` / `ArrayBuffer` |
+| `send: MessageTooLong` / `send: SendQueueFull` / `send: NotABuffer` | send >65507 B, 64 in-flight sends full, or non-buffer payload (same `send:` prefix for `sendto`) |
+| `recvfrom: NotABuffer` / `recvfrom: RecvPending` | invalid buffer or concurrent receive already pending (same `recvfrom:` prefix for `recv`) |
 | `...: socket is closed` | any method after `close()` |
 | `...: socket closed` | **rejection** of a promise pending at `close()` |
 
 Permission errors are `Error` objects with `name: "PermissionDenied"` and
-`code: "PERMISSION_DENIED"`; the rest are `TypeError`s with plain messages.
+`code: "PERMISSION_DENIED"`. Missing/wrong-type top-level argument checks
+(`bind`/`connect` options object, `sendto`/`send`/`recvfrom`/`recv` required arguments)
+throw `TypeError`; all operational and validation errors listed in the table
+above (like `bind: invalid address` or `send: MessageTooLong`) are plain `Error` objects.
 
 ## Full example
 

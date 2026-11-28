@@ -39,6 +39,7 @@ const http_native = @import("http_native.zig");
 const tls_mod = @import("tls_server.zig");
 const headers_mod = @import("../types/headers.zig");
 const response_mod = @import("../types/response.zig");
+const readable_stream = @import("../types/readable_stream.zig");
 const gpa = std.heap.smp_allocator;
 
 pub const MAX_STREAMS = 100;
@@ -54,6 +55,10 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB per stream — over-cap → 413
 // cap is MAX_STREAMS × MAX_BODY_SIZE (up to 1 GB on one connection).
 // Exceeding it is a protocol-abuse signal: fail the session, don't buffer.
 const MAX_SESSION_BODY: usize = 16 * 1024 * 1024;
+/// Ceiling on staged outbound bytes per connection. 16 MiB permits ~160
+/// concurrent 100 KiB responses — far above the 100-stream cap — while
+/// keeping the failure mode a closed connection instead of OOM.
+const MAX_SESSION_OUTPUT: usize = 16 * 1024 * 1024;
 
 /// onRecv return value meaning "protocol error — close the connection".
 pub const FATAL: usize = std.math.maxInt(usize);
@@ -199,6 +204,11 @@ pub const Session = struct {
     going_away: bool = false,
     // Sum of live request-body bytes across streams (bounds MAX_SESSION_BODY).
     body_bytes: usize = 0,
+    // Set when staged response bytes exceed MAX_SESSION_OUTPUT: the sender
+    // fails the callback and onRecv closes the connection. Outbound credit is
+    // peer-controlled (WINDOW_UPDATE), so without a ceiling one session could
+    // stage gigabytes in `output` before a single chunk reached the socket.
+    output_overflow: bool = false,
 
     fn slotOf(self: *Session, stream_id: i32) ?usize {
         for (0..MAX_STREAMS) |i| {
@@ -223,7 +233,9 @@ pub const Session = struct {
                 return self.slotAt(i);
             }
         }
-        return null; // at MAX_STREAMS — nghttp2 enforces the cap anyway
+        // At MAX_STREAMS. Callers must answer RST_STREAM(REFUSED_STREAM):
+        // dropping the request leaves the peer waiting with no response.
+        return null;
     }
     fn findStream(self: *Session, stream_id: i32) ?Slot {
         return self.slotAt(self.slotOf(stream_id) orelse return null);
@@ -343,6 +355,12 @@ pub fn sendCb(
 ) callconv(.c) h2.ssize {
     const slot = slotFromPtr(user_data) orelse return h2.ERR_CALLBACK_FAILURE;
     const sess = getSession(slot) orelse return h2.ERR_CALLBACK_FAILURE;
+    if (sess.output.items.len + length > MAX_SESSION_OUTPUT) {
+        // Fail closed and let onRecv() close the connection. Growing without
+        // a ceiling is the only outcome that is more dangerous than a reset.
+        sess.output_overflow = true;
+        return h2.ERR_CALLBACK_FAILURE;
+    }
     sess.output.appendSlice(gpa, data[0..length]) catch return h2.ERR_WOULDBLOCK;
     return @intCast(length);
 }
@@ -354,7 +372,11 @@ pub fn beginHeadersCb(
 ) callconv(.c) c_int {
     const slot = slotFromPtr(user_data) orelse return 0;
     const sess = getSession(slot) orelse return 0;
-    _ = sess.allocStream(frame.hd.stream_id);
+    if (sess.allocStream(frame.hd.stream_id) == null) {
+        if (sess.ng) |ng| {
+            _ = h2.nghttp2_submit_rst_stream(ng, h2.FLAG_NONE, frame.hd.stream_id, h2.REFUSED_STREAM);
+        }
+    }
     return 0;
 }
 
@@ -428,7 +450,16 @@ pub fn appendReqHeader(st: Slot, n: []const u8, v: []const u8) void {
             break :blk nh;
         };
         st.p.req_hdrs_bytes += n.len + v.len;
-        h.appendEntry(n, v); // validates + lowercases the name
+        h.appendEntry(n, v) catch |err| {
+            // Invalid octets in a regular header are a malformed request
+            // (400), not a server fault; allocation failure is a 503.
+            if (err == error.InvalidHeader) {
+                st.f.bad = true;
+            } else {
+                st.f.internal_error = true;
+            }
+            return;
+        };
     }
 }
 
@@ -444,8 +475,17 @@ pub fn headerCb(
 ) callconv(.c) c_int {
     const slot = slotFromPtr(user_data) orelse return 0;
     const sess = getSession(slot) orelse return 0;
-    // beginHeaders always runs first, but allocate defensively.
-    const st = sess.findStream(frame.hd.stream_id) orelse sess.allocStream(frame.hd.stream_id) orelse return 0;
+    // beginHeaders always runs first, but allocate defensively. If the table
+    // is full, refuse the stream explicitly rather than swallowing its headers.
+    const st: Slot = sess.findStream(frame.hd.stream_id) orelse blk: {
+        const allocated = sess.allocStream(frame.hd.stream_id) orelse {
+            if (sess.ng) |ng| {
+                _ = h2.nghttp2_submit_rst_stream(ng, h2.FLAG_NONE, frame.hd.stream_id, h2.REFUSED_STREAM);
+            }
+            return 0;
+        };
+        break :blk allocated;
+    };
     if (st.dispatched()) return 0; // trailers on a dispatched stream: ignore (v1)
     const n = name[0..namelen];
     const v = value[0..valuelen];
@@ -606,6 +646,9 @@ pub fn onRecv(slot_id: usize, data: []const u8, l: *xev.Loop) usize {
         return FATAL;
     }
     flushNow(slot_id, l);
+    // sendCb sets this when the staging ceiling was hit; the frames it refused
+    // are missing from `output`, so the stream is corrupt — close, don't send.
+    if (sess.output_overflow) return FATAL;
     return @intCast(rc);
 }
 
@@ -638,6 +681,7 @@ fn pumpWrite(slot_id: usize, l: *xev.Loop) bool {
     if (sess.out_armed) {
         return true;
     }
+    std.debug.assert(sess.out_sent <= sess.output.items.len);
     if (sess.out_sent >= sess.output.items.len) {
         sess.output.clearRetainingCapacity();
         sess.out_sent = 0;
@@ -829,6 +873,17 @@ fn reserveBody(slot_id: usize, stream_id: i32, n: usize) ?[]u8 {
     return buf;
 }
 
+/// Fail one stream instead of emitting a malformed response. Silent `catch {}`
+/// used to drop `:status`/`content-length` while still submitting the header
+/// block; a peer can only treat that as a stream error, and a missing
+/// `:status` is a connection error, so be explicit.
+fn resetStream(sess: *Session, stream_id: i32) void {
+    if (sess.ng) |ng| {
+        _ = h2.nghttp2_submit_rst_stream(ng, h2.FLAG_NONE, stream_id, h2.INTERNAL_ERROR);
+    }
+    sess.removeStream(stream_id);
+}
+
 fn submitResponseCore(
     slot_id: usize,
     stream_id: i32,
@@ -863,14 +918,25 @@ fn submitResponseCore(
                 need += pair.name.len + pair.value.len;
             }
         }
-        st.p.resp_blob.ensureTotalCapacity(gpa, need) catch {};
+        st.p.resp_blob.ensureTotalCapacity(gpa, need) catch {
+            resetStream(sess, stream_id);
+            return;
+        };
     }
+    // Reserve the Nv column once so every append below is infallible: a
+    // partially-staged header block is not a representable response.
+    st.p.resp_nv.ensureTotalCapacity(gpa, MAX_NV) catch {
+        resetStream(sess, stream_id);
+        return;
+    };
 
     var status_buf: [8]u8 = undefined;
     const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "200";
-    if (stageNv(st.p, ":status", status_str)) |nv| {
-        st.p.resp_nv.append(gpa, nv) catch {};
-    }
+    const status_nv = stageNv(st.p, ":status", status_str) orelse {
+        resetStream(sess, stream_id);
+        return;
+    };
+    st.p.resp_nv.appendAssumeCapacity(status_nv);
 
     if (hdrs) |h| {
         for (0..h.len()) |i| {
@@ -881,9 +947,11 @@ fn submitResponseCore(
             if (pair.name.len > 64 or pair.value.len > 4096) continue;
             if (std.mem.indexOfAny(u8, pair.name, "\r\n") != null or
                 std.mem.indexOfAny(u8, pair.value, "\r\n") != null) continue; // injection guard
-            if (stageNv(st.p, pair.name, pair.value)) |nv| {
-                st.p.resp_nv.append(gpa, nv) catch break;
-            }
+            const nv = stageNv(st.p, pair.name, pair.value) orelse {
+                resetStream(sess, stream_id);
+                return;
+            };
+            st.p.resp_nv.appendAssumeCapacity(nv);
         }
     }
 
@@ -892,10 +960,19 @@ fn submitResponseCore(
     if (body_len > 0 and st.p.resp_nv.items.len < MAX_NV) {
         var cl_buf: [20]u8 = undefined;
         const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body_len}) catch "0";
-        if (stageNv(st.p, "content-length", cl_str)) |nv| {
-            st.p.resp_nv.append(gpa, nv) catch {};
+        const cl_nv = stageNv(st.p, "content-length", cl_str) orelse {
+            resetStream(sess, stream_id);
+            return;
+        };
+        st.p.resp_nv.appendAssumeCapacity(cl_nv);
+        if (!preloaded) {
+            st.p.resp_body.appendSlice(gpa, body) catch {
+                // content-length is already staged; sending fewer bytes than
+                // advertised corrupts the stream.
+                resetStream(sess, stream_id);
+                return;
+            };
         }
-        if (!preloaded) st.p.resp_body.appendSlice(gpa, body) catch {};
     }
 
     if (st.p.resp_body.items.len == 0) {
@@ -950,7 +1027,17 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
     var hdrs: ?*headers_mod.HeadersData = null;
 
     if (c.isObject(result) != 0) {
+        if (readable_stream.isStream(ctx, result)) {
+            respondErrorH2(slot_id, 501);
+            return;
+        }
         if (response_mod.dataFromJS(ctx, result)) |rd| {
+            if (rd.cold) |cold| {
+                if (cold.stream != null) {
+                    respondErrorH2(slot_id, 501);
+                    return;
+                }
+            }
             // Response instance: body/headers point into ResponseData, which
             // is owned by `result` and outlives this function. Borrow is safe.
             status = rd.status;
@@ -967,6 +1054,10 @@ pub fn respondH2(slot_id: usize, result: c.Value) void {
             }
             const body_val = c.getPropertyStr(ctx, result, "body");
             defer c.freeValue(ctx, body_val);
+            if (readable_stream.isStream(ctx, body_val)) {
+                respondErrorH2(slot_id, 501);
+                return;
+            }
             if (c.isString(body_val) != 0) {
                 if (c.toCString(ctx, body_val)) |cs| {
                     // BORROW LIFETIME (memory rule 4): this cstring is freed by
